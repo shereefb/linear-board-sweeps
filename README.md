@@ -90,6 +90,8 @@ Recent and planned launcher/workflow changes:
 - `COD-89`: dogfood retrospective landed under `docs/superpowers/reports/`, with timing, token, cadence, and user-interruption learnings plus follow-up cards.
 - `COD-91`: self-clearing Linear `Todo` cards for scheduled tick failures, deduped by failure fingerprint.
 - `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
+- `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
+- `COD-99`: retire the `In Progress` state from normal workflow; `Ready for Dev` plus `dev:in-progress` becomes the active-dev representation.
 
 ## Requirements
 
