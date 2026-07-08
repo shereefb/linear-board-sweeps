@@ -48,6 +48,12 @@ Claim/release + blocked signals. The sweeps create these if missing.
 
 Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity, and domain labels are optional and team-specific — the sweeps don't require them.
 
+## The `auto-sweep` project label (activation for the launcher)
+
+`auto-sweep` is a **project-level** label (not an issue label), and it is the on/off switch for the auto-sweep launcher (`scripts/linear-watch.mjs`). A registered workspace is swept automatically **iff its Linear project carries this label** — add it in the Linear UI to activate a project, remove it to pause, without touching the machine that runs the launcher. Projects without it are ignored even if their anchor is registered.
+
+The launcher also writes/reads a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO>]` (a running sweep proving it's alive), `[auto-sweep-reaper]` (a stale claim it auto-released), and `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`).
+
 ## Tracking rules (going forward)
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.

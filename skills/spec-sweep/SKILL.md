@@ -47,6 +47,16 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 
 When the spec genuinely can't be finished without answers only the owner can give: post them as a **single numbered comment** on the card, add `blocked:open-questions`, remove `spec:in-progress`, and **leave it in "Needs Spec"** (do not move to Ready for Dev). A later run resumes it once the owner replies (see §1). Ask each question once — never re-post.
 
+## Machine-independence & handoff (auto-sweep)
+
+Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
+
+- **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `spec:in-progress`, post a comment `[auto-sweep-heartbeat <ISO8601 now>]`. A claim with no heartbeat past its stale threshold is treated as crashed and auto-released by the launcher.
+- **Origin holds everything at rest.** Your artifacts are the spec + plan docs; §3 already merges them to the anchor repo's `main` and pushes before you move the card to "Ready for Dev". Never move the card without that push landing — dev-sweep on another machine reads the spec from `main`.
+- **Push discipline (never force).** For the merge push: `git fetch` → rebase/merge `origin/main` → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment on the card and stop. Never force-push.
+- **Re-read before the terminal move.** Right before moving the card to "Ready for Dev", re-fetch it. If a human (or another run) moved it out of "Needs Spec", do NOT override — comment where the spec/plan landed, release `spec:in-progress`, and stop.
+- **Mark backward moves.** If you send a card backward (e.g. to Backlog as too-vague), add a comment `[auto-sweep-bounce Needs Spec→Backlog]`. Repeated backward moves within 48h get the card parked with `blocked:needs-user` for a human.
+
 ## Guardrails (unattended)
 
 - Docs/specs only. No app code, no migrations, no deploys, no prod writes beyond reads needed to design.

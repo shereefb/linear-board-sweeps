@@ -42,6 +42,18 @@ List "Ready for Dev" + "In Progress" cards **in `config.project`**, oldest-first
 - **Needs the user to continue *development*** (a product decision, missing credential/asset, an API only they can provision): add `blocked:needs-user`, **keep the card in "Ready for Dev"**, comment exactly what's needed, and leave it. Resume when they reply. Ask once.
 - **Needs a human-only action you can't perform** (an env var / secret set in the hosting dashboard, a prod migration, a DNS record, a webhook registered in a third-party console, an OAuth app connected, a billing/plan approval, any platform deploy step you can't trigger — see `config.deploy` and the `Todo` lane in the board rules): don't block the dev — **create a new Linear card in status "Todo"** in `config.project` stating *what* to do, *where* (which dashboard/console), and *why* (which feature it unblocks); link it to the feature card, and continue. If the agent could do it itself, do it — don't make a `Todo`.
 
+## Machine-independence & handoff (auto-sweep)
+
+Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
+
+- **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `dev:in-progress`, post a comment `[auto-sweep-heartbeat <ISO8601 now>]`. A claim with no heartbeat past its stale threshold is treated as crashed and auto-released by the launcher — a long, quiet run that skips heartbeats can be reaped out from under you.
+- **Origin holds everything at rest.** Before you change a card's status OR leave it blocked, ensure all its artifacts are committed and pushed in **every repo you touched** (`config.repos`). Uncommitted work in a local worktree is allowed only while you are actively building.
+- **Checkpoint WIP.** Commit + push the branch at natural checkpoints (after the build first goes green, before code review), not only at the end, so a crash strands as little as possible.
+- **Push discipline (never force).** For every push: `git fetch` → rebase your commits onto the updated remote ref → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment what happened on the card and stop. Never force-push.
+- **Worktrees are disposable; the branch is the truth.** `<PREFIX>-###` is deterministic from the card id. Picking up a card, in each relevant repo: `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree already exists (a prior crashed run, possibly dirty), `git reset --hard origin/<PREFIX>-###` before working. Prune worktrees whose remote branch is gone (`git worktree prune`).
+- **Re-read before the terminal move.** Right before moving the card to "In Review", re-fetch it. If a human (or another run) moved it out of "Ready for Dev"/"In Progress", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
+- **Mark backward bounces.** When you send a card back to "Needs Spec", add a comment `[auto-sweep-bounce Ready for Dev→Needs Spec]`. Two backward bounces within 48h and the launcher parks the card with `blocked:needs-user` — so bounce only on a real spec-quality gate, and say exactly what's missing.
+
 ## Guardrails
 
 - Writes **code** (not docs-only) but **never merges and never deploys** — "In Review" + a pushed branch is the human/QA gate.

@@ -101,6 +101,33 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 - **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
 
+## Step 11 — (Optional) Auto-sweep triggering
+
+Only do this on the **always-on machine** (e.g. a Mac mini) that should run sweeps automatically when cards land in a queue. Skip it for a plain manual-invocation setup. Full design: `KIT/docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`.
+
+1. **Pick the runtime + models** in `TARGET/.claude/linear-sweep.json`: set `runtime` (`codex` default or `claude`) and the per-sweep `models` (`gpt-5.5-codex` @ high for codex, or `claude-opus-4-8` @ high for claude). Omit a model/effort to use the runtime's own default.
+2. **Add the `auto-sweep` project label** in Linear to the project you want swept (project-level label — see `docs/linear-rules.md`). Removing it later pauses the project.
+3. **Install the launcher** (symlinks the wrapper, materializes the launchd plist, prints activation steps — it does NOT activate anything):
+   ```bash
+   "KIT/scripts/install-watch.sh"
+   ```
+4. **Register the workspace anchor** (the repo holding `.claude/linear-sweep.json`) and point auto-update at the kit clone by editing `~/.config/linear-board-sweeps/registry.json` (`kitPath` = `KIT`, optionally `kitRemote` = its origin URL):
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" register "TARGET"
+   node "KIT/scripts/linear-watch.mjs" list          # shows projectId + [auto-sweep: ON/off]
+   ```
+5. **Dry-run** (spends NO tokens — logs the dispatch it would make):
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" tick --dry-run
+   ```
+6. **Activate** the 10-min schedule and check health:
+   ```bash
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist
+   node "KIT/scripts/linear-watch.mjs" health
+   ```
+
+**QA caution:** qa-sweep merges + deploys to production. The launcher will auto-run it once activated; if you don't want auto-deploys, tell the user to keep qa on manual `launchctl kickstart` per workspace (the spec explains how) rather than the shared timer. spec/dev sweeps never merge or deploy and are safe to auto-run.
+
 ## Verify (before declaring done)
 
 - `git -C TARGET check-ignore .env` prints `.env` (key is safe).

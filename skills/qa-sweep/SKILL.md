@@ -57,6 +57,17 @@ Only after §3 passes:
 
 If you can't finish without the owner (ambiguous intended behavior, missing credentials/data, a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "In Review", remove `qa:in-progress`. Ask once; resume when they reply.
 
+## Machine-independence & handoff (auto-sweep)
+
+Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
+
+- **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `qa:in-progress`, post a comment `[auto-sweep-heartbeat <ISO8601 now>]`. A claim with no heartbeat past its stale threshold is treated as crashed and auto-released by the launcher — QA runs are long, so heartbeat diligently.
+- **Reconstruct the environment from the branch, not a local worktree.** `<PREFIX>-###` is deterministic from the card. In each relevant repo (`config.repos`): `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree exists from a prior run, `git reset --hard origin/<PREFIX>-###` before testing. This is how QA runs on a different machine than dev did.
+- **Push discipline (never force).** For every merge/push: `git fetch` → rebase/merge `origin/main` → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment on the card and stop. Never force-push. Push every repo you merged before moving the card to "Done".
+- **Re-read before the terminal move.** Right before merging + moving to "Done", re-fetch the card. If a human moved it out of "In Review", do NOT override — comment your findings, release `qa:in-progress`, and stop.
+- **Mark backward moves.** Sending a card back with `qa:needs-changes` is a normal QA outcome and does not need a bounce marker; but if you move it further back (to "Ready for Dev"/"Needs Spec"), add `[auto-sweep-bounce In Review→<to>]` so the launcher can park a card that oscillates.
+- **Prune after merge.** After deleting a merged branch, `git worktree prune` in each repo so other machines' stale worktrees for the gone branch clean up.
+
 ## Guardrails
 
 - **Ships to production** — only ever ship a feature that passed a real smoke test with a green build. When in doubt, `qa:needs-changes` and stop; never deploy a failing feature.
