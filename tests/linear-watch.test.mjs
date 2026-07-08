@@ -7,8 +7,8 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
-  parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
-  SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES,
+  parallelLimit, drainPassLimit, runDrainLoop, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
+  SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
@@ -282,6 +282,62 @@ test("parallelLimit: defaults invalid and missing config to the bounded parallel
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 0 } }), 2);
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 1 } }), 1);
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 2.8 } }), 2);
+});
+test("drainPassLimit: defaults, clamps, and takes the active-anchor maximum", () => {
+  assert.equal(DEFAULT_MAX_DRAIN_PASSES, 2);
+  assert.equal(MAX_DRAIN_PASSES, 5);
+  assert.equal(drainPassLimit({}), 2);
+  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: "many" } }), 2);
+  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 0 } }), 1);
+  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 3.8 } }), 3);
+  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 99 } }), 5);
+  assert.equal(drainPassLimit([{ parallel: { maxDrainPasses: 1 } }, { parallel: { maxDrainPasses: 4 } }]), 4);
+});
+test("runDrainLoop: rescans until a pass selects no batch", async () => {
+  const seen = [];
+  const result = await runDrainLoop({
+    maxDrainPasses: 5,
+    runPass: async (pass) => {
+      seen.push(pass);
+      return pass < 3 ? { selectedBatch: [{ sweep: "dev" }], dispatched: true } : { selectedBatch: [], dispatched: false };
+    },
+  });
+  assert.deepEqual(seen, [1, 2, 3]);
+  assert.equal(result.budgetExhausted, false);
+});
+test("runDrainLoop: stops at budget and logs exhaustion", async () => {
+  const logs = [];
+  const result = await runDrainLoop({
+    maxDrainPasses: 2,
+    log: (line) => logs.push(line),
+    runPass: async () => ({ selectedBatch: [{ sweep: "spec" }], dispatched: true }),
+  });
+  assert.equal(result.passes.length, 2);
+  assert.equal(result.budgetExhausted, true);
+  assert.match(logs[0], /drain budget exhausted/);
+});
+test("runDrainLoop: dry-run continues from selected batches, not dispatched status", async () => {
+  let calls = 0;
+  await runDrainLoop({
+    maxDrainPasses: 2,
+    runPass: async () => {
+      calls += 1;
+      return { selectedBatch: [{ sweep: "qa" }], dispatched: false };
+    },
+  });
+  assert.equal(calls, 2);
+});
+test("runDrainLoop: stops after a selected pass opts out of continued draining", async () => {
+  let calls = 0;
+  const result = await runDrainLoop({
+    maxDrainPasses: 5,
+    runPass: async () => {
+      calls += 1;
+      return { selectedBatch: [{ sweep: "dev" }], dispatched: true, continueDraining: false };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.budgetExhausted, false);
 });
 test("selectDispatchBatch: defaults to bounded parallel non-ship dispatches", () => {
   const batch = selectDispatchBatch([

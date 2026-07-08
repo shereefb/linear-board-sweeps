@@ -143,7 +143,8 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
    },
    "parallel": {
-     "maxNonShipDispatches": 2
+     "maxNonShipDispatches": 2,
+     "maxDrainPasses": 2
    },
    "fastPath": {
      "enabled": true,
@@ -154,8 +155,8 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "requireReviewerConfidence": "high"
    }
    ```
-   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage. Confirm every chosen runtime CLI (`codex` and/or `claude`) is installed and on `PATH`.
-   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. Set it to `1` for serial mode on smaller machines; that workspace then runs alone or waits for the next tick. ship-sweep is always serial.
+	   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage. Confirm every chosen runtime CLI (`codex` and/or `claude`) is installed and on `PATH`.
+	   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.maxDrainPasses` defaults to `2` and is clamped to `1..5`, so after a dispatched pass the launcher can re-check queues once for cards that arrived while the sweep was running. Set either value to `1` for stricter serial/one-pass mode on smaller machines; ship-sweep is always serial.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `QA Passed`. Set it to false to require normal QA for every card. The human-only `Ready to Ship` move remains required.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
@@ -179,7 +180,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" tick --dry-run
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
-   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch.
+   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch; with `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
 
 6. **Activate the schedule** (10-min timer) and confirm health:
    ```bash

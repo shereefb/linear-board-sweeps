@@ -21,9 +21,10 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
-  "$comment_parallel": "Default bounded non-ship parallelism. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
+  "$comment_parallel": "Default bounded non-ship parallelism and bounded drain-after-dispatch. Set maxNonShipDispatches to 1 for serial mode; maxDrainPasses defaults to 2 and is clamped to 1..5. ship-sweep always stays serial.",
   "parallel": {
-    "maxNonShipDispatches": 2
+    "maxNonShipDispatches": 2,
+    "maxDrainPasses": 2
   },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
