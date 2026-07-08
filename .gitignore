@@ -1,4 +1,13 @@
-.env
 node_modules/
 .DS_Store
 .gstack/
+
+# --- board-sweeps: append these to the target repo's .gitignore ---
+
+# Linear API key + other local tooling secrets (NEVER commit)
+.env
+
+# If the repo uses a broad `.claude/*` ignore, keep the sweep config + skills tracked:
+# (only needed when .claude/* is already ignored elsewhere in this file)
+!.claude/skills/
+!.claude/linear-sweep.json

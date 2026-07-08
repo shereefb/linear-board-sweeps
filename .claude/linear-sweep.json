@@ -1,0 +1,35 @@
+{
+  "$comment": "Repo-local config for the spec/dev/qa/ship board sweeps. Nothing in the skills is hardcoded; they read this file.",
+  "teamName": "Codex",
+  "teamKey": "COD",
+  "project": "Linear Sweep",
+  "projectId": "81455eb7-1ead-474d-a0c1-54efe75f821e",
+  "issuePrefix": "COD",
+  "repos": ["linear-board-sweeps"],
+  "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Omit a model/effort to fall back to the runtime's own default.",
+  "runtime": "codex",
+  "models": {
+    "spec": { "model": "gpt-5.5-codex", "effort": "high" },
+    "dev":  { "model": "gpt-5.5-codex", "effort": "high" },
+    "qa":   { "model": "gpt-5.5-codex", "effort": "high" },
+    "ship": { "model": "gpt-5.5-codex", "effort": "high" }
+  },
+  "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
+  "reviewLenses": {
+    "ui":       { "labels": ["frontend", "design", "ui"] },
+    "devex":    { "labels": ["api", "cli", "sdk"] },
+    "security": { "labels": ["auth", "security", "data"] },
+    "perf":     { "labels": ["performance"] },
+    "research": { "labels": ["integration", "research"] }
+  },
+  "$comment_requireShipApproval": "Ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ready to Ship' before it will merge.",
+  "requireShipApproval": true,
+  "specsDir": "docs/superpowers/specs",
+  "plansDir": "docs/superpowers/plans",
+  "canonicalDocs": {
+    "architecture": "README.md",
+    "schema": null
+  },
+  "deploy": "No production app deploy for this kit. Shipping is merge/push to main; any release publishing or external distribution step must be attended by the owner or tracked as a Todo card.",
+  "credentialsNote": "Linear API key in gitignored .env; no app secrets are required for this repo."
+}
