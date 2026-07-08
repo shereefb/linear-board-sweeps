@@ -18,9 +18,9 @@ Act as a user: exercise each "In Review" feature in a real dev environment, in a
 - Confirm you can run the app. Use your runtime's dev-server method: **Claude Code** → the `preview_*` tools (never Bash for servers); **Codex** → start `npm run dev` via `shell` in the background and read its logs. Capture console/network/server output either way to catch errors. For authenticated flows, `/connect-chrome` + `/setup-browser-cookies` give a real-user session.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `qa:in-progress`, `qa:needs-changes`, `qa:passed`, `blocked:needs-user`.
 
-## 1. Select cards (oldest-first, bounded, claimed)
+## 1. Select cards (top-of-column order, bounded, claimed)
 
-List "In Review" cards **in `config.project`**, oldest-first. For each:
+List "In Review" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Skip** if `blocked:needs-user` or `qa:needs-changes` and no new human reply resolves it; **skip** if `qa:in-progress` < 120 min old (another run owns it — QA is slow). Reclaim a stale claim.
 - **Claim** with `qa:in-progress` before starting; remove it when you finish, block, or bail.
 - **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify the feature from the card + diff surface and apply the matching domain labels to Linear (comment what you applied). A human relabel always wins — never override one. This keeps design/security review lenses firing on legacy cards. (Most cards are labelled at spec time; this covers mid-pipeline entries.)
@@ -46,7 +46,7 @@ Only after §3 passes:
 1. **Attach the screenshots to the Linear card** (Linear file upload: `fileUpload` mutation → PUT the bytes to the returned signed URL with its headers → reference the asset URL as a markdown image in a comment / as an attachment).
 2. Post a **review write-up**: what you tested, what passed, bugs found + fixed (with commit refs), and any residual risk.
 3. Add **`qa:passed`** — this is ship-sweep's green signal and its pre-merge evidence.
-4. **Move the card to "QA Passed" and drop `qa:in-progress` in the same step** (or drop the claim immediately before the move). "QA Passed" is a holding state no sweep fetches, so a claim stranded there after a crash would be invisible to the per-sweep reaper — dropping it before the move avoids that. **Leave the branch pushed and unmerged; do NOT delete the worktree/branch/PR** — ship-sweep needs them.
+4. **Move the card to the bottom of "QA Passed" and drop `qa:in-progress` in the same step** (or drop the claim immediately before the move). Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "QA Passed"`) so the status and bottom rank update together. "QA Passed" is a holding state no sweep fetches, so a claim stranded there after a crash would be invisible to the per-sweep reaper — dropping it before the move avoids that. **Leave the branch pushed and unmerged; do NOT delete the worktree/branch/PR** — ship-sweep needs them.
 
 A human reviews the "QA Passed" column and moves approved cards to "Ready to Ship"; ship-sweep does the merge + deploy from there. qa-sweep's job ends at "QA Passed".
 
@@ -68,7 +68,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 
 - **Never merges, never deploys** — lands a green, smoke-tested feature at "QA Passed" and stops. The human "Ready to Ship" move + ship-sweep own production. Now symmetric with dev-sweep; safe to auto-run.
 - Only pass a feature that passed a real smoke test with a green build. When in doubt, `qa:needs-changes` and stop.
-- ≤2 cards/run; oldest-first; claim/release via `qa:in-progress`; stay within `config.project`.
+- ≤2 cards/run; top-of-column order; claim/release via `qa:in-progress`; stay within `config.project`.
 - Fix scope = UX/UI + obvious bugs found during QA. A feature that's fundamentally broken or half-built goes back with `qa:needs-changes`, not "fixed" into a rewrite.
 - Every question → a card comment; never AskUserQuestion.
 - The card comments + screenshots are the audit trail.

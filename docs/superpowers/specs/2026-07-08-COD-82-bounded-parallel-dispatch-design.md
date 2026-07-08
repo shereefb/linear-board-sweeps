@@ -23,7 +23,7 @@ This serial shape is safe, but it makes one slow workspace hold up unrelated wor
 
 ## Design
 
-Add bounded parallelism to the launcher at the workspace boundary, but define "disjoint" from the resolved repo set, not only from anchor names. A tick still performs one cheap pass over every active workspace: auto-update, reaping, orphan cleanup, bounce checks, and candidate counting. After that, instead of choosing one candidate, it selects up to `parallel.maxNonShipDispatches` non-ship candidates whose resolved `config.repos` paths do not overlap, ordered by the existing downstream priority and oldest actionable card.
+Add bounded parallelism to the launcher at the workspace boundary, but define "disjoint" from the resolved repo set, not only from anchor names. A tick still performs one cheap pass over every active workspace: auto-update, reaping, orphan cleanup, bounce checks, and candidate counting. After that, instead of choosing one candidate, it selects up to `parallel.maxNonShipDispatches` non-ship candidates whose resolved `config.repos` paths do not overlap, ordered by the existing downstream priority and each queue's top actionable Linear card.
 
 Ship remains outside the pool. If any ship candidate exists and this host is the ship runner, the tick dispatches exactly one ship pass and dispatches no other work. This preserves the "one production deploy at a time" invariant and keeps the existing `shipRunner` protection meaningful.
 
@@ -45,7 +45,7 @@ Default `1` preserves current behavior. Values above `1` allow that many non-shi
 
 Add a pure helper, tentatively `selectDispatchBatch(candidates, { maxNonShipDispatches, shipRunner })`:
 
-- Sort using the existing `SWEEP_ORDER`, then `oldestUpdatedAt`.
+- Sort using the existing `SWEEP_ORDER`, then the top actionable card's Linear `sortOrder`.
 - If a ship candidate is dispatchable, return only the highest-priority ship candidate.
 - Otherwise return up to `maxNonShipDispatches` candidates.
 - Deduplicate by `anchorPath`.

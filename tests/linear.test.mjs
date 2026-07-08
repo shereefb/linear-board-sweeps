@@ -2,7 +2,10 @@
 // Run: node --test
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { positionAfter, reviewLensLabels, REQUIRED_STATES, REQUIRED_LABELS } from "../scripts/linear.mjs";
+import {
+  positionAfter, reviewLensLabels, bottomSortOrder, issueUpdateToStateBottomInput,
+  REQUIRED_STATES, REQUIRED_LABELS,
+} from "../scripts/linear.mjs";
 
 // ── board position ───────────────────────────────────────────────────────────
 test("positionAfter: midpoint between the anchor and its next-higher neighbor", () => {
@@ -36,6 +39,18 @@ test("reviewLensLabels: absent/empty/malformed config → []", () => {
   assert.deepEqual(reviewLensLabels({}), []);
   assert.deepEqual(reviewLensLabels(null), []);
   assert.deepEqual(reviewLensLabels({ reviewLenses: { ui: {} } }), []);
+});
+
+// ── issue board placement ───────────────────────────────────────────────────
+test("bottomSortOrder: chooses a rank below the destination column minimum", () => {
+  assert.equal(bottomSortOrder([{ sortOrder: 10 }, { sortOrder: -5 }, { sortOrder: 2 }]), -6);
+  assert.equal(bottomSortOrder([], 1), 0);
+});
+test("issueUpdateToStateBottomInput: builds one state+rank update payload", () => {
+  assert.deepEqual(issueUpdateToStateBottomInput("state-1", [{ sortOrder: 4 }, { sortOrder: 2 }]), {
+    stateId: "state-1",
+    sortOrder: 1,
+  });
 });
 
 // ── taxonomy declarations ────────────────────────────────────────────────────

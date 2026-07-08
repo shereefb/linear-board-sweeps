@@ -33,8 +33,8 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | `SETUP.md` | The agent-facing bootstrap procedure (what to prompt, where to put everything, exact commands). |
 | `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime scheduled sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec/dev/qa also run card-type-gated review lenses; ship-sweep is the only one that merges + deploys. |
 | `skills/unblock-sweep/SKILL.md` | Manual-only interactive workflow for resolving cards parked with blocking labels across registered anchors. It is copied to anchors but never scheduled. |
-| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `query`. |
-| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work — see [Triggering](#triggering-auto-sweep). |
+| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `query`. |
+| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work, using the visible Linear column order — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
 | `templates/linear-sweep.json` | The per-repo config the skills read. Copied + filled into the target's `.claude/`. |
 | `templates/AGENTS.snippet.md` | The "Board sweeps" section appended to the target's `AGENTS.md` — how Codex finds the skills. |
@@ -58,6 +58,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 
 - **Unit = workspace, not repo.** One Linear project maps to one workspace (a container folder of N sibling git repos), anchored at the repo that holds `.claude/`. You `register` each anchor once; activation is a Linear **project label `auto-sweep`** you toggle in the UI.
 - **Cheap when idle.** Every ~10 min the launcher makes a few Linear API calls and a fast-forward `git pull` — **zero LLM tokens** — and dispatches a heavyweight agent pass only when a queue holds genuinely actionable work.
+- **Board order is priority.** Within a status column, the next card is the top visible card in Linear (`Issue.sortOrder`), after blocked/live-claimed cards are filtered. Sweeps move completed or bounced cards to the bottom of the destination column via `node scripts/linear.mjs move-card-bottom <KEY-###> "<State>"`.
 - **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `QA Passed`, and a PID-liveness lock keeps exactly one agent running at a time.
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
@@ -82,7 +83,6 @@ The remaining planned launcher/workflow changes are docs-only designs at this po
 - `COD-82`: bounded non-ship parallel dispatch across disjoint, non-overlapping workspace repo sets, while ship remains serial and single-runner.
 - `COD-83`: an opt-in fast-path eligibility marker for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
-- `COD-85`: Linear board-position order for sweep queues, with cards moved to the bottom of destination columns.
 - `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
 - `COD-89`: dogfood retrospective for the first Linear sweep cards, including timing, token, cadence, and user-interruption learnings.
 - `COD-91`: self-clearing Linear `Todo` cards for scheduled tick failures, deduped by failure fingerprint.

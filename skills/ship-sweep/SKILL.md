@@ -16,9 +16,9 @@ Take cards a human has approved into **"Ready to Ship"** and land them: merge to
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`.
 
-## 1. Select cards (oldest-first, bounded, claimed)
+## 1. Select cards (top-of-column order, bounded, claimed)
 
-List "Ready to Ship" cards **in `config.project`**, oldest-first. For each:
+List "Ready to Ship" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `ship:in-progress` < 120 min old (another run owns it — merge + deploy + canary is slow). Reclaim a stale claim.
 - **Claim** with `ship:in-progress` before starting; remove it when you finish, block, or bail.
 - Process **at most 1 card per run** — one production deploy at a time. If none are actionable, exit cleanly (normal no-op).
@@ -62,8 +62,8 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 
 ## 7. Terminal transition
 
-- **Canary green:** move the card to **"Done"** with a comment: which deploy path ran, the canary result, and the merge commit(s). Remove `ship:in-progress`.
-- **Canary red (the change is already live):** **move the card to "Done", add `blocked:needs-user`, and post a red comment** with the canary findings. Do **NOT** attempt an autonomous rollback (high-risk and deploy-target-specific — flag the human) and do **NOT** leave the card in "Ready to Ship" (it IS deployed; leaving it there invites a re-ship). "Done + blocked:needs-user" means *shipped, please verify.* Remove `ship:in-progress`.
+- **Canary green:** move the card to the **bottom of "Done"** with a comment: which deploy path ran, the canary result, and the merge commit(s). Remove `ship:in-progress`. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Done"`) so the status and bottom rank update together.
+- **Canary red (the change is already live):** **move the card to the bottom of "Done", add `blocked:needs-user`, and post a red comment** with the canary findings. Do **NOT** attempt an autonomous rollback (high-risk and deploy-target-specific — flag the human) and do **NOT** leave the card in "Ready to Ship" (it IS deployed; leaving it there invites a re-ship). "Done + blocked:needs-user" means *shipped, please verify.* Remove `ship:in-progress`.
 
 ## Blocked / needs-user
 
@@ -82,7 +82,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 - **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed`, green-building, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
-- ≤1 card/run; oldest-first; claim/release via `ship:in-progress`; stay within `config.project`.
+- ≤1 card/run; top-of-column order; claim/release via `ship:in-progress`; stay within `config.project`.
 - No autonomous rollback — a red canary flags a human, it does not revert prod.
 - Every question → a card comment (or a new Todo card for manual deploy steps); never AskUserQuestion.
 - The card comments + the `[auto-sweep-deployed]` marker + canary result are the audit trail.

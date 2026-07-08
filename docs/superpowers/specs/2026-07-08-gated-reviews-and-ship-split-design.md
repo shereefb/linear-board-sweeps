@@ -156,7 +156,7 @@ Corollary: qa-sweep, now that it never deploys, is safe to auto-run aggressively
 
 ## ship-sweep (new skill)
 
-Claims `Ready to Ship` cards, oldest-first, `ship:in-progress` claim with heartbeat. `SWEEP_CFG.ship = { states: ["Ready to Ship"], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 }` — the `blocked` array is required so a card parked by the pre-merge sanity check (step 2) is not immediately re-dispatched.
+Claims `Ready to Ship` cards in top-to-bottom Linear column order, with a `ship:in-progress` claim and heartbeat. `SWEEP_CFG.ship = { states: ["Ready to Ship"], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 }` — the `blocked` array is required so a card parked by the pre-merge sanity check (step 2) is not immediately re-dispatched.
 
 **Concurrency: one in-flight prod deploy per repo — and this is NOT free today.** The launcher's tick lock is **per-host** (`~/.local/state/.../tick.lock`), but the design is explicitly multi-machine ("resumable on any machine, coordinate ONLY through origin"). The `ship:in-progress` claim label is a check-then-set with no atomicity, so two launchers on two hosts can both see no claim, both claim, and **both merge + deploy the same card to production** (a TOCTOU race). Mitigation, in order of strength:
 - **Pin ship-sweep to a single designated runner** (a `shipRunner: true` flag in the registry; only that host dispatches ship). Cleanest, and realistic given one always-on Mac mini. **This is the default.**

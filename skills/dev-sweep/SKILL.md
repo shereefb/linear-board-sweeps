@@ -15,12 +15,12 @@ Build features from cards that are "Ready for Dev" or "In Progress", one worktre
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `dev:in-progress`, `blocked:needs-user`.
 
-## 1. Select cards (oldest-first, bounded, claimed)
+## 1. Select cards (top-of-column order, bounded, claimed)
 
-List "Ready for Dev" + "In Progress" cards **in `config.project`**, oldest-first. For each:
+List "Ready for Dev" + "In Progress" cards **in `config.project`**, top-to-bottom as they appear in each Linear column. For each:
 - **Read the comments FIRST.** A card can sit in "Ready for Dev" *after a review* with change requests — understand what's missing before writing code. For "In Progress" cards, respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
-- **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to "Needs Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. (The spec-sweep loop re-specs it.)
+- **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Needs Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Needs Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
 - **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify it from the spec/plan + diff surface and apply the matching domain labels to Linear (comment what you applied). This drives the gated quality lenses in §2. A human relabel always wins — never override one.
 - Process **at most 2 cards per run**. If none are actionable, exit cleanly (normal no-op).
@@ -37,7 +37,7 @@ List "Ready for Dev" + "In Progress" cards **in `config.project`**, oldest-first
 ## 3. Land at "In Review" (no merge)
 
 - Push the worktree's branch to `origin` (open/refresh a PR if that's the repo's convention). **Do NOT merge to `main`. Do NOT deploy.** Do NOT delete the worktree/branch — it's unmerged and awaiting the QA sweep / human review.
-- Move the card to **"In Review"** with a comment: what was built, the spec/plan followed, code-review outcome (both passes) + notable fixes, the branch name, and any residual risk.
+- Move the card to the **bottom of "In Review"** with a comment: what was built, the spec/plan followed, code-review outcome (both passes) + notable fixes, the branch name, and any residual risk. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "In Review"`) so the status and bottom rank update together.
 - Remove `dev:in-progress`.
 
 ## 4. Blocked / hand-offs
@@ -60,7 +60,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 ## Guardrails
 
 - Writes **code** (not docs-only) but **never merges and never deploys** — "In Review" + a pushed branch is the human/QA gate.
-- One worktree per card; ≤2 cards/run; oldest-first; claim/release via `dev:in-progress`; stay within `config.project`.
+- One worktree per card; ≤2 cards/run; top-of-column order; claim/release via `dev:in-progress`; stay within `config.project`.
 - Only build from excellent specs — a weak card goes to "Needs Spec", not into guesswork.
 - Both code reviews must run and their real findings be fixed before "In Review".
 - Every question → a card comment (or a new Todo card for ship needs); never AskUserQuestion.
