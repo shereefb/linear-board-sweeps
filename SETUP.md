@@ -181,7 +181,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
 
-**QA caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production path and only runs from the human-gated `Ready to Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
+**Scheduling caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production merge/deploy path and only runs from the human-gated `Ready to Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
 
 **If this is NOT the always-on machine** (or the user only wants manual runs): skip Step 11 entirely. The sweeps still work on demand via the Step 10 phrases; another machine can pick up any card because all work flows through origin (see each SKILL.md's "Machine-independence & handoff" section).
 
