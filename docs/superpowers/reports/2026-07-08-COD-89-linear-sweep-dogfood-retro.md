@@ -1,7 +1,7 @@
 # COD-89 Linear sweep dogfood retrospective
 
-**Date:** 2026-07-08  
-**Scope:** COD-82, COD-83, COD-84, COD-85, COD-86, COD-87, COD-88, and COD-90  
+**Date:** 2026-07-08
+**Scope:** COD-82, COD-83, COD-84, COD-85, COD-86, COD-87, COD-88, and COD-90
 **Evidence types:** Linear issue snapshots/comments, git history, local launcher logs, and existing specs/plans.
 
 ## Executive summary
