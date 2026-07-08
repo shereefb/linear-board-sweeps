@@ -6,7 +6,7 @@ import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
+  boardOrderValue, sortByBoardPosition, selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
 } from "../scripts/linear-watch.mjs";
@@ -187,22 +187,43 @@ test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated car
   assert.ok(!reapCard.labelNames.includes("dev:in-progress"));
 });
 
+test("sortByBoardPosition: highest Linear sortOrder is top of column", () => {
+  const cards = [
+    { id: "low", identifier: "COD-2", sortOrder: -20 },
+    { id: "missing", identifier: "COD-3" },
+    { id: "high", identifier: "COD-1", sortOrder: 5 },
+  ];
+  assert.deepEqual(sortByBoardPosition(cards).map((c) => c.id), ["high", "low", "missing"]);
+  assert.equal(boardOrderValue(cards[2]), 5);
+  assert.equal(boardOrderValue(cards[1]), Number.NEGATIVE_INFINITY);
+});
+
+test("sortByBoardPosition: applies after blocked and live-claim filtering", () => {
+  const cards = [
+    { id: "bottom", identifier: "COD-1", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+    { id: "blocked-top", identifier: "COD-2", sortOrder: 100, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
+    { id: "live-top", identifier: "COD-3", sortOrder: 90, updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
+    { id: "top", identifier: "COD-4", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+  ];
+  assert.deepEqual(sortByBoardPosition(actionableCards(cards, SWEEP_CFG.dev, NOW)).map((c) => c.id), ["top", "bottom"]);
+});
+
 // ── dispatch selection ───────────────────────────────────────────────────────
 test("selectDispatch: qa beats dev beats spec", () => {
   const pick = selectDispatch([
-    { sweep: "spec", count: 5, oldestUpdatedAt: 1 },
-    { sweep: "qa", count: 1, oldestUpdatedAt: 100 },
-    { sweep: "dev", count: 3, oldestUpdatedAt: 1 },
+    { sweep: "spec", count: 5, topCard: { sortOrder: 1 } },
+    { sweep: "qa", count: 1, topCard: { sortOrder: 100 } },
+    { sweep: "dev", count: 3, topCard: { sortOrder: 1 } },
   ]);
   assert.equal(pick.sweep, "qa");
 });
-test("selectDispatch: within a sweep, oldest card first; zero-count ignored; none → null", () => {
+test("selectDispatch: within a sweep, top board card first; zero-count ignored; none → null", () => {
   const pick = selectDispatch([
-    { sweep: "dev", count: 2, oldestUpdatedAt: 500 },
-    { sweep: "dev", count: 2, oldestUpdatedAt: 100 },
+    { sweep: "dev", count: 2, topCard: { identifier: "COD-1", sortOrder: 5 } },
+    { sweep: "dev", count: 2, topCard: { identifier: "COD-2", sortOrder: 50 } },
   ]);
-  assert.equal(pick.oldestUpdatedAt, 100);
-  assert.equal(selectDispatch([{ sweep: "dev", count: 0, oldestUpdatedAt: 1 }]), null);
+  assert.equal(pick.topCard.identifier, "COD-2");
+  assert.equal(selectDispatch([{ sweep: "dev", count: 0, topCard: { sortOrder: 1 } }]), null);
 });
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────
@@ -216,10 +237,10 @@ test("SWEEP_CFG.ship exists and the derived lists include it", () => {
 });
 test("selectDispatch: ship is dispatched before qa/dev/spec (most-downstream first)", () => {
   const pick = selectDispatch([
-    { sweep: "spec", count: 5, oldestUpdatedAt: 1 },
-    { sweep: "qa", count: 4, oldestUpdatedAt: 1 },
-    { sweep: "ship", count: 1, oldestUpdatedAt: 999 }, // newest, fewest — still wins on stage
-    { sweep: "dev", count: 3, oldestUpdatedAt: 1 },
+    { sweep: "spec", count: 5, topCard: { sortOrder: 1 } },
+    { sweep: "qa", count: 4, topCard: { sortOrder: 1 } },
+    { sweep: "ship", count: 1, topCard: { sortOrder: -999 } }, // lowest rank, fewest — still wins on stage
+    { sweep: "dev", count: 3, topCard: { sortOrder: 1 } },
   ]);
   assert.equal(pick.sweep, "ship");
   assert.equal(SWEEP_ORDER[0], "ship");

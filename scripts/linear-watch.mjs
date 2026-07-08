@@ -246,6 +246,20 @@ export function countActionable(cards, cfg, now, releasedIds = new Set()) {
   return actionableCards(cards, cfg, now, releasedIds).length;
 }
 
+// Linear's Issue.sortOrder is the board-rank field for a card within its
+// workflow state. Higher values render closer to the top of the column.
+export function boardOrderValue(card) {
+  return Number.isFinite(card?.sortOrder) ? card.sortOrder : Number.NEGATIVE_INFINITY;
+}
+
+export function sortByBoardPosition(cards) {
+  return [...cards].sort((a, b) => {
+    const d = boardOrderValue(b) - boardOrderValue(a);
+    if (d !== 0) return d;
+    return String(a.identifier || a.id || "").localeCompare(String(b.identifier || b.id || ""));
+  });
+}
+
 // Reflect this tick's reap/bounce decisions on the in-memory cards so the
 // actionable count is correct: a reaped card loses its claim (actionable again);
 // an escalated card (crash or bounce) gains blocked:needs-user (not actionable).
@@ -264,14 +278,14 @@ export function applyDecisionsInMemory(cards, reaps, bounces) {
 }
 
 // Pick one dispatch across all actionable (workspace,sweep) candidates:
-// qa → dev → spec, then oldest card first.
+// ship → qa → dev → spec, then the top visible card in that Linear column.
 export function selectDispatch(candidates) {
   const ranked = candidates
     .filter((c) => c.count > 0)
     .sort((a, b) => {
       const so = SWEEP_ORDER.indexOf(a.sweep) - SWEEP_ORDER.indexOf(b.sweep);
       if (so !== 0) return so;
-      return (a.oldestUpdatedAt || 0) - (b.oldestUpdatedAt || 0);
+      return boardOrderValue(b.topCard || { sortOrder: b.topSortOrder }) - boardOrderValue(a.topCard || { sortOrder: a.topSortOrder });
     });
   return ranked[0] || null;
 }
@@ -424,7 +438,7 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
       `query($c:String,$states:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
          team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
          pageInfo{ hasNextPage endCursor }
-         nodes{ id identifier updatedAt
+         nodes{ id identifier updatedAt sortOrder
            labels{ nodes{ id name } }
            comments(last:100){ nodes{ body createdAt } } } } }`,
       { c: cursor, states, teamKey, pid: projectId },
@@ -435,6 +449,7 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
         id: n.id,
         identifier: n.identifier,
         updatedAt: n.updatedAt,
+        sortOrder: n.sortOrder,
         labelNames: n.labels.nodes.map((l) => l.name),
         labelIds: Object.fromEntries(n.labels.nodes.map((l) => [l.name, l.id])),
         comments: n.comments.nodes,
@@ -680,9 +695,9 @@ async function tick({ dryRun = false } = {}) {
         } else if (dryRun && foreign.length) {
           logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
         }
-        const actionable = actionableCards(cards, cfg, now);
-        const oldest = actionable.length ? Math.min(...actionable.map((c) => Date.parse(c.updatedAt))) : 0;
-        logFor(anchorPath, sweep, `${actionable.length} actionable`);
+        const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
+        const topCard = actionable[0] || null;
+        logFor(anchorPath, sweep, `${actionable.length} actionable${topCard ? `; top ${topCard.identifier} sortOrder=${topCard.sortOrder}` : ""}`);
         // ship merges + deploys to prod. Only the single designated runner may
         // DISPATCH it (closes the cross-host double-deploy race — the claim label
         // alone is a check-then-set with no atomicity). Reaping above still runs
@@ -691,7 +706,7 @@ async function tick({ dryRun = false } = {}) {
           if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
           continue;
         }
-        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, oldestUpdatedAt: oldest });
+        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder });
       }
 
       // Holding-state reaper: release claims stranded in states no sweep fetches
@@ -717,7 +732,7 @@ async function tick({ dryRun = false } = {}) {
     // Dispatch at most one agent pass.
     const pick = selectDispatch(candidates);
     if (!pick) log("no actionable work — cheap tick");
-    else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable)`);
+    else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable; top ${pick.topCard?.identifier || "unknown"})`);
     else dispatch(pick.anchorPath, pick.sweep, pick.config);
   } finally {
     if (!dryRun) releaseTickLock();

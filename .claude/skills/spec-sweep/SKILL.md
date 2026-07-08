@@ -16,9 +16,9 @@ Autonomously turn this repo's Linear "Needs Spec" cards into review-hardened spe
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
 - Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`.
 
-## 1. Select cards (oldest-first, bounded)
+## 1. Select cards (top-of-column order, bounded)
 
-List "Needs Spec" cards **in `config.project`**, oldest-first, and for each decide:
+List "Needs Spec" cards **in `config.project`**, top-to-bottom as they appear in the Linear column, and for each decide:
 
 - **Skip** if it has `blocked:open-questions` AND its newest comment is not a human answer postdating your questions. Do NOT re-post questions — that is spam.
 - **Resume** if it has `blocked:open-questions` and the newest comment IS a human answer to your questions: remove the label, proceed to spec it.
@@ -48,7 +48,7 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 - Commit on a branch off `main`. **Stage selectively — never `git add -A`.** Put the `<PREFIX>-###` key in the commit subject. End commit messages with your runtime's co-authorship trailer (Claude Code: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; Codex: your own attribution).
 - **Merge to `main` (`--no-ff`) and push.** If a push is rejected non-fast-forward, merge `origin/main` and retry. Delete the merged branch; leave the repo on `main`, clean and synced.
 - **Docs only.** If the change would touch app code, stop and comment on the card instead of committing.
-- Move the card to **"Ready for Dev"** with a summary comment linking the spec + plan paths and listing the review's key corrections. Remove `spec:in-progress`.
+- Move the card to the **bottom of "Ready for Dev"** with a summary comment linking the spec + plan paths and listing the review's key corrections. Remove `spec:in-progress`. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Ready for Dev"`) so the status and bottom rank update together.
 
 ## 4. Blocked on questions
 
@@ -67,7 +67,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 ## Guardrails (unattended)
 
 - Docs/specs only. No app code, no migrations, no deploys, no prod writes beyond reads needed to design.
-- ≤3 cards per run; oldest-first; claim/release via `spec:in-progress`; stay within `config.project`.
+- ≤3 cards per run; top-of-column order; claim/release via `spec:in-progress`; stay within `config.project`.
 - Every question goes to a card comment — never wait on interactive input, never use AskUserQuestion (meaningless unattended).
 - Prefer parallel subagents for independent cards and for the per-card reviews.
 - Leave a clean audit trail: the card comments ARE the log of what happened and why.

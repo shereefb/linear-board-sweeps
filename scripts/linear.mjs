@@ -63,6 +63,18 @@ export function reviewLensLabels(config) {
   return [...names];
 }
 
+// Linear renders larger Issue.sortOrder values closer to the top of a workflow
+// state column. To place an issue at the bottom, choose a value below the
+// current minimum in the destination state.
+export function bottomSortOrder(cards, gap = 1) {
+  const values = (cards || []).map((c) => c.sortOrder).filter(Number.isFinite);
+  return values.length ? Math.min(...values) - Math.abs(gap) : 0;
+}
+
+export function issueUpdateToStateBottomInput(stateId, destinationCards) {
+  return { stateId, sortOrder: bottomSortOrder(destinationCards) };
+}
+
 export const API = "https://api.linear.app/graphql";
 const KEY = process.env.LINEAR_API_KEY;
 
@@ -189,6 +201,40 @@ async function createCard(projectId, stateName, title, description, labelsCsv) {
   return iss;
 }
 
+async function destinationCards(projectId, stateName) {
+  const cards = [];
+  let cursor = null;
+  do {
+    const d = await gql(
+      `query($projectId:ID!,$state:String!,$cursor:String){ issues(first:100, after:$cursor, filter:{ project:{ id:{ eq:$projectId } }, state:{ name:{ eq:$state } } }){ pageInfo{ hasNextPage endCursor } nodes { id sortOrder } } }`,
+      { projectId, state: stateName, cursor }
+    );
+    cards.push(...d.issues.nodes);
+    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
+  } while (cursor);
+  return cards;
+}
+
+async function moveCardBottom(issueIdentifier, stateName) {
+  const cur = await gql(
+    `query($id:String!){ issue(id:$id){ id identifier project { id } team { states(first:100){ nodes { id name } } } } }`,
+    { id: issueIdentifier }
+  );
+  const issue = cur.issue;
+  if (!issue) throw new Error(`Issue "${issueIdentifier}" not found.`);
+  const stateId = issue.team.states.nodes.find((s) => s.name === stateName)?.id;
+  if (!stateId) throw new Error(`State "${stateName}" not found on the issue's team.`);
+  const cards = (await destinationCards(issue.project.id, stateName)).filter((n) => n.id !== issue.id);
+  const input = issueUpdateToStateBottomInput(stateId, cards);
+  const r = await gql(
+    `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
+    { id: issue.id, input }
+  );
+  const moved = r.issueUpdate.issue;
+  console.log(`${moved.identifier} -> ${moved.state.name} bottom (sortOrder=${moved.sortOrder})\n  ${moved.url}`);
+  return moved;
+}
+
 // CLI dispatch — only when run directly (`node linear.mjs …`), NOT when another
 // module imports gql/findTeam. Without this guard, importing linear.mjs would
 // execute a command based on the importer's argv.
@@ -200,10 +246,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "setup-team": () => setupTeam(args[0]),
     "ensure-project": () => ensureProject(args[0], args[1]),
     "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
+    "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

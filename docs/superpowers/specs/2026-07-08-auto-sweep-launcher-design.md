@@ -169,7 +169,7 @@ A card can be genuinely picked up yet immediately bounced: dev-sweep moves an un
 ## Concurrency policy
 
 - **One agent at a time** on the Mac mini. Each tick updates + reaps + counts across *all* active `(workspace, sweep)` pairs (cheap), then dispatches **at most one** agent pass (foreground) and exits.
-- **Selection order** when several pairs are actionable: `qa → dev → spec` (push work toward Done first), then oldest card first. Round-robin fairness emerges across ticks.
+- **Selection order** when several pairs are actionable: `qa → dev → spec` (push work toward Done first), then the top visible card in the Linear column by `Issue.sortOrder`. Round-robin fairness emerges across ticks.
 - During a long foreground dispatch, later launchd fires find the tick lock held (live PID) and exit immediately — reaping pauses for that run's duration, which is fine: an actively-worked card needs no reaping, and other workspaces' stuck cards wait at most one run's length (well under the escalation thresholds).
 - Parallelism and background dispatch are deferred; the design leaves room (per-pair locks + a semaphore) but does not build them.
 
