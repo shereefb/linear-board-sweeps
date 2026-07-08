@@ -6,7 +6,9 @@ import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  boardOrderValue, sortByBoardPosition, selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
+  boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
+  parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
+  SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
@@ -230,6 +232,84 @@ test("selectDispatch: within a sweep, top board card first; zero-count ignored; 
   assert.equal(pick.topCard.identifier, "COD-2");
   assert.equal(selectDispatch([{ sweep: "dev", count: 0, topCard: { sortOrder: 1 } }]), null);
 });
+test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
+  assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);
+  assert.equal(parallelLimit({}), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: "lots" } }), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 0 } }), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 1 } }), 1);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 2.8 } }), 2);
+});
+test("selectDispatchBatch: defaults to bounded parallel non-ship dispatches", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
+  ]);
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
+});
+test("selectDispatchBatch: dispatches disjoint anchors up to the configured non-ship limit", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
+});
+test("selectDispatchBatch: a serial candidate runs alone or waits for another tick", () => {
+  const serialFirst = selectDispatchBatch([
+    { anchorPath: "/ws/serial", config: { repos: ["serial"], parallel: { maxNonShipDispatches: 1 } }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/default", config: { repos: ["default"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(serialFirst.map((c) => c.anchorPath), ["/ws/serial"]);
+
+  const serialSecond = selectDispatchBatch([
+    { anchorPath: "/ws/default-a", config: { repos: ["default-a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/serial", config: { repos: ["serial"], parallel: { maxNonShipDispatches: 1 } }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/default-b", config: { repos: ["default-b"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(serialSecond.map((c) => c.anchorPath), ["/ws/default-a", "/ws/default-b"]);
+});
+test("selectDispatchBatch: dedupes same anchor and overlapping resolved repos", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/b", config: { repos: ["/ws/a"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 3 });
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
+});
+test("selectDispatchBatch: dedupes nested repo path overlap", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["/tmp/shared"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/b", config: { repos: ["/tmp/shared/subrepo"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/c", config: { repos: ["/tmp/other"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 3 });
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
+});
+test("dryRunDispatchMessages: reports every selected dispatch", () => {
+  const messages = dryRunDispatchMessages([
+    { anchorPath: "/ws/a", sweep: "dev", count: 2 },
+    { anchorPath: "/ws/b", sweep: "spec", count: 1 },
+  ]);
+  assert.deepEqual(messages, [
+    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch (2 actionable)" },
+    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch (1 actionable)" },
+  ]);
+});
+test("dispatchBatch: dispatches every selected child and returns exit codes", async () => {
+  const calls = [];
+  const statuses = await dispatchBatch([
+    { anchorPath: "/ws/a", sweep: "dev", config: {} },
+    { anchorPath: "/ws/b", sweep: "spec", config: {} },
+  ], {
+    dispatchFn: async (anchorPath, sweep, config) => {
+      calls.push({ anchorPath, sweep, config });
+      return sweep === "dev" ? 0 : 7;
+    },
+  });
+  assert.deepEqual(statuses, [0, 7]);
+  assert.deepEqual(calls.map((c) => `${c.anchorPath}:${c.sweep}`), ["/ws/a:dev", "/ws/b:spec"]);
+});
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────
 test("SWEEP_CFG.ship exists and the derived lists include it", () => {
@@ -255,6 +335,15 @@ test("selectDispatch: ship is dispatched before qa/dev/spec (most-downstream fir
   ]);
   assert.equal(pick.sweep, "ship");
   assert.equal(SWEEP_ORDER[0], "ship");
+});
+test("selectDispatchBatch: ship suppresses all non-ship dispatch", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 5, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "ship", count: 1, oldestUpdatedAt: 999 },
+    { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "qa", count: 5, oldestUpdatedAt: 1 },
+  ], { maxNonShipDispatches: 3 });
+  assert.equal(batch.length, 1);
+  assert.equal(batch[0].sweep, "ship");
 });
 
 // ── foreign / orphaned-claim reaper ──────────────────────────────────────────

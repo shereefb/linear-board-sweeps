@@ -35,11 +35,11 @@ Extend `linear-sweep.json` with an optional launcher block:
 
 ```json
 "parallel": {
-  "maxNonShipDispatches": 1
+  "maxNonShipDispatches": 2
 }
 ```
 
-Default `1` preserves current behavior. Values above `1` allow that many non-ship passes in a single tick, subject to one candidate per workspace and local capacity.
+Default `2` enables a bounded pair of non-ship passes in a single tick. Set `maxNonShipDispatches` to `1` for serial mode. Any value above `1` is still subject to one candidate per workspace, resolved repo disjointness, and local capacity.
 
 ## Selection and execution
 

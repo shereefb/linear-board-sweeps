@@ -14,7 +14,7 @@ Implement bounded non-ship parallel dispatch across disjoint workspaces. Keep sh
 
 ## Steps
 
-1. Add `parallel.maxNonShipDispatches` config parsing with default `1`. Clamp invalid, missing, or non-numeric values to `1`.
+1. Add `parallel.maxNonShipDispatches` config parsing with default `2`. Clamp invalid, missing, or non-numeric values to `2`; `1` remains the explicit serial option.
 2. Add a pure helper to compute each candidate's disjointness key from resolved repo paths plus project/API identity. Do not rely on `anchorPath` alone.
 3. Add a pure `selectDispatchBatch(candidates, options)` helper. Reuse `SWEEP_ORDER`; return one ship candidate when ship is eligible, otherwise return up to N non-ship candidates with distinct anchors and non-overlapping resolved repo paths.
 4. Keep `selectDispatch()` as a compatibility wrapper or update tests/callers cleanly.
@@ -22,12 +22,12 @@ Implement bounded non-ship parallel dispatch across disjoint workspaces. Keep sh
 6. Update `tick()` to build the batch after `last-tick` is written. In dry-run mode, log every selected candidate.
 7. Update `cmdHealth`, README, and SETUP wording so one tick can supervise a bounded child-agent batch.
 8. Add tests:
-   - default batch size is one,
+   - default batch size is the bounded parallel default,
    - two anchors can dispatch together,
    - same anchor dedupes to one,
    - overlapping resolved repo paths dedupe to one,
    - ship suppresses non-ship dispatch,
-   - invalid config is treated as one,
+   - invalid config falls back to the bounded parallel default,
    - batch dry-run reports all selected dispatches.
 9. Update README/SETUP/templates to document the knob as conservative and non-ship-only.
 
@@ -38,4 +38,4 @@ Implement bounded non-ship parallel dispatch across disjoint workspaces. Keep sh
 
 ## Rollout
 
-Ship with default `1`. Raise the value only on an attended machine after observing CPU/RAM and log behavior.
+Ship with default `2`. Set `maxNonShipDispatches` to `1` for serial mode on constrained hosts, and raise above `2` only on an attended machine after observing CPU/RAM and log behavior.

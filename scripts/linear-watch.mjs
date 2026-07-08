@@ -11,15 +11,16 @@
 //   node linear-watch.mjs health                          # last-tick age; non-zero exit if stale
 //
 // Design: an idle tick is a few cheap Linear API calls + a ff-only git pull and
-// spends ZERO LLM tokens. A heavyweight agent pass is dispatched only when a queue
-// holds genuinely actionable work. Pure decision functions (reap/count/build/lock)
-// are separated from IO so they can be unit-tested without Linear or git.
+// spends ZERO LLM tokens. Heavyweight agent passes are dispatched only when queues
+// hold genuinely actionable work, capped to a bounded non-ship batch. Pure
+// decision functions (reap/count/build/lock) are separated from IO so they can be
+// unit-tested without Linear or git.
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { gql } from "./linear.mjs";
 
@@ -50,6 +51,7 @@ export const ESCALATE_WINDOW_H = 48;
 export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
+export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -285,16 +287,74 @@ export function applyDecisionsInMemory(cards, reaps, bounces) {
   }
 }
 
-// Pick one dispatch across all actionable (workspace,sweep) candidates:
-// ship → qa → dev → spec, then the top visible card in that Linear column.
-export function selectDispatch(candidates) {
-  const ranked = candidates
+function rankedDispatchCandidates(candidates) {
+  return candidates
     .filter((c) => c.count > 0)
     .sort((a, b) => {
       const so = SWEEP_ORDER.indexOf(a.sweep) - SWEEP_ORDER.indexOf(b.sweep);
       if (so !== 0) return so;
       return boardOrderValue(b.topCard || { sortOrder: b.topSortOrder }) - boardOrderValue(a.topCard || { sortOrder: a.topSortOrder });
     });
+}
+
+export function parallelLimit(config) {
+  const raw = config?.parallel?.maxNonShipDispatches;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_NON_SHIP_DISPATCHES;
+}
+
+function repoSet(candidate) {
+  return new Set(resolveRepos(candidate.anchorPath, candidate.config).map((r) => path.resolve(r.path)));
+}
+
+function pathsOverlap(a, b) {
+  const relAB = path.relative(a, b);
+  const relBA = path.relative(b, a);
+  return relAB === "" || relBA === "" || (!relAB.startsWith("..") && !path.isAbsolute(relAB)) || (!relBA.startsWith("..") && !path.isAbsolute(relBA));
+}
+
+function overlapsAny(paths, usedPaths) {
+  for (const p of paths) {
+    for (const used of usedPaths) if (pathsOverlap(p, used)) return true;
+  }
+  return false;
+}
+
+export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT_MAX_NON_SHIP_DISPATCHES } = {}) {
+  const ranked = rankedDispatchCandidates(candidates);
+  const ship = ranked.find((c) => c.sweep === "ship");
+  if (ship) return [ship];
+
+  let limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
+  const picked = [];
+  const usedAnchors = new Set();
+  const usedRepos = new Set();
+  for (const c of ranked.filter((candidate) => candidate.sweep !== "ship")) {
+    if (picked.length >= limit) break;
+    const candidateLimit = parallelLimit(c.config);
+    if (picked.length + 1 > Math.min(limit, candidateLimit)) continue;
+    if (usedAnchors.has(c.anchorPath)) continue;
+    const repos = repoSet(c);
+    if (overlapsAny(repos, usedRepos)) continue;
+    picked.push(c);
+    limit = Math.min(limit, candidateLimit);
+    usedAnchors.add(c.anchorPath);
+    for (const repo of repos) usedRepos.add(repo);
+  }
+  return picked;
+}
+
+export function dryRunDispatchMessages(batch) {
+  return batch.map((pick) => ({
+    anchorPath: pick.anchorPath,
+    sweep: pick.sweep,
+    body: `[dry-run] WOULD dispatch (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""})`,
+  }));
+}
+
+// Compatibility wrapper for older tests/callers that expect one dispatch.
+export function selectDispatch(candidates) {
+  const ranked = rankedDispatchCandidates(candidates);
   return ranked[0] || null;
 }
 
@@ -1056,6 +1116,37 @@ function dispatch(anchorPath, sweep, config) {
   return r.status;
 }
 
+function dispatchAsync(anchorPath, sweep, config) {
+  const modelCfg = (config.models && config.models[sweep]) || {};
+  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
+  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
+  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  fs.mkdirSync(dir, { recursive: true });
+  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+  const fd = fs.openSync(logFile, "a");
+  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      fs.closeSync(fd);
+      logFor(anchorPath, sweep, `dispatch end (exit ${status})`);
+      resolve(status);
+    };
+    child.on("error", (e) => {
+      logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${e.message}`);
+      finish(127);
+    });
+    child.on("close", (status) => finish(status));
+  });
+}
+
+export async function dispatchBatch(batch, { dispatchFn = dispatchAsync } = {}) {
+  return Promise.all(batch.map((c) => dispatchFn(c.anchorPath, c.sweep, c.config)));
+}
+
 // ── tick orchestration ───────────────────────────────────────────────────────
 
 async function tick({ dryRun = false } = {}) {
@@ -1214,37 +1305,29 @@ async function tick({ dryRun = false } = {}) {
     // dispatch, so `health` doesn't read STALE during a legitimately long run.
     writeLastTick();
 
-    // Dispatch at most one agent pass.
-    const pick = selectDispatch(candidates);
-    if (!pick) log("no actionable work — cheap tick");
-    else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable; top ${pick.topCard?.identifier || "unknown"})`);
-    else {
-      const exitCode = dispatch(pick.anchorPath, pick.sweep, pick.config);
-      if (exitCode !== 0) {
+    const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
+    const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
+    if (!batch.length) log("no actionable work — cheap tick");
+    else if (dryRun) {
+      for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
+    } else {
+      const exitCodes = await dispatchBatch(batch);
+      for (const [index, pick] of batch.entries()) {
+        const exitCode = exitCodes[index];
         const active = activeByAnchor.get(pick.anchorPath);
+        if (!active) continue;
         const runtime = pick.config.runtime || "codex";
         const dispatchScope = `${pick.sweep}:dispatch`;
-        const event = failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`);
-        if (active) {
-          try {
-            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set([dispatchScope]), active.envValues, { dryRun: false });
-          } catch (e) {
-            logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
-            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo", runtime, e.message);
-            writeLastTick();
-          }
-        }
-      } else {
-        const active = activeByAnchor.get(pick.anchorPath);
-        const dispatchScope = `${pick.sweep}:dispatch`;
-        if (active) {
-          try {
-            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([dispatchScope]), active.envValues, { dryRun: false });
-          } catch (e) {
-            logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch recovery reconciliation failed: ${e.message}`);
-            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo-recovery", pick.sweep, e.message);
-            writeLastTick();
-          }
+        const failures = exitCode === 0 ? [] : [
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`),
+        ];
+        try {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
+        } catch (e) {
+          const kind = exitCode === 0 ? "failure-todo-recovery" : "failure-todo";
+          logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
+          writeLastTick();
         }
       }
     }
@@ -1355,8 +1438,9 @@ async function cmdUnblockResolve(args) {
 }
 
 function cmdHealth() {
-  // A dispatch runs foreground and can legitimately exceed 3× interval, so a live
-  // tick lock (held by a running PID) counts as healthy even if the stamp is old.
+  // A bounded dispatch batch runs under one foreground launcher and can
+  // legitimately exceed 3× interval, so a live tick lock (held by a running PID)
+  // counts as healthy even if the stamp is old.
   let lockPid = null;
   try { lockPid = JSON.parse(fs.readFileSync(TICK_LOCK, "utf8")).pid; } catch { lockPid = null; }
   let lastTick = null;
