@@ -930,9 +930,25 @@ async function tick({ dryRun = false } = {}) {
       if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(anchorPath)} (.env) — skipping`); recordLocalFailure(anchorPath, config, "config", "missing-env", path.join(anchorPath, ".env"), "LINEAR_API_KEY missing"); continue; }
       try {
         if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
-      } catch (e) { logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`); recordLocalFailure(anchorPath, config, "_", "label-query", config.projectId, e.message); continue; }
-      if (!labeledByKey.get(apiKey).has(config.projectId)) { logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`); continue; }
+      } catch (e) {
+        logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`);
+        const event = failureEventFor(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+        try {
+          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, [event], new Set(), envValues, { dryRun });
+          if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} activation failure Todo decision(s)`);
+        } catch (reconcileError) {
+          logFor(anchorPath, "_", `FATAL failure-todo activation reconciliation failed: ${reconcileError.message}`);
+          recordLocalFailure(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+        }
+        continue;
+      }
+      if (!labeledByKey.get(apiKey).has(config.projectId)) {
+        logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`);
+        try { await reconcileFailureTodos(apiKey, config, anchorPath, [], new Set(["activation"]), envValues, { dryRun }); } catch { /* local health should stay green for paused projects */ }
+        continue;
+      }
       const active = { anchorPath, config, apiKey, envValues, failures: [], checkedScopes: new Set() };
+      active.checkedScopes.add("activation");
       anchors.push(active);
       activeByAnchor.set(anchorPath, active);
     }
