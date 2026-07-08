@@ -24,9 +24,9 @@
   },
   "$comment_requireShipApproval": "Optional. When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ready to Ship' before it will merge.",
   "requireShipApproval": false,
-  "$comment_fastPath": "Optional. Disabled by default. When enabled, dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from In Review directly to Ready to Ship to skip QA Passed. ship-sweep still merges only from human-moved Ready to Ship.",
+  "$comment_fastPath": "Enabled by default. Dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from In Review directly to Ready to Ship to skip QA Passed. Set enabled to false to require normal QA Passed for every card. ship-sweep still merges only from human-moved Ready to Ship.",
   "fastPath": {
-    "enabled": false,
+    "enabled": true,
     "maxChangedFiles": 2,
     "maxDiffLines": 80,
     "allowedLabels": ["bug", "chore", "docs"],

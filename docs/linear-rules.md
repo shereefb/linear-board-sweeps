@@ -54,9 +54,9 @@ Claim/release + blocked signals. The sweeps create these if missing.
 
 ## Fast-path eligibility
 
-Fast path is disabled by default in `linear-sweep.json`. When enabled, dev-sweep may add `fast-path:eligible` only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. Dev-sweep still moves the card to `In Review`; it never moves a card to `Ready to Ship`.
+Fast path is enabled by default in `linear-sweep.json`. Dev-sweep may add `fast-path:eligible` only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. Set `fastPath.enabled` to `false` to require normal QA for every card. Dev-sweep still moves the card to `In Review`; it never moves a card to `Ready to Ship`.
 
-A human can then either leave the card in `In Review` for normal qa-sweep, or manually move it directly to `Ready to Ship` to skip `QA Passed`. ship-sweep accepts `qa:passed` or `fast-path:eligible`, but only after the card is already in the human-gated `Ready to Ship` column and has no live foreign `*:in-progress` claim.
+A human can then either leave the card in `In Review` for normal qa-sweep, or manually move it directly to `Ready to Ship` to skip `QA Passed`. ship-sweep accepts `qa:passed` or enabled `fast-path:eligible` evidence, but only after the card is already in the human-gated `Ready to Ship` column and has no live foreign `*:in-progress` claim. If `fastPath.enabled` is `false`, ship-sweep requires `qa:passed`.
 
 Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity, and domain labels are optional and team-specific — the sweeps don't require them.
 

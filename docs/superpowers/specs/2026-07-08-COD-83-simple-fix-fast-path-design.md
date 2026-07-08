@@ -18,11 +18,11 @@ The card asks for simple fixes/features to move directly to Ready to Ship instea
 
 ## Design
 
-Add an optional fast-path policy for very small, low-risk cards. The policy is conservative and opt-in in `linear-sweep.json`:
+Add a default-on fast-path policy for very small, low-risk cards. The policy remains conservative and can be disabled in `linear-sweep.json`:
 
 ```json
 "fastPath": {
-  "enabled": false,
+  "enabled": true,
   "maxChangedFiles": 2,
   "maxDiffLines": 80,
   "allowedLabels": ["bug", "chore", "docs"],
@@ -41,7 +41,7 @@ When enabled, dev-sweep evaluates the card after implementation, tests, code rev
 - Independent reviewer explicitly classifies the change as high confidence.
 - The card receives a comment explaining exactly why the fast path is eligible.
 
-The human then has a clear choice: leave the card in In Review for normal qa-sweep, or manually move it directly to Ready to Ship to skip QA Passed. Ship-sweep must accept a Ready to Ship card with either `qa:passed` or `fast-path:eligible`, but only because the human moved it into Ready to Ship. If `requireShipApproval` is true, ship-sweep still additionally requires the human-applied `ship:approved` label.
+The human then has a clear choice: leave the card in In Review for normal qa-sweep, or manually move it directly to Ready to Ship to skip QA Passed. Ship-sweep must accept a Ready to Ship card with `qa:passed`, or with `fast-path:eligible` only when `fastPath.enabled !== false`, because the human moved it into Ready to Ship. If `requireShipApproval` is true, ship-sweep still additionally requires the human-applied `ship:approved` label.
 
 Dev-sweep must remove `dev:in-progress` before its terminal status/label update, and actionability should treat any live `*:in-progress` claim as blocking if implementation touches launcher actionability. This avoids a fresh foreign-claim race where ship could see a Ready to Ship card carrying a live dev claim.
 
@@ -63,21 +63,21 @@ Net: dev-sweep owns eligibility; the human owns Ready to Ship.
 
 ### Engineering review decision D2 - default posture
 
-The decision is whether this is enabled by default. The risk of a false positive is higher than the cost of waiting for QA Passed.
+The original decision was whether this is enabled by default. The follow-up decision is to make the feature default-on while keeping tight thresholds and the human Ready-to-Ship gate.
 
-Recommendation: default off. Teams can opt in per repo after dogfooding.
+Recommendation: default on with tight thresholds; teams can opt out per repo by setting `fastPath.enabled` to `false`.
 
-A) Default off (recommended). Completeness: 9/10. It is safe for existing installs and lets teams tune thresholds deliberately.
+A) Default on with tight thresholds (selected). Completeness: 9/10. It satisfies the card's intent, keeps dev-sweep from moving cards to Ready to Ship, and keeps the human production gate.
 
-B) Default on with tight thresholds. Completeness: 6/10. It demonstrates the feature but changes production workflow unexpectedly.
+B) Default off. Completeness: 6/10. It is safest for existing installs but fails the follow-up request to make the feature enabled by default.
 
 C) Default on for docs only. Completeness: 5/10. It is safer but too narrow to satisfy the card's intent.
 
-Net: opt-in keeps the workflow trustworthy.
+Net: default-on makes the fast path available immediately; the tight risk thresholds and human-only Ready to Ship move keep the workflow trustworthy.
 
 ## Schema and architecture impact
 
-No Linear statuses are added. The design adds an optional `fastPath` config block, a `fast-path:eligible` label, and one audit comment convention, for example `[auto-sweep-fast-path COD-83]`. README, SETUP, and `docs/linear-rules.md` should document the feature as planned until implementation lands.
+No Linear statuses are added. The design adds a default-on `fastPath` config block, a `fast-path:eligible` label, and one audit comment convention, for example `[auto-sweep-fast-path COD-83]`. README, SETUP, and `docs/linear-rules.md` should document the default-on behavior.
 
 ## Non-goals
 
@@ -94,5 +94,5 @@ No Linear statuses are added. The design adds an optional `fastPath` config bloc
 - A human can skip QA Passed by manually moving the eligible card from In Review to Ready to Ship.
 - Any disallowed label, size excess, failed test, unresolved review issue, or non-high confidence blocks the fast path.
 - `requireShipApproval` continues to require `ship:approved`.
-- Ship-sweep accepts `qa:passed` or human-moved `fast-path:eligible`, and rejects both if a live foreign claim remains.
+- Ship-sweep accepts `qa:passed` or human-moved `fast-path:eligible` only when `fastPath.enabled !== false`, rejects fast-path-only evidence when opted out, and rejects both if a live foreign claim remains.
 - Tests cover eligible/ineligible classifications and ship-sweep sanity behavior.

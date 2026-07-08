@@ -38,7 +38,7 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin; either `qa:passed` is present OR `fast-path:eligible` is present; no live foreign `*:in-progress` claim remains on the card; the build/tests are green in a reconstructed worktree; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ready to Ship", and stop.** Do not merge a card that didn't actually pass QA or receive the explicit fast-path marker, or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in a reconstructed worktree; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ready to Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
 
 ## 3. Optional final security gate
 
@@ -80,7 +80,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 ## Guardrails
 
-- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or `fast-path:eligible`, green-building, has no live foreign in-progress claim, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive fast-path eligibility.
+- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive enabled fast-path eligibility.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - ≤1 card/run; oldest-first; claim/release via `ship:in-progress`; stay within `config.project`.
 - No autonomous rollback — a red canary flags a human, it does not revert prod.
