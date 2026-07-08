@@ -11,7 +11,6 @@ The pipeline flows left → right. Linear ships most of these by default; the sw
 | `Backlog` | backlog | Raw idea, not yet selected | human |
 | `Needs Spec` | unstarted | Selected but under-specified | human, or dev-sweep bouncing a weak card |
 | `Ready for Dev` | unstarted | Designed + spec'd + eng-reviewed | **spec-sweep** |
-| `In Progress` | started | Actively being built | **dev-sweep** (or human) |
 | `In Review` | started | Built, pushed, awaiting QA | **dev-sweep** |
 | `QA Passed` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** |
 | `Ready to Ship` | started | Human reviewed and approved shipping after `QA Passed`, or after a dev-marked fast path | **human, manually (only)** |
@@ -20,6 +19,8 @@ The pipeline flows left → right. Linear ships most of these by default; the sw
 | `Canceled` | canceled | Won't do | human |
 | `Duplicate` | duplicate | Superseded by another card | anyone |
 | `Archived` | completed | Recorded for history; superseded/retired work | anyone |
+
+`In Progress` is a legacy state retained for history and stale-claim cleanup only. Normal active development stays in `Ready for Dev` and carries `dev:in-progress`.
 
 ### The `Todo` lane — things only the user can do
 
@@ -77,6 +78,6 @@ The launcher also writes/reads a few **audit-marker comments** on cards (you don
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.
 - Put the `<PREFIX>-###` key in the branch name / PR title / commit subjects where practical.
-- Raw ideas → `Backlog`. Selected-but-underspecified → `Needs Spec`. Designed → `Ready for Dev`. Active → `In Progress`. PR/review → `In Review`. QA-passed, awaiting sign-off → `QA Passed`. Tiny fast-path-eligible changes may be moved by a human from `In Review` directly to `Ready to Ship`; otherwise human-approved shipping happens from `QA Passed` → `Ready to Ship`. Shipped + verified → `Done`.
+- Raw ideas → `Backlog`. Selected-but-underspecified → `Needs Spec`. Designed/active → `Ready for Dev` (active work carries `dev:in-progress`). PR/review → `In Review`. QA-passed, awaiting sign-off → `QA Passed`. Tiny fast-path-eligible changes may be moved by a human from `In Review` directly to `Ready to Ship`; otherwise human-approved shipping happens from `QA Passed` → `Ready to Ship`. Shipped + verified → `Done`.
 - Work discovered after the fact → a `Done` card titled `Completed: …` with a short plain-English summary + evidence.
 - Every question during an unattended sweep run goes to a **card comment** — never block on interactive input.

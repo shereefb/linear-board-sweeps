@@ -58,7 +58,7 @@ export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
 // bake + docs, so it gets the same generous window as qa.
 export const SWEEP_CFG = {
   spec: { states: ["Needs Spec"], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 45 },
-  dev: { states: ["Ready for Dev", "In Progress"], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
+  dev: { states: ["Ready for Dev"], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
   qa: { states: ["In Review"], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user"], staleMin: 120 },
   ship: { states: ["Ready to Ship"], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 },
 };
@@ -76,6 +76,10 @@ export const PROPAGATED_SKILL_DIRS = [...SKILL_DIRS, ...MANUAL_SKILL_DIRS];
 // own states are reaped in the main loop). qa moves a card to "QA Passed" and
 // then drops qa:in-progress; a crash between those strands the claim here.
 export const HOLDING_STATES = ["QA Passed"];
+// Legacy workflow states no sweep fetches after retirement, but which may still
+// carry old claim labels from previous runs or manual board moves.
+export const LEGACY_CLEANUP_STATES = ["In Progress"];
+export const CLAIM_CLEANUP_STATES = [...HOLDING_STATES, ...LEGACY_CLEANUP_STATES];
 export const ALL_CLAIMS = SWEEPS.map((s) => SWEEP_CFG[s].claim);
 export const MAX_STALE_MIN = Math.max(...SWEEPS.map((s) => SWEEP_CFG[s].staleMin));
 
@@ -1314,21 +1318,22 @@ async function tick({ dryRun = false } = {}) {
         if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder });
       }
 
-      // Holding-state reaper: release claims stranded in states no sweep fetches
+      // Holding/legacy-state reaper: release claims stranded in states no sweep fetches
       // (e.g. qa:in-progress left on a "QA Passed" card by a crash between the
-      // status move and the claim drop). ownClaim=null → any stale claim here is
-      // orphaned. Cheap; runs after the per-sweep loop. executeOrphanReap needs no
+      // status move and the claim drop, or old dev claims left in retired
+      // "In Progress"). ownClaim=null → any stale claim here is orphaned.
+      // Cheap; runs after the per-sweep loop. executeOrphanReap needs no
       // teamLabelMap (it removes by id from the card), so it is not gated on one.
       try {
-        const held = await fetchCards(apiKey, config.teamKey, config.projectId, HOLDING_STATES);
+        const held = await fetchCards(apiKey, config.teamKey, config.projectId, CLAIM_CLEANUP_STATES);
         active.checkedScopes.add("holding");
         const orphans = foreignClaimReleases(held, now);
         if (!dryRun) {
           for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
         } else if (orphans.length) {
-          logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding states`);
+          logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding/legacy states`);
         }
-      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", HOLDING_STATES.join(","), e.message); }
+      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", CLAIM_CLEANUP_STATES.join(","), e.message); }
 
       try {
         const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });

@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   positionAfter, reviewLensLabels, bottomSortOrder, issueUpdateToStateBottomInput,
-  REQUIRED_STATES, REQUIRED_LABELS,
+  retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
 } from "../scripts/linear.mjs";
 
 // ── board position ───────────────────────────────────────────────────────────
@@ -51,6 +51,62 @@ test("issueUpdateToStateBottomInput: builds one state+rank update payload", () =
     stateId: "state-1",
     sortOrder: 1,
   });
+});
+test("retireStateIssueUpdateInput: moves state/rank without label mutation", () => {
+  assert.deepEqual(retireStateIssueUpdateInput("ready-id", [{ sortOrder: 0 }, { sortOrder: -4 }]), {
+    stateId: "ready-id",
+    sortOrder: -5,
+  });
+});
+test("retireStateAuditComment: records state retirement and label preservation", () => {
+  const body = retireStateAuditComment("In Progress", "Ready for Dev");
+  assert.match(body, /Retiring legacy workflow state `In Progress`/);
+  assert.match(body, /moved this card to `Ready for Dev`/);
+  assert.match(body, /Existing labels were preserved as-is/);
+  assert.match(body, /no new claim label was added/);
+});
+test("retireState: moves source cards, omits label mutation, and comments after update", async () => {
+  const calls = [];
+  const gqlFn = async (query, variables) => {
+    calls.push({ query, variables });
+    if (query.includes("project(id:$id)")) {
+      return { project: { teams: { nodes: [{ states: { nodes: [
+        { id: "in-progress-id", name: "In Progress" },
+        { id: "ready-id", name: "Ready for Dev" },
+      ] } }] } } };
+    }
+    if (query.includes("state:{ name:{ eq:$state }") && variables.state === "In Progress") {
+      return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+        { id: "issue-1", identifier: "COD-1", title: "Active", sortOrder: 10, url: "https://linear/COD-1" },
+      ] } };
+    }
+    if (query.includes("state:{ name:{ eq:$state }") && variables.state === "Ready for Dev") {
+      return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+        { id: "issue-2", sortOrder: 4 },
+        { id: "issue-3", sortOrder: -2 },
+      ] } };
+    }
+    if (query.includes("issueUpdate")) {
+      assert.deepEqual(variables, { id: "issue-1", input: { stateId: "ready-id", sortOrder: -3 } });
+      assert.equal(Object.hasOwn(variables.input, "labelIds"), false);
+      assert.equal(Object.values(variables.input).includes("dev:in-progress"), false);
+      return { issueUpdate: { success: true, issue: { identifier: "COD-1", state: { name: "Ready for Dev" }, sortOrder: -3, url: "https://linear/COD-1" } } };
+    }
+    if (query.includes("commentCreate")) {
+      assert.equal(variables.id, "issue-1");
+      assert.match(variables.b, /Existing labels were preserved as-is/);
+      return { commentCreate: { success: true } };
+    }
+    throw new Error(`unexpected query: ${query}`);
+  };
+  const logs = [];
+  const moved = await retireState("project-1", "In Progress", "Ready for Dev", { gqlFn, log: (line) => logs.push(line) });
+  assert.deepEqual(moved.map((issue) => issue.identifier), ["COD-1"]);
+  const updateIndex = calls.findIndex((c) => c.query.includes("issueUpdate"));
+  const commentIndex = calls.findIndex((c) => c.query.includes("commentCreate"));
+  assert.ok(updateIndex >= 0);
+  assert.ok(commentIndex > updateIndex);
+  assert.ok(logs.some((line) => line.includes("Moved 1 card")));
 });
 
 // ── taxonomy declarations ────────────────────────────────────────────────────

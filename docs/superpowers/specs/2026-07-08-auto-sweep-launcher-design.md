@@ -42,7 +42,7 @@ This matches the kit's existing skills, which already say "operate within `confi
 
 ## Guiding principle
 
-**Origin is the single source of truth — for work state *and* for tooling.** The only thing allowed to be machine-local is a card *actively* In Progress (its uncommitted WIP). Everything else — completed/paused work, spec docs, skill versions — lives on origin, so any machine can pick up any card.
+**Origin is the single source of truth — for work state *and* for tooling.** The only thing allowed to be machine-local is a card actively being developed (its uncommitted WIP while the card remains in `Ready for Dev` with `dev:in-progress`). Everything else — completed/paused work, spec docs, skill versions — lives on origin, so any machine can pick up any card.
 
 ## Architecture
 
@@ -125,7 +125,7 @@ A Linear **project label `auto-sweep`**. A project is swept iff its anchor is **
    - dev-sweep pushes the `<PREFIX>-###` branch in **each** touched repo before → In Review *and* before leaving a `blocked:needs-user` card (partial work is recoverable elsewhere).
    - qa-sweep's merge is already pushed; it pushes every repo it merged.
 2. **Re-read the card before the terminal move.** Right before any status transition, re-fetch the card and confirm it is still in the state the run claimed. If a human (or another process) moved it out from under the run, **do not override** — comment what was built and where the branch is, release the claim, and stop. The claim label stops another *sweep*; this stops the run from clobbering a human's concurrent move.
-3. **Worktree = reconstruct-and-reconcile, never assume-clean.** Worktrees are the one genuinely machine-local git artifact — disposable caches; the branch is the truth. On picking up an In Progress / In Review card, the skill runs `git fetch` in each candidate repo, then:
+3. **Worktree = reconstruct-and-reconcile, never assume-clean.** Worktrees are the one genuinely machine-local git artifact — disposable caches; the branch is the truth. On picking up an actively claimed `Ready for Dev` card or an `In Review` card, the skill runs `git fetch` in each candidate repo, then:
    - **No local worktree** but `origin/<PREFIX>-###` exists → rebuild it at the **deterministic path** `<repo>/.worktrees/<PREFIX>-###`: `git worktree add <repo>/.worktrees/<PREFIX>-### <PREFIX>-###` tracking the remote branch.
    - **Local worktree exists** (a prior crashed run on this machine left it, possibly dirty) → reconcile before working: reset it to `origin/<PREFIX>-###` (`git reset --hard`), discarding stranded uncommitted WIP that never reached origin. Never resume on top of an unknown dirty tree.
    Because the branch name derives from the card and the path is deterministic, any machine reconstructs (or reconciles) the exact worktrees from the card alone, and there is never a path collision or an already-checked-out conflict.
@@ -133,7 +133,7 @@ A Linear **project label `auto-sweep`**. A project is swept iff its anchor is **
 
 **Shared push discipline (one routine, every push).** Every push the design adds — spec docs to `main`, dev branches, WIP checkpoints, qa merges, and the auto-updater's skills commit — goes through the same routine: `git fetch`, replay/rebase the local commits onto the updated remote ref, then push; on a non-fast-forward rejection retry up to **2×**; on final failure **log + comment on the card + skip** (never force-push). This is what keeps an unattended launcher self-healing when a human pushes the same branch from a laptop between the fetch and the push, instead of wedging silently.
 
-**Allowed machine-local state:** a card *actively* In Progress may have uncommitted WIP in one machine's worktree. If that session crashes, the reaper releases the claim and another machine resumes **from the last pushed commit** (uncommitted scraps on the dead machine are forfeit — accepted, and reconciled away by guardrail 3). To shrink the loss window, dev-sweep commits + pushes WIP at natural checkpoints (after the build first goes green, before code review), not only at the end.
+**Allowed machine-local state:** a card actively being developed may have uncommitted WIP in one machine's worktree while it carries `dev:in-progress`. If that session crashes, the reaper releases the claim and another machine resumes **from the last pushed commit** (uncommitted scraps on the dead machine are forfeit — accepted, and reconciled away by guardrail 3). To shrink the loss window, dev-sweep commits + pushes WIP at natural checkpoints (after the build first goes green, before code review), not only at the end.
 
 **Cross-machine reaper safety:** the reaper keys on a **heartbeat** the running sweep refreshes (see Stuck-card handling), not on raw `updatedAt` — so a long, heads-down run that hasn't touched the card is *not* mistaken for a crash by a second machine's reaper. Residual risk: two machines claiming the same unclaimed card in the same instant (Linear has no atomic label compare-and-set). With a single launcher on the Mac mini this is near-zero; the fallback is a harmless duplicate branch push caught as a conflict by the push discipline / at QA. Noted, not engineered around.
 
