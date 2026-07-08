@@ -13,6 +13,7 @@ Take cards a human has approved into **"Ready to Ship"** and land them: merge to
 
 - **Load repo config.** Read `.claude/linear-sweep.json` (fields per spec-sweep §0). Missing file → exit with a one-line error. The production deploy path is `config.deploy` — read it before shipping.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials in `config.credentialsNote`.
+- **Coding guardrail.** Before merge-review debugging or any code change/refactor needed during shipping, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`.
 
