@@ -64,5 +64,5 @@ test("REQUIRED_STATES: new columns declared, QA Passed created before Ready to S
 });
 test("REQUIRED_LABELS: ship/qa taxonomy present", () => {
   const names = REQUIRED_LABELS.map((l) => l.name);
-  for (const n of ["qa:passed", "ship:in-progress", "ship:approved"]) assert.ok(names.includes(n), `missing ${n}`);
+  for (const n of ["qa:passed", "ship:in-progress", "ship:approved", "fast-path:eligible"]) assert.ok(names.includes(n), `missing ${n}`);
 });

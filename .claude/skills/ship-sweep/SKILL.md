@@ -5,7 +5,7 @@ description: Merge + deploy the configured Linear project's human-approved "Read
 
 # Ship Sweep
 
-Take cards a human has approved into **"Ready to Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. This is the **only** sweep that merges and deploys — every card it touches was already smoke-tested green by qa-sweep (`qa:passed`) and explicitly moved to "Ready to Ship" by a person. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change.
+Take cards a human has approved into **"Ready to Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. This is the **only** sweep that merges and deploys — every card it touches was either smoke-tested green by qa-sweep (`qa:passed`) or marked by dev-sweep as `fast-path:eligible`, and explicitly moved to "Ready to Ship" by a person. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. "Deploy" = `config.deploy`; "canary" = the `/canary` skill (or, on Codex, a post-deploy health check of the same URLs/endpoints).
 
@@ -41,7 +41,7 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin, `qa:passed` is present, the build/tests are green in a reconstructed worktree, and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ready to Ship", and stop.** Do not merge a card that didn't actually pass QA or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in a reconstructed worktree; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ready to Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
 
 ## 3. Optional final security gate
 
@@ -85,7 +85,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 ## Guardrails
 
-- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed`, green-building, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA.
+- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive enabled fast-path eligibility.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - One card at a time, but keep draining until the actionable "Ready to Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.
 - No autonomous rollback — a red canary flags a human, it does not revert prod.

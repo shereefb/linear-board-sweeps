@@ -137,10 +137,19 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    },
    "parallel": {
      "maxNonShipDispatches": 2
+   },
+   "fastPath": {
+     "enabled": true,
+     "maxChangedFiles": 2,
+     "maxDiffLines": 80,
+     "allowedLabels": ["bug", "chore", "docs"],
+     "disallowedLabels": ["auth", "security", "data", "frontend", "design", "ui", "api", "cli", "sdk", "integration", "research", "performance"],
+     "requireReviewerConfidence": "high"
    }
    ```
    Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. For Codex, prefer the best model available to the installed account (for this kit's default, `gpt-5.5` with `high` effort). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. Set it to `1` for serial mode on smaller machines; that workspace then runs alone or waits for the next tick. ship-sweep is always serial.
+   `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `QA Passed`. Set it to false to require normal QA for every card. The human-only `Ready to Ship` move remains required.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash
