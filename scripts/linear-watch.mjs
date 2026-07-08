@@ -62,6 +62,9 @@ export const SWEEPS = Object.keys(SWEEP_CFG); // spec, dev, qa, ship — iterati
 export const SWEEP_ORDER = ["ship", "qa", "dev", "spec"];
 // The kit skill directories the auto-updater propagates to anchors — one per sweep.
 export const SKILL_DIRS = SWEEPS.map((s) => `${s}-sweep`);
+// Human-invoked skills copied to anchors but never included in scheduled dispatch.
+export const MANUAL_SKILL_DIRS = ["unblock-sweep"];
+export const PROPAGATED_SKILL_DIRS = [...SKILL_DIRS, ...MANUAL_SKILL_DIRS];
 // Holding states can carry a stale claim but are fetched by NO sweep (a sweep's
 // own states are reaped in the main loop). qa moves a card to "QA Passed" and
 // then drops qa:in-progress; a crash between those strands the claim here.
@@ -302,6 +305,72 @@ export function parseEnv(text) {
   return out;
 }
 
+export const BLOCKING_LABELS = ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes"];
+
+export function blockingLabelsForIssue(labelNames) {
+  return BLOCKING_LABELS.filter((name) => (labelNames || []).includes(name));
+}
+
+export function labelIdsAfterRemoving(labelIdsByName, removeNames) {
+  const remove = new Set(removeNames || []);
+  return Object.entries(labelIdsByName || [])
+    .filter(([name]) => !remove.has(name))
+    .map(([, id]) => id);
+}
+
+function redactSecrets(text) {
+  return String(text || "").replace(/lin_api_[A-Za-z0-9._-]+/g, "[redacted-linear-api-key]");
+}
+
+export function buildUnblockAuditComment({ labels, resolution }) {
+  const labelList = (labels || []).map((l) => `\`${l}\``).join(", ");
+  return [
+    "[unblock-sweep resolution]",
+    `Resolution for blocker label(s): ${labelList || "(none)"}`,
+    "",
+    "Operator resolution:",
+    redactSecrets(resolution || "").trim() || "(no resolution text provided)",
+  ].join("\n");
+}
+
+export function resolutionTextFromArgs(args, stdinText = "") {
+  if ((args || [])[0] === "--stdin") return String(stdinText || "").trim();
+  return (args || []).join(" ").trim();
+}
+
+function recentHumanComments(comments) {
+  return [...(comments || [])]
+    .filter((c) => {
+      const body = c.body || "";
+      return !body.includes(HEARTBEAT_TAG) && !body.includes(REAPER_TAG) && !body.includes(ORPHAN_TAG);
+    })
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+}
+
+export function normalizeBlockedIssue(anchorPath, config, issue, { active = null } = {}) {
+  const labelNodes = issue.labels?.nodes || [];
+  const labelNames = labelNodes.map((l) => l.name);
+  const comments = issue.comments?.nodes || [];
+  const recentComments = recentHumanComments(comments).slice(0, 5);
+  return {
+    anchorPath,
+    project: config.project,
+    projectId: config.projectId,
+    projectActive: active,
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    url: issue.url,
+    state: issue.state?.name || null,
+    updatedAt: issue.updatedAt,
+    labels: labelNames,
+    labelIds: Object.fromEntries(labelNodes.map((l) => [l.name, l.id])),
+    blockingLabels: blockingLabelsForIssue(labelNames),
+    recentComments,
+    newestBlockingComment: recentComments[0] || null,
+  };
+}
+
 // ── IO: filesystem / registry ────────────────────────────────────────────────
 
 function readRegistry() {
@@ -455,6 +524,57 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
   return cards;
 }
 
+async function fetchBlockedIssues(apiKey, teamKey, projectId) {
+  const issues = [];
+  let cursor = null;
+  do {
+    const d = await gql(
+      `query($c:String,$labels:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, labels:{ name:{ in:$labels } } }){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ id identifier title url updatedAt
+           state{ name }
+           labels{ nodes{ id name } }
+           comments(last:20){ nodes{ body createdAt user{ name } } } } } }`,
+      { c: cursor, labels: BLOCKING_LABELS, teamKey, pid: projectId },
+      apiKey
+    );
+    for (const issue of d.issues.nodes) {
+      const labelNames = issue.labels.nodes.map((l) => l.name);
+      if (blockingLabelsForIssue(labelNames).length) issues.push(issue);
+    }
+    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
+  } while (cursor);
+  return issues;
+}
+
+export async function scanBlockedIssues({ registry = readRegistry(), isProjectActive = labeledProjectIds } = {}) {
+  const cards = [];
+  const warnings = [];
+  const activeByKey = new Map();
+  for (const anchorPath of registry.repos || []) {
+    let config;
+    try { config = anchorConfig(anchorPath); } catch (e) { warnings.push({ anchorPath, message: e.message }); continue; }
+    const apiKey = anchorKey(anchorPath);
+    if (!apiKey) { warnings.push({ anchorPath, message: "missing LINEAR_API_KEY in .env" }); continue; }
+    let active = null;
+    try {
+      if (!activeByKey.has(apiKey)) activeByKey.set(apiKey, await isProjectActive(apiKey));
+      active = activeByKey.get(apiKey).has(config.projectId);
+    } catch (e) {
+      warnings.push({ anchorPath, message: `project activation lookup failed: ${e.message}` });
+    }
+    try {
+      const issues = await fetchBlockedIssues(apiKey, config.teamKey, config.projectId);
+      cards.push(...issues.map((issue) => normalizeBlockedIssue(anchorPath, config, issue, { active })));
+    } catch (e) {
+      warnings.push({ anchorPath, message: `blocked issue query failed: ${e.message}` });
+    }
+  }
+  cards.sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));
+  return { cards, warnings };
+}
+
 // Project-label activation (the auto-sweep on/off switch). find-or-create the
 // workspace's `auto-sweep` project label, then add/remove it from the project.
 async function findOrCreateAutoSweepLabel(apiKey) {
@@ -484,6 +604,34 @@ async function setIssueLabels(apiKey, issueId, labelIds) {
 
 async function addComment(apiKey, issueId, body) {
   await gql(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body }, apiKey);
+}
+
+async function fetchIssueLabels(apiKey, issueId) {
+  const d = await gql(
+    `query($id:String!){ issue(id:$id){ id identifier team{ key } project{ id } labels{ nodes{ id name } } } }`,
+    { id: issueId },
+    apiKey
+  );
+  if (!d.issue) throw new Error(`issue not found: ${issueId}`);
+  return {
+    id: d.issue.id,
+    identifier: d.issue.identifier,
+    teamKey: d.issue.team?.key || null,
+    projectId: d.issue.project?.id || null,
+    labelIds: Object.fromEntries(d.issue.labels.nodes.map((l) => [l.name, l.id])),
+  };
+}
+
+export async function resolveBlockedIssue(apiKey, issueId, labels, resolution, scope = {}) {
+  const issue = await fetchIssueLabels(apiKey, issueId);
+  if ((scope.teamKey && issue.teamKey !== scope.teamKey) || (scope.projectId && issue.projectId !== scope.projectId)) {
+    throw new Error(`${issue.identifier} is outside configured anchor project/team; refusing to mutate`);
+  }
+  const selected = blockingLabelsForIssue(labels || []).filter((label) => issue.labelIds[label]);
+  if (!selected.length) throw new Error(`no selected blocking labels are present on ${issue.identifier}`);
+  await addComment(apiKey, issue.id, buildUnblockAuditComment({ labels: selected, resolution }));
+  await setIssueLabels(apiKey, issue.id, labelIdsAfterRemoving(issue.labelIds, selected));
+  return { identifier: issue.identifier, removedLabels: selected };
 }
 
 // Drop one or more claim labels (+ optionally add labels) in a SINGLE write, and
@@ -532,11 +680,11 @@ function kitMarker(kitPath) {
   return git(kitPath, ["rev-parse", "HEAD"], { allowFail: true }).out || null;
 }
 
-// Copy every sweep skill dir + version stamp into a checkout root. Derived from
-// SKILL_DIRS (= SWEEP_CFG keys) so a new sweep propagates to anchors with no edit
-// here — miss this and the new skill never reaches the machines that run it.
+// Copy scheduled sweep skills plus manual operator skills into a checkout root.
+// Scheduled dirs stay derived from SWEEP_CFG; manual dirs are explicit so they
+// propagate to anchors without becoming eligible for unattended dispatch.
 function copySkillsInto(root, kit, marker) {
-  for (const s of SKILL_DIRS) {
+  for (const s of PROPAGATED_SKILL_DIRS) {
     fs.cpSync(path.join(kit, "skills", s), path.join(root, ".claude", "skills", s), { recursive: true });
   }
   fs.writeFileSync(path.join(root, ".claude", "skills", ".sweep-version"), marker + "\n");
@@ -800,6 +948,41 @@ async function cmdList() {
   }
 }
 
+async function cmdUnblockList({ json = false } = {}) {
+  const result = await scanBlockedIssues();
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  for (const w of result.warnings) console.log(`[warning] ${w.anchorPath}: ${w.message}`);
+  if (!result.cards.length) { console.log("No blocked cards found across registered anchors."); return; }
+  for (const card of result.cards) {
+    const status = card.projectActive === null ? "active unknown" : card.projectActive ? "active" : "paused";
+    console.log(`${card.identifier} [${card.state}] ${card.title}`);
+    console.log(`  ${card.url}`);
+    console.log(`  anchor=${card.anchorPath} project=${card.project} (${status})`);
+    console.log(`  blockers=${card.blockingLabels.join(", ")}`);
+    if (card.newestBlockingComment) console.log(`  latest=${card.newestBlockingComment.body.replace(/\s+/g, " ").slice(0, 220)}`);
+  }
+}
+
+async function cmdUnblockResolve(args) {
+  const [anchorPath, issueId, labelsCsv, ...resolutionParts] = args;
+  if (!anchorPath || !issueId || !labelsCsv || !resolutionParts.length) {
+    throw new Error("usage: unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>)");
+  }
+  const abs = path.resolve(anchorPath);
+  const config = anchorConfig(abs);
+  const apiKey = anchorKey(abs);
+  if (!apiKey) throw new Error(`no LINEAR_API_KEY in ${abs}/.env`);
+  const labels = labelsCsv.split(",").map((s) => s.trim()).filter(Boolean);
+  const stdinText = resolutionParts[0] === "--stdin" ? fs.readFileSync(0, "utf8") : "";
+  const resolution = resolutionTextFromArgs(resolutionParts, stdinText);
+  if (!resolution) throw new Error("resolution text is required");
+  const r = await resolveBlockedIssue(apiKey, issueId, labels, resolution, { teamKey: config.teamKey, projectId: config.projectId });
+  console.log(`${r.identifier}: removed ${r.removedLabels.join(", ")}`);
+}
+
 function cmdHealth() {
   // A dispatch runs foreground and can legitimately exceed 3× interval, so a live
   // tick lock (held by a running PID) counts as healthy even if the stamp is old.
@@ -823,11 +1006,13 @@ async function main() {
     case "activate": return cmdActivate(args[0] || ".", true);
     case "deactivate": return cmdActivate(args[0] || ".", false);
     case "list": return cmdList();
+    case "unblock-list": return cmdUnblockList({ json: args.includes("--json") });
+    case "unblock-resolve": return cmdUnblockResolve(args);
     case "ship-runner": return cmdShipRunner(args[0]);
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | tick [--dry-run] | health");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | tick [--dry-run] | health");
       process.exit(1);
   }
 }

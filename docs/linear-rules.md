@@ -66,6 +66,10 @@ Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity,
 
 The launcher also writes/reads a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO>]` (a running sweep proving it's alive), `[auto-sweep-reaper]` (a stale claim it auto-released), and `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`).
 
+## Manual unblock workflow
+
+`unblock-sweep` is a human-invoked skill for reviewing cards that carry `blocked:open-questions`, `blocked:needs-user`, or `qa:needs-changes` across all registered anchors, including paused projects. It shows one blocked card at a time, records the user's resolution in a Linear audit comment, and removes only the selected blocking label(s). It is copied to anchors for Claude/Codex discovery but is not part of scheduled `SWEEPS`.
+
 ## Tracking rules (going forward)
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.
