@@ -9,10 +9,10 @@
   "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Omit a model/effort to fall back to the runtime's own default (~/.codex/config.toml or Claude Code settings). For a claude workspace, set runtime='claude' and use claude model ids (e.g. claude-opus-4-8). Note: gated review lenses run INSIDE a sweep's single dispatched agent and inherit its model — there is no per-lens model tier.",
   "runtime": "codex",
   "models": {
-    "spec": { "model": "gpt-5.5-codex", "effort": "high" },
-    "dev":  { "model": "gpt-5.5-codex", "effort": "high" },
-    "qa":   { "model": "gpt-5.5-codex", "effort": "high" },
-    "ship": { "model": "gpt-5.5-codex", "effort": "high" }
+    "spec": {},
+    "dev":  {},
+    "qa":   {},
+    "ship": {}
   },
   "$comment_reviewLenses": "Optional. Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens (design at spec+qa, devex at spec, security at spec+dev+ship, perf at dev/qa, research at spec). Omit the whole block to run only the always-on lenses (eng-review, code-review, /qa). setup-team creates these labels; sweeps auto-apply them to unlabelled cards (generate-if-missing).",
   "reviewLenses": {

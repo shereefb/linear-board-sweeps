@@ -9,10 +9,10 @@
   "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Omit a model/effort to fall back to the runtime's own default.",
   "runtime": "codex",
   "models": {
-    "spec": { "model": "gpt-5.5-codex", "effort": "high" },
-    "dev":  { "model": "gpt-5.5-codex", "effort": "high" },
-    "qa":   { "model": "gpt-5.5-codex", "effort": "high" },
-    "ship": { "model": "gpt-5.5-codex", "effort": "high" }
+    "spec": {},
+    "dev":  {},
+    "qa":   {},
+    "ship": {}
   },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
