@@ -141,7 +141,7 @@ Status names **decided**: `QA Passed` (machine says green) → `Ready to Ship` (
 ship-sweep watches `Ready to Ship`, and moving a card there is the developer's approval signal. Two layers keep an accidental move from shipping junk:
 
 1. **The `qa:passed` + green-build sanity gate** (ship-sweep step 2) means a card that never actually passed QA cannot be shipped even if it lands in `Ready to Ship` by mistake.
-2. **Serial dispatch** means a mistaken *bulk* drag of several cards ships **one card per tick** (~10 min apart), leaving a window for a human to pull the rest back before they deploy.
+2. **Serial draining** means a mistaken *bulk* drag of several cards is still processed one card at a time, with each card independently claimed, sanity-checked, deployed, canaried, and recorded before the next card starts. A single ship-sweep keeps draining until the actionable queue is empty, then re-lists once more to catch cards added mid-run.
 
 **This is a strong policy gate, not a structural invariant** (earlier framing overstated it): Linear does not itself forbid a machine/automation/bulk-drag from entering `Ready to Ship`, and a *move* is not proof anyone *reviewed*. For teams that want a harder gate, `linear-sweep.json` may set `"requireShipApproval": true`, which makes ship-sweep additionally require a human-applied **`ship:approved`** label (a second deliberate act) before it will merge. Off by default (the move is the approval); opt-in for higher-stakes projects.
 

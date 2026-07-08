@@ -17,12 +17,14 @@ Take cards a human has approved into **"Ready to Ship"** and land them: merge to
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`.
 
-## 1. Select cards (top-of-column order, bounded, claimed)
+## 1. Select cards (top-of-column order, drain queue, claimed)
 
 List "Ready to Ship" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `ship:in-progress` < 120 min old (another run owns it — merge + deploy + canary is slow). Reclaim a stale claim.
 - **Claim** with `ship:in-progress` before starting; remove it when you finish, block, or bail.
-- Process **at most 1 card per run** — one production deploy at a time. If none are actionable, exit cleanly (normal no-op).
+- Continue selecting and processing one actionable card at a time until no actionable "Ready to Ship" cards remain. This preserves one production deploy at a time without leaving approved cards waiting for a later run.
+- After each terminal transition or card-specific block, re-list the queue before choosing the next card. If a card is blocked, it is no longer actionable; keep draining any remaining unblocked cards.
+- After the queue first appears empty, re-list "Ready to Ship" once more before exiting. If new actionable cards appeared while you were shipping, continue the same one-at-a-time loop, then perform the final empty-queue recheck again.
 
 ## 2. Resume detection FIRST — key on the merge commit, not the branch
 
@@ -70,6 +72,8 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 
 If you can't finish without the owner (a failing sanity gate, a security block, a manual deploy step you can't perform, ambiguous intended behavior): comment the specifics, add `blocked:needs-user`, remove `ship:in-progress`, and leave the card where it is (Ready to Ship if not yet merged; Done if already deployed). Ask once; resume when they reply.
 
+If the blocker is card-specific (for example, missing `qa:passed` on one card), re-list and continue draining other actionable cards. If the blocker is global to the run (for example, missing Linear auth, broken git push credentials, or an unavailable deploy path that would affect every remaining card), stop after releasing the current claim and recording the blocker.
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the launcher, and any other machine coordinate ONLY through origin. ship-sweep is single-runner, but a crash still has to hand off cleanly.
@@ -83,7 +87,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 - **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed`, green-building, and a human moved to "Ready to Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
-- ≤1 card/run; top-of-column order; claim/release via `ship:in-progress`; stay within `config.project`.
+- One card at a time, but keep draining until the actionable "Ready to Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.
 - No autonomous rollback — a red canary flags a human, it does not revert prod.
 - Every question → a card comment (or a new Todo card for manual deploy steps); never AskUserQuestion.
 - The card comments + the `[auto-sweep-deployed]` marker + canary result are the audit trail.
