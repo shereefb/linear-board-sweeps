@@ -82,6 +82,8 @@ The next planned launcher/workflow changes are docs-only designs at this point:
 - `COD-85`: Linear board-position order for sweep queues, with cards moved to the bottom of destination columns.
 - `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
 - `COD-89`: dogfood retrospective for the first Linear sweep cards, including timing, token, cadence, and user-interruption learnings.
+- `COD-91`: self-clearing Linear `Todo` cards for scheduled tick failures, deduped by failure fingerprint.
+- `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
 
 ## Requirements
 
