@@ -12,6 +12,8 @@ import {
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
+  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
+  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -399,6 +401,152 @@ test("resolveBlockedIssue: rejects issues outside the anchor team/project before
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ── scheduled failure Todo reconciliation ───────────────────────────────────
+const failureEvent = (over = {}) => ({
+  anchorPath: "/ws/linear-board-sweeps",
+  anchorSlug: "linear-board-sweeps",
+  projectId: "project-1",
+  scope: "dev",
+  kind: "dispatch-start",
+  stableTarget: "codex",
+  message: "spawn codex ENOENT lin_api_secret",
+  seenAt: "2026-07-08T12:00:00Z",
+  ...over,
+});
+const existingFailureTodo = (fingerprint, over = {}) => ({
+  id: over.id || "todo-1",
+  identifier: over.identifier || "COD-100",
+  updatedAt: over.updatedAt || hoursAgo(2),
+  scope: over.scope || "dev",
+  lastMessage: over.lastMessage || "spawn codex ENOENT [REDACTED]",
+  description: `${FAILURE_TODO_TAG} ${fingerprint}]`,
+  comments: over.comments || [],
+  ...over,
+});
+
+test("failureFingerprint: stable same input, different target differs", () => {
+  const a = failureFingerprint(failureEvent());
+  const b = failureFingerprint(failureEvent({ message: "different volatile error" }));
+  const c = failureFingerprint(failureEvent({ stableTarget: "claude" }));
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  assert.match(a, /^[a-f0-9]{16}$/);
+});
+test("sanitizeFailureMessage: redacts Linear keys, common tokens, and supplied env values", () => {
+  const msg = "LINEAR_API_KEY=lin_api_abc123 token ghp_deadbeef password shh path /tmp";
+  const clean = sanitizeFailureMessage(msg, ["shh"]);
+  assert.equal(clean.includes("lin_api_abc123"), false);
+  assert.equal(clean.includes("ghp_deadbeef"), false);
+  assert.equal(clean.includes("shh"), false);
+  assert.match(clean, /\[REDACTED\]/);
+});
+test("failure Todo helpers include action, recovery condition, marker, and sanitized message", () => {
+  const event = failureEvent();
+  const fp = failureFingerprint(event);
+  assert.equal(failureTodoTitle(event), "Scheduled sweep failure: linear-board-sweeps / dev / dispatch-start");
+  const body = failureTodoBody(event, fp, { envValues: ["lin_api_secret"] });
+  assert.match(body, /What failed:/);
+  assert.match(body, /How to clear:/);
+  assert.match(body, /Recovery condition:/);
+  assert.match(body, new RegExp(`\\${FAILURE_TODO_TAG} ${fp}\\]`));
+  assert.equal(body.includes("lin_api_secret"), false);
+  assert.match(failureTodoBody(event, fp, { firstSeen: "2026-07-08T00:00:00Z" }), /First seen: 2026-07-08T00:00:00Z/);
+});
+test("failureTodoDecisions: creates a missing Todo and suppresses duplicate creates", () => {
+  const event = failureEvent();
+  const fp = failureFingerprint(event);
+  const first = failureTodoDecisions([event], [], new Set(["dev"]), NOW);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].action, "create");
+  assert.equal(first[0].fingerprint, fp);
+
+  const second = failureTodoDecisions([event], [existingFailureTodo(fp)], new Set(["dev"]), NOW);
+  assert.deepEqual(second, []);
+});
+test("failureTodoDecisions: updates changed messages and throttles unchanged messages", () => {
+  const event = failureEvent({ message: "new failure text" });
+  const fp = failureFingerprint(event);
+  const changed = failureTodoDecisions([event], [existingFailureTodo(fp, { lastMessage: "old failure text", updatedAt: minsAgo(10) })], new Set(["dev"]), NOW);
+  assert.equal(changed[0].action, "update");
+
+  const unchangedSoon = failureTodoDecisions([event], [existingFailureTodo(fp, { lastMessage: "new failure text", updatedAt: minsAgo(10) })], new Set(["dev"]), NOW);
+  assert.deepEqual(unchangedSoon, []);
+
+  const unchangedOld = failureTodoDecisions([event], [existingFailureTodo(fp, { lastMessage: "new failure text", updatedAt: hoursAgo(26) })], new Set(["dev"]), NOW);
+  assert.equal(unchangedOld[0].action, "update");
+});
+test("failureTodoDecisions: unchanged multiline messages are throttled", () => {
+  const event = failureEvent({ message: "first line\nsecond line" });
+  const fp = failureFingerprint(event);
+  const todo = existingFailureTodo(fp, {
+    lastMessage: undefined,
+    updatedAt: minsAgo(10),
+    description: failureTodoBody(event, fp),
+  });
+  assert.deepEqual(failureTodoDecisions([event], [todo], new Set(["dev"]), NOW), []);
+});
+test("failureTodoDecisions: only closes recovered Todos for checked scopes", () => {
+  const fp = failureFingerprint(failureEvent());
+  const unchecked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["qa"]), NOW);
+  assert.deepEqual(unchecked, []);
+
+  const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["dev"]), NOW);
+  assert.equal(checked[0].action, "close");
+});
+test("failureTodoDecisions: dispatch failures recover only after dispatch succeeds", () => {
+  const event = failureEvent({ scope: "dev:dispatch" });
+  const fp = failureFingerprint(event);
+  const cheapCheck = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev:dispatch" })], new Set(["dev"]), NOW);
+  assert.deepEqual(cheapCheck, []);
+
+  const dispatchCheck = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev:dispatch" })], new Set(["dev:dispatch"]), NOW);
+  assert.equal(dispatchCheck[0].action, "close");
+});
+test("failureTodoDecisions: holding-state failures use the holding recovery scope", () => {
+  const event = failureEvent({ scope: "holding", kind: "holding-state-fetch" });
+  const fp = failureFingerprint(event);
+  const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "holding" })], new Set(["holding"]), NOW);
+  assert.equal(checked[0].action, "close");
+});
+test("failureTodoDecisions: update failures recover when update is checked", () => {
+  const event = failureEvent({ scope: "update", kind: "skills-refresh" });
+  const fp = failureFingerprint(event);
+  assert.deepEqual(failureTodoDecisions([], [existingFailureTodo(fp, { scope: "update" })], new Set(["dev"]), NOW), []);
+  assert.equal(failureTodoDecisions([], [existingFailureTodo(fp, { scope: "update" })], new Set(["update"]), NOW)[0].action, "close");
+});
+test("failureTodoDecisions: duplicate matching Todos are commented deterministically", () => {
+  const event = failureEvent();
+  const fp = failureFingerprint(event);
+  const decisions = failureTodoDecisions([event], [
+    existingFailureTodo(fp, { id: "older", identifier: "COD-101", updatedAt: hoursAgo(3) }),
+    existingFailureTodo(fp, { id: "newer", identifier: "COD-102", updatedAt: hoursAgo(1) }),
+  ], new Set(["dev"]), NOW);
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].action, "duplicate");
+  assert.equal(decisions[0].todo.id, "older");
+  assert.equal(decisions[0].primary.identifier, "COD-102");
+});
+test("failureTodoDecisions: duplicate comments are throttled", () => {
+  const event = failureEvent();
+  const fp = failureFingerprint(event);
+  const duplicate = existingFailureTodo(fp, {
+    id: "older",
+    identifier: "COD-101",
+    updatedAt: hoursAgo(3),
+    comments: [{ body: "Duplicate auto-sweep failure Todo for `abc`.", createdAt: minsAgo(20) }],
+  });
+  const primary = existingFailureTodo(fp, { id: "newer", identifier: "COD-102", updatedAt: hoursAgo(1) });
+  assert.deepEqual(failureTodoDecisions([event], [duplicate, primary], new Set(["dev"]), NOW), []);
+
+  duplicate.comments = [{ body: "Duplicate auto-sweep failure Todo for `abc`.", createdAt: hoursAgo(26) }];
+  assert.equal(failureTodoDecisions([event], [duplicate, primary], new Set(["dev"]), NOW)[0].action, "duplicate");
+});
+test("healthStatus: config/key failures make health non-zero even after recent tick", () => {
+  assert.equal(healthStatus({ lastTick: { at: new Date(NOW).toISOString(), failures: [{ kind: "missing-key" }] }, now: NOW, intervalS: 600 }).ok, false);
+  assert.equal(healthStatus({ lastTick: { at: new Date(NOW).toISOString(), failures: [] }, now: NOW, intervalS: 600 }).ok, true);
+  assert.equal(healthStatus({ lastTick: { at: hoursAgo(1) }, now: NOW, intervalS: 600 }).ok, false);
 });
 
 // ── push discipline ──────────────────────────────────────────────────────────

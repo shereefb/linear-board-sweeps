@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { refreshAnchorSkills } from "../scripts/linear-watch.mjs";
+import { refreshAnchorSkills, runUpdate } from "../scripts/linear-watch.mjs";
 
 const KIT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const g = (cwd, ...args) => {
@@ -50,6 +50,29 @@ test("refreshAnchorSkills: commits to main even when a feature branch is checked
     // Primary tree is still on the feature branch, and the temp worktree is gone.
     assert.equal(g(anchor, "symbolic-ref", "--short", "HEAD"), "COD-1-feature");
     assert.ok(!fs.existsSync(path.join(anchor, ".worktrees", ".skills-update")));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runUpdate: failed kit fetch is reported before merging stale refs", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
+  try {
+    const kit = path.join(root, "kit");
+    fs.mkdirSync(kit);
+    g(kit, "init", "-b", "main");
+    g(kit, "config", "user.email", "t@t.t");
+    g(kit, "config", "user.name", "t");
+    fs.writeFileSync(path.join(kit, "VERSION"), "1.0.0\n");
+    g(kit, "add", "VERSION");
+    g(kit, "commit", "-m", "seed kit");
+
+    const failures = [];
+    runUpdate({ autoUpdate: true, kitPath: kit, kitRef: "main", repos: [] }, (...args) => failures.push(args));
+
+    assert.equal(failures.length, 1);
+    assert.deepEqual(failures[0].slice(0, 4), [null, "update", "kit-fetch", kit]);
+    assert.match(failures[0][4], /kit fetch failed/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

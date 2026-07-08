@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { gql } from "./linear.mjs";
@@ -40,11 +41,15 @@ export const REAPER_TAG = "[auto-sweep-reaper]"; // crash-reap audit marker — 
 export const ORPHAN_TAG = "[auto-sweep-orphan]"; // foreign/orphan claim release — distinct so it doesn't inflate the crash count
 export const PARK_TAG = "[auto-sweep-parked]"; // bounce-escalation park — distinct from REAPER_TAG and BOUNCE_TAG
 export const BOUNCE_TAG = "[auto-sweep-bounce";
+export const FAILURE_TODO_TAG = "[auto-sweep-tick-failure";
+export const FAILURE_RECOVERED_TAG = "[auto-sweep-tick-recovered";
+export const FAILURE_DUPLICATE_NOTE = "Duplicate auto-sweep failure Todo";
 export const CRASH_ESCALATE_AFTER = 3; // reaps within the window before blocking
 export const BOUNCE_ESCALATE_AFTER = 2; // backward bounces within the window before blocking
 export const ESCALATE_WINDOW_H = 48;
 export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
+export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -375,6 +380,155 @@ export function normalizeBlockedIssue(anchorPath, config, issue, { active = null
   };
 }
 
+// FailureEvent shape:
+// {
+//   anchorPath, anchorSlug, projectId,
+//   scope, kind, stableTarget,
+//   message, seenAt
+// }
+export function failureFingerprint(event) {
+  const input = [
+    event.anchorSlug || anchorSlug(event.anchorPath || "_"),
+    event.scope || "_",
+    event.kind || "_",
+    event.stableTarget || "_",
+  ].join("|");
+  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function sanitizeFailureMessage(message, envValues = []) {
+  let out = String(message || "");
+  out = out.replace(/lin_api_[A-Za-z0-9_-]+/g, "[REDACTED]");
+  out = out.replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, "[REDACTED]");
+  out = out.replace(/\b(?:xox[baprs]-|sk-[A-Za-z0-9_-]{12,})[A-Za-z0-9_-]*/g, "[REDACTED]");
+  for (const value of envValues || []) {
+    if (!value || String(value).length < 3) continue;
+    out = out.replace(new RegExp(escapeRegExp(value), "g"), "[REDACTED]");
+  }
+  return out.length > 2000 ? `${out.slice(0, 2000)}...` : out;
+}
+
+export function failureTodoTitle(event) {
+  const anchor = event.anchorSlug || anchorSlug(event.anchorPath || "_");
+  return `Scheduled sweep failure: ${anchor} / ${event.scope || "_"} / ${event.kind || "unknown"}`;
+}
+
+export function failureTodoBody(event, fingerprint, { envValues = [], firstSeen = null } = {}) {
+  const seenAt = event.seenAt || new Date().toISOString();
+  const message = sanitizeFailureMessage(event.message, envValues);
+  return [
+    `What failed: scheduled sweep tick reported \`${event.kind || "unknown"}\` for \`${event.scope || "_"}\`.`,
+    `Anchor: \`${event.anchorSlug || anchorSlug(event.anchorPath || "_")}\``,
+    `Project: \`${event.projectId || "unknown"}\``,
+    `Target: \`${event.stableTarget || "_"}\``,
+    `First seen: ${firstSeen || seenAt}`,
+    `Last seen: ${seenAt}`,
+    `Last error: ${message}`,
+    "",
+    "How to clear: fix the reported launcher/runtime/config issue, then let the scheduled tick run again.",
+    "Recovery condition: a later tick checks this same scope without observing this failure fingerprint; the launcher then comments recovery and moves this Todo to Done.",
+    "",
+    `${FAILURE_TODO_TAG} ${fingerprint}]`,
+  ].join("\n");
+}
+
+function markerFingerprint(text) {
+  const m = String(text || "").match(/\[auto-sweep-tick-failure\s+([a-f0-9-]+)\]/i);
+  return m ? m[1] : null;
+}
+
+function failureTodoFingerprint(todo) {
+  return todo.fingerprint || markerFingerprint(todo.description) || markerFingerprint((todo.comments || []).map((c) => c.body).join("\n"));
+}
+
+function failureTodoScope(todo) {
+  if (todo.scope) return todo.scope;
+  const m = String(todo.description || "").match(/What failed:.*?for `([^`]+)`/);
+  return m ? m[1] : "_";
+}
+
+function failureTodoLastMessage(todo) {
+  if (todo.lastMessage !== undefined) return String(todo.lastMessage);
+  const matches = [...String(todo.description || "").matchAll(/Last error:\s*([\s\S]*?)(?:\n\nHow to clear:|$)/g)];
+  return matches.length ? matches[matches.length - 1][1].trim() : "";
+}
+
+function failureTodoFirstSeen(todo) {
+  const m = String(todo.description || "").match(/First seen:\s*(.*)/);
+  return m ? m[1].trim() : null;
+}
+
+function newestFirst(a, b) {
+  return Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0);
+}
+
+function shouldCommentDuplicate(todo, now) {
+  const last = (todo.comments || [])
+    .filter((c) => String(c.body || "").includes(FAILURE_DUPLICATE_NOTE))
+    .map((c) => Date.parse(c.createdAt))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => b - a)[0];
+  return !last || now - last >= FAILURE_TODO_THROTTLE_MS;
+}
+
+export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [] } = {}) {
+  const decisions = [];
+  const byFingerprint = new Map();
+  for (const todo of existingTodos || []) {
+    const fp = failureTodoFingerprint(todo);
+    if (!fp) continue;
+    if (!byFingerprint.has(fp)) byFingerprint.set(fp, []);
+    byFingerprint.get(fp).push(todo);
+  }
+  for (const todos of byFingerprint.values()) todos.sort(newestFirst);
+
+  const current = new Map();
+  for (const event of currentFailures || []) {
+    const fp = failureFingerprint(event);
+    if (!current.has(fp)) current.set(fp, { event, fingerprint: fp, message: sanitizeFailureMessage(event.message, envValues) });
+  }
+
+  for (const currentFailure of current.values()) {
+    const todos = byFingerprint.get(currentFailure.fingerprint) || [];
+    const primary = todos[0];
+    if (!primary) {
+      decisions.push({ action: "create", ...currentFailure });
+      continue;
+    }
+    for (const duplicate of todos.slice(1)) {
+      if (shouldCommentDuplicate(duplicate, now)) decisions.push({ action: "duplicate", fingerprint: currentFailure.fingerprint, todo: duplicate, primary });
+    }
+    const previousMessage = failureTodoLastMessage(primary);
+    const age = now - Date.parse(primary.updatedAt || primary.createdAt || 0);
+    if (previousMessage !== currentFailure.message || age >= FAILURE_TODO_THROTTLE_MS) {
+      decisions.push({ action: "update", todo: primary, ...currentFailure });
+    }
+  }
+
+  for (const [fp, todos] of byFingerprint.entries()) {
+    if (current.has(fp)) continue;
+    const primary = todos[0];
+    const scope = failureTodoScope(primary);
+    if (checkedScopes && checkedScopes.has(scope)) decisions.push({ action: "close", fingerprint: fp, todo: primary });
+  }
+
+  return decisions;
+}
+
+export function healthStatus({ lastTick, lockPid = null, isAlive = isAlivePid, now = Date.now(), intervalS = INTERVAL_S } = {}) {
+  if (lockPid && isAlive(lockPid)) return { ok: true, reason: `tick in progress (pid ${lockPid})` };
+  if (!lastTick) return { ok: false, reason: "no successful tick recorded" };
+  if (Array.isArray(lastTick.failures) && lastTick.failures.length) return { ok: false, reason: `latest tick had ${lastTick.failures.length} local failure(s)` };
+  const ageS = (now - Date.parse(lastTick.at)) / 1000;
+  if (!Number.isFinite(ageS)) return { ok: false, reason: "last tick timestamp unreadable" };
+  if (ageS > 3 * intervalS) return { ok: false, reason: `STALE: > 3× interval (${3 * intervalS}s)`, ageS };
+  return { ok: true, reason: `last tick ${lastTick.at} (${Math.round(ageS)}s ago)`, ageS };
+}
+
 // ── IO: filesystem / registry ────────────────────────────────────────────────
 
 function readRegistry() {
@@ -404,6 +558,12 @@ function anchorKey(anchorPath) {
   const envPath = path.join(anchorPath, ".env");
   if (!fs.existsSync(envPath)) return null;
   return parseEnv(fs.readFileSync(envPath, "utf8")).LINEAR_API_KEY || null;
+}
+
+function anchorEnvValues(anchorPath) {
+  const envPath = path.join(anchorPath, ".env");
+  if (!fs.existsSync(envPath)) return [];
+  return Object.values(parseEnv(fs.readFileSync(envPath, "utf8"))).filter((v) => v && String(v).length >= 3);
 }
 
 function anchorSlug(anchorPath) {
@@ -603,6 +763,20 @@ async function teamLabelMap(apiKey, teamKey) {
   return team ? Object.fromEntries(team.labels.nodes.map((l) => [l.name, l.id])) : {};
 }
 
+async function teamMeta(apiKey, teamKey) {
+  const d = await gql(
+    `query($k:String!){ teams(filter:{ key:{ eq:$k } }){ nodes{ id states(first:100){ nodes{ id name } } } } }`,
+    { k: teamKey },
+    apiKey
+  );
+  const team = d.teams.nodes[0];
+  if (!team) throw new Error(`team ${teamKey} not found`);
+  return {
+    teamId: team.id,
+    stateIds: Object.fromEntries(team.states.nodes.map((s) => [s.name, s.id])),
+  };
+}
+
 async function setIssueLabels(apiKey, issueId, labelIds) {
   await gql(`mutation($id:String!,$ids:[String!]){ issueUpdate(id:$id, input:{ labelIds:$ids }){ success } }`, { id: issueId, ids: [...new Set(labelIds)] }, apiKey);
 }
@@ -637,6 +811,93 @@ export async function resolveBlockedIssue(apiKey, issueId, labels, resolution, s
   await addComment(apiKey, issue.id, buildUnblockAuditComment({ labels: selected, resolution }));
   await setIssueLabels(apiKey, issue.id, labelIdsAfterRemoving(issue.labelIds, selected));
   return { identifier: issue.identifier, removedLabels: selected };
+}
+
+async function fetchFailureTodos(apiKey, teamKey, projectId) {
+  const todos = [];
+  let cursor = null;
+  do {
+    const d = await gql(
+      `query($c:String,$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ eq:"Todo" } } }){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ id identifier title description updatedAt createdAt
+           comments(last:100){ nodes{ body createdAt } } } } }`,
+      { c: cursor, teamKey, pid: projectId },
+      apiKey
+    );
+    for (const n of d.issues.nodes) {
+      const commentText = n.comments.nodes.map((c) => c.body).join("\n");
+      if (!markerFingerprint(n.description) && !markerFingerprint(commentText)) continue;
+      todos.push({
+        id: n.id,
+        identifier: n.identifier,
+        title: n.title,
+        description: n.description || "",
+        updatedAt: n.updatedAt,
+        createdAt: n.createdAt,
+        comments: n.comments.nodes,
+      });
+    }
+    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
+  } while (cursor);
+  return todos;
+}
+
+async function createFailureTodo(apiKey, meta, projectId, event, fingerprint, envValues) {
+  const stateId = meta.stateIds.Todo;
+  if (!stateId) throw new Error("Todo state not found on team");
+  const r = await gql(
+    `mutation($i:IssueCreateInput!){ issueCreate(input:$i){ success issue{ id identifier } } }`,
+    { i: { teamId: meta.teamId, projectId, stateId, title: failureTodoTitle(event), description: failureTodoBody(event, fingerprint, { envValues }) } },
+    apiKey
+  );
+  return r.issueCreate.issue;
+}
+
+async function updateFailureTodo(apiKey, todo, event, fingerprint, envValues) {
+  await gql(
+    `mutation($id:String!,$description:String!){ issueUpdate(id:$id, input:{ description:$description }){ success } }`,
+    { id: todo.id, description: failureTodoBody(event, fingerprint, { envValues, firstSeen: failureTodoFirstSeen(todo) }) },
+    apiKey
+  );
+  await addComment(apiKey, todo.id, `Failure still active for \`${event.scope || "_"}\` at ${event.seenAt || new Date().toISOString()}.\n\nLast error: ${sanitizeFailureMessage(event.message, envValues)}\n\n${FAILURE_TODO_TAG} ${fingerprint}]`);
+}
+
+async function closeFailureTodo(apiKey, meta, decision) {
+  const doneId = meta.stateIds.Done;
+  if (!doneId) throw new Error("Done state not found on team");
+  const iso = new Date().toISOString();
+  await addComment(apiKey, decision.todo.id, `${FAILURE_RECOVERED_TAG} ${decision.fingerprint} ${iso}] Later tick checked \`${failureTodoScope(decision.todo)}\` without seeing this failure. Moving to Done.`);
+  await gql(`mutation($id:String!,$stateId:String!){ issueUpdate(id:$id, input:{ stateId:$stateId }){ success } }`, { id: decision.todo.id, stateId: doneId }, apiKey);
+}
+
+async function commentDuplicateFailureTodo(apiKey, decision) {
+  await addComment(apiKey, decision.todo.id, `${FAILURE_DUPLICATE_NOTE} for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
+}
+
+async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, { dryRun = false } = {}) {
+  const existing = await fetchFailureTodos(apiKey, config.teamKey, config.projectId);
+  const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues });
+  if (dryRun) return decisions;
+  if (!decisions.length) return decisions;
+  const meta = await teamMeta(apiKey, config.teamKey);
+  for (const d of decisions) {
+    if (d.action === "create") {
+      const issue = await createFailureTodo(apiKey, meta, config.projectId, d.event, d.fingerprint, envValues);
+      logFor(anchorPath, "_", `failure-todo create ${issue.identifier} ${d.fingerprint}`);
+    } else if (d.action === "update") {
+      await updateFailureTodo(apiKey, d.todo, d.event, d.fingerprint, envValues);
+      logFor(anchorPath, "_", `failure-todo update ${d.todo.identifier} ${d.fingerprint}`);
+    } else if (d.action === "close") {
+      await closeFailureTodo(apiKey, meta, d);
+      logFor(anchorPath, "_", `failure-todo recovered ${d.todo.identifier} ${d.fingerprint}`);
+    } else if (d.action === "duplicate") {
+      await commentDuplicateFailureTodo(apiKey, d);
+      logFor(anchorPath, "_", `failure-todo duplicate ${d.todo.identifier} -> ${d.primary.identifier}`);
+    }
+  }
+  return decisions;
 }
 
 // Drop one or more claim labels (+ optionally add labels) in a SINGLE write, and
@@ -725,17 +986,33 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   }
 }
 
-function runUpdate(reg) {
+export function runUpdate(reg, onFailure = () => {}) {
   if (!reg.autoUpdate || !reg.kitPath) return;
   const kit = reg.kitPath;
   if (reg.kitRemote) {
     const url = git(kit, ["remote", "get-url", "origin"], { allowFail: true }).out;
-    if (url !== reg.kitRemote) { log(`update: kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`); return; }
+    if (url !== reg.kitRemote) {
+      const msg = `kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`;
+      log(`update: ${msg}`);
+      onFailure(null, "update", "kit-remote", kit, msg);
+      return;
+    }
   }
   const before = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
-  git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
+  const fetchResult = git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
+  if (fetchResult.status !== 0) {
+    const msg = `kit fetch failed for origin/${reg.kitRef}: ${fetchResult.err}`;
+    log(`update: ${msg}`);
+    onFailure(null, "update", "kit-fetch", kit, msg);
+    return;
+  }
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
-  if (merge.status !== 0) { log(`update: kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`); return; }
+  if (merge.status !== 0) {
+    const msg = `kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`;
+    log(`update: ${msg}`);
+    onFailure(null, "update", "kit-fast-forward", kit, msg);
+    return;
+  }
   const after = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
   if (before !== after) {
     const diff = git(kit, ["log", "--oneline", `${before}..${after}`], { allowFail: true }).out;
@@ -750,8 +1027,10 @@ function runUpdate(reg) {
       if (!isNewerVersion(marker, installed)) continue;
       const res = refreshAnchorSkills(anchor, kit, marker);
       log(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
+      if (!res.ok) onFailure(anchor, "update", "skills-refresh", marker, res.reason);
     } catch (e) {
       log(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
+      onFailure(anchor, "update", "skills-refresh", marker, e.message);
     }
   }
 }
@@ -785,7 +1064,29 @@ async function tick({ dryRun = false } = {}) {
     if (!acquireTickLock()) { log("another tick holds the lock — exit"); return; }
   }
   try {
-    if (!dryRun) runUpdate(reg);
+    const localFailures = [];
+    const updateFailures = [];
+    const activeByAnchor = new Map();
+    const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
+      anchorPath,
+      anchorSlug: anchorSlug(anchorPath),
+      projectId: config?.projectId || "unknown",
+      scope,
+      kind,
+      stableTarget,
+      message: String(message || ""),
+      seenAt: new Date().toISOString(),
+    });
+    const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
+      localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+    };
+    const writeLastTick = () => {
+      if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null, failures: localFailures }) + "\n");
+    };
+    const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
+      updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
+    };
+    if (!dryRun) runUpdate(reg, recordUpdateFailure);
     rotateLogs();
 
     // Resolve active anchors: registered ∩ auto-sweep-labeled. One workspace's
@@ -793,20 +1094,47 @@ async function tick({ dryRun = false } = {}) {
     const labeledByKey = new Map();
     const anchors = [];
     for (const anchorPath of reg.repos) {
-      let config, apiKey;
-      try { config = anchorConfig(anchorPath); apiKey = anchorKey(anchorPath); } catch (e) { log(`FATAL config ${anchorPath}: ${e.message}`); continue; }
-      if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(anchorPath)} (.env) — skipping`); continue; }
+      let config, apiKey, envValues;
+      try { config = anchorConfig(anchorPath); apiKey = anchorKey(anchorPath); envValues = anchorEnvValues(anchorPath); } catch (e) { log(`FATAL config ${anchorPath}: ${e.message}`); recordLocalFailure(anchorPath, null, "config", "config", anchorPath, e.message); continue; }
+      if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(anchorPath)} (.env) — skipping`); recordLocalFailure(anchorPath, config, "config", "missing-env", path.join(anchorPath, ".env"), "LINEAR_API_KEY missing"); continue; }
       try {
         if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
-      } catch (e) { logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`); continue; }
-      if (!labeledByKey.get(apiKey).has(config.projectId)) { logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`); continue; }
-      anchors.push({ anchorPath, config, apiKey });
+      } catch (e) {
+        logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`);
+        const event = failureEventFor(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+        try {
+          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, [event], new Set(), envValues, { dryRun });
+          if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} activation failure Todo decision(s)`);
+        } catch (reconcileError) {
+          logFor(anchorPath, "_", `FATAL failure-todo activation reconciliation failed: ${reconcileError.message}`);
+          recordLocalFailure(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+        }
+        continue;
+      }
+      if (!labeledByKey.get(apiKey).has(config.projectId)) {
+        logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`);
+        continue;
+      }
+      const active = { anchorPath, config, apiKey, envValues, failures: [], checkedScopes: new Set() };
+      active.checkedScopes.add("activation");
+      anchors.push(active);
+      activeByAnchor.set(anchorPath, active);
+    }
+    for (const f of updateFailures) {
+      const active = f.anchorPath ? activeByAnchor.get(f.anchorPath) : null;
+      if (active) active.failures.push(failureEventFor(f.anchorPath, active.config, f.scope, f.kind, f.stableTarget, f.message));
+      else recordLocalFailure(f.anchorPath || "_", null, f.scope, f.kind, f.stableTarget, f.message);
+    }
+    if (!dryRun && reg.autoUpdate && !updateFailures.some((f) => !f.anchorPath)) {
+      for (const active of anchors) active.checkedScopes.add("update");
     }
 
     // Reap + count across every active (workspace, sweep). Cheap; always runs.
     const now = Date.now();
     const candidates = [];
-    for (const { anchorPath, config, apiKey } of anchors) {
+    for (const active of anchors) {
+      const { anchorPath, config, apiKey, envValues } = active;
+      const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
       // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
       // an idle workspace never pays for it (keeps the idle path cheap).
       let _labelMap = null;
@@ -814,7 +1142,7 @@ async function tick({ dryRun = false } = {}) {
       for (const sweep of SWEEPS) {
         const cfg = SWEEP_CFG[sweep];
         let cards;
-        try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); continue; }
+        try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); active.checkedScopes.add(sweep); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); recordFailure(sweep, "fetch", cfg.states.join(","), e.message); continue; }
         const reaps = reapDecisions(cards, cfg, now);
         // Bounce-escalation is a backward-oscillation guard for the earlier stages.
         // Skip it for ship: a card in "Ready to Ship" was human-approved, and its
@@ -822,10 +1150,10 @@ async function tick({ dryRun = false } = {}) {
         const bounces = sweep === "ship" ? [] : bounceDecisions(cards, cfg, now);
         if (!dryRun && (reaps.length || bounces.length)) {
           let labelMap;
-          try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); labelMap = null; }
+          try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); recordFailure(sweep, "label-map", config.teamKey, e.message); labelMap = null; }
           if (labelMap) {
-            for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); } }
-            for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); } }
+            for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
+            for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); recordFailure(sweep, "bounce", d.identifier, e.message); } }
           }
         } else if (dryRun && (reaps.length || bounces.length)) {
           logFor(anchorPath, sweep, `[dry-run] would reap ${reaps.length}, escalate-bounce ${bounces.length}`);
@@ -839,7 +1167,7 @@ async function tick({ dryRun = false } = {}) {
         // (no extra query). Runs on every host (cleanup, not dispatch).
         const foreign = foreignClaimReleases(cards, now, cfg.claim);
         if (!dryRun && foreign.length) {
-          for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); } }
+          for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
         } else if (dryRun && foreign.length) {
           logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
         }
@@ -864,24 +1192,62 @@ async function tick({ dryRun = false } = {}) {
       // teamLabelMap (it removes by id from the card), so it is not gated on one.
       try {
         const held = await fetchCards(apiKey, config.teamKey, config.projectId, HOLDING_STATES);
+        active.checkedScopes.add("holding");
         const orphans = foreignClaimReleases(held, now);
         if (!dryRun) {
-          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); } }
+          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
         } else if (orphans.length) {
           logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding states`);
         }
-      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); }
+      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", HOLDING_STATES.join(","), e.message); }
+
+      try {
+        const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });
+        if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} failure Todo decision(s)`);
+      } catch (e) {
+        logFor(anchorPath, "_", `FATAL failure-todo reconciliation failed: ${e.message}`);
+        recordLocalFailure(anchorPath, config, "_", "failure-todo", config.projectId, e.message);
+      }
     }
 
     // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
     // dispatch, so `health` doesn't read STALE during a legitimately long run.
-    if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null }) + "\n");
+    writeLastTick();
 
     // Dispatch at most one agent pass.
     const pick = selectDispatch(candidates);
     if (!pick) log("no actionable work — cheap tick");
     else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable; top ${pick.topCard?.identifier || "unknown"})`);
-    else dispatch(pick.anchorPath, pick.sweep, pick.config);
+    else {
+      const exitCode = dispatch(pick.anchorPath, pick.sweep, pick.config);
+      if (exitCode !== 0) {
+        const active = activeByAnchor.get(pick.anchorPath);
+        const runtime = pick.config.runtime || "codex";
+        const dispatchScope = `${pick.sweep}:dispatch`;
+        const event = failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`);
+        if (active) {
+          try {
+            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set([dispatchScope]), active.envValues, { dryRun: false });
+          } catch (e) {
+            logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo", runtime, e.message);
+            writeLastTick();
+          }
+        }
+      } else {
+        const active = activeByAnchor.get(pick.anchorPath);
+        const dispatchScope = `${pick.sweep}:dispatch`;
+        if (active) {
+          try {
+            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([dispatchScope]), active.envValues, { dryRun: false });
+          } catch (e) {
+            logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch recovery reconciliation failed: ${e.message}`);
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo-recovery", pick.sweep, e.message);
+            writeLastTick();
+          }
+        }
+      }
+    }
   } finally {
     if (!dryRun) releaseTickLock();
   }
@@ -993,12 +1359,11 @@ function cmdHealth() {
   // tick lock (held by a running PID) counts as healthy even if the stamp is old.
   let lockPid = null;
   try { lockPid = JSON.parse(fs.readFileSync(TICK_LOCK, "utf8")).pid; } catch { lockPid = null; }
-  if (lockPid && isAlivePid(lockPid)) { console.log(`tick in progress (pid ${lockPid})`); return; }
-  if (!fs.existsSync(LAST_TICK)) { console.log("no successful tick recorded"); process.exit(1); }
-  const { at } = JSON.parse(fs.readFileSync(LAST_TICK, "utf8"));
-  const ageS = (Date.now() - Date.parse(at)) / 1000;
-  console.log(`last tick ${at} (${Math.round(ageS)}s ago)`);
-  if (ageS > 3 * INTERVAL_S) { console.error(`STALE: > 3× interval (${3 * INTERVAL_S}s)`); process.exit(1); }
+  let lastTick = null;
+  try { lastTick = JSON.parse(fs.readFileSync(LAST_TICK, "utf8")); } catch { lastTick = null; }
+  const status = healthStatus({ lastTick, lockPid });
+  console.log(status.reason);
+  if (!status.ok) process.exit(1);
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
