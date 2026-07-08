@@ -101,32 +101,61 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 - **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
 
-## Step 11 — (Optional) Auto-sweep triggering
+## Step 11 — Auto-sweep triggering (run the sweeps automatically)
 
-Only do this on the **always-on machine** (e.g. a Mac mini) that should run sweeps automatically when cards land in a queue. Skip it for a plain manual-invocation setup. Full design: `KIT/docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`.
+This makes the sweeps fire on a schedule when cards land in a queue, instead of you invoking them by hand. It runs on **one always-on machine** (e.g. a Mac mini). If the user only wants manual invocation, skip this step and tell them the natural-language phrases from Step 10. Full design + rationale: `KIT/docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`.
 
-1. **Pick the runtime + models** in `TARGET/.claude/linear-sweep.json`: set `runtime` (`codex` default or `claude`) and the per-sweep `models` (`gpt-5.5-codex` @ high for codex, or `claude-opus-4-8` @ high for claude). Omit a model/effort to use the runtime's own default.
-2. **Add the `auto-sweep` project label** in Linear to the project you want swept (project-level label — see `docs/linear-rules.md`). Removing it later pauses the project.
-3. **Install the launcher** (symlinks the wrapper, materializes the launchd plist, prints activation steps — it does NOT activate anything):
+**Do this step only on the always-on machine.** If you're not sure this is that machine, ask the user before installing launchd. Every command below is idempotent — safe to re-run.
+
+**Concepts you need (read once):**
+- **Workspace** = one Linear project ↔ one **anchor repo** (the repo holding `.claude/linear-sweep.json`, i.e. `TARGET`) plus any sibling repos it lists in `config.repos`. One anchor per project.
+- **Activation** = a Linear **project label `auto-sweep`**. The launcher only sweeps a registered anchor whose project carries that label. `activate`/`deactivate` toggle it via the API.
+- **`ANCHOR`** below = the absolute path to `TARGET` (the anchor repo). Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
+
+1. **Ensure `runtime` + `models` exist** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has them. If not, add:
+   ```jsonc
+   "runtime": "codex",                       // or "claude"
+   "models": {
+     "spec": { "model": "gpt-5.5-codex", "effort": "high" },
+     "dev":  { "model": "gpt-5.5-codex", "effort": "high" },
+     "qa":   { "model": "gpt-5.5-codex", "effort": "high" }
+   }
+   ```
+   For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Omit a model/effort to fall back to the runtime's own default. Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
+
+2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash
    "KIT/scripts/install-watch.sh"
    ```
-4. **Register the workspace anchor** (the repo holding `.claude/linear-sweep.json`) and point auto-update at the kit clone by editing `~/.config/linear-board-sweeps/registry.json` (`kitPath` = `KIT`, optionally `kitRemote` = its origin URL):
+
+3. **Register the anchor.** This also auto-wires the kit clone for auto-update (`kitPath`/`kitRemote`) on first run — no registry editing needed:
    ```bash
-   node "KIT/scripts/linear-watch.mjs" register "TARGET"
-   node "KIT/scripts/linear-watch.mjs" list          # shows projectId + [auto-sweep: ON/off]
-   ```
-5. **Dry-run** (spends NO tokens — logs the dispatch it would make):
-   ```bash
-   node "KIT/scripts/linear-watch.mjs" tick --dry-run
-   ```
-6. **Activate** the 10-min schedule and check health:
-   ```bash
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist
-   node "KIT/scripts/linear-watch.mjs" health
+   node "KIT/scripts/linear-watch.mjs" register "ANCHOR"
    ```
 
-**QA caution:** qa-sweep merges + deploys to production. The launcher will auto-run it once activated; if you don't want auto-deploys, tell the user to keep qa on manual `launchctl kickstart` per workspace (the spec explains how) rather than the shared timer. spec/dev sweeps never merge or deploy and are safe to auto-run.
+4. **Activate the project** (adds the `auto-sweep` label via the API; creates the label if it doesn't exist yet):
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" activate "ANCHOR"
+   node "KIT/scripts/linear-watch.mjs" list        # each anchor → projectId + [auto-sweep: ON]
+   ```
+
+5. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" tick --dry-run
+   tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
+   ```
+   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4.
+
+6. **Activate the schedule** (10-min timer) and confirm health:
+   ```bash
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist
+   node "KIT/scripts/linear-watch.mjs" health      # "last tick …" or "tick in progress"
+   ```
+   Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
+
+**QA caution — decide before activating.** `qa-sweep` **merges and deploys to production**. Once the schedule is on, it will auto-run qa for any card that reaches "In Review". If the user does NOT want automatic prod deploys, do NOT rely on the shared timer for qa — tell them to trigger qa manually (`launchctl kickstart -k gui/$(id -u)/com.linear-board-sweeps.watch` runs a full tick; or run a qa pass by hand) and keep the timer for the safe spec/dev sweeps. spec and dev never merge or deploy. Ask the user which they want and say what you did.
+
+**If this is NOT the always-on machine** (or the user only wants manual runs): skip Step 11 entirely. The sweeps still work on demand via the Step 10 phrases; another machine can pick up any card because all work flows through origin (see each SKILL.md's "Machine-independence & handoff" section).
 
 ## Verify (before declaring done)
 

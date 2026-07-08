@@ -239,7 +239,7 @@ Integration smoke: `tick --dry-run` against a seeded test project asserts the di
 
 ### New files (in the kit)
 
-- `scripts/linear-watch.mjs` — the engine (`register` / `unregister` / `list` / `tick [--dry-run]` / `health`, with internal update/reap/count/dispatch; imports `linear.mjs`'s Linear client).
+- `scripts/linear-watch.mjs` — the engine (`register` / `unregister` / `activate` / `deactivate` / `list` / `tick [--dry-run]` / `health`, with internal update/reap/count/dispatch; imports `linear.mjs`'s Linear client). `register` auto-wires `kitPath`/`kitRemote`; `activate`/`deactivate` toggle the project's `auto-sweep` label via the API (find-or-create the label, then add/remove it from the project) so setup needs no Linear UI step.
 - `scripts/linear-watch.sh` — launchd env shim (PATH for node/git/codex/claude), calls `node linear-watch.mjs tick`.
 - `scripts/install-watch.sh` — symlink the wrapper to `~/.local/bin`, copy the plist to `~/Library/LaunchAgents`, **print** the `launchctl bootstrap gui/$(id -u) …` command. Never auto-activates.
 - `templates/launchd/com.linear-board-sweeps.watch.plist` — `StartInterval 600`, `RunAtLoad false`, stdout/err to `~/.local/state/linear-board-sweeps/`.

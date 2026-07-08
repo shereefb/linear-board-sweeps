@@ -18,8 +18,11 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { gql } from "./linear.mjs";
+
+// The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
+const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 // ── Paths & constants ────────────────────────────────────────────────────────
 
@@ -402,6 +405,23 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
   return cards;
 }
 
+// Project-label activation (the auto-sweep on/off switch). find-or-create the
+// workspace's `auto-sweep` project label, then add/remove it from the project.
+async function findOrCreateAutoSweepLabel(apiKey) {
+  const q = await gql(`query{ projectLabels(filter:{ name:{ eq:"${AUTO_SWEEP_LABEL}" } }){ nodes{ id name } } }`, {}, apiKey);
+  const existing = q.projectLabels.nodes.find((n) => n.name === AUTO_SWEEP_LABEL);
+  if (existing) return existing.id;
+  const r = await gql(`mutation($n:String!){ projectLabelCreate(input:{ name:$n }){ success projectLabel{ id } } }`, { n: AUTO_SWEEP_LABEL }, apiKey);
+  return r.projectLabelCreate.projectLabel.id;
+}
+async function projectLabelIds(apiKey, projectId) {
+  const d = await gql(`query($id:String!){ project(id:$id){ labels{ nodes{ id } } } }`, { id: projectId }, apiKey);
+  return d.project.labels.nodes.map((n) => n.id);
+}
+async function setProjectLabels(apiKey, projectId, ids) {
+  await gql(`mutation($id:String!,$ids:[String!]){ projectUpdate(id:$id, input:{ labelIds:$ids }){ success } }`, { id: projectId, ids: [...new Set(ids)] }, apiKey);
+}
+
 async function teamLabelMap(apiKey, teamKey) {
   const d = await gql(`query($k:String!){ teams(filter:{ key:{ eq:$k } }){ nodes{ labels(first:250){ nodes{ id name } } } } }`, { k: teamKey }, apiKey);
   const team = d.teams.nodes[0];
@@ -615,6 +635,13 @@ function cmdRegister(anchorPath) {
   anchorConfig(abs); // throws if no .claude/linear-sweep.json
   const reg = readRegistry();
   if (!reg.repos.includes(abs)) reg.repos.push(abs);
+  // Auto-wire the kit clone for auto-update on first register (don't override a
+  // value the user already set) so setup needs no hand-editing of the registry.
+  if (!reg.kitPath) { reg.kitPath = KIT_ROOT; console.log(`kitPath → ${KIT_ROOT}`); }
+  if (!reg.kitRemote) {
+    const url = git(KIT_ROOT, ["remote", "get-url", "origin"], { allowFail: true }).out;
+    if (url) { reg.kitRemote = url; console.log(`kitRemote → ${url}`); }
+  }
   writeRegistry(reg);
   console.log(`registered ${abs}`);
 }
@@ -625,6 +652,18 @@ function cmdUnregister(anchorPath) {
   reg.repos = reg.repos.filter((p) => p !== abs);
   writeRegistry(reg);
   console.log(`unregistered ${abs}`);
+}
+
+async function cmdActivate(anchorPath, on) {
+  const abs = path.resolve(anchorPath);
+  const config = anchorConfig(abs);
+  const apiKey = anchorKey(abs);
+  if (!apiKey) throw new Error(`no LINEAR_API_KEY in ${abs}/.env`);
+  const labelId = await findOrCreateAutoSweepLabel(apiKey);
+  const cur = await projectLabelIds(apiKey, config.projectId);
+  const next = on ? [...cur, labelId] : cur.filter((id) => id !== labelId);
+  await setProjectLabels(apiKey, config.projectId, next);
+  console.log(`${on ? "activated" : "deactivated"} auto-sweep on project ${config.projectId} (${path.basename(abs)})`);
 }
 
 async function cmdList() {
@@ -666,11 +705,13 @@ async function main() {
   switch (cmd) {
     case "register": return cmdRegister(args[0]);
     case "unregister": return cmdUnregister(args[0]);
+    case "activate": return cmdActivate(args[0] || ".", true);
+    case "deactivate": return cmdActivate(args[0] || ".", false);
     case "list": return cmdList();
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | list | tick [--dry-run] | health");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | list | tick [--dry-run] | health");
       process.exit(1);
   }
 }

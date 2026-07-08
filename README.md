@@ -14,9 +14,12 @@ Point Claude or Codex at this repo from any project, on any machine, and it has 
 
 From inside the target repo, tell your agent (Claude Code or Codex):
 
-> "Set up the Linear board-sweeps workflow in this repo. Clone `https://github.com/shereefb/linear-board-sweeps` into a sibling folder if it isn't already there, then follow its SETUP.md."
+> "Set up this repo for Linear sweeping. Clone `https://github.com/shereefb/linear-board-sweeps` into a sibling folder if it isn't already there, then follow its SETUP.md end to end."
 
-**The agent does everything** — it clones this kit itself, reads [SETUP.md](SETUP.md), then creates the board statuses + labels, installs the skills, writes the repo config, wires the Codex adapter, and tells you how to run it. The only things it needs from you: a Linear API key (`lin_api_…`) once, and your team/project name.
+**The agent does everything** — it clones this kit itself, reads [SETUP.md](SETUP.md), then creates the board statuses + labels, installs the skills, writes the repo config, wires the Codex adapter, and (on an always-on machine) installs the auto-sweep launcher, registers the workspace, activates the project, and turns on the schedule. The only things it needs from you: a Linear API key (`lin_api_…`) once, and your team/project name.
+
+- **Manual invocation only?** The agent stops after the base install; you run sweeps with the phrases below.
+- **Automatic triggering?** Tell it "…and set up auto-sweep triggering on this machine" (or just answer its Step 11 prompt). It installs the launcher and activates the project — see [Triggering](#triggering-auto-sweep).
 
 (SETUP.md Step 0 handles the clone, so the same prompt works whether or not the kit is already on the machine.)
 
@@ -27,7 +30,7 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | `SETUP.md` | The agent-facing bootstrap procedure (what to prompt, where to put everything, exact commands). |
 | `skills/{spec,dev,qa}-sweep/SKILL.md` | The three cross-runtime sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. |
 | `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `query`. |
-| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`, `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work — see [Triggering](#triggering-auto-sweep). |
+| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
 | `templates/linear-sweep.json` | The per-repo config the skills read. Copied + filled into the target's `.claude/`. |
 | `templates/AGENTS.snippet.md` | The "Board sweeps" section appended to the target's `AGENTS.md` — how Codex finds the skills. |
@@ -53,7 +56,17 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
 - **Per-workspace runtime + per-sweep model** live in `linear-sweep.json` (`runtime`, `models`), default `codex`.
 
-Install: `scripts/install-watch.sh` (symlinks the wrapper, materializes the launchd plist, prints the activation commands — it never auto-activates). Validate first with `node scripts/linear-watch.mjs tick --dry-run` (spends no tokens). Full design + rationale: [`docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`](docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md). **QA caution:** qa-sweep merges + deploys to prod — leave it on manual `kickstart` per workspace unless you really want auto-deploys.
+Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
+
+```bash
+scripts/install-watch.sh                                 # symlink wrapper + install plist (no activation)
+node scripts/linear-watch.mjs register <anchor-repo>     # register; auto-wires kitPath for self-update
+node scripts/linear-watch.mjs activate <anchor-repo>     # add the auto-sweep label to the project (API)
+node scripts/linear-watch.mjs tick --dry-run             # validate live, spends no tokens
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist  # turn on the 10-min timer
+```
+
+`list` shows each anchor + `[auto-sweep: ON/off]`; `health` reports liveness; `deactivate` pauses a project. Full design + rationale: [`docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`](docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md). **QA caution:** qa-sweep merges + deploys to prod — keep it on manual `kickstart` unless you really want auto-deploys.
 
 ## Requirements
 
