@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Fires the auto-sweep launcher every 600s. install-watch.sh copies this into
+     ~/Library/LaunchAgents and prints the launchctl bootstrap command; it does NOT
+     activate anything. RunAtLoad is false so activation is a deliberate step. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.linear-board-sweeps.watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__/linear-watch.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>__STATE__/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__STATE__/launchd.err.log</string>
+</dict>
+</plist>
