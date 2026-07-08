@@ -64,6 +64,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
 - **Bounded non-ship parallelism.** `parallel.maxNonShipDispatches` defaults to `2`, so one tick can dispatch a small batch of non-ship sweeps when their resolved repo paths do not overlap. Set it to `1` for serial mode; that workspace then runs alone or waits for the next tick. ship always stays serial.
+- **Same-repo card slots.** Inside a selected non-ship workspace/sweep candidate, `parallel.sameRepoCardLimits` defaults to `spec:4`, `dev:4`, `qa:1`, `ship:1`. The parent launcher claims exact cards with owner-token heartbeats, dispatches child agents with `AUTO_SWEEP_ISSUE` and isolated worktree/log/temp/port paths, and writes per-card run records. `maxNonShipDispatches` counts workspace candidates; `sameRepoCardLimits` counts child card slots.
 - **Default fast path.** `fastPath` is enabled by default; dev-sweep may mark tiny, high-confidence changes `fast-path:eligible`, and a human can then move the card from `In Review` straight to `Ready to Ship` to skip `QA Passed`. Set `fastPath.enabled` to `false` to require normal QA for every card.
 - **Runtime selection** lives in `linear-sweep.json`. The launcher resolves `runtimes.<sweep>` first, then falls back to legacy `runtime` + `models.<sweep>`, then to Codex defaults. The template defaults to Claude for spec/review/ship and Codex high-effort for dev/QA. `runtimes.review` is a reviewer role preference, not a scheduled sweep.
 
@@ -93,7 +94,7 @@ Recent and planned launcher/workflow changes:
 - `COD-97`: per-stage runtime overrides so scheduled sweeps can mix Claude and Codex while preserving legacy `runtime` + `models` configs.
 - `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
 - `COD-99`: retire the `In Progress` state from normal workflow; `Ready for Dev` plus `dev:in-progress` becomes the active-dev representation.
-- `COD-100`: planned same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, and ship still serial.
+- `COD-100`: same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, owner-token card claims, isolated child env, card-specific run records, and ship still serial.
 
 ## Requirements
 

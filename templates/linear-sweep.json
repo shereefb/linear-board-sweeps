@@ -21,9 +21,15 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
-  "$comment_parallel": "Optional. Default is 2, so the launcher can run a bounded pair of non-ship sweeps in one tick when their resolved repo paths do not overlap. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
+  "$comment_parallel": "Optional. maxNonShipDispatches defaults to 2 and counts selected workspace/sweep candidates. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts child card slots inside each selected non-ship candidate. Set maxNonShipDispatches to 1 for serial workspace mode; ship-sweep always stays serial.",
   "parallel": {
-    "maxNonShipDispatches": 2
+    "maxNonShipDispatches": 2,
+    "sameRepoCardLimits": {
+      "spec": 4,
+      "dev": 4,
+      "qa": 1,
+      "ship": 1
+    }
   },
   "$comment_reviewLenses": "Optional. Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens (design at spec+qa, devex at spec, security at spec+dev+ship, perf at dev/qa, research at spec). Omit the whole block to run only the always-on lenses (eng-review, code-review, /qa). setup-team creates these labels; sweeps auto-apply them to unlabelled cards (generate-if-missing).",
   "reviewLenses": {

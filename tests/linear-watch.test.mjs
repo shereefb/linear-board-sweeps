@@ -7,8 +7,10 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
-  parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
-  SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES,
+  parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
+  latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
+  dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
+  SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
@@ -75,6 +77,11 @@ test("buildCommand: omitted model/effort emit no flags (runtime default)", () =>
   const { args } = buildCommand({ runtime: "codex", sweep: "spec", anchorPath: "/ws/a" });
   assert.ok(!args.includes("-m"));
   assert.ok(!args.includes("-c"));
+});
+test("buildCommand: single-card dispatch names the issue and forbids other cards", () => {
+  const { args } = buildCommand({ runtime: "codex", sweep: "dev", anchorPath: "/ws/a", issueIdentifier: "COD-123" });
+  assert.match(args.at(-1), /COD-123 only/);
+  assert.match(args.at(-1), /Do not process other cards/);
 });
 test("buildCommand: claude passes --model and -p prompt", () => {
   const { cmd, args } = buildCommand({ runtime: "claude", sweep: "qa", model: "claude-opus-4-8", anchorPath: "/ws/a" });
@@ -283,6 +290,59 @@ test("parallelLimit: defaults invalid and missing config to the bounded parallel
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 1 } }), 1);
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 2.8 } }), 2);
 });
+test("sameRepoCardLimit: defaults, invalid values, and forced ship serial limit", () => {
+  assert.deepEqual(DEFAULT_SAME_REPO_CARD_LIMITS, { spec: 4, dev: 4, qa: 1, ship: 1 });
+  assert.equal(sameRepoCardLimit({}, "spec"), 4);
+  assert.equal(sameRepoCardLimit({}, "dev"), 4);
+  assert.equal(sameRepoCardLimit({}, "qa"), 1);
+  assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { dev: 2.9 } } }, "dev"), 2);
+  assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { dev: 0 } } }, "dev"), 4);
+  assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { dev: "many" } } }, "dev"), 4);
+  assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { ship: 9 } } }, "ship"), 1);
+});
+test("selectCardSlots: chooses top actionable cards and assigns stable slot indexes", () => {
+  const cards = [
+    { id: "blocked", identifier: "COD-1", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
+    { id: "live", identifier: "COD-2", sortOrder: 90, updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
+    { id: "second", identifier: "COD-3", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+    { id: "first", identifier: "COD-4", sortOrder: 20, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+  ];
+  const slots = selectCardSlots(cards, SWEEP_CFG.dev, "dev", 2, NOW);
+  assert.deepEqual(slots.map((s) => `${s.slotIndex}:${s.identifier}`), ["0:COD-4", "1:COD-3"]);
+});
+test("owner-token claim confirmation uses latest matching heartbeat owner", () => {
+  const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
+  assert.equal(owner, "host_a:run:COD-5:0");
+  assert.equal(heartbeatOwner(`${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}]`), owner);
+  const card = {
+    id: "c",
+    identifier: "COD-5",
+    stateName: "Ready for Dev",
+    labelNames: ["dev:in-progress"],
+    comments: [
+      { body: `${HEARTBEAT_TAG} ${minsAgo(3)} owner=other] dev:in-progress`, createdAt: minsAgo(3) },
+      { body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}] dev:in-progress`, createdAt: minsAgo(1) },
+    ],
+  };
+  assert.equal(latestHeartbeatOwner(card, "dev:in-progress"), owner);
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Ready for Dev"]), true);
+  assert.equal(claimConfirmed({ ...card, stateName: "In Review" }, SWEEP_CFG.dev, owner, ["Ready for Dev"]), false);
+  assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, owner, ["Ready for Dev"]), false);
+});
+test("card run paths/env are isolated per issue and slot", () => {
+  assert.equal(SAME_REPO_PORT_BASE, 47000);
+  assert.equal(cardWorktreePath("/ws/repo", { repos: ["repo"] }, "COD-6"), "/ws/repo/.worktrees/COD-6");
+  const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  assert.equal(paths.worktreePath, "/ws/repo/.worktrees/COD-6");
+  assert.match(paths.logDir, /linear-board-sweeps\/repo\/dev\/COD-6$/);
+  assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/COD-6\/tmp$/);
+  assert.equal(paths.portBase, 47020);
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
+  assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
+  assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
+  assert.equal(pick.sameRepoLimit, 4);
+});
 test("selectDispatchBatch: defaults to bounded parallel non-ship dispatches", () => {
   const batch = selectDispatchBatch([
     { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
@@ -335,8 +395,28 @@ test("dryRunDispatchMessages: reports every selected dispatch", () => {
     { anchorPath: "/ws/b", sweep: "spec", count: 1, config: { runtimes: { spec: { runtime: "claude", model: "claude-opus-4-8" } } } },
   ]);
   assert.deepEqual(messages, [
-    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch codex / gpt-5.5 / effort=high (2 actionable)" },
-    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch claude / claude-opus-4-8 (1 actionable)" },
+    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch codex / gpt-5.5 / effort=high (2 actionable; sameRepoLimit=4)" },
+    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch claude / claude-opus-4-8 (1 actionable; sameRepoLimit=4)" },
+  ]);
+});
+test("dryRunDispatchMessages: reports expanded same-repo card slots when cards are attached", () => {
+  const messages = dryRunDispatchMessages([
+    {
+      anchorPath: "/ws/a",
+      sweep: "dev",
+      count: 2,
+      config: { parallel: { sameRepoCardLimits: { dev: 2 } } },
+      topCard: { identifier: "COD-8" },
+      cards: [
+        { id: "a", identifier: "COD-7", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+        { id: "b", identifier: "COD-8", sortOrder: 5, updatedAt: minsAgo(1), labelNames: [], comments: [] },
+      ],
+    },
+  ]);
+  assert.deepEqual(messages.map((m) => m.body), [
+    "[dry-run] WOULD dispatch codex (2 actionable; top COD-8; sameRepoLimit=2)",
+    "[dry-run] slot 1/2 dev COD-8 sortOrder=5",
+    "[dry-run] slot 2/2 dev COD-7 sortOrder=1",
   ]);
 });
 test("dispatchBatch: dispatches every selected child and returns exit codes", async () => {

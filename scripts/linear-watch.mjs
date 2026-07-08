@@ -33,6 +33,7 @@ const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, ".config", "linear-board-sweeps");
 const REGISTRY_PATH = path.join(CONFIG_DIR, "registry.json");
 const STATE_DIR = path.join(HOME, ".local", "state", "linear-board-sweeps");
+const CACHE_DIR = path.join(HOME, ".cache", "linear-board-sweeps");
 const TICK_LOCK = path.join(STATE_DIR, "tick.lock");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 
@@ -52,6 +53,9 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
+export const DEFAULT_SAME_REPO_CARD_LIMITS = { spec: 4, dev: 4, qa: 1, ship: 1 };
+export const SAME_REPO_PORT_BASE = 47000;
+export const CLAIM_CONFIRM_DELAY_MS = 1500;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -81,7 +85,10 @@ export const MAX_STALE_MIN = Math.max(...SWEEPS.map((s) => SWEEP_CFG[s].staleMin
 
 const AUTO_SWEEP_LABEL = "auto-sweep";
 
-function unattendedPrompt(sweep) {
+function unattendedPrompt(sweep, issueIdentifier = null) {
+  if (issueIdentifier) {
+    return `Unattended scheduled run. Follow the ${sweep}-sweep skill exactly for ${issueIdentifier} only. Do not process other cards. Do not ask questions — route them to card comments per the skill.`;
+  }
   return `Unattended scheduled run. Follow the ${sweep}-sweep skill exactly, perform ONE pass, then stop. Do not ask questions — route them to card comments per the skill.`;
 }
 
@@ -132,8 +139,8 @@ export function runtimeSummary({ runtime, model, effort } = {}) {
 
 // Build the runtime command for one unattended pass. Omitted model/effort ⇒ no
 // flag emitted (fall back to the runtime's own default).
-export function buildCommand({ runtime, sweep, model, effort, anchorPath }) {
-  const prompt = unattendedPrompt(sweep);
+export function buildCommand({ runtime, sweep, model, effort, anchorPath, issueIdentifier = null }) {
+  const prompt = unattendedPrompt(sweep, issueIdentifier);
   if (runtime === "claude") {
     const args = ["-p", prompt];
     if (model) args.push("--model", model);
@@ -337,6 +344,109 @@ export function parallelLimit(config) {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_NON_SHIP_DISPATCHES;
 }
 
+export function sameRepoCardLimit(config, sweep) {
+  if (sweep === "ship") return 1;
+  const defaults = DEFAULT_SAME_REPO_CARD_LIMITS;
+  const fallback = defaults[sweep] || 1;
+  const raw = config?.parallel?.sameRepoCardLimits?.[sweep];
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+export function selectCardSlots(cards, cfg, sweep, limit, now) {
+  const n = Math.max(1, Math.floor(Number(limit)) || 1);
+  return sortByBoardPosition(actionableCards(cards || [], cfg, now))
+    .slice(0, n)
+    .map((card, slotIndex) => ({
+      id: card.id,
+      identifier: card.identifier,
+      sortOrder: card.sortOrder,
+      sweep,
+      slotIndex,
+      card,
+    }));
+}
+
+export function ownerToken({ host = os.hostname(), parentRunId, issueIdentifier, slotIndex }) {
+  return [host, parentRunId, issueIdentifier, slotIndex].map((p) => String(p ?? "").replace(/\s+/g, "_")).join(":");
+}
+
+export function heartbeatOwner(body) {
+  return ((body || "").match(/\bowner=([^\]\s]+)/) || [])[1] || null;
+}
+
+export function latestHeartbeatOwner(card, claim = null) {
+  const beats = (card?.comments || [])
+    .map((c) => {
+      const body = c.body || "";
+      if (!body.includes(HEARTBEAT_TAG)) return null;
+      if (claim && !body.includes(claim)) return null;
+      const owner = heartbeatOwner(body);
+      const t = Date.parse(c.createdAt);
+      return owner && !Number.isNaN(t) ? { owner, t } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.t - a.t);
+  return beats[0]?.owner || null;
+}
+
+export function claimConfirmed(card, cfg, owner, expectedStates = []) {
+  if (!card || !hasLabel(card, cfg.claim)) return false;
+  if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
+  if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
+  return latestHeartbeatOwner(card, cfg.claim) === owner;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function cardWorktreePath(anchorPath, config, issueIdentifier) {
+  const repo = resolveRepos(anchorPath, config)[0]?.path || anchorPath;
+  return worktreePath(repo, issueIdentifier);
+}
+
+export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, childIndex = slot.slotIndex || 0) {
+  const issueIdentifier = slot.identifier;
+  const logDir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep, issueIdentifier);
+  const tmpDir = path.join(CACHE_DIR, parentRunId, issueIdentifier, "tmp");
+  const portBase = SAME_REPO_PORT_BASE + childIndex * 10;
+  return {
+    worktreePath: cardWorktreePath(anchorPath, config, issueIdentifier),
+    logDir,
+    tmpDir,
+    portBase,
+    appPort: portBase,
+    screenshotDir: path.join(logDir, "screenshots"),
+    browserProfileDir: path.join(CACHE_DIR, parentRunId, issueIdentifier, "browser"),
+  };
+}
+
+export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
+  if (!pick.issueIdentifier) return pick;
+  const paths = cardRunPaths(pick.anchorPath, pick.config, pick.sweep, {
+    identifier: pick.issueIdentifier,
+    slotIndex: pick.slotIndex || 0,
+  }, parentRunId, childIndex);
+  return {
+    ...pick,
+    cardRunId: `${parentRunId}:${pick.issueIdentifier}:${pick.slotIndex || 0}`,
+    sameRepoLimit: sameRepoCardLimit(pick.config, pick.sweep),
+    ...paths,
+    childEnv: {
+      AUTO_SWEEP_ISSUE: pick.issueIdentifier,
+      AUTO_SWEEP_SLOT_INDEX: String(pick.slotIndex || 0),
+      AUTO_SWEEP_WORKTREE: paths.worktreePath,
+      AUTO_SWEEP_LOG_DIR: paths.logDir,
+      AUTO_SWEEP_TMPDIR: paths.tmpDir,
+      AUTO_SWEEP_PORT_BASE: String(paths.portBase),
+      AUTO_SWEEP_APP_PORT: String(paths.appPort),
+      AUTO_SWEEP_SCREENSHOT_DIR: paths.screenshotDir,
+      AUTO_SWEEP_BROWSER_PROFILE_DIR: paths.browserProfileDir,
+    },
+  };
+}
+
 function repoSet(candidate) {
   return new Set(resolveRepos(candidate.anchorPath, candidate.config).map((r) => path.resolve(r.path)));
 }
@@ -379,11 +489,25 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT
 }
 
 export function dryRunDispatchMessages(batch) {
-  return batch.map((pick) => ({
-    anchorPath: pick.anchorPath,
-    sweep: pick.sweep,
-    body: `[dry-run] WOULD dispatch ${runtimeSummary(runtimeConfigForSweep(pick.config || {}, pick.sweep))} (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""})`,
-  }));
+  const out = [];
+  for (const pick of batch) {
+    const limit = sameRepoCardLimit(pick.config || {}, pick.sweep);
+    out.push({
+      anchorPath: pick.anchorPath,
+      sweep: pick.sweep,
+      body: `[dry-run] WOULD dispatch ${runtimeSummary(runtimeConfigForSweep(pick.config || {}, pick.sweep))} (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""}; sameRepoLimit=${limit})`,
+    });
+    if (pick.cards) {
+      for (const slot of selectCardSlots(pick.cards, SWEEP_CFG[pick.sweep], pick.sweep, limit, Date.now())) {
+        out.push({
+          anchorPath: pick.anchorPath,
+          sweep: pick.sweep,
+          body: `[dry-run] slot ${slot.slotIndex + 1}/${limit} ${pick.sweep} ${slot.identifier} sortOrder=${slot.sortOrder}`,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 // Compatibility wrapper for older tests/callers that expect one dispatch.
@@ -762,6 +886,7 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
          team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
          pageInfo{ hasNextPage endCursor }
          nodes{ id identifier updatedAt sortOrder
+           state{ name }
            labels{ nodes{ id name } }
            comments(last:100){ nodes{ body createdAt } } } } }`,
       { c: cursor, states, teamKey, pid: projectId },
@@ -771,6 +896,7 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
       cards.push({
         id: n.id,
         identifier: n.identifier,
+        stateName: n.state?.name,
         updatedAt: n.updatedAt,
         sortOrder: n.sortOrder,
         labelNames: n.labels.nodes.map((l) => l.name),
@@ -781,6 +907,28 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
     cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
   } while (cursor);
   return cards;
+}
+
+async function fetchCard(apiKey, issueId) {
+  const d = await gql(
+    `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
+       labels{ nodes{ id name } }
+       comments(last:100){ nodes{ body createdAt } } } }`,
+    { id: issueId },
+    apiKey
+  );
+  const n = d.issue;
+  if (!n) throw new Error(`issue not found: ${issueId}`);
+  return {
+    id: n.id,
+    identifier: n.identifier,
+    stateName: n.state?.name,
+    updatedAt: n.updatedAt,
+    sortOrder: n.sortOrder,
+    labelNames: n.labels.nodes.map((l) => l.name),
+    labelIds: Object.fromEntries(n.labels.nodes.map((l) => [l.name, l.id])),
+    comments: n.comments.nodes,
+  };
 }
 
 async function fetchBlockedIssues(apiKey, teamKey, projectId) {
@@ -1032,6 +1180,105 @@ async function executeBounce(apiKey, card, labelMap) {
   await addComment(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
 }
 
+async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now }) {
+  const cfg = SWEEP_CFG[sweep];
+  const claimId = labelMap[cfg.claim];
+  if (!claimId) throw new Error(`missing team label ${cfg.claim}`);
+  const claimed = [];
+  const candidates = sortByBoardPosition(actionableCards(cards, cfg, now));
+  for (const card of candidates) {
+    if (claimed.length >= limit) break;
+    const slotIndex = claimed.length;
+    const owner = ownerToken({ parentRunId, issueIdentifier: card.identifier, slotIndex });
+    try {
+      await applyLabelEdit(apiKey, card, { add: { [cfg.claim]: claimId } });
+      await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Claimed for same-repo parallel ${sweep} slot ${slotIndex + 1}/${limit}.`);
+      await sleep(CLAIM_CONFIRM_DELAY_MS);
+      const fresh = await fetchCard(apiKey, card.id);
+      if (!claimConfirmed(fresh, cfg, owner, cfg.states)) {
+        if (hasLabel(fresh, cfg.claim) && latestHeartbeatOwner(fresh, cfg.claim) === owner) {
+          await applyLabelEdit(apiKey, fresh, { remove: [cfg.claim] });
+        }
+        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
+        continue;
+      }
+      claimed.push({
+        ...fresh,
+        card: fresh,
+        id: fresh.id,
+        identifier: fresh.identifier,
+        sweep,
+        slotIndex,
+        ownerToken: owner,
+        sortOrder: fresh.sortOrder,
+      });
+    } catch (e) {
+      logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${e.message}`);
+    }
+  }
+  return claimed;
+}
+
+async function releaseOwnedDispatchClaim(apiKey, pick, reason) {
+  const cfg = SWEEP_CFG[pick.sweep];
+  if (!cfg || !pick.issueId || !pick.ownerToken) return false;
+  const fresh = await fetchCard(apiKey, pick.issueId);
+  if (!hasLabel(fresh, cfg.claim)) return false;
+  if (latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
+  await applyLabelEdit(apiKey, fresh, { remove: [cfg.claim] });
+  await addComment(apiKey, fresh.id, `${ORPHAN_TAG} Released launch pre-claim \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Will retry on a later tick.`);
+  return true;
+}
+
+async function expandDispatchBatch(batch, { dryRun, parentRunId, activeByAnchor, now }) {
+  const expanded = [];
+  let childIndex = 0;
+  for (const pick of batch) {
+    if (pick.sweep === "ship") {
+      expanded.push(pick);
+      continue;
+    }
+    const limit = sameRepoCardLimit(pick.config, pick.sweep);
+    let slots = [];
+    if (dryRun) {
+      slots = selectCardSlots(pick.cards || [], SWEEP_CFG[pick.sweep], pick.sweep, limit, now);
+    } else {
+      const active = activeByAnchor.get(pick.anchorPath);
+      if (!active) continue;
+      let labelMap;
+      try {
+        labelMap = await teamLabelMap(active.apiKey, pick.config.teamKey);
+      } catch (e) {
+        logFor(pick.anchorPath, pick.sweep, `claim label map error: ${e.message}`);
+        continue;
+      }
+      slots = await claimCardSlots(active.apiKey, pick.anchorPath, pick.config, pick.sweep, pick.cards || [], {
+        parentRunId,
+        limit,
+        labelMap,
+        now,
+      });
+    }
+    logFor(pick.anchorPath, pick.sweep, `same-repo slots ${slots.length}/${limit} selected under workspace candidate (${pick.count} actionable)`);
+    for (const slot of slots) {
+      expanded.push(withCardDispatchEnv({
+        anchorPath: pick.anchorPath,
+        config: pick.config,
+        sweep: pick.sweep,
+        count: 1,
+        topCard: slot.card,
+        issueId: slot.id,
+        issueIdentifier: slot.identifier,
+        slotIndex: slot.slotIndex,
+        ownerToken: slot.ownerToken,
+        parentRunId,
+      }, parentRunId, childIndex));
+      childIndex += 1;
+    }
+  }
+  return expanded;
+}
+
 // ── IO: auto-update ──────────────────────────────────────────────────────────
 
 function kitMarker(kitPath) {
@@ -1131,34 +1378,68 @@ export function runUpdate(reg, onFailure = () => {}) {
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
 
-function dispatch(anchorPath, sweep, config) {
+function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, exitCode, startedAt, endedAt }) {
+  if (!pick.issueIdentifier || !pick.logDir) return;
+  const record = {
+    parentRunId: pick.parentRunId,
+    cardRunId: pick.cardRunId,
+    issueIdentifier: pick.issueIdentifier,
+    sweep: pick.sweep,
+    slotIndex: pick.slotIndex || 0,
+    sameRepoLimit: pick.sameRepoLimit,
+    worktreePath: pick.worktreePath,
+    logPath: logFile,
+    ports: pick.appPort ? { base: pick.portBase, app: pick.appPort } : undefined,
+    runtime: runtimeCfg.runtime || "codex",
+    model: runtimeCfg.model,
+    effort: runtimeCfg.effort,
+    exitCode,
+    startedAt,
+    endedAt,
+  };
+  fs.mkdirSync(pick.logDir, { recursive: true });
+  const f = path.join(pick.logDir, `run-records-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.jsonl`);
+  fs.appendFileSync(f, JSON.stringify(record) + "\n");
+}
+
+function dispatch(anchorPath, sweep, config, pick = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
-  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : ""), ...(pick.childEnv || {}) };
+  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
+  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
+  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
+  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  const startedAt = new Date().toISOString();
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
   const r = spawnSync(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
   fs.closeSync(fd);
   // A missing runtime binary (ENOENT) sets r.error and leaves r.status null — that
   // is NOT a successful no-op. Surface it loudly so `health` / logs show the launcher
   // is dispatching nothing rather than silently "succeeding".
-  if (r.error) { logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${r.error.message}`); return 127; }
-  logFor(anchorPath, sweep, `dispatch end (exit ${r.status})`);
-  return r.status;
+  const status = r.error ? 127 : r.status;
+  if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${r.error.message}`);
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (exit ${status})`);
+  writeRunRecord({ pick, runtimeCfg, logFile, exitCode: status, startedAt, endedAt: new Date().toISOString() });
+  return status;
 }
 
-function dispatchAsync(anchorPath, sweep, config) {
+function dispatchAsync(anchorPath, sweep, config, pick = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
-  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : ""), ...(pick.childEnv || {}) };
+  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
+  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
+  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
+  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  const startedAt = new Date().toISOString();
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
     let settled = false;
@@ -1166,7 +1447,8 @@ function dispatchAsync(anchorPath, sweep, config) {
       if (settled) return;
       settled = true;
       fs.closeSync(fd);
-      logFor(anchorPath, sweep, `dispatch end (exit ${status})`);
+      logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (exit ${status})`);
+      writeRunRecord({ pick, runtimeCfg, logFile, exitCode: status, startedAt, endedAt: new Date().toISOString() });
       resolve(status);
     };
     child.on("error", (e) => {
@@ -1178,13 +1460,14 @@ function dispatchAsync(anchorPath, sweep, config) {
 }
 
 export async function dispatchBatch(batch, { dispatchFn = dispatchAsync } = {}) {
-  return Promise.all(batch.map((c) => dispatchFn(c.anchorPath, c.sweep, c.config)));
+  return Promise.all(batch.map((c) => dispatchFn(c.anchorPath, c.sweep, c.config, c)));
 }
 
 // ── tick orchestration ───────────────────────────────────────────────────────
 
 async function tick({ dryRun = false } = {}) {
   const reg = readRegistry();
+  const parentRunId = `${os.hostname()}-${process.pid}-${Date.now().toString(36)}`;
   if (!dryRun) {
     if (!acquireTickLock()) { log("another tick holds the lock — exit"); return; }
   }
@@ -1307,7 +1590,7 @@ async function tick({ dryRun = false } = {}) {
           if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
           continue;
         }
-        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder });
+        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
       }
 
       // Holding-state reaper: release claims stranded in states no sweep fetches
@@ -1345,17 +1628,35 @@ async function tick({ dryRun = false } = {}) {
     else if (dryRun) {
       for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
     } else {
-      const exitCodes = await dispatchBatch(batch);
-      for (const [index, pick] of batch.entries()) {
+      const dispatches = await expandDispatchBatch(batch, { dryRun: false, parentRunId, activeByAnchor, now });
+      if (!dispatches.length) { log("no confirmed card slots — cheap tick"); return; }
+      const exitCodes = await dispatchBatch(dispatches);
+      for (const [index, pick] of dispatches.entries()) {
         const exitCode = exitCodes[index];
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) continue;
         const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
         const runtime = runtimeSummary(runtimeCfg);
-        const dispatchScope = `${pick.sweep}:dispatch`;
+        const dispatchScope = pick.issueIdentifier ? `${pick.sweep}:${pick.issueIdentifier}:dispatch` : `${pick.sweep}:dispatch`;
+        const stableTarget = pick.issueIdentifier ? JSON.stringify({
+          runtime,
+          issueIdentifier: pick.issueIdentifier,
+          worktreePath: pick.worktreePath,
+          logDir: pick.logDir,
+        }) : runtime;
         const failures = exitCode === 0 ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${pick.sweep}-sweep via ${runtime} exited ${exitCode}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} exited ${exitCode}`),
         ];
+        if (exitCode === 127 && pick.issueIdentifier) {
+          try {
+            const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
+            if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
+          } catch (e) {
+            logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
+            writeLastTick();
+          }
+        }
         try {
           await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
         } catch (e) {

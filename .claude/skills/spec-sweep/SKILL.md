@@ -22,6 +22,8 @@ Autonomously turn this repo's Linear "Needs Spec" cards into review-hardened spe
 
 ## 1. Select cards (top-of-column order, bounded)
 
+**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other Needs-Spec card. Treat an existing fresh `spec:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths. In same-repo parallel mode, draft only this card's docs before landing. If this child performs its own fetch/merge/push/card move, first acquire a repo-local landing lock such as `mkdir "$(git -C "$AUTO_SWEEP_WORKTREE" rev-parse --git-common-dir)/auto-sweep-spec-landing.lock"` and release it on exit; hold that lock only for the serialized landing section.
+
 List "Needs Spec" cards **in `config.project`**, top-to-bottom as they appear in the Linear column, and for each decide:
 
 - **Skip** if it has `blocked:open-questions` AND its newest comment is not a human answer postdating your questions. Do NOT re-post questions — that is spam.
@@ -50,7 +52,7 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 
 - Write spec → `<config.specsDir>/YYYY-MM-DD-<prefix-key>-<topic>-design.md` and plan → `<config.plansDir>/…-implementation.md` in the affected repo.
 - Commit on a branch off `main`. **Stage selectively — never `git add -A`.** Put the `<PREFIX>-###` key in the commit subject. End commit messages with your runtime's co-authorship trailer (Claude Code: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`; Codex: your own attribution).
-- **Merge to `main` (`--no-ff`) and push.** If a push is rejected non-fast-forward, merge `origin/main` and retry. Delete the merged branch; leave the repo on `main`, clean and synced.
+- **Merge to `main` (`--no-ff`) and push.** In single-card auto-sweep mode, hold the repo-local landing lock from §1 for this fetch/merge/push/card-move section. If a push is rejected non-fast-forward, merge `origin/main` and retry. Delete the merged branch; leave the repo on `main`, clean and synced.
 - **Docs only.** If the change would touch app code, stop and comment on the card instead of committing.
 - Move the card to the **bottom of "Ready for Dev"** with a summary comment linking the spec + plan paths and listing the review's key corrections. Remove `spec:in-progress`. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Ready for Dev"`) so the status and bottom rank update together.
 
