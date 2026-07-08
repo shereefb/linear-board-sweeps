@@ -378,17 +378,16 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
   let cursor = null;
   do {
     const d = await gql(
-      `query($c:String,$states:[String!],$teamKey:String!){ issues(first:100, after:$c, filter:{
-         team:{ key:{ eq:$teamKey } }, state:{ name:{ in:$states } } }){
+      `query($c:String,$states:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
          pageInfo{ hasNextPage endCursor }
-         nodes{ id identifier updatedAt project{ id }
+         nodes{ id identifier updatedAt
            labels{ nodes{ id name } }
            comments(last:100){ nodes{ body createdAt } } } } }`,
-      { c: cursor, states, teamKey },
+      { c: cursor, states, teamKey, pid: projectId },
       apiKey
     );
     for (const n of d.issues.nodes) {
-      if (n.project?.id !== projectId) continue; // scope to this anchor's project
       cards.push({
         id: n.id,
         identifier: n.identifier,
@@ -445,6 +444,44 @@ function kitMarker(kitPath) {
   return git(kitPath, ["rev-parse", "HEAD"], { allowFail: true }).out || null;
 }
 
+// Copy the three skill dirs + version stamp into a checkout root.
+function copySkillsInto(root, kit, marker) {
+  for (const s of ["spec-sweep", "dev-sweep", "qa-sweep"]) {
+    fs.cpSync(path.join(kit, "skills", s), path.join(root, ".claude", "skills", s), { recursive: true });
+  }
+  fs.writeFileSync(path.join(root, ".claude", "skills", ".sweep-version"), marker + "\n");
+}
+
+// Refresh an anchor's committed skills, ALWAYS landing the commit on `main`.
+// If `main` is checked out clean in the primary tree, commit there; otherwise use
+// a dedicated throwaway worktree checked out on `main`, so a stray feature branch
+// in the primary tree never receives the skills commit.
+export function refreshAnchorSkills(anchor, kit, marker) {
+  const head = git(anchor, ["symbolic-ref", "--short", "HEAD"], { allowFail: true }).out;
+  if (head === "main") {
+    if (git(anchor, ["status", "--porcelain"], { allowFail: true }).out) return { ok: false, reason: "main dirty — skipped" };
+    copySkillsInto(anchor, kit, marker);
+    git(anchor, ["add", ".claude/skills"], { allowFail: true });
+    git(anchor, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
+    const p = pushWithRetry(anchor, "main");
+    return { ok: p.ok, reason: p.ok ? "committed on main" : "push failed" };
+  }
+  // Primary tree is elsewhere — commit to main via a dedicated worktree.
+  const wt = path.join(anchor, ".worktrees", ".skills-update");
+  git(anchor, ["worktree", "remove", "--force", wt], { allowFail: true }); // clear any leftover
+  const add = git(anchor, ["worktree", "add", wt, "main"], { allowFail: true });
+  if (add.status !== 0) return { ok: false, reason: `cannot check out main in a worktree (already checked out elsewhere?): ${add.err}` };
+  try {
+    copySkillsInto(wt, kit, marker);
+    git(wt, ["add", ".claude/skills"], { allowFail: true });
+    git(wt, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
+    const p = pushWithRetry(wt, "main");
+    return { ok: p.ok, reason: p.ok ? "committed on main via worktree" : "push failed" };
+  } finally {
+    git(anchor, ["worktree", "remove", "--force", wt], { allowFail: true });
+  }
+}
+
 function runUpdate(reg) {
   if (!reg.autoUpdate || !reg.kitPath) return;
   const kit = reg.kitPath;
@@ -464,24 +501,12 @@ function runUpdate(reg) {
   const marker = kitMarker(kit);
   for (const anchor of reg.repos) {
     try {
-      const installed = fs.existsSync(path.join(anchor, ".claude", "skills", ".sweep-version"))
-        ? fs.readFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "utf8").trim()
-        : null;
+      // Compare against what MAIN carries (via git show), not the primary working
+      // tree — which may be on a lagging feature branch and would loop-update.
+      const installed = git(anchor, ["show", "main:.claude/skills/.sweep-version"], { allowFail: true }).out || null;
       if (!isNewerVersion(marker, installed)) continue;
-      // Commit skills to main ONLY. A stray checked-out feature branch must never
-      // receive the skills commit, so require the primary tree on a clean main.
-      const head = git(anchor, ["symbolic-ref", "--short", "HEAD"], { allowFail: true }).out;
-      if (head !== "main") { log(`update: ${anchorSlug(anchor)} not on main (${head}) — skipping skills refresh`); continue; }
-      const dirty = git(anchor, ["status", "--porcelain"], { allowFail: true }).out;
-      if (dirty) { log(`update: ${anchorSlug(anchor)} working tree dirty — skipping skills refresh`); continue; }
-      for (const s of ["spec-sweep", "dev-sweep", "qa-sweep"]) {
-        fs.cpSync(path.join(kit, "skills", s), path.join(anchor, ".claude", "skills", s), { recursive: true });
-      }
-      fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), marker + "\n");
-      git(anchor, ["add", ".claude/skills"], { allowFail: true });
-      git(anchor, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
-      const pushed = pushWithRetry(anchor, "main");
-      log(`update: ${anchorSlug(anchor)} skills → ${marker} (push ${pushed.ok ? "ok" : "FAILED"})`);
+      const res = refreshAnchorSkills(anchor, kit, marker);
+      log(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
     } catch (e) {
       log(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
     }
