@@ -39,6 +39,7 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | `templates/AGENTS.snippet.md` | The "Board sweeps" section appended to the target's `AGENTS.md` — how Codex finds the skills. |
 | `templates/gitignore.snippet` | `.env` + `.claude/` tracking rules for the target's `.gitignore`. |
 | `docs/linear-rules.md` | The canonical board taxonomy (statuses, labels) + feature-tracking rules. |
+| `docs/superpowers/reports/` | Evidence-backed retrospectives and workflow reports produced by sweep cards such as COD-89. |
 
 ## How it stays runtime-agnostic
 
@@ -72,16 +73,16 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.
 
 `list` shows each anchor + `[auto-sweep: ON/off]` + this host's ship-runner state; `health` reports liveness; `deactivate` pauses a project. Full design + rationale: [`docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`](docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md) and [`2026-07-08-gated-reviews-and-ship-split-design.md`](docs/superpowers/specs/2026-07-08-gated-reviews-and-ship-split-design.md). **Ship-runner:** production deploys run only on the one host with `ship-runner on`; qa-sweep no longer deploys, so it's safe to auto-run. `--dry-run` validates queue counting but not the merge/deploy path — watch the first real ship attended.
 
-### Planned workflow extensions
+### Workflow extensions and reports
 
-The next planned launcher/workflow changes are docs-only designs at this point:
+Recent and planned launcher/workflow changes:
 
 - `COD-82`: bounded non-ship parallel dispatch across disjoint, non-overlapping workspace repo sets, while ship remains serial and single-runner.
 - `COD-83`: an opt-in fast-path eligibility marker for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
 - `COD-85`: Linear board-position order for sweep queues, with cards moved to the bottom of destination columns.
 - `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
-- `COD-89`: dogfood retrospective for the first Linear sweep cards, including timing, token, cadence, and user-interruption learnings.
+- `COD-89`: dogfood retrospective landed under `docs/superpowers/reports/`, with timing, token, cadence, and user-interruption learnings plus follow-up cards.
 
 ## Requirements
 
