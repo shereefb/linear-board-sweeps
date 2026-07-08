@@ -641,12 +641,15 @@ function anchorSlug(anchorPath) {
 }
 
 // One log writer. slug "_" = launcher-wide lines; otherwise a workspace slug.
-function writeLog(slug, sweep, msg) {
-  const dir = path.join(STATE_DIR, slug, sweep);
+function writeLogAt(stateDir, slug, sweep, msg) {
+  const dir = path.join(stateDir, slug, sweep);
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString();
   fs.appendFileSync(path.join(dir, `${stamp.slice(0, 10).replace(/-/g, "")}.log`), `[${stamp}] ${msg}\n`);
   process.stderr.write(`[${stamp}] ${slug === "_" ? "" : slug + "/"}${sweep} ${msg}\n`);
+}
+function writeLog(slug, sweep, msg) {
+  writeLogAt(STATE_DIR, slug, sweep, msg);
 }
 const log = (msg) => writeLog("_", "_", msg);
 const logFor = (anchorPath, sweep, msg) => writeLog(anchorSlug(anchorPath), sweep, msg);
@@ -1056,14 +1059,15 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   }
 }
 
-export function runUpdate(reg, onFailure = () => {}) {
+export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = {}) {
   if (!reg.autoUpdate || !reg.kitPath) return;
+  const updateLog = (msg) => writeLogAt(stateDir, "_", "_", msg);
   const kit = reg.kitPath;
   if (reg.kitRemote) {
     const url = git(kit, ["remote", "get-url", "origin"], { allowFail: true }).out;
     if (url !== reg.kitRemote) {
       const msg = `kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`;
-      log(`update: ${msg}`);
+      updateLog(`update: ${msg}`);
       onFailure(null, "update", "kit-remote", kit, msg);
       return;
     }
@@ -1072,21 +1076,21 @@ export function runUpdate(reg, onFailure = () => {}) {
   const fetchResult = git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
   if (fetchResult.status !== 0) {
     const msg = `kit fetch failed for origin/${reg.kitRef}: ${fetchResult.err}`;
-    log(`update: ${msg}`);
+    updateLog(`update: ${msg}`);
     onFailure(null, "update", "kit-fetch", kit, msg);
     return;
   }
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
   if (merge.status !== 0) {
     const msg = `kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`;
-    log(`update: ${msg}`);
+    updateLog(`update: ${msg}`);
     onFailure(null, "update", "kit-fast-forward", kit, msg);
     return;
   }
   const after = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
   if (before !== after) {
     const diff = git(kit, ["log", "--oneline", `${before}..${after}`], { allowFail: true }).out;
-    log(`update: kit ${before?.slice(0, 8)}..${after?.slice(0, 8)}\n${diff}`);
+    updateLog(`update: kit ${before?.slice(0, 8)}..${after?.slice(0, 8)}\n${diff}`);
   }
   const marker = kitMarker(kit);
   for (const anchor of reg.repos) {
@@ -1096,10 +1100,10 @@ export function runUpdate(reg, onFailure = () => {}) {
       const installed = git(anchor, ["show", "main:.claude/skills/.sweep-version"], { allowFail: true }).out || null;
       if (!isNewerVersion(marker, installed)) continue;
       const res = refreshAnchorSkills(anchor, kit, marker);
-      log(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
+      updateLog(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
       if (!res.ok) onFailure(anchor, "update", "skills-refresh", marker, res.reason);
     } catch (e) {
-      log(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
+      updateLog(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
       onFailure(anchor, "update", "skills-refresh", marker, e.message);
     }
   }

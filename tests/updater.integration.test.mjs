@@ -59,6 +59,7 @@ test("runUpdate: failed kit fetch is reported before merging stale refs", () => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
   try {
     const kit = path.join(root, "kit");
+    const isolatedState = path.join(root, "state");
     fs.mkdirSync(kit);
     g(kit, "init", "-b", "main");
     g(kit, "config", "user.email", "t@t.t");
@@ -68,11 +69,57 @@ test("runUpdate: failed kit fetch is reported before merging stale refs", () => 
     g(kit, "commit", "-m", "seed kit");
 
     const failures = [];
-    runUpdate({ autoUpdate: true, kitPath: kit, kitRef: "main", repos: [] }, (...args) => failures.push(args));
+    runUpdate(
+      { autoUpdate: true, kitPath: kit, kitRef: "main", repos: [] },
+      (...args) => failures.push(args),
+      { stateDir: isolatedState }
+    );
 
     assert.equal(failures.length, 1);
     assert.deepEqual(failures[0].slice(0, 4), [null, "update", "kit-fetch", kit]);
     assert.match(failures[0][4], /kit fetch failed/);
+    assert.match(
+      fs.readFileSync(path.join(isolatedState, "_", "_", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`), "utf8"),
+      /update: kit fetch failed/
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runUpdate: updater tests can isolate state logs away from live launcher state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
+  try {
+    const kit = path.join(root, "kit");
+    const isolatedState = path.join(root, "state");
+    const liveLog = path.join(
+      os.homedir(),
+      ".local",
+      "state",
+      "linear-board-sweeps",
+      "_",
+      "_",
+      `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`
+    );
+    const liveBefore = fs.existsSync(liveLog) ? fs.readFileSync(liveLog, "utf8") : null;
+
+    fs.mkdirSync(kit);
+    g(kit, "init", "-b", "main");
+    g(kit, "config", "user.email", "t@t.t");
+    g(kit, "config", "user.name", "t");
+    fs.writeFileSync(path.join(kit, "VERSION"), "1.0.0\n");
+    g(kit, "add", "VERSION");
+    g(kit, "commit", "-m", "seed kit");
+
+    runUpdate(
+      { autoUpdate: true, kitPath: kit, kitRef: "main", repos: [] },
+      () => {},
+      { stateDir: isolatedState }
+    );
+
+    const isolatedLog = path.join(isolatedState, "_", "_", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+    assert.match(fs.readFileSync(isolatedLog, "utf8"), /update: kit fetch failed/);
+    assert.equal(fs.existsSync(liveLog) ? fs.readFileSync(liveLog, "utf8") : null, liveBefore);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
