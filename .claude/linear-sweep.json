@@ -6,13 +6,20 @@
   "projectId": "81455eb7-1ead-474d-a0c1-54efe75f821e",
   "issuePrefix": "COD",
   "repos": ["linear-board-sweeps"],
-  "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Keep explicit supported best-model overrides here so scheduled sweeps do not silently drift with runtime defaults.",
+  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
   "models": {
     "spec": { "model": "gpt-5.5", "effort": "high" },
     "dev":  { "model": "gpt-5.5", "effort": "high" },
     "qa":   { "model": "gpt-5.5", "effort": "high" },
     "ship": { "model": "gpt-5.5", "effort": "high" }
+  },
+  "runtimes": {
+    "spec":   { "runtime": "claude", "model": "claude-opus-4-8" },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+    "review": { "runtime": "claude", "model": "claude-opus-4-8" },
+    "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+    "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
   "$comment_parallel": "Default bounded non-ship parallelism. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
   "parallel": {

@@ -126,14 +126,21 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 - **Activation** = a Linear **project label `auto-sweep`**. The launcher only sweeps a registered anchor whose project carries that label. `activate`/`deactivate` toggle it via the API.
 - **`ANCHOR`** below = the absolute path to `TARGET` (the anchor repo). Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
 
-1. **Ensure `runtime` + `models` exist** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has them. If not, add:
+1. **Ensure runtime selection exists** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has this. If not, add:
    ```jsonc
-   "runtime": "codex",                       // or "claude"
+   "runtime": "codex",                       // legacy fallback when runtimes.<sweep> is absent
    "models": {
      "spec": { "model": "gpt-5.5", "effort": "high" },
      "dev":  { "model": "gpt-5.5", "effort": "high" },
      "qa":   { "model": "gpt-5.5", "effort": "high" },
      "ship": { "model": "gpt-5.5", "effort": "high" }
+   },
+   "runtimes": {
+     "spec":   { "runtime": "claude", "model": "claude-opus-4-8" },
+     "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+     "review": { "runtime": "claude", "model": "claude-opus-4-8" },
+     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
    },
    "parallel": {
      "maxNonShipDispatches": 2
@@ -147,7 +154,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "requireReviewerConfidence": "high"
    }
    ```
-   Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. For Codex, prefer the best model available to the installed account (for this kit's default, `gpt-5.5` with `high` effort). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
+   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage. Confirm every chosen runtime CLI (`codex` and/or `claude`) is installed and on `PATH`.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. Set it to `1` for serial mode on smaller machines; that workspace then runs alone or waits for the next tick. ship-sweep is always serial.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `QA Passed`. Set it to false to require normal QA for every card. The human-only `Ready to Ship` move remains required.
 

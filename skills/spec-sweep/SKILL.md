@@ -9,6 +9,8 @@ Autonomously turn this repo's Linear "Needs Spec" cards into review-hardened spe
 
 > **Runtime (Claude Code + Codex).** This skill speaks in *actions*; map them to your runtime's tools. On **Codex**, see the "Board sweeps" section of `AGENTS.md` for the tool mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool for named skills and Task for subagents. Referenced helper skills (`brainstorming`, `plan-eng-review`, `code-review`, `test-driven-development`, `using-git-worktrees`) load natively on both when installed.
 
+> **Reviewer runtime role.** If `.claude/linear-sweep.json` defines `runtimes.review`, prefer that runtime/model for independent reviewer subagents when your runtime supports explicit reviewer dispatch. If unsupported, run the reviewer in the current runtime and note that limitation in the Linear handoff. `review` is a role only, never a scheduled sweep.
+
 > **Karpathy planning guardrail.** Spec-sweep stays docs-only. When a spec or plan reasons about future code changes, use `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin if available; if unavailable, apply its core checks manually: think first, keep the plan simple, keep future edits surgical, and define concrete verification.
 
 ## 0. Preflight (fail fast, cleanly)

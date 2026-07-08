@@ -106,6 +106,30 @@ export function worktreePath(repoPath, branch) {
   return path.join(repoPath, ".worktrees", branch);
 }
 
+export function runtimeConfigForSweep(config = {}, sweep) {
+  const stageCfg = config?.runtimes && config.runtimes[sweep];
+  if (stageCfg && typeof stageCfg === "object") {
+    return {
+      runtime: stageCfg.runtime || config.runtime || "codex",
+      model: stageCfg.model,
+      effort: stageCfg.effort,
+    };
+  }
+  const modelCfg = (config?.models && config.models[sweep]) || {};
+  return {
+    runtime: config?.runtime || "codex",
+    model: modelCfg.model,
+    effort: modelCfg.effort,
+  };
+}
+
+export function runtimeSummary({ runtime, model, effort } = {}) {
+  const parts = [runtime || "codex"];
+  if (model) parts.push(model);
+  if (effort) parts.push(`effort=${effort}`);
+  return parts.join(" / ");
+}
+
 // Build the runtime command for one unattended pass. Omitted model/effort ⇒ no
 // flag emitted (fall back to the runtime's own default).
 export function buildCommand({ runtime, sweep, model, effort, anchorPath }) {
@@ -358,7 +382,7 @@ export function dryRunDispatchMessages(batch) {
   return batch.map((pick) => ({
     anchorPath: pick.anchorPath,
     sweep: pick.sweep,
-    body: `[dry-run] WOULD dispatch (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""})`,
+    body: `[dry-run] WOULD dispatch ${runtimeSummary(runtimeConfigForSweep(pick.config || {}, pick.sweep))} (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""})`,
   }));
 }
 
@@ -1108,14 +1132,14 @@ export function runUpdate(reg, onFailure = () => {}) {
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
 
 function dispatch(anchorPath, sweep, config) {
-  const modelCfg = (config.models && config.models[sweep]) || {};
-  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
+  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath });
   const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
   const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  logFor(anchorPath, sweep, `dispatch: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
   const r = spawnSync(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
   fs.closeSync(fd);
   // A missing runtime binary (ENOENT) sets r.error and leaves r.status null — that
@@ -1127,14 +1151,14 @@ function dispatch(anchorPath, sweep, config) {
 }
 
 function dispatchAsync(anchorPath, sweep, config) {
-  const modelCfg = (config.models && config.models[sweep]) || {};
-  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
+  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath });
   const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
   const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  logFor(anchorPath, sweep, `dispatch: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
     let settled = false;
@@ -1326,10 +1350,11 @@ async function tick({ dryRun = false } = {}) {
         const exitCode = exitCodes[index];
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) continue;
-        const runtime = pick.config.runtime || "codex";
+        const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
+        const runtime = runtimeSummary(runtimeCfg);
         const dispatchScope = `${pick.sweep}:dispatch`;
         const failures = exitCode === 0 ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${pick.sweep}-sweep via ${runtime} exited ${exitCode}`),
         ];
         try {
           await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });

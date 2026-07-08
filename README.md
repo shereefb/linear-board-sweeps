@@ -65,7 +65,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
 - **Bounded non-ship parallelism.** `parallel.maxNonShipDispatches` defaults to `2`, so one tick can dispatch a small batch of non-ship sweeps when their resolved repo paths do not overlap. Set it to `1` for serial mode; that workspace then runs alone or waits for the next tick. ship always stays serial.
 - **Default fast path.** `fastPath` is enabled by default; dev-sweep may mark tiny, high-confidence changes `fast-path:eligible`, and a human can then move the card from `In Review` straight to `Ready to Ship` to skip `QA Passed`. Set `fastPath.enabled` to `false` to require normal QA for every card.
-- **Runtime selection** lives in `linear-sweep.json`. Today `runtime` plus per-sweep `models` controls dispatch. COD-97 plans optional per-stage `runtimes` overrides so one workspace can spec with Claude, code/QA with Codex, review with Claude, and ship with Claude while preserving the legacy fields.
+- **Runtime selection** lives in `linear-sweep.json`. The launcher resolves `runtimes.<sweep>` first, then falls back to legacy `runtime` + `models.<sweep>`, then to Codex defaults. The template defaults to Claude for spec/review/ship and Codex high-effort for dev/QA. `runtimes.review` is a reviewer role preference, not a scheduled sweep.
 
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
 
@@ -90,6 +90,7 @@ Recent and planned launcher/workflow changes:
 - `COD-89`: dogfood retrospective landed under `docs/superpowers/reports/`, with timing, token, cadence, and user-interruption learnings plus follow-up cards.
 - `COD-91`: self-clearing Linear `Todo` cards for scheduled tick failures, deduped by failure fingerprint.
 - `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
+- `COD-97`: per-stage runtime overrides so scheduled sweeps can mix Claude and Codex while preserving legacy `runtime` + `models` configs.
 - `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
 - `COD-99`: retire the `In Progress` state from normal workflow; `Ready for Dev` plus `dev:in-progress` becomes the active-dev representation.
 

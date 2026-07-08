@@ -6,13 +6,20 @@
   "projectId": "<project uuid — get it from: node scripts/linear.mjs ensure-project \"<team>\" \"<project>\">",
   "issuePrefix": "<team key used in card ids, e.g. COD>",
   "repos": ["<repo folder name(s) the sweeps may touch>"],
-  "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Keep explicit supported best-model overrides here so scheduled sweeps do not silently drift with runtime defaults. For a claude workspace, set runtime='claude' and use claude model ids (e.g. claude-opus-4-8). Note: gated review lenses run INSIDE a sweep's single dispatched agent and inherit its model — there is no per-lens model tier.",
+  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
   "models": {
     "spec": { "model": "gpt-5.5", "effort": "high" },
     "dev":  { "model": "gpt-5.5", "effort": "high" },
     "qa":   { "model": "gpt-5.5", "effort": "high" },
     "ship": { "model": "gpt-5.5", "effort": "high" }
+  },
+  "runtimes": {
+    "spec":   { "runtime": "claude", "model": "claude-opus-4-8" },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+    "review": { "runtime": "claude", "model": "claude-opus-4-8" },
+    "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+    "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
   "$comment_parallel": "Optional. Default is 2, so the launcher can run a bounded pair of non-ship sweeps in one tick when their resolved repo paths do not overlap. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
   "parallel": {

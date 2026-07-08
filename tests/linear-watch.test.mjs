@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
+  resolveRepos, worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
@@ -36,6 +36,31 @@ test("resolveRepos: empty repos defaults to the anchor itself", () => {
 });
 test("worktreePath is deterministic under the repo", () => {
   assert.equal(worktreePath("/ws/repo", "COD-42"), "/ws/repo/.worktrees/COD-42");
+});
+
+// ── runtime config ───────────────────────────────────────────────────────────
+test("runtimeConfigForSweep: per-sweep runtimes override legacy runtime/models", () => {
+  const resolved = runtimeConfigForSweep({
+    runtime: "codex",
+    models: { ship: { model: "gpt-5.5", effort: "high" } },
+    runtimes: { ship: { runtime: "claude", model: "claude-sonnet-5" } },
+  }, "ship");
+  assert.deepEqual(resolved, { runtime: "claude", model: "claude-sonnet-5", effort: undefined });
+});
+test("runtimeConfigForSweep: legacy runtime/models preserve old config behavior", () => {
+  assert.deepEqual(runtimeConfigForSweep({
+    runtime: "codex",
+    models: { dev: { model: "gpt-5.5", effort: "high" } },
+  }, "dev"), { runtime: "codex", model: "gpt-5.5", effort: "high" });
+});
+test("runtimeConfigForSweep: defaults to codex with runtime defaults", () => {
+  assert.deepEqual(runtimeConfigForSweep({}, "spec"), { runtime: "codex", model: undefined, effort: undefined });
+});
+test("runtimeConfigForSweep: review is role config only and never scheduled", () => {
+  assert.equal(SWEEPS.includes("review"), false);
+  assert.deepEqual(runtimeConfigForSweep({
+    runtimes: { review: { runtime: "claude", model: "claude-opus-4-8" } },
+  }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
 });
 
 // ── command builder ──────────────────────────────────────────────────────────
@@ -306,12 +331,12 @@ test("selectDispatchBatch: dedupes nested repo path overlap", () => {
 });
 test("dryRunDispatchMessages: reports every selected dispatch", () => {
   const messages = dryRunDispatchMessages([
-    { anchorPath: "/ws/a", sweep: "dev", count: 2 },
-    { anchorPath: "/ws/b", sweep: "spec", count: 1 },
+    { anchorPath: "/ws/a", sweep: "dev", count: 2, config: { runtimes: { dev: { runtime: "codex", model: "gpt-5.5", effort: "high" } } } },
+    { anchorPath: "/ws/b", sweep: "spec", count: 1, config: { runtimes: { spec: { runtime: "claude", model: "claude-opus-4-8" } } } },
   ]);
   assert.deepEqual(messages, [
-    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch (2 actionable)" },
-    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch (1 actionable)" },
+    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch codex / gpt-5.5 / effort=high (2 actionable)" },
+    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch claude / claude-opus-4-8 (1 actionable)" },
   ]);
 });
 test("dispatchBatch: dispatches every selected child and returns exit codes", async () => {
