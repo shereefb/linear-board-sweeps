@@ -163,6 +163,16 @@ export function countMarkers(card, tag, now, windowH = ESCALATE_WINDOW_H) {
 
 const hasLabel = (card, name) => (card.labelNames || []).includes(name);
 
+function liveClaimLabel(card, now, releasedIds = new Set()) {
+  if (releasedIds.has(card.id)) return null;
+  return ALL_CLAIMS.find((claim) => {
+    if (!hasLabel(card, claim)) return false;
+    const owner = SWEEPS.find((s) => SWEEP_CFG[s].claim === claim);
+    const staleMin = owner ? SWEEP_CFG[owner].staleMin : MAX_STALE_MIN;
+    return heartbeatAgeMin(card, now) <= staleMin;
+  }) || null;
+}
+
 // Decide reaping/escalation for one (workspace, sweep). Pure: returns actions;
 // the caller executes them against Linear.
 export function reapDecisions(cards, cfg, now) {
@@ -238,7 +248,7 @@ export function bounceDecisions(cards, cfg, now, windowH = ESCALATE_WINDOW_H) {
 export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
-    const liveClaim = hasLabel(card, cfg.claim) && !releasedIds.has(card.id) && heartbeatAgeMin(card, now) <= cfg.staleMin;
+    const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
 }

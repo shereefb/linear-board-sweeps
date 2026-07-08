@@ -34,6 +34,7 @@ export const REQUIRED_LABELS = [
   { name: "qa:passed", color: "#4cb782" },
   { name: "ship:in-progress", color: "#4cb782" },
   { name: "ship:approved", color: "#4cb782" },
+  { name: "fast-path:eligible", color: "#5e6ad2" },
   { name: "blocked:open-questions", color: "#eb5757" },
   { name: "blocked:needs-user", color: "#eb5757" },
 ];

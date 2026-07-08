@@ -173,6 +173,24 @@ test("countActionable: a stale-heartbeat claim that wasn't released still counts
   const card = { id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
   assert.equal(countActionable([card], SWEEP_CFG.dev, NOW, new Set()), 1);
 });
+test("actionableCards: excludes cards with live foreign in-progress claims", () => {
+  const card = {
+    id: "ship",
+    updatedAt: minsAgo(1),
+    labelNames: ["fast-path:eligible", "dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }],
+  };
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.ship, NOW), []);
+});
+test("actionableCards: allows cards with stale foreign in-progress claims after reaper release", () => {
+  const card = {
+    id: "ship",
+    updatedAt: minsAgo(300),
+    labelNames: ["fast-path:eligible", "dev:in-progress"],
+    comments: [],
+  };
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.ship, NOW).map((c) => c.id), ["ship"]);
+});
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
   const reapCard = { id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
