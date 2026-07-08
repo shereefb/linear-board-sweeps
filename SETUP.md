@@ -122,13 +122,13 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```jsonc
    "runtime": "codex",                       // or "claude"
    "models": {
-     "spec": {},
-     "dev":  {},
-     "qa":   {},
-     "ship": {}
+     "spec": { "model": "gpt-5.5", "effort": "high" },
+     "dev":  { "model": "gpt-5.5", "effort": "high" },
+     "qa":   { "model": "gpt-5.5", "effort": "high" },
+     "ship": { "model": "gpt-5.5", "effort": "high" }
    }
    ```
-   Empty per-sweep objects make the runtime use its own default model and effort (for Codex, `~/.codex/config.toml`). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`) if you need explicit overrides. Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
+   Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. For Codex, prefer the best model available to the installed account (for this kit's default, `gpt-5.5` with `high` effort). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash

@@ -6,13 +6,13 @@
   "projectId": "81455eb7-1ead-474d-a0c1-54efe75f821e",
   "issuePrefix": "COD",
   "repos": ["linear-board-sweeps"],
-  "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Omit a model/effort to fall back to the runtime's own default.",
+  "$comment_runtime": "Which agent CLI the auto-sweep launcher dispatches for this workspace, and the per-sweep model + reasoning effort. Keep explicit supported best-model overrides here so scheduled sweeps do not silently drift with runtime defaults.",
   "runtime": "codex",
   "models": {
-    "spec": {},
-    "dev":  {},
-    "qa":   {},
-    "ship": {}
+    "spec": { "model": "gpt-5.5", "effort": "high" },
+    "dev":  { "model": "gpt-5.5", "effort": "high" },
+    "qa":   { "model": "gpt-5.5", "effort": "high" },
+    "ship": { "model": "gpt-5.5", "effort": "high" }
   },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
