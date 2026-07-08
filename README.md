@@ -31,7 +31,8 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | Path | What it is |
 |------|-----------|
 | `SETUP.md` | The agent-facing bootstrap procedure (what to prompt, where to put everything, exact commands). |
-| `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec/dev/qa also run card-type-gated review lenses; ship-sweep is the only one that merges + deploys. |
+| `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime scheduled sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec/dev/qa also run card-type-gated review lenses; ship-sweep is the only one that merges + deploys. |
+| `skills/unblock-sweep/SKILL.md` | Manual-only interactive workflow for resolving cards parked with blocking labels across registered anchors. It is copied to anchors but never scheduled. |
 | `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `query`. |
 | `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
@@ -48,6 +49,8 @@ The `SKILL.md` files speak in **actions** ("brainstorm a spec", "dispatch a revi
 - **Codex** auto-loads `AGENTS.md`; the "Board sweeps" section points it at the same `SKILL.md` files and gives the Codex tool mapping (`shell`, `apply_patch`, `spawn_agent`, `update_plan`).
 
 Same files, both runtimes. Invoke with natural language: "run the spec sweep", "run the dev sweep", "run the QA sweep", "run the ship sweep".
+
+`unblock-sweep` is different: it is a human-invoked maintenance workflow, not part of the scheduled queue. Invoke it when you want to review cards blocked on user input; it lists blocked cards across registered anchors, records your resolution as a Linear comment, and removes only the blocking labels you choose.
 
 ## Triggering (auto-sweep)
 
@@ -75,10 +78,15 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.
 
 ### Planned workflow extensions
 
-The next planned launcher/workflow changes are docs-only designs at this point:
+The remaining planned launcher/workflow changes are docs-only designs at this point:
 
 - `COD-83`: an opt-in fast-path eligibility marker for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
+- `COD-85`: Linear board-position order for sweep queues, with cards moved to the bottom of destination columns.
+- `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
+- `COD-89`: dogfood retrospective for the first Linear sweep cards, including timing, token, cadence, and user-interruption learnings.
+- `COD-91`: self-clearing Linear `Todo` cards for scheduled tick failures, deduped by failure fingerprint.
+- `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
 
 ## Requirements
 

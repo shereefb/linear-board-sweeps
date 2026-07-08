@@ -65,11 +65,11 @@ Copy the printed `projectId` for the config.
 
 ## Step 6 — Install the skills
 
-Copy the three skill folders into the target's Claude Code skills dir:
+Copy the sweep skill folders and manual unblock skill into the target's Claude Code skills dir:
 
 ```bash
 mkdir -p "TARGET/.claude/skills"
-cp -R "KIT/skills/spec-sweep" "KIT/skills/dev-sweep" "KIT/skills/qa-sweep" "TARGET/.claude/skills/"
+cp -R "KIT/skills/spec-sweep" "KIT/skills/dev-sweep" "KIT/skills/qa-sweep" "KIT/skills/ship-sweep" "KIT/skills/unblock-sweep" "TARGET/.claude/skills/"
 ```
 
 Claude Code discovers these natively. (For Codex, Step 8 wires them via AGENTS.md.)
@@ -105,6 +105,7 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 
 - **Claude Code:** the skills auto-register — say "run the spec sweep" / "run the dev sweep" / "run the QA sweep" (or "spec the needs-spec cards", etc.).
 - **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep; Step 8 should already have enabled it.
+- **Manual unblock:** say "run the unblock sweep" when blocked cards need your input. It is interactive, never scheduled, and removes blocking labels only after you choose a resolution.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
 
 ## Step 11 — Auto-sweep triggering (run the sweeps automatically)
@@ -172,6 +173,6 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 
 - `git -C TARGET check-ignore .env` prints `.env` (key is safe).
 - `TARGET/.claude/linear-sweep.json` has a real `projectId` and no `<placeholders>`.
-- `TARGET/.claude/skills/{spec,dev,qa}-sweep/SKILL.md` exist.
+- `TARGET/.claude/skills/{spec,dev,qa,ship}-sweep/SKILL.md` and `TARGET/.claude/skills/unblock-sweep/SKILL.md` exist.
 - `TARGET/AGENTS.md` contains the "Board sweeps" section with real values.
 - `node KIT/scripts/linear.mjs whoami` succeeds with the target's `.env` loaded.
