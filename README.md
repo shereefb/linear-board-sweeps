@@ -79,6 +79,9 @@ The next planned launcher/workflow changes are docs-only designs at this point:
 - `COD-82`: bounded non-ship parallel dispatch across disjoint, non-overlapping workspace repo sets, while ship remains serial and single-runner.
 - `COD-83`: an opt-in fast-path eligibility marker for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
+- `COD-85`: Linear board-position order for sweep queues, with cards moved to the bottom of destination columns.
+- `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
+- `COD-89`: dogfood retrospective for the first Linear sweep cards, including timing, token, cadence, and user-interruption learnings.
 
 ## Requirements
 
