@@ -9,6 +9,8 @@ Autonomously turn this repo's Linear "Needs Spec" cards into review-hardened spe
 
 > **Runtime (Claude Code + Codex).** This skill speaks in *actions*; map them to your runtime's tools. On **Codex**, see the "Board sweeps" section of `AGENTS.md` for the tool mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool for named skills and Task for subagents. Referenced helper skills (`brainstorming`, `plan-eng-review`, `code-review`, `test-driven-development`, `using-git-worktrees`) load natively on both when installed.
 
+> **Karpathy planning guardrail.** Spec-sweep stays docs-only. When a spec or plan reasons about future code changes, use `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin if available; if unavailable, apply its core checks manually: think first, keep the plan simple, keep future edits surgical, and define concrete verification.
+
 ## 0. Preflight (fail fast, cleanly)
 
 - **Load repo config.** Read `.claude/linear-sweep.json` from the repo root. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.

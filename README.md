@@ -46,7 +46,7 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 The `SKILL.md` files speak in **actions** ("brainstorm a spec", "dispatch a reviewer subagent", "run the dev server"), not tool names.
 
 - **Claude Code** discovers `.claude/skills/` natively and maps actions to its tools (Skill, Task, `preview_*`).
-- **Codex** auto-loads `AGENTS.md`; the "Board sweeps" section points it at the same `SKILL.md` files and gives the Codex tool mapping (`shell`, `apply_patch`, `spawn_agent`, `update_plan`).
+- **Codex** auto-loads `AGENTS.md`; the "Board sweeps" section points it at the same `SKILL.md` files, gives the Codex tool mapping (`shell`, `apply_patch`, `spawn_agent`, `update_plan`), and installs the Karpathy coding guardrail with a manual fallback if the plugin is unavailable.
 
 Same files, both runtimes. Invoke with natural language: "run the spec sweep", "run the dev sweep", "run the QA sweep", "run the ship sweep".
 

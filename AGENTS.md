@@ -2,6 +2,11 @@
 
 Four Linear board sweeps drive features from idea -> shipped on the **Codex** team's **Linear Sweep** project, with a human gate before anything reaches production. They are **canonical, cross-runtime skills**: the same `SKILL.md` files run under Claude Code (discovered natively) and Codex (via this section). Read the whole `SKILL.md` before acting.
 
+## Coding workflow
+
+- For any task involving writing, reviewing, debugging, refactoring, or otherwise changing code, invoke the installed Andrej Karpathy skill (`andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin) before starting that work.
+- If the skill is unavailable in the current session, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
+
 **Config:** all four read `.claude/linear-sweep.json` at the repo root for the team/project/prefix and repo-specific paths - nothing is hardcoded. Team `Codex` (key `COD`), project `Linear Sweep`, issue prefix `COD-###`. Deploy path: No production app deploy for this kit. Shipping is merge/push to main; any release publishing or external distribution step must be attended by the owner or tracked as a Todo card. Optional `reviewLenses` gate card-type review lenses; `requireShipApproval` hardens the ship gate.
 
 **Codex tool mapping (all four):** read/search/git via `shell`; edit files via `apply_patch`; subagents via `spawn_agent`/`wait_agent`/`close_agent` (needs `[features] multi_agent = true` in `~/.codex/config.toml`); progress via `update_plan`; run the dev server via `shell` in the background (no `preview_*` tools on Codex). Use your own commit attribution - not the `Co-Authored-By: Claude` trailer shown in the files. Detect worktree/branch state with read-only git before creating/finishing branches.

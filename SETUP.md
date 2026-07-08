@@ -82,7 +82,7 @@ If `TARGET/.gitignore` has a broad `.claude/*` ignore, make sure `!.claude/skill
 
 ## Step 8 — Wire Codex (AGENTS.md adapter)
 
-Append `KIT/templates/AGENTS.snippet.md` to `TARGET/AGENTS.md` (create `AGENTS.md` at the repo root if it doesn't exist). Replace `<TEAM>`, `<KEY>`, `<PROJECT>`, `<DEPLOY>` to match the config. This is how **Codex** finds the sweeps (it auto-loads `AGENTS.md`; it does not scan `.claude/skills/`).
+Append `KIT/templates/AGENTS.snippet.md` to `TARGET/AGENTS.md` (create `AGENTS.md` at the repo root if it doesn't exist). Replace `<TEAM>`, `<KEY>`, `<PROJECT>`, `<DEPLOY>` to match the config. This is how **Codex** finds the sweeps (it auto-loads `AGENTS.md`; it does not scan `.claude/skills/`). The snippet also installs the coding workflow guardrail: use `andrej-karpathy-skill` before code-writing/review/debug/refactor work, or apply its core checks manually if the skill is unavailable.
 
 If the user will run `dev-sweep` under Codex, ensure `~/.codex/config.toml` has multi-agent support enabled. Preserve any existing `[features]` entries and add the missing key yourself:
 
@@ -95,6 +95,13 @@ Verify it is present before continuing:
 
 ```bash
 grep -A20 '^\[features\]' ~/.codex/config.toml | grep '^multi_agent = true'
+```
+
+Verify the adapter includes the coding workflow guardrail:
+
+```bash
+grep -q 'andrej-karpathy-skill' TARGET/AGENTS.md
+grep -q 'Coding workflow' TARGET/AGENTS.md
 ```
 
 ## Step 9 — Commit
@@ -170,5 +177,5 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 - `git -C TARGET check-ignore .env` prints `.env` (key is safe).
 - `TARGET/.claude/linear-sweep.json` has a real `projectId` and no `<placeholders>`.
 - `TARGET/.claude/skills/{spec,dev,qa,ship}-sweep/SKILL.md` and `TARGET/.claude/skills/unblock-sweep/SKILL.md` exist.
-- `TARGET/AGENTS.md` contains the "Board sweeps" section with real values.
+- `TARGET/AGENTS.md` contains the "Board sweeps" section with real values and the `andrej-karpathy-skill` coding workflow guardrail.
 - `node KIT/scripts/linear.mjs whoami` succeeds with the target's `.env` loaded.

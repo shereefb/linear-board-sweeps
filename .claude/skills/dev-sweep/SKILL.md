@@ -13,6 +13,7 @@ Build features from cards that are "Ready for Dev" or "In Progress", one worktre
 
 - **Load repo config.** Read `.claude/linear-sweep.json` (see spec-sweep §0 for fields). Missing file → exit with a one-line error.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
+- **Coding guardrail.** Before writing, reviewing, debugging, refactoring, or otherwise changing code, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `dev:in-progress`, `blocked:needs-user`.
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
