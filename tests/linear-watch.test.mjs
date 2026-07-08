@@ -347,6 +347,21 @@ test("failureTodoDecisions: only closes recovered Todos for checked scopes", () 
   const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["dev"]), NOW);
   assert.equal(checked[0].action, "close");
 });
+test("failureTodoDecisions: dispatch failures recover only after dispatch succeeds", () => {
+  const event = failureEvent({ scope: "dev:dispatch" });
+  const fp = failureFingerprint(event);
+  const cheapCheck = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev:dispatch" })], new Set(["dev"]), NOW);
+  assert.deepEqual(cheapCheck, []);
+
+  const dispatchCheck = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev:dispatch" })], new Set(["dev:dispatch"]), NOW);
+  assert.equal(dispatchCheck[0].action, "close");
+});
+test("failureTodoDecisions: holding-state failures use the holding recovery scope", () => {
+  const event = failureEvent({ scope: "holding", kind: "holding-state-fetch" });
+  const fp = failureFingerprint(event);
+  const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "holding" })], new Set(["holding"]), NOW);
+  assert.equal(checked[0].action, "close");
+});
 test("failureTodoDecisions: duplicate matching Todos are commented deterministically", () => {
   const event = failureEvent();
   const fp = failureFingerprint(event);
@@ -358,6 +373,21 @@ test("failureTodoDecisions: duplicate matching Todos are commented deterministic
   assert.equal(decisions[0].action, "duplicate");
   assert.equal(decisions[0].todo.id, "older");
   assert.equal(decisions[0].primary.identifier, "COD-102");
+});
+test("failureTodoDecisions: duplicate comments are throttled", () => {
+  const event = failureEvent();
+  const fp = failureFingerprint(event);
+  const duplicate = existingFailureTodo(fp, {
+    id: "older",
+    identifier: "COD-101",
+    updatedAt: hoursAgo(3),
+    comments: [{ body: "Duplicate auto-sweep failure Todo for `abc`.", createdAt: minsAgo(20) }],
+  });
+  const primary = existingFailureTodo(fp, { id: "newer", identifier: "COD-102", updatedAt: hoursAgo(1) });
+  assert.deepEqual(failureTodoDecisions([event], [duplicate, primary], new Set(["dev"]), NOW), []);
+
+  duplicate.comments = [{ body: "Duplicate auto-sweep failure Todo for `abc`.", createdAt: hoursAgo(26) }];
+  assert.equal(failureTodoDecisions([event], [duplicate, primary], new Set(["dev"]), NOW)[0].action, "duplicate");
 });
 test("healthStatus: config/key failures make health non-zero even after recent tick", () => {
   assert.equal(healthStatus({ lastTick: { at: new Date(NOW).toISOString(), failures: [{ kind: "missing-key" }] }, now: NOW, intervalS: 600 }).ok, false);

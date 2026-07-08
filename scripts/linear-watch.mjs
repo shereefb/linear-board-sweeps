@@ -43,6 +43,7 @@ export const PARK_TAG = "[auto-sweep-parked]"; // bounce-escalation park — dis
 export const BOUNCE_TAG = "[auto-sweep-bounce";
 export const FAILURE_TODO_TAG = "[auto-sweep-tick-failure";
 export const FAILURE_RECOVERED_TAG = "[auto-sweep-tick-recovered";
+export const FAILURE_DUPLICATE_NOTE = "Duplicate auto-sweep failure Todo";
 export const CRASH_ESCALATE_AFTER = 3; // reaps within the window before blocking
 export const BOUNCE_ESCALATE_AFTER = 2; // backward bounces within the window before blocking
 export const ESCALATE_WINDOW_H = 48;
@@ -382,6 +383,15 @@ function newestFirst(a, b) {
   return Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0);
 }
 
+function shouldCommentDuplicate(todo, now) {
+  const last = (todo.comments || [])
+    .filter((c) => String(c.body || "").includes(FAILURE_DUPLICATE_NOTE))
+    .map((c) => Date.parse(c.createdAt))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => b - a)[0];
+  return !last || now - last >= FAILURE_TODO_THROTTLE_MS;
+}
+
 export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [] } = {}) {
   const decisions = [];
   const byFingerprint = new Map();
@@ -407,7 +417,7 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
       continue;
     }
     for (const duplicate of todos.slice(1)) {
-      decisions.push({ action: "duplicate", fingerprint: currentFailure.fingerprint, todo: duplicate, primary });
+      if (shouldCommentDuplicate(duplicate, now)) decisions.push({ action: "duplicate", fingerprint: currentFailure.fingerprint, todo: duplicate, primary });
     }
     const previousMessage = failureTodoLastMessage(primary);
     const age = now - Date.parse(primary.updatedAt || primary.createdAt || 0);
@@ -700,7 +710,7 @@ async function closeFailureTodo(apiKey, meta, decision) {
 }
 
 async function commentDuplicateFailureTodo(apiKey, decision) {
-  await addComment(apiKey, decision.todo.id, `Duplicate auto-sweep failure Todo for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
+  await addComment(apiKey, decision.todo.id, `${FAILURE_DUPLICATE_NOTE} for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
 }
 
 async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, { dryRun = false } = {}) {
@@ -813,17 +823,27 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   }
 }
 
-function runUpdate(reg) {
+function runUpdate(reg, onFailure = () => {}) {
   if (!reg.autoUpdate || !reg.kitPath) return;
   const kit = reg.kitPath;
   if (reg.kitRemote) {
     const url = git(kit, ["remote", "get-url", "origin"], { allowFail: true }).out;
-    if (url !== reg.kitRemote) { log(`update: kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`); return; }
+    if (url !== reg.kitRemote) {
+      const msg = `kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`;
+      log(`update: ${msg}`);
+      onFailure(null, "update", "kit-remote", kit, msg);
+      return;
+    }
   }
   const before = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
   git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
-  if (merge.status !== 0) { log(`update: kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`); return; }
+  if (merge.status !== 0) {
+    const msg = `kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`;
+    log(`update: ${msg}`);
+    onFailure(null, "update", "kit-fast-forward", kit, msg);
+    return;
+  }
   const after = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
   if (before !== after) {
     const diff = git(kit, ["log", "--oneline", `${before}..${after}`], { allowFail: true }).out;
@@ -838,8 +858,10 @@ function runUpdate(reg) {
       if (!isNewerVersion(marker, installed)) continue;
       const res = refreshAnchorSkills(anchor, kit, marker);
       log(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
+      if (!res.ok) onFailure(anchor, "update", "skills-refresh", marker, res.reason);
     } catch (e) {
       log(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
+      onFailure(anchor, "update", "skills-refresh", marker, e.message);
     }
   }
 }
@@ -873,9 +895,8 @@ async function tick({ dryRun = false } = {}) {
     if (!acquireTickLock()) { log("another tick holds the lock — exit"); return; }
   }
   try {
-    if (!dryRun) runUpdate(reg);
-    rotateLogs();
     const localFailures = [];
+    const updateFailures = [];
     const activeByAnchor = new Map();
     const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
       anchorPath,
@@ -890,6 +911,11 @@ async function tick({ dryRun = false } = {}) {
     const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
       localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
     };
+    const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
+      updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
+    };
+    if (!dryRun) runUpdate(reg, recordUpdateFailure);
+    rotateLogs();
 
     // Resolve active anchors: registered ∩ auto-sweep-labeled. One workspace's
     // API error must never abort the whole tick — skip it and carry on.
@@ -906,6 +932,11 @@ async function tick({ dryRun = false } = {}) {
       const active = { anchorPath, config, apiKey, envValues, failures: [], checkedScopes: new Set() };
       anchors.push(active);
       activeByAnchor.set(anchorPath, active);
+    }
+    for (const f of updateFailures) {
+      const active = f.anchorPath ? activeByAnchor.get(f.anchorPath) : null;
+      if (active) active.failures.push(failureEventFor(f.anchorPath, active.config, f.scope, f.kind, f.stableTarget, f.message));
+      else recordLocalFailure(f.anchorPath || "_", null, f.scope, f.kind, f.stableTarget, f.message);
     }
 
     // Reap + count across every active (workspace, sweep). Cheap; always runs.
@@ -978,7 +1009,7 @@ async function tick({ dryRun = false } = {}) {
         } else if (orphans.length) {
           logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding states`);
         }
-      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("_", "holding-state-fetch", HOLDING_STATES.join(","), e.message); }
+      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", HOLDING_STATES.join(","), e.message); }
 
       try {
         const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });
@@ -1002,12 +1033,23 @@ async function tick({ dryRun = false } = {}) {
       if (exitCode !== 0) {
         const active = activeByAnchor.get(pick.anchorPath);
         const runtime = pick.config.runtime || "codex";
-        const event = failureEventFor(pick.anchorPath, pick.config, pick.sweep, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`);
+        const dispatchScope = `${pick.sweep}:dispatch`;
+        const event = failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", runtime, `${runtime} ${pick.sweep}-sweep exited ${exitCode}`);
         if (active) {
           try {
-            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set([pick.sweep]), active.envValues, { dryRun: false });
+            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set([dispatchScope]), active.envValues, { dryRun: false });
           } catch (e) {
             logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+          }
+        }
+      } else {
+        const active = activeByAnchor.get(pick.anchorPath);
+        const dispatchScope = `${pick.sweep}:dispatch`;
+        if (active) {
+          try {
+            await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([dispatchScope]), active.envValues, { dryRun: false });
+          } catch (e) {
+            logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch recovery reconciliation failed: ${e.message}`);
           }
         }
       }
