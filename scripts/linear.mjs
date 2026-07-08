@@ -26,14 +26,17 @@ export const REQUIRED_LABELS = [
   { name: "blocked:needs-user", color: "#eb5757" },
 ];
 
-const API = "https://api.linear.app/graphql";
+export const API = "https://api.linear.app/graphql";
 const KEY = process.env.LINEAR_API_KEY;
 
-async function gql(query, variables) {
-  if (!KEY) throw new Error("LINEAR_API_KEY not set. Load it from your gitignored .env: `set -a && . ./.env && set +a`.");
+// Shared Linear client. `apiKey` defaults to the process env so this file's own
+// commands keep working; linear-watch.mjs passes a per-anchor key (each workspace
+// loads its own .env), so one gql() serves many keys without a module-global.
+export async function gql(query, variables, apiKey = process.env.LINEAR_API_KEY) {
+  if (!apiKey) throw new Error("LINEAR_API_KEY not set. Load it from your gitignored .env: `set -a && . ./.env && set +a`.");
   const res = await fetch(API, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: KEY },
+    headers: { "Content-Type": "application/json", Authorization: apiKey },
     body: JSON.stringify({ query, variables }),
   });
   const json = await res.json();
@@ -123,16 +126,22 @@ async function createCard(projectId, stateName, title, description, labelsCsv) {
   return iss;
 }
 
-const [cmd, ...args] = process.argv.slice(2);
-const run = {
-  whoami: () => whoami(),
-  "setup-team": () => setupTeam(args[0]),
-  "ensure-project": () => ensureProject(args[0], args[1]),
-  "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
-  query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
-};
-if (!run[cmd]) {
-  console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | query <graphql>");
-  process.exit(1);
+// CLI dispatch — only when run directly (`node linear.mjs …`), NOT when another
+// module imports gql/findTeam. Without this guard, importing linear.mjs would
+// execute a command based on the importer's argv.
+import { pathToFileURL } from "node:url";
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const [cmd, ...args] = process.argv.slice(2);
+  const run = {
+    whoami: () => whoami(),
+    "setup-team": () => setupTeam(args[0]),
+    "ensure-project": () => ensureProject(args[0], args[1]),
+    "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
+    query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
+  };
+  if (!run[cmd]) {
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | query <graphql>");
+    process.exit(1);
+  }
+  run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
 }
-run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
