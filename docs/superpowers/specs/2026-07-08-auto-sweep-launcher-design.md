@@ -160,16 +160,27 @@ The tick lock dies with the launcher process, but the **Linear claim label** (`<
 
 ## Per-workspace runtime dispatch
 
-Each anchor's `.claude/linear-sweep.json` gains one field:
+Each anchor's `.claude/linear-sweep.json` gains a runtime + per-sweep model block:
 
 ```json
-"runtime": "codex"
+"runtime": "codex",
+"models": {
+  "spec": { "model": "gpt-5.5-codex", "effort": "high" },
+  "dev":  { "model": "gpt-5.5-codex", "effort": "high" },
+  "qa":   { "model": "gpt-5.5-codex", "effort": "high" }
+}
 ```
 
-`"codex"` (default) or `"claude"`. A command-builder maps it for one unattended pass, cwd = anchor:
+- `runtime` is `"codex"` (default) or `"claude"`. One runtime per workspace; the `models` entries name the model **for that runtime's family** (codex → a Codex/OpenAI model; claude → a Claude model such as `claude-opus-4-8`).
+- **Per-sweep tiering** is deliberate: spec / dev / qa have different cost/quality profiles, so each can carry its own `model` + reasoning `effort`. For now all three are set to the best model at high effort (codex: `gpt-5.5-codex` @ high; claude: `claude-opus-4-8` @ high); this leaves room to drop spec/qa to a cheaper tier later without any code change.
+- Any entry omitted → fall back to the runtime's own configured default (`~/.codex/config.toml` / Claude Code settings).
 
-- **codex:** `codex exec --cd <anchor> "<prompt>"`
-- **claude:** `claude -p "<prompt>"` executed in `<anchor>`
+The command-builder maps a `(runtime, model, effort)` triple for one unattended pass, cwd = anchor:
+
+- **codex:** `codex exec --cd <anchor> -m <model> -c model_reasoning_effort=<effort> "<prompt>"`
+- **claude:** `claude -p "<prompt>" --model <model>` (with `<effort>` mapped to Claude Code's reasoning/thinking control) executed in `<anchor>`
+
+The exact effort flags are confirmed against each CLI during implementation; the config captures the intent (`gpt-5.5-codex`/`claude-opus-4-8` at `high`) and the builder wires it to whatever each runtime exposes. Subagents the sweeps spawn inherit their model from the runtime's own agent config, layered under this main-loop selection.
 
 Prompt (both): *"Unattended scheduled run. Follow the `<sweep>-sweep` skill exactly, perform ONE pass, then stop. Do not ask questions — route them to card comments per the skill."* stdout/stderr → the per-workspace/sweep log.
 
@@ -204,7 +215,7 @@ At the top of each tick (lock-guarded, before any dispatch), when `registry.auto
 
 ### Edited files
 
-- `templates/linear-sweep.json` — add `"runtime": "codex"`.
+- `templates/linear-sweep.json` — add `"runtime"` + the per-sweep `"models"` block (defaults: `gpt-5.5-codex` @ high per sweep for codex; a `claude`-runtime example showing `claude-opus-4-8` @ high).
 - `skills/{spec,dev,qa}-sweep/SKILL.md` — the three handoff guardrails (push-on-transition per touched repo; fetch + reconstruct worktrees; prune stale worktrees) and, for dev-sweep, WIP checkpoint pushes.
 - `SETUP.md` — a "Triggering / auto-sweep" section: create the `auto-sweep` project label, `register` each anchor, install + activate the launcher, per-workspace runtime, auto-update settings, and the qa caution below.
 - `README.md` — a row in the "What's inside" table for the launcher.
@@ -228,6 +239,8 @@ At the top of each tick (lock-guarded, before any dispatch), when `registry.auto
 | Dispatches per tick | 1 | One agent at a time |
 | Log retention | 14 days | |
 | Default runtime | codex | Per-workspace override to claude |
+| Model (per sweep) | `gpt-5.5-codex` (codex) / `claude-opus-4-8` (claude) | Per-sweep tiering; unset → runtime default |
+| Reasoning effort | high | Per sweep; mapped to each CLI's effort control |
 | `kitRef` | `main` | Follow kit main; pinnable to a tag/SHA later |
 | `autoUpdate` | true | Registry kill-switch |
 
