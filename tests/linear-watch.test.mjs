@@ -9,6 +9,9 @@ import {
   selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
+  BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
+  blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
+  buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -214,6 +217,12 @@ test("SWEEP_CFG.ship exists and the derived lists include it", () => {
   assert.ok(SWEEPS.includes("ship"));
   assert.ok(SKILL_DIRS.includes("ship-sweep")); // auto-updater propagates the new skill
 });
+test("manual unblock skill propagates but is never scheduled", () => {
+  assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep"]);
+  assert.ok(PROPAGATED_SKILL_DIRS.includes("unblock-sweep"));
+  assert.ok(!SWEEPS.includes("unblock"));
+  assert.ok(!SKILL_DIRS.includes("unblock-sweep"));
+});
 test("selectDispatch: ship is dispatched before qa/dev/spec (most-downstream first)", () => {
   const pick = selectDispatch([
     { sweep: "spec", count: 5, oldestUpdatedAt: 1 },
@@ -261,6 +270,114 @@ test("parseEnv: strips quotes, ignores comments/blanks", () => {
   const e = parseEnv('# c\nLINEAR_API_KEY="lin_api_x"\nFOO=bar\n\n');
   assert.equal(e.LINEAR_API_KEY, "lin_api_x");
   assert.equal(e.FOO, "bar");
+});
+
+// ── manual unblock workflow helpers ─────────────────────────────────────────
+test("blockingLabelsForIssue: detects only unblockable blocking labels", () => {
+  assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes"]);
+  const labels = ["Feature", "blocked:needs-user", "qa:passed", "qa:needs-changes"];
+  assert.deepEqual(blockingLabelsForIssue(labels), ["blocked:needs-user", "qa:needs-changes"]);
+});
+test("normalizeBlockedIssue: captures anchor, active state, issue context, and newest blocking comment", () => {
+  const issue = {
+    id: "issue-id",
+    identifier: "COD-9",
+    title: "Blocked card",
+    url: "https://linear.app/x/COD-9",
+    updatedAt: "2026-07-08T10:00:00Z",
+    state: { name: "Ready for Dev" },
+    labels: { nodes: [{ id: "l1", name: "blocked:open-questions" }, { id: "l2", name: "cli" }] },
+    comments: { nodes: [
+      { body: "older note", createdAt: "2026-07-08T09:00:00Z", user: { name: "A" } },
+      { body: "Need API key before continuing", createdAt: "2026-07-08T10:01:00Z", user: { name: "B" } },
+    ] },
+  };
+  const normalized = normalizeBlockedIssue("/repo", { project: "Linear Sweep", projectId: "p1" }, issue, { active: false });
+  assert.equal(normalized.anchorPath, "/repo");
+  assert.equal(normalized.project, "Linear Sweep");
+  assert.equal(normalized.projectActive, false);
+  assert.equal(normalized.identifier, "COD-9");
+  assert.deepEqual(normalized.blockingLabels, ["blocked:open-questions"]);
+  assert.equal(normalized.newestBlockingComment.body, "Need API key before continuing");
+  assert.deepEqual(Object.keys(normalized.labelIds).sort(), ["blocked:open-questions", "cli"]);
+});
+test("labelIdsAfterRemoving: removes selected blockers and preserves unrelated labels", () => {
+  const next = labelIdsAfterRemoving(
+    { "blocked:needs-user": "blocked-id", "qa:needs-changes": "qa-id", cli: "cli-id" },
+    ["blocked:needs-user"]
+  );
+  assert.deepEqual(next, ["qa-id", "cli-id"]);
+});
+test("buildUnblockAuditComment: records resolution and selected labels without leaking secrets", () => {
+  const body = buildUnblockAuditComment({
+    labels: ["blocked:needs-user"],
+    resolution: "User confirmed the token was provisioned in the dashboard.",
+  });
+  assert.match(body, /unblock-sweep resolution/);
+  assert.match(body, /blocked:needs-user/);
+  assert.match(body, /token was provisioned/);
+  assert.doesNotMatch(body, /lin_api_/);
+});
+test("resolutionTextFromArgs: supports stdin so resolution text is not shell-interpreted", () => {
+  assert.equal(resolutionTextFromArgs(["--stdin"], "Resolved with `quoted`; text"), "Resolved with `quoted`; text");
+  assert.equal(resolutionTextFromArgs(["plain", "text"], ""), "plain text");
+});
+test("resolveBlockedIssue: comments first, removes selected blockers, and preserves other labels", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push(body);
+    if (body.query.includes("issue(id:$id)")) {
+      return { json: async () => ({ data: { issue: {
+        id: "issue-id",
+        identifier: "COD-1",
+        team: { key: "COD" },
+        project: { id: "project-id" },
+        labels: { nodes: [
+          { id: "blocked-id", name: "blocked:needs-user" },
+          { id: "qa-id", name: "qa:needs-changes" },
+          { id: "cli-id", name: "cli" },
+        ] },
+      } } }) };
+    }
+    if (body.query.includes("commentCreate")) return { json: async () => ({ data: { commentCreate: { success: true } } }) };
+    if (body.query.includes("issueUpdate")) return { json: async () => ({ data: { issueUpdate: { success: true } } }) };
+    throw new Error(`unexpected query: ${body.query}`);
+  };
+  try {
+    const result = await resolveBlockedIssue("lin_api_test", "COD-1", ["blocked:needs-user"], "Token provisioned", { teamKey: "COD", projectId: "project-id" });
+    assert.deepEqual(result, { identifier: "COD-1", removedLabels: ["blocked:needs-user"] });
+    assert.ok(calls[1].query.includes("commentCreate"));
+    assert.ok(calls[2].query.includes("issueUpdate"));
+    assert.deepEqual(calls[2].variables.ids, ["qa-id", "cli-id"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+test("resolveBlockedIssue: rejects issues outside the anchor team/project before mutating", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    calls.push(body);
+    return { json: async () => ({ data: { issue: {
+      id: "issue-id",
+      identifier: "OTHER-1",
+      team: { key: "OTHER" },
+      project: { id: "other-project" },
+      labels: { nodes: [{ id: "blocked-id", name: "blocked:needs-user" }] },
+    } } }) };
+  };
+  try {
+    await assert.rejects(
+      resolveBlockedIssue("lin_api_test", "OTHER-1", ["blocked:needs-user"], "Done", { teamKey: "COD", projectId: "project-id" }),
+      /outside configured anchor/
+    );
+    assert.equal(calls.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 // ── push discipline ──────────────────────────────────────────────────────────
