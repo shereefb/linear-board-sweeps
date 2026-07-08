@@ -14,6 +14,10 @@
     "qa":   { "model": "gpt-5.5", "effort": "high" },
     "ship": { "model": "gpt-5.5", "effort": "high" }
   },
+  "$comment_parallel": "Optional. Conservative default is 1. Values above 1 let the launcher run that many non-ship sweeps in one tick, but only across anchors whose resolved repo paths do not overlap. ship-sweep always stays serial.",
+  "parallel": {
+    "maxNonShipDispatches": 1
+  },
   "$comment_reviewLenses": "Optional. Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens (design at spec+qa, devex at spec, security at spec+dev+ship, perf at dev/qa, research at spec). Omit the whole block to run only the always-on lenses (eng-review, code-review, /qa). setup-team creates these labels; sweeps auto-apply them to unlabelled cards (generate-if-missing).",
   "reviewLenses": {
     "ui":       { "labels": ["frontend", "design", "ui"] },

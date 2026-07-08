@@ -126,9 +126,13 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "dev":  { "model": "gpt-5.5", "effort": "high" },
      "qa":   { "model": "gpt-5.5", "effort": "high" },
      "ship": { "model": "gpt-5.5", "effort": "high" }
+   },
+   "parallel": {
+     "maxNonShipDispatches": 1
    }
    ```
    Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. For Codex, prefer the best model available to the installed account (for this kit's default, `gpt-5.5` with `high` effort). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
+   Keep `parallel.maxNonShipDispatches` at `1` unless this machine can comfortably run multiple non-ship agents; values above `1` only parallelize disjoint anchors whose resolved repo paths do not overlap. ship-sweep is always serial.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash
@@ -151,7 +155,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" tick --dry-run
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
-   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4.
+   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch.
 
 6. **Activate the schedule** (10-min timer) and confirm health:
    ```bash
@@ -160,7 +164,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
 
-**QA caution — decide before activating.** `qa-sweep` **merges and deploys to production**. Once the schedule is on, it will auto-run qa for any card that reaches "In Review". If the user does NOT want automatic prod deploys, do NOT rely on the shared timer for qa — tell them to trigger qa manually (`launchctl kickstart -k gui/$(id -u)/com.linear-board-sweeps.watch` runs a full tick; or run a qa pass by hand) and keep the timer for the safe spec/dev sweeps. spec and dev never merge or deploy. Ask the user which they want and say what you did.
+**QA caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production path and only runs from the human-gated `Ready to Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
 
 **If this is NOT the always-on machine** (or the user only wants manual runs): skip Step 11 entirely. The sweeps still work on demand via the Step 10 phrases; another machine can pick up any card because all work flows through origin (see each SKILL.md's "Machine-independence & handoff" section).
 

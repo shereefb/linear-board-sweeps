@@ -11,14 +11,15 @@
 //   node linear-watch.mjs health                          # last-tick age; non-zero exit if stale
 //
 // Design: an idle tick is a few cheap Linear API calls + a ff-only git pull and
-// spends ZERO LLM tokens. A heavyweight agent pass is dispatched only when a queue
-// holds genuinely actionable work. Pure decision functions (reap/count/build/lock)
-// are separated from IO so they can be unit-tested without Linear or git.
+// spends ZERO LLM tokens. Heavyweight agent passes are dispatched only when queues
+// hold genuinely actionable work, capped to a bounded non-ship batch. Pure
+// decision functions (reap/count/build/lock) are separated from IO so they can be
+// unit-tested without Linear or git.
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { gql } from "./linear.mjs";
 
@@ -263,16 +264,55 @@ export function applyDecisionsInMemory(cards, reaps, bounces) {
   }
 }
 
-// Pick one dispatch across all actionable (workspace,sweep) candidates:
-// qa → dev → spec, then oldest card first.
-export function selectDispatch(candidates) {
-  const ranked = candidates
+function rankedDispatchCandidates(candidates) {
+  return candidates
     .filter((c) => c.count > 0)
     .sort((a, b) => {
       const so = SWEEP_ORDER.indexOf(a.sweep) - SWEEP_ORDER.indexOf(b.sweep);
       if (so !== 0) return so;
       return (a.oldestUpdatedAt || 0) - (b.oldestUpdatedAt || 0);
     });
+}
+
+export function parallelLimit(config) {
+  const raw = config?.parallel?.maxNonShipDispatches;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+function repoSet(candidate) {
+  return new Set(resolveRepos(candidate.anchorPath, candidate.config).map((r) => path.resolve(r.path)));
+}
+
+function overlapsAny(paths, usedPaths) {
+  for (const p of paths) if (usedPaths.has(p)) return true;
+  return false;
+}
+
+export function selectDispatchBatch(candidates, { maxNonShipDispatches = 1 } = {}) {
+  const ranked = rankedDispatchCandidates(candidates);
+  const ship = ranked.find((c) => c.sweep === "ship");
+  if (ship) return [ship];
+
+  const limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
+  const picked = [];
+  const usedAnchors = new Set();
+  const usedRepos = new Set();
+  for (const c of ranked.filter((candidate) => candidate.sweep !== "ship")) {
+    if (picked.length >= limit) break;
+    if (usedAnchors.has(c.anchorPath)) continue;
+    const repos = repoSet(c);
+    if (overlapsAny(repos, usedRepos)) continue;
+    picked.push(c);
+    usedAnchors.add(c.anchorPath);
+    for (const repo of repos) usedRepos.add(repo);
+  }
+  return picked;
+}
+
+// Compatibility wrapper for older tests/callers that expect one dispatch.
+export function selectDispatch(candidates) {
+  const ranked = rankedDispatchCandidates(candidates);
   return ranked[0] || null;
 }
 
@@ -614,6 +654,37 @@ function dispatch(anchorPath, sweep, config) {
   return r.status;
 }
 
+function dispatchAsync(anchorPath, sweep, config) {
+  const modelCfg = (config.models && config.models[sweep]) || {};
+  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
+  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
+  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  fs.mkdirSync(dir, { recursive: true });
+  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+  const fd = fs.openSync(logFile, "a");
+  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      fs.closeSync(fd);
+      logFor(anchorPath, sweep, `dispatch end (exit ${status})`);
+      resolve(status);
+    };
+    child.on("error", (e) => {
+      logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${e.message}`);
+      finish(127);
+    });
+    child.on("close", (status) => finish(status));
+  });
+}
+
+async function dispatchBatch(batch) {
+  await Promise.all(batch.map((c) => dispatchAsync(c.anchorPath, c.sweep, c.config)));
+}
+
 // ── tick orchestration ───────────────────────────────────────────────────────
 
 async function tick({ dryRun = false } = {}) {
@@ -714,11 +785,12 @@ async function tick({ dryRun = false } = {}) {
     // dispatch, so `health` doesn't read STALE during a legitimately long run.
     if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null }) + "\n");
 
-    // Dispatch at most one agent pass.
-    const pick = selectDispatch(candidates);
-    if (!pick) log("no actionable work — cheap tick");
-    else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable)`);
-    else dispatch(pick.anchorPath, pick.sweep, pick.config);
+    const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
+    const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
+    if (!batch.length) log("no actionable work — cheap tick");
+    else if (dryRun) {
+      for (const pick of batch) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable)`);
+    } else await dispatchBatch(batch);
   } finally {
     if (!dryRun) releaseTickLock();
   }
@@ -791,8 +863,9 @@ async function cmdList() {
 }
 
 function cmdHealth() {
-  // A dispatch runs foreground and can legitimately exceed 3× interval, so a live
-  // tick lock (held by a running PID) counts as healthy even if the stamp is old.
+  // A bounded dispatch batch runs under one foreground launcher and can
+  // legitimately exceed 3× interval, so a live tick lock (held by a running PID)
+  // counts as healthy even if the stamp is old.
   let lockPid = null;
   try { lockPid = JSON.parse(fs.readFileSync(TICK_LOCK, "utf8")).pid; } catch { lockPid = null; }
   if (lockPid && isAlivePid(lockPid)) { console.log(`tick in progress (pid ${lockPid})`); return; }

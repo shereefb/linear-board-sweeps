@@ -55,9 +55,10 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 
 - **Unit = workspace, not repo.** One Linear project maps to one workspace (a container folder of N sibling git repos), anchored at the repo that holds `.claude/`. You `register` each anchor once; activation is a Linear **project label `auto-sweep`** you toggle in the UI.
 - **Cheap when idle.** Every ~10 min the launcher makes a few Linear API calls and a fast-forward `git pull` — **zero LLM tokens** — and dispatches a heavyweight agent pass only when a queue holds genuinely actionable work.
-- **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `QA Passed`, and a PID-liveness lock keeps exactly one agent running at a time.
+- **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `QA Passed`, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
+- **Bounded non-ship parallelism.** Optional `parallel.maxNonShipDispatches` lets one tick dispatch multiple non-ship sweeps, but only across anchors whose resolved repo paths do not overlap. Default `1` preserves serial behavior; ship always stays serial.
 - **Per-workspace runtime + per-sweep model** live in `linear-sweep.json` (`runtime`, `models`), default `codex`.
 
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
@@ -76,7 +77,6 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.
 
 The next planned launcher/workflow changes are docs-only designs at this point:
 
-- `COD-82`: bounded non-ship parallel dispatch across disjoint, non-overlapping workspace repo sets, while ship remains serial and single-runner.
 - `COD-83`: an opt-in fast-path eligibility marker for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
 
