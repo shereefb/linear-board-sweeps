@@ -7,6 +7,7 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
+  foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
 } from "../scripts/linear-watch.mjs";
 
@@ -202,6 +203,57 @@ test("selectDispatch: within a sweep, oldest card first; zero-count ignored; non
   ]);
   assert.equal(pick.oldestUpdatedAt, 100);
   assert.equal(selectDispatch([{ sweep: "dev", count: 0, oldestUpdatedAt: 1 }]), null);
+});
+
+// ── ship sweep: config + dispatch priority ───────────────────────────────────
+test("SWEEP_CFG.ship exists and the derived lists include it", () => {
+  assert.deepEqual(SWEEP_CFG.ship.states, ["Ready to Ship"]);
+  assert.equal(SWEEP_CFG.ship.claim, "ship:in-progress");
+  assert.ok(SWEEP_CFG.ship.blocked.includes("blocked:needs-user")); // parked cards aren't re-dispatched
+  assert.equal(SWEEP_CFG.ship.staleMin, 120);
+  assert.ok(SWEEPS.includes("ship"));
+  assert.ok(SKILL_DIRS.includes("ship-sweep")); // auto-updater propagates the new skill
+});
+test("selectDispatch: ship is dispatched before qa/dev/spec (most-downstream first)", () => {
+  const pick = selectDispatch([
+    { sweep: "spec", count: 5, oldestUpdatedAt: 1 },
+    { sweep: "qa", count: 4, oldestUpdatedAt: 1 },
+    { sweep: "ship", count: 1, oldestUpdatedAt: 999 }, // newest, fewest — still wins on stage
+    { sweep: "dev", count: 3, oldestUpdatedAt: 1 },
+  ]);
+  assert.equal(pick.sweep, "ship");
+  assert.equal(SWEEP_ORDER[0], "ship");
+});
+
+// ── foreign / orphaned-claim reaper ──────────────────────────────────────────
+test("foreignClaimReleases: releases a stale orphaned claim; a fresh heartbeat is spared", () => {
+  const stale = { id: "s", identifier: "COD-7", updatedAt: minsAgo(300), labelNames: ["qa:in-progress"], comments: [] };
+  const fresh = { id: "f", identifier: "COD-8", updatedAt: minsAgo(1), labelNames: ["qa:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] };
+  const d = foreignClaimReleases([stale, fresh], NOW);
+  assert.equal(d.length, 1);
+  assert.equal(d[0].id, "s");
+  assert.deepEqual(d[0].releaseClaims, ["qa:in-progress"]);
+  assert.equal(d[0].action, "reap-orphan");
+});
+test("foreignClaimReleases: batches TWO stale claims on one card into a single decision (no clobber)", () => {
+  // The bug the batching fixes: releasing per-claim with full-set overwrites
+  // re-added an earlier removal. One decision → one write → both cleared.
+  const card = { id: "m", identifier: "COD-10", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], comments: [] };
+  const d = foreignClaimReleases([card], NOW);
+  assert.equal(d.length, 1);
+  assert.deepEqual([...d[0].releaseClaims].sort(), ["qa:in-progress", "ship:in-progress"]);
+});
+test("foreignClaimReleases: excludes ownClaim so the sweep's own reaper (with escalation) handles it", () => {
+  const card = { id: "o", identifier: "COD-11", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], comments: [] };
+  const d = foreignClaimReleases([card], NOW, "qa:in-progress"); // processing the qa sweep's In Review cards
+  assert.deepEqual(d[0].releaseClaims, ["ship:in-progress"]); // only the foreign ship claim, not qa's own
+});
+test("foreignClaimReleases: an unclaimed card is ignored; holding-state constants sane", () => {
+  const card = { id: "u", identifier: "COD-9", updatedAt: minsAgo(300), labelNames: [], comments: [] };
+  assert.deepEqual(foreignClaimReleases([card], NOW), []);
+  assert.deepEqual(HOLDING_STATES, ["QA Passed"]); // the state qa lands in but no sweep fetches
+  assert.equal(MAX_STALE_MIN, 120);
 });
 
 // ── env parsing ──────────────────────────────────────────────────────────────
