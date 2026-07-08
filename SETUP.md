@@ -84,11 +84,17 @@ If `TARGET/.gitignore` has a broad `.claude/*` ignore, make sure `!.claude/skill
 
 Append `KIT/templates/AGENTS.snippet.md` to `TARGET/AGENTS.md` (create `AGENTS.md` at the repo root if it doesn't exist). Replace `<TEAM>`, `<KEY>`, `<PROJECT>`, `<DEPLOY>` to match the config. This is how **Codex** finds the sweeps (it auto-loads `AGENTS.md`; it does not scan `.claude/skills/`).
 
-If the user will run `dev-sweep` under Codex, tell them to add to `~/.codex/config.toml`:
+If the user will run `dev-sweep` under Codex, ensure `~/.codex/config.toml` has multi-agent support enabled. Preserve any existing `[features]` entries and add the missing key yourself:
 
 ```toml
 [features]
 multi_agent = true
+```
+
+Verify it is present before continuing:
+
+```bash
+grep -A20 '^\[features\]' ~/.codex/config.toml | grep '^multi_agent = true'
 ```
 
 ## Step 9 — Commit
@@ -98,7 +104,7 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 ## Step 10 — Tell the user how to run it
 
 - **Claude Code:** the skills auto-register — say "run the spec sweep" / "run the dev sweep" / "run the QA sweep" (or "spec the needs-spec cards", etc.).
-- **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep.
+- **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep; Step 8 should already have enabled it.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
 
 ## Step 11 — Auto-sweep triggering (run the sweeps automatically)

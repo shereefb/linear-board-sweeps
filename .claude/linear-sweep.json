@@ -22,8 +22,8 @@
     "perf":     { "labels": ["performance"] },
     "research": { "labels": ["integration", "research"] }
   },
-  "$comment_requireShipApproval": "Ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ready to Ship' before it will merge.",
-  "requireShipApproval": true,
+  "$comment_requireShipApproval": "Optional. When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ready to Ship' before it will merge.",
+  "requireShipApproval": false,
   "specsDir": "docs/superpowers/specs",
   "plansDir": "docs/superpowers/plans",
   "canonicalDocs": {
