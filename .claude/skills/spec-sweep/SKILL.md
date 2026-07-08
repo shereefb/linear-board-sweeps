@@ -56,6 +56,10 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 
 When the spec genuinely can't be finished without answers only the owner can give: post them as a **single numbered comment** on the card, add `blocked:open-questions`, remove `spec:in-progress`, and **leave it in "Needs Spec"** (do not move to Ready for Dev). A later run resumes it once the owner replies (see §1). Ask each question once — never re-post.
 
+## Run record events (best-effort)
+
+When `AUTO_SWEEP_RUN_ID` and `AUTO_SWEEP_RECORD_PATH` are present, append JSONL events for durable retrospectives when practical. Supported event types: `claim` (`identifier`), `terminal-state` (`identifier`, `state`), `artifact` (`path`), `branch` (`name`), and `pr` (`url`). Event writes are best-effort only: never let metrics append failures block or fail the sweep, and never include raw prompts, logs, `.env` contents, or secrets.
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.

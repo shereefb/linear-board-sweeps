@@ -52,6 +52,9 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
+export const RUN_RECORD_SCHEMA_VERSION = 1;
+export const RUN_RECORD_TAG = "[auto-sweep-run-record";
+export const UNAVAILABLE = "unavailable";
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -640,6 +643,161 @@ function anchorSlug(anchorPath) {
   return path.basename(anchorPath).replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
+export function makeRunId(slug, sweep, now = new Date(), suffix = String(process.pid)) {
+  const stamp = now.toISOString().replace(/[-:.]/g, "").replace("T", "-").replace("Z", "Z");
+  const safeSlug = String(slug || "workspace").replace(/[^a-zA-Z0-9._-]/g, "-");
+  const safeSweep = String(sweep || "sweep").replace(/[^a-zA-Z0-9._-]/g, "-");
+  const safeSuffix = String(suffix || "").replace(/[^a-zA-Z0-9._-]/g, "-");
+  return [safeSlug, safeSweep, stamp, safeSuffix].filter(Boolean).join("-");
+}
+
+export function runRecordPath(now = new Date(), stateDir = STATE_DIR) {
+  const d = now instanceof Date ? now : new Date(now);
+  return path.join(stateDir, "runs", `${d.toISOString().slice(0, 7).replace("-", "")}.jsonl`);
+}
+
+export function baseRunRecord({ runId, anchorPath, projectId, sweep, runtime, model, reasoningEffort, startedAt }) {
+  return {
+    schemaVersion: RUN_RECORD_SCHEMA_VERSION,
+    runId,
+    anchorPath,
+    projectId: projectId || null,
+    sweep,
+    runtime: runtime || UNAVAILABLE,
+    model: model || UNAVAILABLE,
+    reasoningEffort: reasoningEffort || UNAVAILABLE,
+    startedAt: startedAt instanceof Date ? startedAt.toISOString() : startedAt,
+    endedAt: null,
+    durationMs: null,
+    exitCode: null,
+    dispatchStarted: false,
+    claimedIssues: [],
+    terminalStates: [],
+    createdArtifacts: [],
+    branches: [],
+    prs: [],
+    tokenUsage: UNAVAILABLE,
+    userInterruptions: UNAVAILABLE,
+    questionCounts: UNAVAILABLE,
+  };
+}
+
+export function sanitizeRunRecordValue(value, envValues = []) {
+  if (typeof value === "string") {
+    let out = value
+      .replace(/lin_api_[A-Za-z0-9._-]+/g, "[redacted-linear-api-key]")
+      .replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b/g, "[redacted-github-token]")
+      .replace(/\bsk-[A-Za-z0-9._-]+\b/g, "[redacted-api-key]")
+      .replace(/\bxox[baprs]-[A-Za-z0-9-]+\b/g, "[redacted-slack-token]");
+    for (const secret of envValues || []) {
+      if (typeof secret !== "string" || secret.length < 8) continue;
+      out = out.split(secret).join("[redacted-env-value]");
+    }
+    return out;
+  }
+  if (Array.isArray(value)) return value.map((v) => sanitizeRunRecordValue(v, envValues));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, sanitizeRunRecordValue(v, envValues)]));
+  }
+  return value;
+}
+
+function uniqueStrings(values) {
+  return [...new Set((values || []).filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim()))];
+}
+
+export function parseRunEvents(eventPath, runId, { envValues = [] } = {}) {
+  if (!eventPath || !fs.existsSync(eventPath)) return [];
+  const events = [];
+  for (const line of fs.readFileSync(eventPath, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (!event || event.runId !== runId || typeof event.type !== "string") continue;
+      events.push(sanitizeRunRecordValue(event, envValues));
+    } catch {
+      // Agent-written event lines are best-effort; malformed lines never break
+      // launcher-owned finalization.
+    }
+  }
+  return events;
+}
+
+export function aggregateRunEvents(events) {
+  const claimedIssues = [];
+  const terminalStates = [];
+  const createdArtifacts = [];
+  const branches = [];
+  const prs = [];
+  for (const event of events || []) {
+    if (event.type === "claim" && typeof event.identifier === "string") claimedIssues.push(event.identifier);
+    else if (event.type === "terminal-state" && typeof event.identifier === "string") {
+      terminalStates.push({ identifier: event.identifier, state: typeof event.state === "string" ? event.state : UNAVAILABLE });
+    } else if (event.type === "artifact" && typeof event.path === "string") createdArtifacts.push(event.path);
+    else if (event.type === "branch" && typeof event.name === "string") branches.push(event.name);
+    else if (event.type === "pr" && typeof event.url === "string") prs.push(event.url);
+  }
+  return {
+    claimedIssues: uniqueStrings(claimedIssues),
+    terminalStates: terminalStates.filter((s, i, arr) => arr.findIndex((x) => x.identifier === s.identifier) === i),
+    createdArtifacts: uniqueStrings(createdArtifacts),
+    branches: uniqueStrings(branches),
+    prs: uniqueStrings(prs),
+  };
+}
+
+export function finalizeRunRecord(base, events, result) {
+  const aggregated = aggregateRunEvents(events);
+  return {
+    ...base,
+    endedAt: result.endedAt instanceof Date ? result.endedAt.toISOString() : result.endedAt,
+    durationMs: result.durationMs,
+    exitCode: result.exitCode,
+    dispatchStarted: result.dispatchStarted === true,
+    claimedIssues: aggregated.claimedIssues,
+    terminalStates: aggregated.terminalStates,
+    createdArtifacts: aggregated.createdArtifacts,
+    branches: aggregated.branches,
+    prs: aggregated.prs,
+    tokenUsage: UNAVAILABLE,
+    userInterruptions: UNAVAILABLE,
+    questionCounts: UNAVAILABLE,
+  };
+}
+
+function appendJsonLine(file, object) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, JSON.stringify(object) + "\n");
+}
+
+function touchedIssueIdentifiers(record, events) {
+  return uniqueStrings([
+    ...(record.claimedIssues || []),
+    ...(record.terminalStates || []).map((s) => s.identifier),
+    ...(events || []).filter((e) => e.type === "terminal-state").map((e) => e.identifier),
+  ]);
+}
+
+export function runRecordComment(record) {
+  const lines = [
+    `${RUN_RECORD_TAG} ${record.runId}]`,
+    `summary: ${record.sweep} exited ${record.exitCode} in ${record.durationMs}ms`,
+  ];
+  if ((record.createdArtifacts || []).length) {
+    lines.push("artifacts:");
+    for (const artifact of record.createdArtifacts.slice(0, 8)) lines.push(`- ${artifact}`);
+  }
+  if ((record.branches || []).length) {
+    lines.push("branches:");
+    for (const branch of record.branches.slice(0, 8)) lines.push(`- ${branch}`);
+  }
+  if ((record.prs || []).length) {
+    lines.push("prs:");
+    for (const pr of record.prs.slice(0, 8)) lines.push(`- ${pr}`);
+  }
+  return lines.join("\n");
+}
+
 // One log writer. slug "_" = launcher-wide lines; otherwise a workspace slug.
 function writeLog(slug, sweep, msg) {
   const dir = path.join(STATE_DIR, slug, sweep);
@@ -650,6 +808,14 @@ function writeLog(slug, sweep, msg) {
 }
 const log = (msg) => writeLog("_", "_", msg);
 const logFor = (anchorPath, sweep, msg) => writeLog(anchorSlug(anchorPath), sweep, msg);
+
+function writeLogAt(stateDir, slug, sweep, msg) {
+  const dir = path.join(stateDir, slug, sweep);
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString();
+  fs.appendFileSync(path.join(dir, `${stamp.slice(0, 10).replace(/-/g, "")}.log`), `[${stamp}] ${msg}\n`);
+  process.stderr.write(`[${stamp}] ${slug === "_" ? "" : slug + "/"}${sweep} ${msg}\n`);
+}
 
 function rotateLogs() {
   const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
@@ -853,6 +1019,23 @@ async function setIssueLabels(apiKey, issueId, labelIds) {
 
 async function addComment(apiKey, issueId, body) {
   await gql(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body }, apiKey);
+}
+
+export async function resolveRunIssues(apiKey, identifiers, scope = {}) {
+  const out = [];
+  for (const identifier of uniqueStrings(identifiers)) {
+    const d = await gql(
+      `query($id:String!){ issue(id:$id){ id identifier state{ name } team{ key } project{ id } } }`,
+      { id: identifier },
+      apiKey
+    );
+    const issue = d.issue;
+    if (!issue) continue;
+    if (scope.teamKey && issue.team?.key !== scope.teamKey) continue;
+    if (scope.projectId && issue.project?.id !== scope.projectId) continue;
+    out.push({ id: issue.id, identifier: issue.identifier, state: issue.state?.name || UNAVAILABLE });
+  }
+  return out;
 }
 
 async function fetchIssueLabels(apiKey, issueId) {
@@ -1107,47 +1290,135 @@ export function runUpdate(reg, onFailure = () => {}) {
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
 
-function dispatch(anchorPath, sweep, config) {
+function dispatchRunContext(anchorPath, sweep, config, opts = {}) {
+  const stateDir = opts.stateDir || STATE_DIR;
+  const nowFn = opts.nowFn || (() => new Date());
   const modelCfg = (config.models && config.models[sweep]) || {};
-  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
-  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  const runtime = config.runtime || "codex";
+  const startedAt = nowFn();
+  const slug = anchorSlug(anchorPath);
+  const runId = makeRunId(slug, sweep, startedAt);
+  const eventDir = path.join(stateDir, slug, sweep);
+  const eventPath = path.join(eventDir, `${runId}.events.jsonl`);
+  const finalPath = runRecordPath(startedAt, stateDir);
+  const base = baseRunRecord({
+    runId,
+    anchorPath,
+    projectId: config.projectId,
+    sweep,
+    runtime,
+    model: modelCfg.model,
+    reasoningEffort: modelCfg.effort,
+    startedAt,
+  });
+  const { cmd, args, cwd } = buildCommand({ runtime, sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
+  const env = {
+    ...process.env,
+    ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : ""),
+    AUTO_SWEEP_RUN_ID: runId,
+    AUTO_SWEEP_RECORD_PATH: eventPath,
+    AUTO_SWEEP_ANCHOR_PATH: anchorPath,
+    AUTO_SWEEP_SWEEP: sweep,
+  };
+  const dir = path.join(stateDir, slug, sweep);
   fs.mkdirSync(dir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
-  const r = spawnSync(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
-  fs.closeSync(fd);
+  const logFile = path.join(dir, `${startedAt.toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+  return { anchorPath, sweep, config, stateDir, nowFn, slug, runId, eventPath, finalPath, base, cmd, args, cwd, env, logFile, startedAt };
+}
+
+async function finalizeDispatchRun(ctx, { endedAt, status, error, logger, resolveIssues = resolveRunIssues, addIssueComment = addComment, apiKeyOverride = null }) {
+  const envValues = Object.values(ctx.env).filter((v) => typeof v === "string" && v.length >= 8);
+  const events = parseRunEvents(ctx.eventPath, ctx.runId, { envValues });
+  const exitCode = error ? 127 : (Number.isInteger(status) ? status : 1);
+  const record = finalizeRunRecord(ctx.base, events, {
+    startedAt: ctx.startedAt,
+    endedAt,
+    durationMs: Math.max(0, endedAt.getTime() - ctx.startedAt.getTime()),
+    exitCode,
+    dispatchStarted: !error,
+  });
+  const apiKey = apiKeyOverride || ctx.env.LINEAR_API_KEY;
+  let resolvedIssues = [];
+  const identifiers = touchedIssueIdentifiers(record, events);
+  if (apiKey && identifiers.length) {
+    try {
+      resolvedIssues = await resolveIssues(apiKey, identifiers, { teamKey: ctx.config.teamKey, projectId: ctx.config.projectId });
+      if (resolvedIssues.length) {
+        record.terminalStates = resolvedIssues.map((issue) => ({ identifier: issue.identifier, state: issue.state || UNAVAILABLE }));
+      }
+    } catch (e) {
+      logger(ctx.slug, ctx.sweep, `run-record Linear enrichment skipped: ${e.message}`);
+    }
+  }
+  try {
+    appendJsonLine(ctx.finalPath, record);
+  } catch (e) {
+    logger(ctx.slug, ctx.sweep, `FATAL run-record write failed: ${e.message}`);
+  }
+  if (apiKey && resolvedIssues.length) {
+    const body = runRecordComment(record);
+    for (const issue of resolvedIssues) {
+      try { await addIssueComment(apiKey, issue.id, body); } catch (e) { logger(ctx.slug, ctx.sweep, `run-record comment failed ${issue.identifier}: ${e.message}`); }
+    }
+  }
+  return exitCode;
+}
+
+export async function dispatch(anchorPath, sweep, config, opts = {}) {
+  const spawnFn = opts.spawnFn || spawnSync;
+  const logger = opts.logFn || ((slug, s, msg) => writeLogAt(opts.stateDir || STATE_DIR, slug, s, msg));
+  const ctx = dispatchRunContext(anchorPath, sweep, config, opts);
+  const fd = fs.openSync(ctx.logFile, "a");
+  logger(ctx.slug, sweep, `dispatch: ${ctx.cmd} ${ctx.args.slice(0, 3).join(" ")} … run=${ctx.runId}`);
+  let r;
+  try {
+    r = spawnFn(ctx.cmd, ctx.args, { cwd: ctx.cwd, env: ctx.env, stdio: ["ignore", fd, fd] });
+  } catch (error) {
+    r = { status: null, error };
+  } finally {
+    fs.closeSync(fd);
+  }
+  const exitCode = await finalizeDispatchRun(ctx, {
+    endedAt: ctx.nowFn(),
+    status: r.status,
+    error: r.error,
+    logger,
+    resolveIssues: opts.resolveIssues || resolveRunIssues,
+    addIssueComment: opts.addCommentFn || addComment,
+    apiKeyOverride: opts.apiKey || null,
+  });
   // A missing runtime binary (ENOENT) sets r.error and leaves r.status null — that
   // is NOT a successful no-op. Surface it loudly so `health` / logs show the launcher
   // is dispatching nothing rather than silently "succeeding".
-  if (r.error) { logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${r.error.message}`); return 127; }
-  logFor(anchorPath, sweep, `dispatch end (exit ${r.status})`);
-  return r.status;
+  if (r.error) { logger(ctx.slug, sweep, `FATAL dispatch could not start ${ctx.cmd}: ${r.error.message}`); return 127; }
+  logger(ctx.slug, sweep, `dispatch end (exit ${r.status}) run=${ctx.runId}`);
+  return exitCode;
 }
 
 function dispatchAsync(anchorPath, sweep, config) {
-  const modelCfg = (config.models && config.models[sweep]) || {};
-  const { cmd, args, cwd } = buildCommand({ runtime: config.runtime || "codex", sweep, model: modelCfg.model, effort: modelCfg.effort, anchorPath });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : "") };
-  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  const ctx = dispatchRunContext(anchorPath, sweep, config);
+  const fd = fs.openSync(ctx.logFile, "a");
+  logFor(anchorPath, sweep, `dispatch: ${ctx.cmd} ${ctx.args.slice(0, 3).join(" ")} … run=${ctx.runId}`);
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
+    const child = spawn(ctx.cmd, ctx.args, { cwd: ctx.cwd, env: ctx.env, stdio: ["ignore", fd, fd] });
     let settled = false;
-    const finish = (status) => {
+    const finish = (status, error = null) => {
       if (settled) return;
       settled = true;
       fs.closeSync(fd);
-      logFor(anchorPath, sweep, `dispatch end (exit ${status})`);
-      resolve(status);
+      finalizeDispatchRun(ctx, {
+        endedAt: new Date(),
+        status,
+        error,
+        logger: (slug, s, msg) => writeLogAt(STATE_DIR, slug, s, msg),
+      }).then((exitCode) => {
+        if (error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${ctx.cmd}: ${error.message}`);
+        else logFor(anchorPath, sweep, `dispatch end (exit ${status}) run=${ctx.runId}`);
+        resolve(exitCode);
+      });
     };
     child.on("error", (e) => {
-      logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${e.message}`);
-      finish(127);
+      finish(127, e);
     });
     child.on("close", (status) => finish(status));
   });

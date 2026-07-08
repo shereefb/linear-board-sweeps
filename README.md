@@ -66,6 +66,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Bounded non-ship parallelism.** `parallel.maxNonShipDispatches` defaults to `2`, so one tick can dispatch a small batch of non-ship sweeps when their resolved repo paths do not overlap. Set it to `1` for serial mode; that workspace then runs alone or waits for the next tick. ship always stays serial.
 - **Default fast path.** `fastPath` is enabled by default; dev-sweep may mark tiny, high-confidence changes `fast-path:eligible`, and a human can then move the card from `In Review` straight to `Ready to Ship` to skip `QA Passed`. Set `fastPath.enabled` to `false` to require normal QA for every card.
 - **Runtime selection** lives in `linear-sweep.json`. Today `runtime` plus per-sweep `models` controls dispatch. COD-97 plans optional per-stage `runtimes` overrides so one workspace can spec with Claude, code/QA with Codex, review with Claude, and ship with Claude while preserving the legacy fields.
+- **Structured run records.** Every real dispatch appends one JSON object to `~/.local/state/linear-board-sweeps/runs/YYYYMM.jsonl`, including runtime/model/effort, duration, exit outcome, claimed cards, terminal states, artifacts, branches, PRs, and explicit `unavailable` values for metrics the runtime does not expose.
 
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
 
@@ -78,6 +79,27 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.
 ```
 
 `list` shows each anchor + `[auto-sweep: ON/off]` + this host's ship-runner state; `health` reports liveness and exits non-zero when the latest tick could not even report a config/key failure to Linear; `deactivate` pauses a project. Scheduled launcher failures that happen after project metadata and a usable API key are available are reconciled into deduplicated `Todo` cards marked with `[auto-sweep-tick-failure <fingerprint>]`; a later tick that checks the same scope cleanly comments recovery and moves the Todo to `Done`. Full design + rationale: [`docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`](docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md) and [`2026-07-08-gated-reviews-and-ship-split-design.md`](docs/superpowers/specs/2026-07-08-gated-reviews-and-ship-split-design.md). **Ship-runner:** production deploys run only on the one host with `ship-runner on`; qa-sweep no longer deploys, so it's safe to auto-run. `--dry-run` validates queue counting but not the merge/deploy path — watch the first real ship attended.
+
+### Run records
+
+Scheduled dispatches write append-only JSONL records under:
+
+```bash
+~/.local/state/linear-board-sweeps/runs/YYYYMM.jsonl
+```
+
+Each record uses `schemaVersion: 1` and includes `runId`, `anchorPath`, `projectId`, `sweep`, `runtime`, `model`, `reasoningEffort`, `startedAt`, `endedAt`, `durationMs`, `exitCode`, `dispatchStarted`, `claimedIssues`, `terminalStates`, `createdArtifacts`, `branches`, `prs`, `tokenUsage`, `userInterruptions`, and `questionCounts`. Fields that the runtime cannot expose are set to the literal string `unavailable` rather than omitted.
+
+During a dispatch, the launcher also passes `AUTO_SWEEP_RUN_ID`, `AUTO_SWEEP_RECORD_PATH`, `AUTO_SWEEP_ANCHOR_PATH`, and `AUTO_SWEEP_SWEEP` to the agent. Sweeps may append best-effort JSONL events to `AUTO_SWEEP_RECORD_PATH`, for example:
+
+```jsonl
+{"runId":"...","type":"claim","identifier":"COD-94"}
+{"runId":"...","type":"artifact","path":"docs/superpowers/specs/example.md"}
+{"runId":"...","type":"branch","name":"COD-94"}
+{"runId":"...","type":"pr","url":"https://github.com/owner/repo/pull/123"}
+```
+
+Malformed event lines are ignored. Event strings are redacted before storage or Linear mirroring, and raw prompts/log output are not stored in structured records. When claimed issue identifiers resolve inside the configured project, the launcher re-reads their current Linear states and posts one compact `[auto-sweep-run-record <runId>]` marker comment per touched card.
 
 ### Workflow extensions and reports
 

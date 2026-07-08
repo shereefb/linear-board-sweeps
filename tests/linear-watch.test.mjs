@@ -2,6 +2,9 @@
 // Run: node --test
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
@@ -16,6 +19,9 @@ import {
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus,
+  makeRunId, runRecordPath, baseRunRecord, parseRunEvents, finalizeRunRecord,
+  sanitizeRunRecordValue, runRecordComment, dispatch,
+  RUN_RECORD_SCHEMA_VERSION, RUN_RECORD_TAG, UNAVAILABLE,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -56,6 +62,158 @@ test("buildCommand: claude passes --model and -p prompt", () => {
   assert.equal(cmd, "claude");
   assert.equal(args[0], "-p");
   assert.deepEqual(args.slice(2), ["--model", "claude-opus-4-8"]);
+});
+
+// ── run records ──────────────────────────────────────────────────────────────
+test("run record helpers: schema includes every required field and unavailable defaults", () => {
+  const startedAt = new Date("2026-07-08T12:00:00.000Z");
+  const runId = makeRunId("linear-board-sweeps", "dev", startedAt, "test");
+  assert.equal(runId, "linear-board-sweeps-dev-20260708-120000000Z-test");
+  assert.equal(runRecordPath(startedAt, "/state"), "/state/runs/202607.jsonl");
+  const base = baseRunRecord({
+    runId,
+    anchorPath: "/repo",
+    projectId: "project-id",
+    sweep: "dev",
+    runtime: "codex",
+    model: "gpt-5.5",
+    reasoningEffort: "high",
+    startedAt,
+  });
+  const required = [
+    "schemaVersion", "runId", "anchorPath", "projectId", "sweep", "runtime", "model", "reasoningEffort",
+    "startedAt", "endedAt", "durationMs", "exitCode", "dispatchStarted", "claimedIssues", "terminalStates",
+    "createdArtifacts", "branches", "prs", "tokenUsage", "userInterruptions", "questionCounts",
+  ];
+  assert.deepEqual(required.filter((k) => !(k in base)), []);
+  assert.equal(base.schemaVersion, RUN_RECORD_SCHEMA_VERSION);
+  assert.equal(base.tokenUsage, UNAVAILABLE);
+  assert.equal(base.userInterruptions, UNAVAILABLE);
+  assert.equal(base.questionCounts, UNAVAILABLE);
+});
+
+test("parseRunEvents/finalizeRunRecord: ignores malformed lines and aggregates sanitized events", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-events-"));
+  const eventPath = path.join(dir, "events.jsonl");
+  const runId = "run-1";
+  fs.writeFileSync(eventPath, [
+    JSON.stringify({ runId, type: "claim", identifier: "COD-94" }),
+    JSON.stringify({ runId, type: "artifact", path: "docs/out.md?token=lin_api_secret123" }),
+    "{not json",
+    JSON.stringify({ runId: "other", type: "claim", identifier: "COD-1" }),
+    JSON.stringify({ runId, type: "branch", name: "COD-94" }),
+    JSON.stringify({ runId, type: "pr", url: "https://github.test/pr/1" }),
+    JSON.stringify({ runId, type: "terminal-state", identifier: "COD-94", state: "In Review" }),
+  ].join("\n"));
+  const events = parseRunEvents(eventPath, runId);
+  assert.equal(events.length, 5);
+  assert.doesNotMatch(events.find((e) => e.type === "artifact").path, /lin_api_/);
+  const record = finalizeRunRecord(
+    baseRunRecord({ runId, anchorPath: "/repo", projectId: "p", sweep: "dev", runtime: "codex", model: "m", reasoningEffort: "high", startedAt: "2026-07-08T12:00:00.000Z" }),
+    events,
+    { endedAt: "2026-07-08T12:00:01.000Z", durationMs: 1000, exitCode: 0, dispatchStarted: true }
+  );
+  assert.deepEqual(record.claimedIssues, ["COD-94"]);
+  assert.deepEqual(record.terminalStates, [{ identifier: "COD-94", state: "In Review" }]);
+  assert.deepEqual(record.branches, ["COD-94"]);
+  assert.deepEqual(record.prs, ["https://github.test/pr/1"]);
+  assert.equal(record.dispatchStarted, true);
+});
+
+test("sanitizeRunRecordValue: recursively redacts known token-like strings and env values", () => {
+  const input = {
+    a: "lin_api_secret and ghp_deadbeef and github_pat_finegrainedtoken and sk-testsecret",
+    b: ["prefix SECRET_ENV_VALUE suffix"],
+  };
+  const out = sanitizeRunRecordValue(input, ["SECRET_ENV_VALUE"]);
+  assert.doesNotMatch(JSON.stringify(out), /lin_api_|ghp_|github_pat_|sk-testsecret|SECRET_ENV_VALUE/);
+});
+
+test("runRecordComment: posts compact marker without raw logs", () => {
+  const body = runRecordComment({
+    runId: "run-1",
+    sweep: "dev",
+    exitCode: 0,
+    durationMs: 42,
+    createdArtifacts: ["docs/spec.md"],
+    branches: ["COD-94"],
+    prs: ["https://github.test/pr/1"],
+  });
+  assert.match(body, new RegExp(`\\${RUN_RECORD_TAG} run-1\\]`));
+  assert.match(body, /summary: dev exited 0 in 42ms/);
+  assert.doesNotMatch(body, /stdout|stderr|prompt/i);
+});
+
+test("dispatch: runtime start failure still appends final record with dispatchStarted false", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-dispatch-fail-"));
+  const anchor = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-anchor-"));
+  fs.mkdirSync(path.join(anchor, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(anchor, ".env"), "LINEAR_API_KEY=lin_api_test\n");
+  const times = [new Date("2026-07-08T12:00:00.000Z"), new Date("2026-07-08T12:00:02.500Z")];
+  const status = await dispatch(anchor, "dev", {
+    projectId: "project-id",
+    teamKey: "COD",
+    runtime: "codex",
+    models: { dev: { model: "gpt-5.5", effort: "high" } },
+  }, {
+    stateDir,
+    nowFn: () => times.shift(),
+    spawnFn: () => ({ status: null, error: new Error("spawn ENOENT") }),
+    logFn: () => {},
+  });
+  assert.equal(status, 127);
+  const lines = fs.readFileSync(path.join(stateDir, "runs", "202607.jsonl"), "utf8").trim().split("\n");
+  assert.equal(lines.length, 1);
+  const record = JSON.parse(lines[0]);
+  assert.equal(record.exitCode, 127);
+  assert.equal(record.dispatchStarted, false);
+  assert.equal(record.durationMs, 2500);
+  assert.equal(record.tokenUsage, UNAVAILABLE);
+});
+
+test("dispatch: passes run env vars, re-reads terminal states, and comments only resolved issue ids", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-dispatch-ok-"));
+  const anchor = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-anchor-"));
+  fs.mkdirSync(path.join(anchor, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(anchor, ".env"), "LINEAR_API_KEY=lin_api_test\n");
+  const comments = [];
+  const times = [new Date("2026-07-08T12:00:00.000Z"), new Date("2026-07-08T12:00:00.750Z")];
+  const status = await dispatch(anchor, "dev", {
+    projectId: "project-id",
+    teamKey: "COD",
+    runtime: "codex",
+    models: { dev: { model: "gpt-5.5", effort: "high" } },
+  }, {
+    stateDir,
+    nowFn: () => times.shift(),
+    logFn: () => {},
+    spawnFn: (_cmd, _args, opts) => {
+      assert.equal(opts.env.AUTO_SWEEP_SWEEP, "dev");
+      assert.equal(opts.env.AUTO_SWEEP_ANCHOR_PATH, anchor);
+      assert.ok(opts.env.AUTO_SWEEP_RUN_ID);
+      assert.ok(opts.env.AUTO_SWEEP_RECORD_PATH.endsWith(".events.jsonl"));
+      fs.appendFileSync(opts.env.AUTO_SWEEP_RECORD_PATH, JSON.stringify({ runId: opts.env.AUTO_SWEEP_RUN_ID, type: "claim", identifier: "COD-94" }) + "\n");
+      fs.appendFileSync(opts.env.AUTO_SWEEP_RECORD_PATH, JSON.stringify({ runId: opts.env.AUTO_SWEEP_RUN_ID, type: "terminal-state", identifier: "COD-94", state: "Ready for Dev" }) + "\n");
+      fs.appendFileSync(opts.env.AUTO_SWEEP_RECORD_PATH, JSON.stringify({ runId: opts.env.AUTO_SWEEP_RUN_ID, type: "artifact", path: "docs/out.md" }) + "\n");
+      return { status: 0 };
+    },
+    resolveIssues: async (_apiKey, identifiers, scope) => {
+      assert.deepEqual(identifiers, ["COD-94"]);
+      assert.deepEqual(scope, { teamKey: "COD", projectId: "project-id" });
+      return [{ id: "issue-uuid", identifier: "COD-94", state: "In Review" }];
+    },
+    addCommentFn: async (_apiKey, issueId, body) => {
+      comments.push({ issueId, body });
+    },
+  });
+  assert.equal(status, 0);
+  assert.deepEqual(comments.map((c) => c.issueId), ["issue-uuid"]);
+  assert.match(comments[0].body, /\[auto-sweep-run-record /);
+  const record = JSON.parse(fs.readFileSync(path.join(stateDir, "runs", "202607.jsonl"), "utf8").trim());
+  assert.equal(record.dispatchStarted, true);
+  assert.deepEqual(record.claimedIssues, ["COD-94"]);
+  assert.deepEqual(record.terminalStates, [{ identifier: "COD-94", state: "In Review" }]);
+  assert.deepEqual(record.createdArtifacts, ["docs/out.md"]);
 });
 
 // ── PID lock ─────────────────────────────────────────────────────────────────

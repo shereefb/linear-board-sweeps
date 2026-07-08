@@ -47,6 +47,10 @@ List "Ready for Dev" + "In Progress" cards **in `config.project`**, top-to-botto
 - **Needs the user to continue *development*** (a product decision, missing credential/asset, an API only they can provision): add `blocked:needs-user`, **keep the card in "Ready for Dev"**, comment exactly what's needed, and leave it. Resume when they reply. Ask once.
 - **Needs a human-only action you can't perform** (an env var / secret set in the hosting dashboard, a prod migration, a DNS record, a webhook registered in a third-party console, an OAuth app connected, a billing/plan approval, any platform deploy step you can't trigger — see `config.deploy` and the `Todo` lane in the board rules): don't block the dev — **create a new Linear card in status "Todo"** in `config.project` stating *what* to do, *where* (which dashboard/console), and *why* (which feature it unblocks); link it to the feature card, and continue. If the agent could do it itself, do it — don't make a `Todo`.
 
+## Run record events (best-effort)
+
+When `AUTO_SWEEP_RUN_ID` and `AUTO_SWEEP_RECORD_PATH` are present, append JSONL events for durable retrospectives when practical. Supported event types: `claim` (`identifier`), `terminal-state` (`identifier`, `state`), `artifact` (`path`), `branch` (`name`), and `pr` (`url`). Event writes are best-effort only: never let metrics append failures block or fail the sweep, and never include raw prompts, logs, `.env` contents, or secrets.
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.

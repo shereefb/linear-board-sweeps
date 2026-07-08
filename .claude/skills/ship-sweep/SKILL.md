@@ -74,6 +74,10 @@ If you can't finish without the owner (a failing sanity gate, a security block, 
 
 If the blocker is card-specific (for example, missing `qa:passed` on one card), re-list and continue draining other actionable cards. If the blocker is global to the run (for example, missing Linear auth, broken git push credentials, or an unavailable deploy path that would affect every remaining card), stop after releasing the current claim and recording the blocker.
 
+## Run record events (best-effort)
+
+When `AUTO_SWEEP_RUN_ID` and `AUTO_SWEEP_RECORD_PATH` are present, append JSONL events for durable retrospectives when practical. Supported event types: `claim` (`identifier`), `terminal-state` (`identifier`, `state`), `artifact` (`path`), `branch` (`name`), and `pr` (`url`). Event writes are best-effort only: never let metrics append failures block or fail the sweep, and never include raw prompts, logs, `.env` contents, or secrets.
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the launcher, and any other machine coordinate ONLY through origin. ship-sweep is single-runner, but a crash still has to hand off cleanly.

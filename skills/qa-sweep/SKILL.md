@@ -55,6 +55,10 @@ A human reviews the "QA Passed" column and moves approved cards to "Ready to Shi
 
 If you can't finish without the owner (ambiguous intended behavior, missing credentials/data, a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "In Review", remove `qa:in-progress`. Ask once; resume when they reply.
 
+## Run record events (best-effort)
+
+When `AUTO_SWEEP_RUN_ID` and `AUTO_SWEEP_RECORD_PATH` are present, append JSONL events for durable retrospectives when practical. Supported event types: `claim` (`identifier`), `terminal-state` (`identifier`, `state`), `artifact` (`path`), `branch` (`name`), and `pr` (`url`). Event writes are best-effort only: never let metrics append failures block or fail the sweep, and never include raw prompts, logs, `.env` contents, or secrets.
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
