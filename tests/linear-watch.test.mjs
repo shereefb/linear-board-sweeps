@@ -4,7 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
-  heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, countActionable,
+  heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
+  countActionable, actionableCards, applyDecisionsInMemory,
   selectDispatch, parseEnv, pushWithRetry, SWEEP_CFG,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
 } from "../scripts/linear-watch.mjs";
@@ -140,8 +141,19 @@ test("bounceDecisions: escalates after 2 backward bounces in window", () => {
 test("bounceDecisions: one bounce does not escalate; already-blocked is skipped", () => {
   const one = { id: "a", identifier: "COD-3", labelNames: [], comments: [{ body: `${BOUNCE_TAG} dev→spec]`, createdAt: hoursAgo(1) }] };
   const blocked = { id: "b", identifier: "COD-4", labelNames: ["blocked:needs-user"], comments: [
-    { body: `${BOUNCE_TAG} x]`, createdAt: hoursAgo(1) }, { body: `${BOUNCE_TAG} y]`, createdAt: hoursAgo(2) } ] };
+    { body: `${BOUNCE_TAG} A→B]`, createdAt: hoursAgo(1) }, { body: `${BOUNCE_TAG} A→B]`, createdAt: hoursAgo(2) } ] };
   assert.deepEqual(bounceDecisions([one, blocked], SWEEP_CFG.dev, NOW), []);
+});
+test("bounceDecisions: two DIFFERENT state-pairs do NOT escalate (only same-pair oscillation does)", () => {
+  const card = { id: "c", identifier: "COD-5", labelNames: [], comments: [
+    { body: `${BOUNCE_TAG} Ready for Dev→Needs Spec]`, createdAt: hoursAgo(1) },
+    { body: `${BOUNCE_TAG} In Review→Ready for Dev]`, createdAt: hoursAgo(2) },
+  ] };
+  assert.deepEqual(bounceDecisions([card], SWEEP_CFG.dev, NOW), []);
+});
+test("bouncePairKey: parses <from>→<to> (with spaces) into an unordered pair; A→B == B→A", () => {
+  assert.equal(bouncePairKey(`${BOUNCE_TAG} Ready for Dev→Needs Spec]`), bouncePairKey(`${BOUNCE_TAG} Needs Spec→Ready for Dev]`));
+  assert.equal(bouncePairKey("no marker here"), null);
 });
 
 // ── actionable count ─────────────────────────────────────────────────────────
@@ -159,6 +171,19 @@ test("countActionable: excludes blocked and live-claimed, counts released + plai
 test("countActionable: a stale-heartbeat claim that wasn't released still counts (it's not live)", () => {
   const card = { id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
   assert.equal(countActionable([card], SWEEP_CFG.dev, NOW, new Set()), 1);
+});
+test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
+  // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
+  const reapCard = { id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  const escCard = { id: "e", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [
+    { body: REAPER_TAG, createdAt: hoursAgo(2) }, { body: REAPER_TAG, createdAt: hoursAgo(4) } ] };
+  const cards = [reapCard, escCard];
+  const reaps = reapDecisions(cards, SWEEP_CFG.dev, NOW);
+  applyDecisionsInMemory(cards, reaps, []);
+  const ids = actionableCards(cards, SWEEP_CFG.dev, NOW).map((c) => c.id);
+  assert.deepEqual(ids, ["r"]); // reaped one is actionable; escalated one is now blocked
+  assert.ok(escCard.labelNames.includes("blocked:needs-user"));
+  assert.ok(!reapCard.labelNames.includes("dev:in-progress"));
 });
 
 // ── dispatch selection ───────────────────────────────────────────────────────

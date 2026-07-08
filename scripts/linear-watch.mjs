@@ -161,29 +161,67 @@ export function reapDecisions(cards, cfg, now) {
   return out;
 }
 
-// Backward-bounce escalation (SKILLs write [auto-sweep-bounce …] on a backward move).
-export function bounceDecisions(cards, cfg, now) {
+// Extract the unordered state-pair from a `[auto-sweep-bounce <from>→<to>]`
+// marker body (null if not a bounce marker). Unordered so A→B and B→A count as
+// the same oscillating pair.
+export function bouncePairKey(body) {
+  const i = (body || "").indexOf(BOUNCE_TAG);
+  if (i < 0) return null;
+  const m = body.slice(i + BOUNCE_TAG.length).match(/\s*(.+?)→(.+?)\]/);
+  if (!m) return null;
+  return [m[1].trim(), m[2].trim()].sort().join(" ⇄ ");
+}
+
+// Backward-bounce escalation (SKILLs write [auto-sweep-bounce <from>→<to>] on a
+// backward move). Escalate only when the SAME state-pair oscillates ≥ threshold
+// times in the window — two unrelated backward moves (dev→spec once, qa→dev once)
+// must NOT trip it.
+export function bounceDecisions(cards, cfg, now, windowH = ESCALATE_WINDOW_H) {
   const out = [];
+  const cutoff = now - windowH * 3600000;
   for (const card of cards) {
     if (hasLabel(card, "blocked:needs-user")) continue; // already parked
-    if (countMarkers(card, BOUNCE_TAG, now) >= BOUNCE_ESCALATE_AFTER) {
+    const perPair = new Map();
+    for (const c of card.comments || []) {
+      if (Date.parse(c.createdAt) < cutoff) continue;
+      const key = bouncePairKey(c.body || "");
+      if (key) perPair.set(key, (perPair.get(key) || 0) + 1);
+    }
+    if ([...perPair.values()].some((n) => n >= BOUNCE_ESCALATE_AFTER)) {
       out.push({ id: card.id, identifier: card.identifier, action: "escalate-bounce" });
     }
   }
   return out;
 }
 
-// Count actionable cards after reaping. releasedIds = cards whose claim was just
-// released this tick (they become actionable again).
-export function countActionable(cards, cfg, now, releasedIds = new Set()) {
-  let n = 0;
-  for (const card of cards) {
-    if ((cfg.blocked || []).some((b) => hasLabel(card, b))) continue; // blocked
+// The actionable subset: not blocked, and not owned by a live run. releasedIds =
+// cards whose claim was just released this tick (they become actionable again).
+export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
+  return cards.filter((card) => {
+    if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
     const liveClaim = hasLabel(card, cfg.claim) && !releasedIds.has(card.id) && heartbeatAgeMin(card, now) <= cfg.staleMin;
-    if (liveClaim) continue; // owned by a live run
-    n += 1;
+    return !liveClaim; // exclude cards owned by a live run
+  });
+}
+export function countActionable(cards, cfg, now, releasedIds = new Set()) {
+  return actionableCards(cards, cfg, now, releasedIds).length;
+}
+
+// Reflect this tick's reap/bounce decisions on the in-memory cards so the
+// actionable count is correct: a reaped card loses its claim (actionable again);
+// an escalated card (crash or bounce) gains blocked:needs-user (not actionable).
+export function applyDecisionsInMemory(cards, reaps, bounces) {
+  const byId = new Map(cards.map((c) => [c.id, c]));
+  for (const d of reaps) {
+    const card = byId.get(d.id);
+    if (!card) continue;
+    card.labelNames = (card.labelNames || []).filter((n) => n !== d.releaseClaim);
+    if (d.action === "escalate-crash" && !card.labelNames.includes("blocked:needs-user")) card.labelNames.push("blocked:needs-user");
   }
-  return n;
+  for (const d of bounces) {
+    const card = byId.get(d.id);
+    if (card && !(card.labelNames || []).includes("blocked:needs-user")) card.labelNames = [...(card.labelNames || []), "blocked:needs-user"];
+  }
 }
 
 // Pick one dispatch across all actionable (workspace,sweep) candidates:
@@ -242,27 +280,20 @@ function anchorKey(anchorPath) {
   return parseEnv(fs.readFileSync(envPath, "utf8")).LINEAR_API_KEY || null;
 }
 
-function log(msg, sweep = "_") {
-  const slug = "_";
-  const dir = path.join(STATE_DIR, slug, sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  const stamp = new Date().toISOString();
-  const line = `[${stamp}] ${msg}\n`;
-  fs.appendFileSync(path.join(dir, `${stamp.slice(0, 10).replace(/-/g, "")}.log`), line);
-  process.stderr.write(line);
-}
-
 function anchorSlug(anchorPath) {
   return path.basename(anchorPath).replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
-function logFor(anchorPath, sweep, msg) {
-  const dir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+// One log writer. slug "_" = launcher-wide lines; otherwise a workspace slug.
+function writeLog(slug, sweep, msg) {
+  const dir = path.join(STATE_DIR, slug, sweep);
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString();
   fs.appendFileSync(path.join(dir, `${stamp.slice(0, 10).replace(/-/g, "")}.log`), `[${stamp}] ${msg}\n`);
-  process.stderr.write(`[${stamp}] ${anchorSlug(anchorPath)}/${sweep} ${msg}\n`);
+  process.stderr.write(`[${stamp}] ${slug === "_" ? "" : slug + "/"}${sweep} ${msg}\n`);
 }
+const log = (msg) => writeLog("_", "_", msg);
+const logFor = (anchorPath, sweep, msg) => writeLog(anchorSlug(anchorPath), sweep, msg);
 
 function rotateLogs() {
   const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
@@ -352,7 +383,7 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
          pageInfo{ hasNextPage endCursor }
          nodes{ id identifier updatedAt project{ id }
            labels{ nodes{ id name } }
-           comments(first:100){ nodes{ body createdAt } } } } }`,
+           comments(last:100){ nodes{ body createdAt } } } } }`,
       { c: cursor, states, teamKey },
       apiKey
     );
@@ -470,6 +501,10 @@ function dispatch(anchorPath, sweep, config) {
   logFor(anchorPath, sweep, `dispatch: ${cmd} ${args.slice(0, 3).join(" ")} …`);
   const r = spawnSync(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
   fs.closeSync(fd);
+  // A missing runtime binary (ENOENT) sets r.error and leaves r.status null — that
+  // is NOT a successful no-op. Surface it loudly so `health` / logs show the launcher
+  // is dispatching nothing rather than silently "succeeding".
+  if (r.error) { logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${r.error.message}`); return 127; }
   logFor(anchorPath, sweep, `dispatch end (exit ${r.status})`);
   return r.status;
 }
@@ -485,16 +520,18 @@ async function tick({ dryRun = false } = {}) {
     if (!dryRun) runUpdate(reg);
     rotateLogs();
 
-    // Resolve active anchors: registered ∩ auto-sweep-labeled.
+    // Resolve active anchors: registered ∩ auto-sweep-labeled. One workspace's
+    // API error must never abort the whole tick — skip it and carry on.
     const labeledByKey = new Map();
     const anchors = [];
     for (const anchorPath of reg.repos) {
       let config, apiKey;
       try { config = anchorConfig(anchorPath); apiKey = anchorKey(anchorPath); } catch (e) { log(`FATAL config ${anchorPath}: ${e.message}`); continue; }
       if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(anchorPath)} (.env) — skipping`); continue; }
-      if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
-      const active = labeledByKey.get(apiKey).has(config.projectId);
-      if (!active) { logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`); continue; }
+      try {
+        if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
+      } catch (e) { logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`); continue; }
+      if (!labeledByKey.get(apiKey).has(config.projectId)) { logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`); continue; }
       anchors.push({ anchorPath, config, apiKey });
     }
 
@@ -502,34 +539,45 @@ async function tick({ dryRun = false } = {}) {
     const now = Date.now();
     const candidates = [];
     for (const { anchorPath, config, apiKey } of anchors) {
-      const labelMap = dryRun ? {} : await teamLabelMap(apiKey, config.teamKey);
+      // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
+      // an idle workspace never pays for it (keeps the idle path cheap).
+      let _labelMap = null;
+      const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
       for (const sweep of ["spec", "dev", "qa"]) {
         const cfg = SWEEP_CFG[sweep];
         let cards;
         try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); continue; }
         const reaps = reapDecisions(cards, cfg, now);
         const bounces = bounceDecisions(cards, cfg, now);
-        const releasedIds = new Set(reaps.filter((d) => d.action === "reap" || d.action === "escalate-crash").map((d) => d.id));
-        if (!dryRun) {
-          for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); } }
-          for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); } }
-        } else if (reaps.length || bounces.length) {
+        if (!dryRun && (reaps.length || bounces.length)) {
+          let labelMap;
+          try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); labelMap = null; }
+          if (labelMap) {
+            for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); } }
+            for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); } }
+          }
+        } else if (dryRun && (reaps.length || bounces.length)) {
           logFor(anchorPath, sweep, `[dry-run] would reap ${reaps.length}, escalate-bounce ${bounces.length}`);
         }
-        const count = countActionable(cards, cfg, now, releasedIds);
-        const oldest = cards.length ? Math.min(...cards.map((c) => Date.parse(c.updatedAt))) : 0;
-        logFor(anchorPath, sweep, `${count} actionable`);
-        if (count > 0) candidates.push({ anchorPath, config, sweep, count, oldestUpdatedAt: oldest });
+        // Reflect the decisions in memory so the count is correct: a reaped card
+        // becomes actionable, an escalated (crash or bounce) card is now blocked.
+        applyDecisionsInMemory(cards, reaps, bounces);
+        const actionable = actionableCards(cards, cfg, now);
+        const oldest = actionable.length ? Math.min(...actionable.map((c) => Date.parse(c.updatedAt))) : 0;
+        logFor(anchorPath, sweep, `${actionable.length} actionable`);
+        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, oldestUpdatedAt: oldest });
       }
     }
+
+    // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
+    // dispatch, so `health` doesn't read STALE during a legitimately long run.
+    if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null }) + "\n");
 
     // Dispatch at most one agent pass.
     const pick = selectDispatch(candidates);
     if (!pick) log("no actionable work — cheap tick");
     else if (dryRun) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable)`);
     else dispatch(pick.anchorPath, pick.sweep, pick.config);
-
-    if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null }) + "\n");
   } finally {
     if (!dryRun) releaseTickLock();
   }
@@ -574,6 +622,11 @@ async function cmdList() {
 }
 
 function cmdHealth() {
+  // A dispatch runs foreground and can legitimately exceed 3× interval, so a live
+  // tick lock (held by a running PID) counts as healthy even if the stamp is old.
+  let lockPid = null;
+  try { lockPid = JSON.parse(fs.readFileSync(TICK_LOCK, "utf8")).pid; } catch { lockPid = null; }
+  if (lockPid && isAlivePid(lockPid)) { console.log(`tick in progress (pid ${lockPid})`); return; }
   if (!fs.existsSync(LAST_TICK)) { console.log("no successful tick recorded"); process.exit(1); }
   const { at } = JSON.parse(fs.readFileSync(LAST_TICK, "utf8"));
   const ageS = (Date.now() - Date.parse(at)) / 1000;
