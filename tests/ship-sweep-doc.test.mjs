@@ -17,3 +17,13 @@ test("ship-sweep drains Ready to Ship one card at a time until empty", () => {
     assert.match(body, /After the queue first appears empty, re-list "Ready to Ship" once more/);
   }
 });
+
+test("SETUP unattended activation guidance points production caution at ship-sweep", () => {
+  const body = fs.readFileSync("SETUP.md", "utf8");
+  const caution = body.match(/\*\*Scheduling caution[^]*?(?=\n\n\*\*If this is NOT the always-on machine)/)?.[0] || "";
+  assert.ok(caution, "missing Step 11 scheduling caution");
+  assert.doesNotMatch(caution, /QA caution/i);
+  assert.match(caution, /`?ship-sweep`? is the only production merge\/deploy path/);
+  assert.match(caution, /`?qa-sweep`? never merges or deploys/);
+  assert.match(caution, /human-gated `Ready to Ship` column/);
+});
