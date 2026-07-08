@@ -370,7 +370,7 @@ function failureTodoScope(todo) {
 
 function failureTodoLastMessage(todo) {
   if (todo.lastMessage !== undefined) return String(todo.lastMessage);
-  const matches = [...String(todo.description || "").matchAll(/Last error:\s*(.*)/g)];
+  const matches = [...String(todo.description || "").matchAll(/Last error:\s*([\s\S]*?)(?:\n\nHow to clear:|$)/g)];
   return matches.length ? matches[matches.length - 1][1].trim() : "";
 }
 
@@ -938,6 +938,9 @@ async function tick({ dryRun = false } = {}) {
       if (active) active.failures.push(failureEventFor(f.anchorPath, active.config, f.scope, f.kind, f.stableTarget, f.message));
       else recordLocalFailure(f.anchorPath || "_", null, f.scope, f.kind, f.stableTarget, f.message);
     }
+    if (!dryRun && reg.autoUpdate && !updateFailures.some((f) => !f.anchorPath)) {
+      for (const active of anchors) active.checkedScopes.add("update");
+    }
 
     // Reap + count across every active (workspace, sweep). Cheap; always runs.
     const now = Date.now();
@@ -1005,7 +1008,7 @@ async function tick({ dryRun = false } = {}) {
         active.checkedScopes.add("holding");
         const orphans = foreignClaimReleases(held, now);
         if (!dryRun) {
-          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("_", "orphan-reap", d.identifier, e.message); } }
+          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
         } else if (orphans.length) {
           logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding states`);
         }

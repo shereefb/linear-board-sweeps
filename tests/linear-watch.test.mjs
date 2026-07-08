@@ -339,6 +339,16 @@ test("failureTodoDecisions: updates changed messages and throttles unchanged mes
   const unchangedOld = failureTodoDecisions([event], [existingFailureTodo(fp, { lastMessage: "new failure text", updatedAt: hoursAgo(26) })], new Set(["dev"]), NOW);
   assert.equal(unchangedOld[0].action, "update");
 });
+test("failureTodoDecisions: unchanged multiline messages are throttled", () => {
+  const event = failureEvent({ message: "first line\nsecond line" });
+  const fp = failureFingerprint(event);
+  const todo = existingFailureTodo(fp, {
+    lastMessage: undefined,
+    updatedAt: minsAgo(10),
+    description: failureTodoBody(event, fp),
+  });
+  assert.deepEqual(failureTodoDecisions([event], [todo], new Set(["dev"]), NOW), []);
+});
 test("failureTodoDecisions: only closes recovered Todos for checked scopes", () => {
   const fp = failureFingerprint(failureEvent());
   const unchecked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["qa"]), NOW);
@@ -361,6 +371,12 @@ test("failureTodoDecisions: holding-state failures use the holding recovery scop
   const fp = failureFingerprint(event);
   const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "holding" })], new Set(["holding"]), NOW);
   assert.equal(checked[0].action, "close");
+});
+test("failureTodoDecisions: update failures recover when update is checked", () => {
+  const event = failureEvent({ scope: "update", kind: "skills-refresh" });
+  const fp = failureFingerprint(event);
+  assert.deepEqual(failureTodoDecisions([], [existingFailureTodo(fp, { scope: "update" })], new Set(["dev"]), NOW), []);
+  assert.equal(failureTodoDecisions([], [existingFailureTodo(fp, { scope: "update" })], new Set(["update"]), NOW)[0].action, "close");
 });
 test("failureTodoDecisions: duplicate matching Todos are commented deterministically", () => {
   const event = failureEvent();
