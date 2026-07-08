@@ -6,6 +6,7 @@
 //   node linear-watch.mjs register <anchor-repo-path>     # add a workspace anchor
 //   node linear-watch.mjs unregister <anchor-repo-path>
 //   node linear-watch.mjs list                            # anchors + projectId + auto-sweep?
+//   node linear-watch.mjs ship-runner [on|off]            # pin ship-sweep dispatch to THIS host
 //   node linear-watch.mjs tick [--dry-run]                # one scheduled pass (launchd calls this)
 //   node linear-watch.mjs health                          # last-tick age; non-zero exit if stale
 //
@@ -35,7 +36,9 @@ const LAST_TICK = path.join(STATE_DIR, "last-tick");
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
-export const REAPER_TAG = "[auto-sweep-reaper]";
+export const REAPER_TAG = "[auto-sweep-reaper]"; // crash-reap audit marker — COUNTED by the escalate-crash counter
+export const ORPHAN_TAG = "[auto-sweep-orphan]"; // foreign/orphan claim release — distinct so it doesn't inflate the crash count
+export const PARK_TAG = "[auto-sweep-parked]"; // bounce-escalation park — distinct from REAPER_TAG and BOUNCE_TAG
 export const BOUNCE_TAG = "[auto-sweep-bounce";
 export const CRASH_ESCALATE_AFTER = 3; // reaps within the window before blocking
 export const BOUNCE_ESCALATE_AFTER = 2; // backward bounces within the window before blocking
@@ -44,14 +47,27 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
-// longest NORMAL single-card run for that sweep.
+// longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
+// bake + docs, so it gets the same generous window as qa.
 export const SWEEP_CFG = {
-  spec: { states: ["Needs Spec"], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 30 },
+  spec: { states: ["Needs Spec"], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 45 },
   dev: { states: ["Ready for Dev", "In Progress"], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
   qa: { states: ["In Review"], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user"], staleMin: 120 },
+  ship: { states: ["Ready to Ship"], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 },
 };
-// Selection order: push work toward Done first.
-export const SWEEP_ORDER = ["qa", "dev", "spec"];
+// Every list below derives from SWEEP_CFG so adding a sweep is a one-line change.
+export const SWEEPS = Object.keys(SWEEP_CFG); // spec, dev, qa, ship — iteration order
+// Dispatch priority: push the MOST-downstream work first (ship a blessed card
+// before starting new QA, etc.). Explicit so it doesn't rely on indexOf(-1) luck.
+export const SWEEP_ORDER = ["ship", "qa", "dev", "spec"];
+// The kit skill directories the auto-updater propagates to anchors — one per sweep.
+export const SKILL_DIRS = SWEEPS.map((s) => `${s}-sweep`);
+// Holding states can carry a stale claim but are fetched by NO sweep (a sweep's
+// own states are reaped in the main loop). qa moves a card to "QA Passed" and
+// then drops qa:in-progress; a crash between those strands the claim here.
+export const HOLDING_STATES = ["QA Passed"];
+export const ALL_CLAIMS = SWEEPS.map((s) => SWEEP_CFG[s].claim);
+export const MAX_STALE_MIN = Math.max(...SWEEPS.map((s) => SWEEP_CFG[s].staleMin));
 
 const AUTO_SWEEP_LABEL = "auto-sweep";
 
@@ -164,6 +180,26 @@ export function reapDecisions(cards, cfg, now) {
   return out;
 }
 
+// Release stale claims that no per-sweep reaper will handle: a claim stranded in
+// a HOLDING state (no sweep fetches it — e.g. qa:in-progress left in "QA Passed"),
+// or a FOREIGN claim in a sweep's state (a sweep reaps only its OWN cfg.claim, so
+// e.g. a ship:in-progress dragged into "In Review" is invisible to qa's reaper).
+// Batches ALL of a card's releasable claims into ONE decision so a single write
+// clears them together — releasing per-claim with full-set overwrites would
+// re-add earlier removals. `ownClaim` (a sweep's cfg.claim, or null in a holding
+// state) is left to that sweep's own reaper (which also escalates). Uses
+// MAX_STALE_MIN: a live run of the owning sweep can't be sitting in this state,
+// so the conservative threshold never false-releases a live claim. Pure.
+export function foreignClaimReleases(cards, now, ownClaim = null, claims = ALL_CLAIMS, staleMin = MAX_STALE_MIN) {
+  const out = [];
+  for (const card of cards) {
+    if (heartbeatAgeMin(card, now) <= staleMin) continue; // a live run may be mid-transition
+    const releaseClaims = claims.filter((c) => c !== ownClaim && hasLabel(card, c));
+    if (releaseClaims.length) out.push({ id: card.id, identifier: card.identifier, action: "reap-orphan", releaseClaims });
+  }
+  return out;
+}
+
 // Extract the unordered state-pair from a `[auto-sweep-bounce <from>→<to>]`
 // marker body (null if not a bounce marker). Unordered so A→B and B→A count as
 // the same oscillating pair.
@@ -259,10 +295,14 @@ export function parseEnv(text) {
 // ── IO: filesystem / registry ────────────────────────────────────────────────
 
 function readRegistry() {
-  if (!fs.existsSync(REGISTRY_PATH)) return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, repos: [] };
+  // shipRunner (default false): only a host whose registry sets it true may
+  // DISPATCH ship-sweep — the single-runner pin that closes the cross-host
+  // double-deploy race. Set it on exactly one machine.
+  if (!fs.existsSync(REGISTRY_PATH)) return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [] };
   const r = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
   r.repos = r.repos || [];
   r.kitRef = r.kitRef || "main";
+  r.shipRunner = r.shipRunner === true;
   return r;
 }
 
@@ -436,24 +476,42 @@ async function addComment(apiKey, issueId, body) {
   await gql(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body }, apiKey);
 }
 
+// Drop one or more claim labels (+ optionally add labels) in a SINGLE write, and
+// keep the in-memory card.labelIds in sync so a later executor on the same card
+// computes from current state, not the pre-write snapshot (otherwise a full-set
+// overwrite re-adds what an earlier write removed). Returns nothing.
+async function applyLabelEdit(apiKey, card, { remove = [], add = {} }) {
+  for (const name of remove) delete card.labelIds[name];
+  for (const [name, id] of Object.entries(add)) card.labelIds[name] = id; // add after remove: add wins on a name collision
+  card.labelNames = Object.keys(card.labelIds);
+  await setIssueLabels(apiKey, card.id, Object.values(card.labelIds));
+}
+
 // Execute a reap/escalate decision: drop the claim label (+ optionally add
 // blocked:needs-user) and post the audit comment.
 async function executeReap(apiKey, card, decision, labelMap, sweep) {
-  const keep = Object.entries(card.labelIds).filter(([name]) => name !== decision.releaseClaim).map(([, id]) => id);
   if (decision.action === "escalate-crash" && labelMap["blocked:needs-user"]) {
-    await setIssueLabels(apiKey, card.id, [...keep, labelMap["blocked:needs-user"]]);
+    await applyLabelEdit(apiKey, card, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
     await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` and set **blocked:needs-user** — the ${sweep} sweep has stranded this card ${decision.count}× (the runtime likely keeps dying on it). Needs a human before it retries.`);
   } else {
-    await setIssueLabels(apiKey, card.id, keep);
+    await applyLabelEdit(apiKey, card, { remove: [decision.releaseClaim] });
     await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
   }
 }
 
+// Release orphaned/foreign claims (all of a card's, in one write) — no escalation;
+// the card advanced and the owning sweep just crashed before dropping its claim.
+// Uses ORPHAN_TAG (not REAPER_TAG) so it does not inflate the crash-escalation count.
+async function executeOrphanReap(apiKey, card, decision) {
+  await applyLabelEdit(apiKey, card, { remove: decision.releaseClaims });
+  const list = decision.releaseClaims.map((c) => `\`${c}\``).join(", ");
+  await addComment(apiKey, card.id, `${ORPHAN_TAG} Auto-released orphaned claim(s) ${list} — stale heartbeat in a state their owning sweep does not run; the prior run likely crashed after advancing the card but before dropping its claim.`);
+}
+
 async function executeBounce(apiKey, card, labelMap) {
   if (!labelMap["blocked:needs-user"]) return;
-  const ids = [...Object.values(card.labelIds), labelMap["blocked:needs-user"]];
-  await setIssueLabels(apiKey, card.id, ids);
-  await addComment(apiKey, card.id, `${REAPER_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
+  await applyLabelEdit(apiKey, card, { add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
+  await addComment(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
 }
 
 // ── IO: auto-update ──────────────────────────────────────────────────────────
@@ -464,9 +522,11 @@ function kitMarker(kitPath) {
   return git(kitPath, ["rev-parse", "HEAD"], { allowFail: true }).out || null;
 }
 
-// Copy the three skill dirs + version stamp into a checkout root.
+// Copy every sweep skill dir + version stamp into a checkout root. Derived from
+// SKILL_DIRS (= SWEEP_CFG keys) so a new sweep propagates to anchors with no edit
+// here — miss this and the new skill never reaches the machines that run it.
 function copySkillsInto(root, kit, marker) {
-  for (const s of ["spec-sweep", "dev-sweep", "qa-sweep"]) {
+  for (const s of SKILL_DIRS) {
     fs.cpSync(path.join(kit, "skills", s), path.join(root, ".claude", "skills", s), { recursive: true });
   }
   fs.writeFileSync(path.join(root, ".claude", "skills", ".sweep-version"), marker + "\n");
@@ -588,12 +648,15 @@ async function tick({ dryRun = false } = {}) {
       // an idle workspace never pays for it (keeps the idle path cheap).
       let _labelMap = null;
       const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
-      for (const sweep of ["spec", "dev", "qa"]) {
+      for (const sweep of SWEEPS) {
         const cfg = SWEEP_CFG[sweep];
         let cards;
         try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); continue; }
         const reaps = reapDecisions(cards, cfg, now);
-        const bounces = bounceDecisions(cards, cfg, now);
+        // Bounce-escalation is a backward-oscillation guard for the earlier stages.
+        // Skip it for ship: a card in "Ready to Ship" was human-approved, and its
+        // historical bounce markers (from earlier dev/qa churn) must not re-block it.
+        const bounces = sweep === "ship" ? [] : bounceDecisions(cards, cfg, now);
         if (!dryRun && (reaps.length || bounces.length)) {
           let labelMap;
           try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); labelMap = null; }
@@ -607,11 +670,44 @@ async function tick({ dryRun = false } = {}) {
         // Reflect the decisions in memory so the count is correct: a reaped card
         // becomes actionable, an escalated (crash or bounce) card is now blocked.
         applyDecisionsInMemory(cards, reaps, bounces);
+        // Release FOREIGN stale claims stranded in this sweep's states — a sweep's
+        // own reaper handles only its cfg.claim, so e.g. a ship:in-progress dragged
+        // into "In Review" would otherwise leak forever. Reuses the fetched cards
+        // (no extra query). Runs on every host (cleanup, not dispatch).
+        const foreign = foreignClaimReleases(cards, now, cfg.claim);
+        if (!dryRun && foreign.length) {
+          for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); } }
+        } else if (dryRun && foreign.length) {
+          logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
+        }
         const actionable = actionableCards(cards, cfg, now);
         const oldest = actionable.length ? Math.min(...actionable.map((c) => Date.parse(c.updatedAt))) : 0;
         logFor(anchorPath, sweep, `${actionable.length} actionable`);
+        // ship merges + deploys to prod. Only the single designated runner may
+        // DISPATCH it (closes the cross-host double-deploy race — the claim label
+        // alone is a check-then-set with no atomicity). Reaping above still runs
+        // on every host, so a stale ship claim is released regardless of runner.
+        if (sweep === "ship" && !reg.shipRunner) {
+          if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
+          continue;
+        }
         if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, oldestUpdatedAt: oldest });
       }
+
+      // Holding-state reaper: release claims stranded in states no sweep fetches
+      // (e.g. qa:in-progress left on a "QA Passed" card by a crash between the
+      // status move and the claim drop). ownClaim=null → any stale claim here is
+      // orphaned. Cheap; runs after the per-sweep loop. executeOrphanReap needs no
+      // teamLabelMap (it removes by id from the card), so it is not gated on one.
+      try {
+        const held = await fetchCards(apiKey, config.teamKey, config.projectId, HOLDING_STATES);
+        const orphans = foreignClaimReleases(held, now);
+        if (!dryRun) {
+          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); } }
+        } else if (orphans.length) {
+          logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding states`);
+        }
+      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); }
     }
 
     // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
@@ -666,8 +762,17 @@ async function cmdActivate(anchorPath, on) {
   console.log(`${on ? "activated" : "deactivated"} auto-sweep on project ${config.projectId} (${path.basename(abs)})`);
 }
 
+// Toggle this host's ship-runner pin (only a shipRunner host dispatches ship-sweep).
+function cmdShipRunner(arg) {
+  const reg = readRegistry();
+  if (arg === "on" || arg === "off") { reg.shipRunner = arg === "on"; writeRegistry(reg); }
+  else if (arg) { console.error(`usage: ship-runner [on|off]`); process.exit(1); }
+  console.log(`shipRunner: ${reg.shipRunner ? "ON — this host may dispatch ship-sweep (merge + deploy to prod)" : "off — this host will NOT dispatch ship-sweep"}`);
+}
+
 async function cmdList() {
   const reg = readRegistry();
+  console.log(`ship-runner: ${reg.shipRunner ? "ON (this host)" : "off"}`);
   if (!reg.repos.length) { console.log("(no anchors registered)"); return; }
   const labeledByKey = new Map();
   for (const anchorPath of reg.repos) {
@@ -708,10 +813,11 @@ async function main() {
     case "activate": return cmdActivate(args[0] || ".", true);
     case "deactivate": return cmdActivate(args[0] || ".", false);
     case "list": return cmdList();
+    case "ship-runner": return cmdShipRunner(args[0]);
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | list | tick [--dry-run] | health");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | tick [--dry-run] | health");
       process.exit(1);
   }
 }

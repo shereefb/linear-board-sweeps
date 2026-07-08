@@ -22,14 +22,17 @@ List "Ready for Dev" + "In Progress" cards **in `config.project`**, oldest-first
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
 - **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to "Needs Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. (The spec-sweep loop re-specs it.)
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
+- **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify it from the spec/plan + diff surface and apply the matching domain labels to Linear (comment what you applied). This drives the gated quality lenses in §2. A human relabel always wins — never override one.
 - Process **at most 2 cards per run**. If none are actionable, exit cleanly (normal no-op).
 
 ## 2. Per feature — build it
 
 1. **Isolate on a worktree.** Create a git worktree off `main` (superpowers:using-git-worktrees), branch named with the `<PREFIX>-###` key, in the correct repo from `config.repos`. One worktree per card — features never share a tree.
-2. **Develop against the spec + plan** (and any review-comment change requests). Use subagents / parallel work where the design decomposes cleanly; prefer TDD (superpowers:test-driven-development) for logic. Match existing code conventions.
+2. **Develop against the spec + plan** (and any review-comment change requests). Use subagents / parallel work where the design decomposes cleanly; prefer TDD (superpowers:test-driven-development) for logic. Match existing code conventions. **For a frontend card, run a design pass (`/frontend-design` or a taste pass like `/design-taste-frontend`) as you build** — raise the visual floor here so qa-sweep isn't the first design feedback.
 3. **Update canonical docs** per `config.canonicalDocs`. If the feature changes data shape / subsystems and the config names architecture/schema docs, update them (marking not-yet-live as planned). For a single-repo project keep the architecture doc (e.g. `CLAUDE.md`) accurate.
-4. **Code review — run BOTH.** Run `/code-review` (the code-review skill) on the diff AND the `code-reviewer` subagent (feature-dev:code-reviewer) for an independent pass. Fix every real finding until quality is genuinely great; re-review after fixes. Verify the build + tests are green (`npm run build`, `npm test`, `npm run lint` as applicable).
+4. **Gated quality lenses (by card type).** In addition to the always-on code review below: a **security-sensitive card** (auth / data / external input) → `/cso` on the actual diff (the plan-review caught design flaws; this catches implementation flaws). A **perf-sensitive card** → `/benchmark` in the worktree before landing. Fold findings in.
+5. **Code review — run BOTH.** Run `/code-review` (the code-review skill) on the diff AND the `code-reviewer` subagent (feature-dev:code-reviewer) for an independent pass. Fix every real finding until quality is genuinely great; re-review after fixes.
+6. **Verify green — observed, not asserted.** Confirm the build + tests are green (`npm run build`, `npm test`, `npm run lint` as applicable), and use the `verify` skill to exercise the change end-to-end so "it works" is something you watched happen, not a claim.
 
 ## 3. Land at "In Review" (no merge)
 
