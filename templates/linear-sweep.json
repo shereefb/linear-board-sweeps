@@ -1,0 +1,18 @@
+{
+  "$comment": "Repo-local config for the spec/dev/qa board sweeps. Copy to <target-repo>/.claude/linear-sweep.json and fill in. Nothing in the skills is hardcoded — they read this file.",
+  "teamName": "<Linear team name, e.g. Codex>",
+  "teamKey": "<Linear team key, e.g. COD>",
+  "project": "<Linear project name, e.g. My App>",
+  "projectId": "<project uuid — get it from: node scripts/linear.mjs ensure-project \"<team>\" \"<project>\">",
+  "issuePrefix": "<team key used in card ids, e.g. COD>",
+  "repos": ["<repo folder name(s) the sweeps may touch>"],
+  "specsDir": "docs/superpowers/specs",
+  "plansDir": "docs/superpowers/plans",
+  "canonicalDocs": {
+    "$comment": "Single-repo projects can point architecture at CLAUDE.md/AGENTS.md and leave schema null. Multi-repo setups name a canonical schema.md/architecture.md pair.",
+    "architecture": "CLAUDE.md",
+    "schema": null
+  },
+  "deploy": "<how this project reaches production — e.g. 'Vercel auto-deploys on push to main; some changes need a Vercel env var, a DB migration applied, or a platform CLI deploy'>",
+  "credentialsNote": "<where app + tooling secrets live — e.g. '.env.local for app secrets; Linear key in gitignored .env'>"
+}

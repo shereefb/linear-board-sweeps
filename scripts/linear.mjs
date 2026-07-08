@@ -1,0 +1,138 @@
+#!/usr/bin/env node
+// Portable Linear engine for the board-sweeps workflow. No dependencies (Node 18+ global fetch).
+// Auth: LINEAR_API_KEY in the environment (load from a gitignored .env: `set -a && . ./.env && set +a`).
+//
+// Usage:
+//   node linear.mjs whoami
+//   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
+//   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
+//   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
+//   node linear.mjs query '{ viewer { name } }'            # raw GraphQL
+//
+// The canonical board definition the sweeps depend on:
+export const REQUIRED_STATES = [
+  { name: "Needs Spec", type: "unstarted", color: "#9b59b6" },
+  { name: "Ready for Dev", type: "unstarted", color: "#4ea7fc" },
+  { name: "Archived", type: "completed", color: "#95a2b3" },
+  // Backlog / Todo / In Progress / In Review / Done / Canceled / Duplicate are Linear defaults —
+  // setup-team only creates the three above if missing.
+];
+export const REQUIRED_LABELS = [
+  { name: "spec:in-progress", color: "#4cb782" },
+  { name: "dev:in-progress", color: "#4cb782" },
+  { name: "qa:in-progress", color: "#4cb782" },
+  { name: "qa:needs-changes", color: "#f2994a" },
+  { name: "blocked:open-questions", color: "#eb5757" },
+  { name: "blocked:needs-user", color: "#eb5757" },
+];
+
+const API = "https://api.linear.app/graphql";
+const KEY = process.env.LINEAR_API_KEY;
+
+async function gql(query, variables) {
+  if (!KEY) throw new Error("LINEAR_API_KEY not set. Load it from your gitignored .env: `set -a && . ./.env && set +a`.");
+  const res = await fetch(API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: KEY },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error("Linear API error: " + JSON.stringify(json.errors));
+  return json.data;
+}
+
+async function findTeam(nameOrKey) {
+  const d = await gql(`{ teams(first:250){ nodes { id name key } } }`);
+  const q = nameOrKey.toLowerCase();
+  const t = d.teams.nodes.find((n) => n.name.toLowerCase() === q || n.key.toLowerCase() === q);
+  if (!t) throw new Error(`Team "${nameOrKey}" not found. Available: ${d.teams.nodes.map((n) => `${n.name} (${n.key})`).join(", ")}`);
+  return t;
+}
+
+async function whoami() {
+  const d = await gql(`{ viewer { name email } teams(first:250){ nodes { name key } } }`);
+  console.log(`viewer: ${d.viewer.name} <${d.viewer.email}>`);
+  console.log("teams:");
+  d.viewer && d.teams.nodes.forEach((t) => console.log(`  ${t.name} (${t.key})`));
+}
+
+async function setupTeam(nameOrKey) {
+  const team = await findTeam(nameOrKey);
+  const d = await gql(
+    `query($id:String!){ team(id:$id){ states(first:100){nodes{name}} labels(first:250){nodes{name}} } }`,
+    { id: team.id }
+  );
+  const haveStates = new Set(d.team.states.nodes.map((s) => s.name));
+  const haveLabels = new Set(d.team.labels.nodes.map((l) => l.name));
+
+  for (const s of REQUIRED_STATES) {
+    if (haveStates.has(s.name)) { console.log(`state "${s.name}": exists`); continue; }
+    const r = await gql(
+      `mutation($i:WorkflowStateCreateInput!){ workflowStateCreate(input:$i){ success } }`,
+      { i: { teamId: team.id, name: s.name, type: s.type, color: s.color } }
+    );
+    console.log(`state "${s.name}": ${r.workflowStateCreate.success ? "CREATED" : "FAILED"}`);
+  }
+  for (const l of REQUIRED_LABELS) {
+    if (haveLabels.has(l.name)) { console.log(`label "${l.name}": exists`); continue; }
+    const r = await gql(
+      `mutation($i:IssueLabelCreateInput!){ issueLabelCreate(input:$i){ success } }`,
+      { i: { teamId: team.id, name: l.name, color: l.color } }
+    );
+    console.log(`label "${l.name}": ${r.issueLabelCreate.success ? "CREATED" : "FAILED"}`);
+  }
+  console.log(`\nTeam "${team.name}" (${team.key}) ready. teamId=${team.id}`);
+}
+
+async function ensureProject(teamNameOrKey, projectName) {
+  const team = await findTeam(teamNameOrKey);
+  const d = await gql(
+    `query($id:String!){ team(id:$id){ projects(first:250){ nodes { id name } } } }`,
+    { id: team.id }
+  );
+  const existing = d.team.projects.nodes.find((p) => p.name.toLowerCase() === projectName.toLowerCase());
+  if (existing) { console.log(`project "${projectName}" exists: ${existing.id}`); return existing.id; }
+  const r = await gql(
+    `mutation($i:ProjectCreateInput!){ projectCreate(input:$i){ success project { id name } } }`,
+    { i: { name: projectName, teamIds: [team.id] } }
+  );
+  console.log(`project "${projectName}" CREATED: ${r.projectCreate.project.id}`);
+  return r.projectCreate.project.id;
+}
+
+async function createCard(projectId, stateName, title, description, labelsCsv) {
+  // Resolve the project's team, then map state + label names to ids.
+  const pd = await gql(`query($id:String!){ project(id:$id){ teams(first:1){nodes{id}} } }`, { id: projectId });
+  const teamId = pd.project.teams.nodes[0].id;
+  const meta = await gql(
+    `query($id:String!){ team(id:$id){ states(first:100){nodes{id name}} labels(first:250){nodes{id name}} } }`,
+    { id: teamId }
+  );
+  const stateId = meta.team.states.nodes.find((s) => s.name === stateName)?.id;
+  if (!stateId) throw new Error(`State "${stateName}" not found on the team. Run setup-team first.`);
+  const labelNames = (labelsCsv || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const labelIds = labelNames
+    .map((n) => meta.team.labels.nodes.find((l) => l.name === n)?.id)
+    .filter(Boolean);
+  const r = await gql(
+    `mutation($i:IssueCreateInput!){ issueCreate(input:$i){ success issue { identifier url } } }`,
+    { i: { teamId, projectId, title, description, stateId, labelIds } }
+  );
+  const iss = r.issueCreate.issue;
+  console.log(`${iss.identifier} [${stateName}] ${title}\n  ${iss.url}`);
+  return iss;
+}
+
+const [cmd, ...args] = process.argv.slice(2);
+const run = {
+  whoami: () => whoami(),
+  "setup-team": () => setupTeam(args[0]),
+  "ensure-project": () => ensureProject(args[0], args[1]),
+  "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
+  query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
+};
+if (!run[cmd]) {
+  console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | query <graphql>");
+  process.exit(1);
+}
+run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
