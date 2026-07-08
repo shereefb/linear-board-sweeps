@@ -92,6 +92,7 @@ Recent and planned launcher/workflow changes:
 - `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
 - `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
 - `COD-99`: retire the `In Progress` state from normal workflow; `Ready for Dev` plus `dev:in-progress` becomes the active-dev representation.
+- `COD-100`: planned same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, and ship still serial.
 
 ## Requirements
 
