@@ -823,7 +823,7 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   }
 }
 
-function runUpdate(reg, onFailure = () => {}) {
+export function runUpdate(reg, onFailure = () => {}) {
   if (!reg.autoUpdate || !reg.kitPath) return;
   const kit = reg.kitPath;
   if (reg.kitRemote) {
@@ -836,7 +836,13 @@ function runUpdate(reg, onFailure = () => {}) {
     }
   }
   const before = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
-  git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
+  const fetchResult = git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
+  if (fetchResult.status !== 0) {
+    const msg = `kit fetch failed for origin/${reg.kitRef}: ${fetchResult.err}`;
+    log(`update: ${msg}`);
+    onFailure(null, "update", "kit-fetch", kit, msg);
+    return;
+  }
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
   if (merge.status !== 0) {
     const msg = `kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`;
