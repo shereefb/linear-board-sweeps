@@ -12,11 +12,13 @@ Point Claude or Codex at this repo from any project, on any machine, and it has 
 
 ## Use it
 
-Tell your agent, from inside the target repo:
+From inside the target repo, tell your agent (Claude Code or Codex):
 
-> "Set up the board-sweeps workflow from `<path-to>/linear-board-sweeps` — follow its SETUP.md."
+> "Set up the Linear board-sweeps workflow in this repo. Clone `https://github.com/shereefb/linear-board-sweeps` into a sibling folder if it isn't already there, then follow its SETUP.md."
 
-The agent reads [SETUP.md](SETUP.md) and does the rest: prompts you for your Linear team/project/key, creates the board statuses + labels, installs the skills, writes the repo config, wires the Codex adapter, and tells you how to run it. You provide a Linear API key (`lin_api_…`) once.
+**The agent does everything** — it clones this kit itself, reads [SETUP.md](SETUP.md), then creates the board statuses + labels, installs the skills, writes the repo config, wires the Codex adapter, and tells you how to run it. The only things it needs from you: a Linear API key (`lin_api_…`) once, and your team/project name.
+
+(SETUP.md Step 0 handles the clone, so the same prompt works whether or not the kit is already on the machine.)
 
 ## What's inside
 

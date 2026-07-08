@@ -40,7 +40,7 @@ List "Ready for Dev" + "In Progress" cards **in `config.project`**, oldest-first
 ## 4. Blocked / hand-offs
 
 - **Needs the user to continue *development*** (a product decision, missing credential/asset, an API only they can provision): add `blocked:needs-user`, **keep the card in "Ready for Dev"**, comment exactly what's needed, and leave it. Resume when they reply. Ask once.
-- **Needs the user to *deploy / ship*** (an env var, a prod migration, a third-party registration like `hs project upload`, an operator config — see `config.deploy`): don't block the dev — **create a new Linear card in status "Todo"** in `config.project` describing the ship prerequisite, link it to the feature card, and continue.
+- **Needs a human-only action you can't perform** (an env var / secret set in the hosting dashboard, a prod migration, a DNS record, a webhook registered in a third-party console, an OAuth app connected, a billing/plan approval, any platform deploy step you can't trigger — see `config.deploy` and the `Todo` lane in the board rules): don't block the dev — **create a new Linear card in status "Todo"** in `config.project` stating *what* to do, *where* (which dashboard/console), and *why* (which feature it unblocks); link it to the feature card, and continue. If the agent could do it itself, do it — don't make a `Todo`.
 
 ## Guardrails
 

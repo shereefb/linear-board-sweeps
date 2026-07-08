@@ -14,10 +14,24 @@ The pipeline flows left → right. Linear ships most of these by default; the sw
 | `In Progress` | started | Actively being built | **dev-sweep** (or human) |
 | `In Review` | started | Built, pushed, awaiting QA | **dev-sweep** |
 | `Done` | completed | Smoke-tested + merged + deployed | **qa-sweep** |
-| `Todo` | unstarted | Ship prerequisite (env var, migration, platform deploy) | dev/qa-sweep spins these off |
+| `Todo` | unstarted | **A human action item the agent can't do** (see below) | dev/qa-sweep (or any sweep) spins these off |
 | `Canceled` | canceled | Won't do | human |
 | `Duplicate` | duplicate | Superseded by another card | anyone |
 | `Archived` | completed | Recorded for history; superseded/retired work | anyone |
+
+### The `Todo` lane — things only the user can do
+
+`Todo` is the board's hand-off lane for **work the agent cannot perform itself and must delegate to the human.** Whenever a sweep hits a step that requires a person — a credential, a console click, a real-world action — it does **not** silently block or drop it. It extracts a `Todo` card describing exactly what the user must do, links it to the feature card, and keeps going. This gives the user a single tracked list of "what's waiting on me."
+
+Typical `Todo` cards:
+
+- **Infra / DNS** — add a DNS record, point a domain, configure a CDN.
+- **Credentials & secrets** — provision an API key, set an env var in the hosting dashboard (Vercel/Fly/etc.), rotate a token.
+- **Third-party portals** — register a webhook in an external console, connect an OAuth app, verify a sender domain, upload an app to a store.
+- **Platform / deploy steps the agent can't trigger** — apply a prod DB migration, run a one-off deploy command, flip a feature flag in a SaaS UI.
+- **Account / billing / legal** — approve a paid plan, sign a DPA, grant a permission the agent lacks.
+
+Each `Todo` card should state, in plain language: *what* to do, *where* (which dashboard/console), and *why* (which feature it unblocks). When the user finishes it, they move the card to `Done` (or comment "done") and the linked feature can proceed. A `Todo` is never something the agent could have done itself — if the agent can do it, it does, and no card is created.
 
 ## Workflow labels
 

@@ -6,8 +6,13 @@ Do the work; don't just describe it. Prompt the user only for the inputs in Step
 
 ---
 
-## Step 0 — Prerequisites
+## Step 0 — Get the kit + prerequisites
 
+- **Obtain `KIT` yourself.** If you're already reading this file, you have it — set `KIT` to its path. If not (the user gave you only the prompt), clone it into a folder sibling to `TARGET` and use that as `KIT`:
+  ```bash
+  git clone https://github.com/shereefb/linear-board-sweeps "$(dirname "$TARGET")/linear-board-sweeps"
+  ```
+  If the sibling folder already exists, `git -C "<that path>" pull` instead of cloning. Don't ask the user to clone it — do it.
 - Node 18+ (for `scripts/linear.mjs`, which uses global `fetch`).
 - The user needs a **Linear API key** (`lin_api_…`): Linear → Settings → Security & access → Personal API keys → Create key.
 - `TARGET` is a git repo.

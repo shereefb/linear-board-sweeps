@@ -16,7 +16,7 @@ Three Linear board sweeps drive features from idea → shipped on the **<TEAM>**
 - **Dev sweep** — "Ready for Dev" + "In Progress" → "In Review" (writes code on a worktree, runs code review + an independent reviewer subagent, pushes the branch, no merge): `.claude/skills/dev-sweep/SKILL.md`.
 - **QA sweep** — "In Review" → "Done" (smoke-test as a user, fix UX bugs, screenshots to the card, then MERGE + DEPLOY TO PROD): `.claude/skills/qa-sweep/SKILL.md`. Higher-risk — ships only a green, smoke-tested feature; prefer attended.
 
-**Statuses:** Backlog → Needs Spec → Ready for Dev → In Progress → In Review → Done (plus Todo for ship prerequisites, Canceled/Duplicate/Archived). **Workflow labels:** `spec:in-progress`, `dev:in-progress`, `qa:in-progress`, `qa:needs-changes`, `blocked:open-questions`, `blocked:needs-user`.
+**Statuses:** Backlog → Needs Spec → Ready for Dev → In Progress → In Review → Done. Plus **`Todo`** = a human-only action item the agent can't do (DNS, a dashboard secret, a third-party console step, a deploy the agent can't trigger); sweeps spin these off and link them to the feature card so the user has one tracked to-do list. Also Canceled/Duplicate/Archived. **Workflow labels:** `spec:in-progress`, `dev:in-progress`, `qa:in-progress`, `qa:needs-changes`, `blocked:open-questions`, `blocked:needs-user`.
 
 **Auth:** `LINEAR_API_KEY` lives in the gitignored `.env` at repo root (`set -a && . ./.env && set +a`), never committed.
 
