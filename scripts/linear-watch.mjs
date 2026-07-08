@@ -944,7 +944,6 @@ async function tick({ dryRun = false } = {}) {
       }
       if (!labeledByKey.get(apiKey).has(config.projectId)) {
         logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`);
-        try { await reconcileFailureTodos(apiKey, config, anchorPath, [], new Set(["activation"]), envValues, { dryRun }); } catch { /* local health should stay green for paused projects */ }
         continue;
       }
       const active = { anchorPath, config, apiKey, envValues, failures: [], checkedScopes: new Set() };
