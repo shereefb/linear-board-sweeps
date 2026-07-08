@@ -911,6 +911,9 @@ async function tick({ dryRun = false } = {}) {
     const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
       localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
     };
+    const writeLastTick = () => {
+      if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null, failures: localFailures }) + "\n");
+    };
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
     };
@@ -1025,7 +1028,7 @@ async function tick({ dryRun = false } = {}) {
 
     // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
     // dispatch, so `health` doesn't read STALE during a legitimately long run.
-    if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null, failures: localFailures }) + "\n");
+    writeLastTick();
 
     // Dispatch at most one agent pass.
     const pick = selectDispatch(candidates);
@@ -1043,6 +1046,8 @@ async function tick({ dryRun = false } = {}) {
             await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set([dispatchScope]), active.envValues, { dryRun: false });
           } catch (e) {
             logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo", runtime, e.message);
+            writeLastTick();
           }
         }
       } else {
@@ -1053,6 +1058,8 @@ async function tick({ dryRun = false } = {}) {
             await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([dispatchScope]), active.envValues, { dryRun: false });
           } catch (e) {
             logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch recovery reconciliation failed: ${e.message}`);
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "failure-todo-recovery", pick.sweep, e.message);
+            writeLastTick();
           }
         }
       }
