@@ -14,6 +14,10 @@
     "qa":   { "model": "gpt-5.5", "effort": "high" },
     "ship": { "model": "gpt-5.5", "effort": "high" }
   },
+  "$comment_parallel": "Default bounded non-ship parallelism. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
+  "parallel": {
+    "maxNonShipDispatches": 2
+  },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
     "ui":       { "labels": ["frontend", "design", "ui"] },

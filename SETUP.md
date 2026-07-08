@@ -129,11 +129,11 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "ship": { "model": "gpt-5.5", "effort": "high" }
    },
    "parallel": {
-     "maxNonShipDispatches": 1
+     "maxNonShipDispatches": 2
    }
    ```
    Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. For Codex, prefer the best model available to the installed account (for this kit's default, `gpt-5.5` with `high` effort). For a `claude` workspace use claude model ids (e.g. `claude-opus-4-8`). Confirm the chosen `runtime` CLI (`codex` or `claude`) is installed and on `PATH`.
-   Keep `parallel.maxNonShipDispatches` at `1` unless this machine can comfortably run multiple non-ship agents; values above `1` act as a host-level cap for the tick and only parallelize disjoint anchors whose resolved repo paths do not overlap. ship-sweep is always serial.
+   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. Set it to `1` for serial mode on smaller machines; that workspace then runs alone or waits for the next tick. ship-sweep is always serial.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash

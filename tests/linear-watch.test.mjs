@@ -6,7 +6,7 @@ import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  selectDispatch, selectDispatchBatch, parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry, SWEEP_CFG,
+  selectDispatch, selectDispatchBatch, parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry, SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
@@ -207,19 +207,20 @@ test("selectDispatch: within a sweep, oldest card first; zero-count ignored; non
   assert.equal(pick.oldestUpdatedAt, 100);
   assert.equal(selectDispatch([{ sweep: "dev", count: 0, oldestUpdatedAt: 1 }]), null);
 });
-test("parallelLimit: defaults invalid, missing, and disabled config to one", () => {
-  assert.equal(parallelLimit({}), 1);
-  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: "lots" } }), 1);
-  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 0 } }), 1);
+test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
+  assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);
+  assert.equal(parallelLimit({}), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: "lots" } }), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 0 } }), 2);
+  assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 1 } }), 1);
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 2.8 } }), 2);
 });
-test("selectDispatchBatch: defaults to one non-ship dispatch", () => {
+test("selectDispatchBatch: defaults to bounded parallel non-ship dispatches", () => {
   const batch = selectDispatchBatch([
     { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
     { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
   ]);
-  assert.equal(batch.length, 1);
-  assert.equal(batch[0].anchorPath, "/ws/a");
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
 });
 test("selectDispatchBatch: dispatches disjoint anchors up to the configured non-ship limit", () => {
   const batch = selectDispatchBatch([
@@ -228,6 +229,20 @@ test("selectDispatchBatch: dispatches disjoint anchors up to the configured non-
     { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
   ], { maxNonShipDispatches: 2 });
   assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
+});
+test("selectDispatchBatch: a serial candidate runs alone or waits for another tick", () => {
+  const serialFirst = selectDispatchBatch([
+    { anchorPath: "/ws/serial", config: { repos: ["serial"], parallel: { maxNonShipDispatches: 1 } }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/default", config: { repos: ["default"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(serialFirst.map((c) => c.anchorPath), ["/ws/serial"]);
+
+  const serialSecond = selectDispatchBatch([
+    { anchorPath: "/ws/default-a", config: { repos: ["default-a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/serial", config: { repos: ["serial"], parallel: { maxNonShipDispatches: 1 } }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/default-b", config: { repos: ["default-b"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(serialSecond.map((c) => c.anchorPath), ["/ws/default-a", "/ws/default-b"]);
 });
 test("selectDispatchBatch: dedupes same anchor and overlapping resolved repos", () => {
   const batch = selectDispatchBatch([

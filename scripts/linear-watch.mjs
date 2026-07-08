@@ -46,6 +46,7 @@ export const BOUNCE_ESCALATE_AFTER = 2; // backward bounces within the window be
 export const ESCALATE_WINDOW_H = 48;
 export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
+export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -280,7 +281,7 @@ function rankedDispatchCandidates(candidates) {
 export function parallelLimit(config) {
   const raw = config?.parallel?.maxNonShipDispatches;
   const n = Math.floor(Number(raw));
-  return Number.isFinite(n) && n > 0 ? n : 1;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_NON_SHIP_DISPATCHES;
 }
 
 function repoSet(candidate) {
@@ -300,21 +301,24 @@ function overlapsAny(paths, usedPaths) {
   return false;
 }
 
-export function selectDispatchBatch(candidates, { maxNonShipDispatches = 1 } = {}) {
+export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT_MAX_NON_SHIP_DISPATCHES } = {}) {
   const ranked = rankedDispatchCandidates(candidates);
   const ship = ranked.find((c) => c.sweep === "ship");
   if (ship) return [ship];
 
-  const limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
+  let limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
   const picked = [];
   const usedAnchors = new Set();
   const usedRepos = new Set();
   for (const c of ranked.filter((candidate) => candidate.sweep !== "ship")) {
     if (picked.length >= limit) break;
+    const candidateLimit = parallelLimit(c.config);
+    if (picked.length + 1 > Math.min(limit, candidateLimit)) continue;
     if (usedAnchors.has(c.anchorPath)) continue;
     const repos = repoSet(c);
     if (overlapsAny(repos, usedRepos)) continue;
     picked.push(c);
+    limit = Math.min(limit, candidateLimit);
     usedAnchors.add(c.anchorPath);
     for (const repo of repos) usedRepos.add(repo);
   }
