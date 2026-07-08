@@ -58,7 +58,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `QA Passed`, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
-- **Bounded non-ship parallelism.** Optional `parallel.maxNonShipDispatches` lets one tick dispatch multiple non-ship sweeps, but only across anchors whose resolved repo paths do not overlap. Default `1` preserves serial behavior; ship always stays serial.
+- **Bounded non-ship parallelism.** Optional `parallel.maxNonShipDispatches` lets one tick dispatch multiple non-ship sweeps, but only across anchors whose resolved repo paths do not overlap. The tick uses the highest active candidate limit as the host-level cap. Default `1` preserves serial behavior; ship always stays serial.
 - **Per-workspace runtime + per-sweep model** live in `linear-sweep.json` (`runtime`, `models`), default `codex`.
 
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):

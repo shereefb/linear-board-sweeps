@@ -6,7 +6,7 @@ import {
   resolveRepos, worktreePath, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  selectDispatch, selectDispatchBatch, parallelLimit, parseEnv, pushWithRetry, SWEEP_CFG,
+  selectDispatch, selectDispatchBatch, parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry, SWEEP_CFG,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
 } from "../scripts/linear-watch.mjs";
@@ -234,6 +234,38 @@ test("selectDispatchBatch: dedupes same anchor and overlapping resolved repos", 
     { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
   ], { maxNonShipDispatches: 3 });
   assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
+});
+test("selectDispatchBatch: dedupes nested repo path overlap", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["/tmp/shared"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/b", config: { repos: ["/tmp/shared/subrepo"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
+    { anchorPath: "/ws/c", config: { repos: ["/tmp/other"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+  ], { maxNonShipDispatches: 3 });
+  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
+});
+test("dryRunDispatchMessages: reports every selected dispatch", () => {
+  const messages = dryRunDispatchMessages([
+    { anchorPath: "/ws/a", sweep: "dev", count: 2 },
+    { anchorPath: "/ws/b", sweep: "spec", count: 1 },
+  ]);
+  assert.deepEqual(messages, [
+    { anchorPath: "/ws/a", sweep: "dev", body: "[dry-run] WOULD dispatch (2 actionable)" },
+    { anchorPath: "/ws/b", sweep: "spec", body: "[dry-run] WOULD dispatch (1 actionable)" },
+  ]);
+});
+test("dispatchBatch: dispatches every selected child and returns exit codes", async () => {
+  const calls = [];
+  const statuses = await dispatchBatch([
+    { anchorPath: "/ws/a", sweep: "dev", config: {} },
+    { anchorPath: "/ws/b", sweep: "spec", config: {} },
+  ], {
+    dispatchFn: async (anchorPath, sweep, config) => {
+      calls.push({ anchorPath, sweep, config });
+      return sweep === "dev" ? 0 : 7;
+    },
+  });
+  assert.deepEqual(statuses, [0, 7]);
+  assert.deepEqual(calls.map((c) => `${c.anchorPath}:${c.sweep}`), ["/ws/a:dev", "/ws/b:spec"]);
 });
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────

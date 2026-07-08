@@ -14,7 +14,7 @@
     "qa":   { "model": "gpt-5.5", "effort": "high" },
     "ship": { "model": "gpt-5.5", "effort": "high" }
   },
-  "$comment_parallel": "Optional. Conservative default is 1. Values above 1 let the launcher run that many non-ship sweeps in one tick, but only across anchors whose resolved repo paths do not overlap. ship-sweep always stays serial.",
+  "$comment_parallel": "Optional. Conservative default is 1. The launcher uses the highest maxNonShipDispatches among active candidate workspaces for that tick. Values above 1 let the host run that many non-ship sweeps in one tick, but only across anchors whose resolved repo paths do not overlap. ship-sweep always stays serial.",
   "parallel": {
     "maxNonShipDispatches": 1
   },

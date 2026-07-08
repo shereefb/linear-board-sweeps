@@ -284,8 +284,16 @@ function repoSet(candidate) {
   return new Set(resolveRepos(candidate.anchorPath, candidate.config).map((r) => path.resolve(r.path)));
 }
 
+function pathsOverlap(a, b) {
+  const relAB = path.relative(a, b);
+  const relBA = path.relative(b, a);
+  return relAB === "" || relBA === "" || (!relAB.startsWith("..") && !path.isAbsolute(relAB)) || (!relBA.startsWith("..") && !path.isAbsolute(relBA));
+}
+
 function overlapsAny(paths, usedPaths) {
-  for (const p of paths) if (usedPaths.has(p)) return true;
+  for (const p of paths) {
+    for (const used of usedPaths) if (pathsOverlap(p, used)) return true;
+  }
   return false;
 }
 
@@ -308,6 +316,14 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = 1 } = {
     for (const repo of repos) usedRepos.add(repo);
   }
   return picked;
+}
+
+export function dryRunDispatchMessages(batch) {
+  return batch.map((pick) => ({
+    anchorPath: pick.anchorPath,
+    sweep: pick.sweep,
+    body: `[dry-run] WOULD dispatch (${pick.count} actionable)`,
+  }));
 }
 
 // Compatibility wrapper for older tests/callers that expect one dispatch.
@@ -681,8 +697,8 @@ function dispatchAsync(anchorPath, sweep, config) {
   });
 }
 
-async function dispatchBatch(batch) {
-  await Promise.all(batch.map((c) => dispatchAsync(c.anchorPath, c.sweep, c.config)));
+export async function dispatchBatch(batch, { dispatchFn = dispatchAsync } = {}) {
+  return Promise.all(batch.map((c) => dispatchFn(c.anchorPath, c.sweep, c.config)));
 }
 
 // ── tick orchestration ───────────────────────────────────────────────────────
@@ -789,7 +805,7 @@ async function tick({ dryRun = false } = {}) {
     const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
     if (!batch.length) log("no actionable work — cheap tick");
     else if (dryRun) {
-      for (const pick of batch) logFor(pick.anchorPath, pick.sweep, `[dry-run] WOULD dispatch (${pick.count} actionable)`);
+      for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
     } else await dispatchBatch(batch);
   } finally {
     if (!dryRun) releaseTickLock();
