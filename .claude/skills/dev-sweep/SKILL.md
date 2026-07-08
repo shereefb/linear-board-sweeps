@@ -1,11 +1,11 @@
 ---
 name: dev-sweep
-description: Develop the configured Linear project's "Ready for Dev" + "In Progress" cards on isolated worktrees, run code review, then move to "In Review" and push the branch (no merge). Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "develop the ready-for-dev cards", "run the dev sweep", or on a schedule.
+description: Develop the configured Linear project's "Ready for Dev" cards on isolated worktrees, run code review, then move to "In Review" and push the branch (no merge). Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "develop the ready-for-dev cards", "run the dev sweep", or on a schedule.
 ---
 
 # Dev Sweep
 
-Build features from cards that are "Ready for Dev" or "In Progress", one worktree per feature, with subagents/parallel work where it helps. Land each at "In Review" with a pushed branch and a clean code review — **never merge, never deploy** (that's the QA sweep's job). Your baseline expectation is an **excellent spec** to build from; if a card isn't that, bounce it.
+Build features from "Ready for Dev" cards, one worktree per feature, with subagents/parallel work where it helps. Active development is represented by `Ready for Dev` plus the `dev:in-progress` claim label, not a separate board state. Land each at "In Review" with a pushed branch and a clean code review — **never merge, never deploy** (that's the QA sweep's job). Your baseline expectation is an **excellent spec** to build from; if a card isn't that, bounce it.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`), detect worktree/branch state with read-only git first, and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. The code-review pass = the `code-review` skill on the diff plus one independent code-reviewer subagent (Claude: `feature-dev:code-reviewer`; Codex: a `spawn_agent` reviewer).
 
@@ -18,8 +18,8 @@ Build features from cards that are "Ready for Dev" or "In Progress", one worktre
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
 
-List "Ready for Dev" + "In Progress" cards **in `config.project`**, top-to-bottom as they appear in each Linear column. For each:
-- **Read the comments FIRST.** A card can sit in "Ready for Dev" *after a review* with change requests — understand what's missing before writing code. For "In Progress" cards, respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
+List "Ready for Dev" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
+- **Read the comments FIRST.** A card can sit in "Ready for Dev" *after a review* with change requests — understand what's missing before writing code. Respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
 - **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Needs Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Needs Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
@@ -56,7 +56,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 - **Checkpoint WIP.** Commit + push the branch at natural checkpoints (after the build first goes green, before code review), not only at the end, so a crash strands as little as possible.
 - **Push discipline (never force).** For every push: `git fetch` → rebase your commits onto the updated remote ref → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment what happened on the card and stop. Never force-push.
 - **Worktrees are disposable; the branch is the truth.** `<PREFIX>-###` is deterministic from the card id. Picking up a card, in each relevant repo: `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree already exists (a prior crashed run, possibly dirty), `git reset --hard origin/<PREFIX>-###` before working. Prune worktrees whose remote branch is gone (`git worktree prune`).
-- **Re-read before the terminal move.** Right before moving the card to "In Review", re-fetch it. If a human (or another run) moved it out of "Ready for Dev"/"In Progress", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
+- **Re-read before the terminal move.** Right before moving the card to "In Review", re-fetch it. If a human (or another run) moved it out of "Ready for Dev", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
 - **Mark backward bounces.** When you send a card back to "Needs Spec", add a comment `[auto-sweep-bounce Ready for Dev→Needs Spec]`. Two backward bounces within 48h and the launcher parks the card with `blocked:needs-user` — so bounce only on a real spec-quality gate, and say exactly what's missing.
 
 ## Guardrails

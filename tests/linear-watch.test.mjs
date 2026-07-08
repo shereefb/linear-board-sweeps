@@ -9,7 +9,8 @@ import {
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
   parallelLimit, dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES,
-  foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES, MAX_STALE_MIN,
+  foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
+  LEGACY_CLEANUP_STATES, CLAIM_CLEANUP_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
@@ -36,6 +37,11 @@ test("resolveRepos: empty repos defaults to the anchor itself", () => {
 });
 test("worktreePath is deterministic under the repo", () => {
   assert.equal(worktreePath("/ws/repo", "COD-42"), "/ws/repo/.worktrees/COD-42");
+});
+
+test("SWEEP_CFG.dev fetches Ready for Dev only; active dev is the claim label", () => {
+  assert.deepEqual(SWEEP_CFG.dev.states, ["Ready for Dev"]);
+  assert.equal(SWEEP_CFG.dev.claim, "dev:in-progress");
 });
 
 // ── command builder ──────────────────────────────────────────────────────────
@@ -179,6 +185,20 @@ test("countActionable: excludes blocked and live-claimed, counts released + plai
 test("countActionable: a stale-heartbeat claim that wasn't released still counts (it's not live)", () => {
   const card = { id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
   assert.equal(countActionable([card], SWEEP_CFG.dev, NOW, new Set()), 1);
+});
+test("actionableCards: live dev claim in Ready for Dev is not double-dispatched", () => {
+  const card = {
+    id: "active",
+    state: { name: "Ready for Dev" },
+    updatedAt: minsAgo(1),
+    labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }],
+  };
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
+});
+test("actionableCards: stale dev claim in Ready for Dev becomes actionable", () => {
+  const card = { id: "stale", state: { name: "Ready for Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
   const card = {
@@ -392,7 +412,15 @@ test("foreignClaimReleases: an unclaimed card is ignored; holding-state constant
   const card = { id: "u", identifier: "COD-9", updatedAt: minsAgo(300), labelNames: [], comments: [] };
   assert.deepEqual(foreignClaimReleases([card], NOW), []);
   assert.deepEqual(HOLDING_STATES, ["QA Passed"]); // the state qa lands in but no sweep fetches
+  assert.deepEqual(LEGACY_CLEANUP_STATES, ["In Progress"]); // retired dev state still gets orphan cleanup
+  assert.deepEqual(CLAIM_CLEANUP_STATES, ["QA Passed", "In Progress"]);
   assert.equal(MAX_STALE_MIN, 120);
+});
+test("foreignClaimReleases: stale dev claim in legacy In Progress is released by cleanup pass", () => {
+  const card = { id: "legacy", identifier: "COD-99", state: { name: "In Progress" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  const d = foreignClaimReleases([card], NOW);
+  assert.equal(d.length, 1);
+  assert.deepEqual(d[0].releaseClaims, ["dev:in-progress"]);
 });
 
 // ── env parsing ──────────────────────────────────────────────────────────────

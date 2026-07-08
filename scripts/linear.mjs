@@ -10,6 +10,7 @@ import path from "node:path";
 //   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
 //   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
+//   node linear.mjs retire-state "<projectId>" "In Progress" "Ready for Dev"
 //   node linear.mjs query '{ viewer { name } }'            # raw GraphQL
 //
 // The canonical board definition the sweeps depend on:
@@ -23,7 +24,8 @@ export const REQUIRED_STATES = [
   { name: "QA Passed", type: "started", color: "#f2c94c", after: "In Review" },
   { name: "Ready to Ship", type: "started", color: "#5e6ad2", after: "QA Passed" },
   { name: "Archived", type: "completed", color: "#95a2b3" },
-  // Backlog / Todo / In Progress / In Review / Done / Canceled / Duplicate are Linear defaults —
+  // Backlog / Todo / In Review / Done / Canceled / Duplicate are Linear defaults —
+  // In Progress is a legacy default state; COD-99 stops using it for active dev.
   // setup-team only creates the ones above if missing.
 ];
 export const REQUIRED_LABELS = [
@@ -74,6 +76,18 @@ export function bottomSortOrder(cards, gap = 1) {
 
 export function issueUpdateToStateBottomInput(stateId, destinationCards) {
   return { stateId, sortOrder: bottomSortOrder(destinationCards) };
+}
+
+export function retireStateAuditComment(sourceState, destinationState) {
+  return [
+    `Retiring legacy workflow state \`${sourceState}\`: moved this card to \`${destinationState}\`.`,
+    "",
+    "Existing labels were preserved as-is; no new claim label was added.",
+  ].join("\n");
+}
+
+export function retireStateIssueUpdateInput(destinationStateId, destinationCards) {
+  return issueUpdateToStateBottomInput(destinationStateId, destinationCards);
 }
 
 export const API = "https://api.linear.app/graphql";
@@ -203,10 +217,14 @@ async function createCard(projectId, stateName, title, description, labelsCsv) {
 }
 
 async function destinationCards(projectId, stateName) {
+  return destinationCardsWith(gql, projectId, stateName);
+}
+
+async function destinationCardsWith(gqlFn, projectId, stateName) {
   const cards = [];
   let cursor = null;
   do {
-    const d = await gql(
+    const d = await gqlFn(
       `query($projectId:ID!,$state:String!,$cursor:String){ issues(first:100, after:$cursor, filter:{ project:{ id:{ eq:$projectId } }, state:{ name:{ eq:$state } } }){ pageInfo{ hasNextPage endCursor } nodes { id sortOrder } } }`,
       { projectId, state: stateName, cursor }
     );
@@ -236,6 +254,75 @@ async function moveCardBottom(issueIdentifier, stateName) {
   return moved;
 }
 
+async function projectStateIds(projectId) {
+  return projectStateIdsWith(gql, projectId);
+}
+
+async function projectStateIdsWith(gqlFn, projectId) {
+  const d = await gqlFn(
+    `query($id:String!){ project(id:$id){ teams(first:1){ nodes{ states(first:100){ nodes{ id name } } } } } }`,
+    { id: projectId }
+  );
+  const states = d.project?.teams?.nodes?.[0]?.states?.nodes || [];
+  return Object.fromEntries(states.map((s) => [s.name, s.id]));
+}
+
+async function cardsInState(projectId, stateName) {
+  return cardsInStateWith(gql, projectId, stateName);
+}
+
+async function cardsInStateWith(gqlFn, projectId, stateName) {
+  const cards = [];
+  let cursor = null;
+  do {
+    const d = await gqlFn(
+      `query($projectId:ID!,$state:String!,$cursor:String){ issues(first:100, after:$cursor, filter:{ project:{ id:{ eq:$projectId } }, state:{ name:{ eq:$state } } }){ pageInfo{ hasNextPage endCursor } nodes { id identifier title sortOrder url } } }`,
+      { projectId, state: stateName, cursor }
+    );
+    cards.push(...d.issues.nodes);
+    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
+  } while (cursor);
+  return cards;
+}
+
+async function commentIssue(issueId, body) {
+  await commentIssueWith(gql, issueId, body);
+}
+
+async function commentIssueWith(gqlFn, issueId, body) {
+  await gqlFn(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body });
+}
+
+export async function retireState(projectId, sourceState, destinationState, { gqlFn = gql, log = console.log } = {}) {
+  if (!projectId || !sourceState || !destinationState) throw new Error("usage: retire-state <projectId> <sourceState> <destinationState>");
+  if (sourceState === destinationState) throw new Error("source and destination states must differ");
+  const stateIds = await projectStateIdsWith(gqlFn, projectId);
+  const destinationStateId = stateIds[destinationState];
+  if (!destinationStateId) throw new Error(`State "${destinationState}" not found on the project team.`);
+  if (!stateIds[sourceState]) throw new Error(`State "${sourceState}" not found on the project team.`);
+
+  const sourceCards = await cardsInStateWith(gqlFn, projectId, sourceState);
+  if (!sourceCards.length) {
+    log(`No cards in "${sourceState}" to move.`);
+    return [];
+  }
+
+  const moved = [];
+  for (const card of sourceCards) {
+    const destination = (await destinationCardsWith(gqlFn, projectId, destinationState)).filter((n) => n.id !== card.id);
+    const input = retireStateIssueUpdateInput(destinationStateId, destination);
+    const r = await gqlFn(
+      `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
+      { id: card.id, input }
+    );
+    await commentIssueWith(gqlFn, card.id, retireStateAuditComment(sourceState, destinationState));
+    moved.push(r.issueUpdate.issue);
+    log(`${r.issueUpdate.issue.identifier} -> ${destinationState} bottom (sortOrder=${r.issueUpdate.issue.sortOrder})`);
+  }
+  log(`Moved ${moved.length} card(s) from "${sourceState}" to "${destinationState}".`);
+  return moved;
+}
+
 // CLI dispatch — only when run directly (`node linear.mjs …`), NOT when another
 // module imports gql/findTeam. Without this guard, importing linear.mjs would
 // execute a command based on the importer's argv.
@@ -248,10 +335,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "ensure-project": () => ensureProject(args[0], args[1]),
     "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
+    "retire-state": () => retireState(args[0], args[1], args[2]),
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
