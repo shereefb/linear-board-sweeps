@@ -53,7 +53,7 @@ Confirm the viewer + that the target team appears. If the team is missing, the k
 node "KIT/scripts/linear.mjs" setup-team "<Team>"
 ```
 
-Creates `Needs Spec`, `Ready for Dev`, `Archived` and the six workflow labels if missing (see `docs/linear-rules.md`). Safe to re-run.
+Creates `Spec`, `Dev`, `QA`, `Signoff`, `Ship`, `Archived`, and the workflow labels if missing (see `docs/linear-rules.md`). Safe to re-run.
 
 ## Step 5 — Resolve the project id
 
@@ -62,6 +62,13 @@ node "KIT/scripts/linear.mjs" ensure-project "<Team>" "<Project>"
 ```
 
 Copy the printed `projectId` for the config.
+
+For an existing pre-rename board, pause auto-sweep, merge the code update first, then rename legacy columns in place before reactivating:
+
+```bash
+node "KIT/scripts/linear.mjs" rename-states "<projectId>"
+node "KIT/scripts/linear-watch.mjs" tick --dry-run
+```
 
 ## Step 6 — Install the skills
 
@@ -110,7 +117,7 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 
 ## Step 10 — Tell the user how to run it
 
-- **Claude Code:** the skills auto-register — say "run the spec sweep" / "run the dev sweep" / "run the QA sweep" (or "spec the needs-spec cards", etc.).
+- **Claude Code:** the skills auto-register — say "run the spec sweep" / "run the dev sweep" / "run the QA sweep" (or "spec the Spec cards", etc.).
 - **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep; Step 8 should already have enabled it.
 - **Manual unblock:** say "run the unblock sweep" when blocked cards need your input. It is interactive, never scheduled, and removes blocking labels only after you choose a resolution.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
@@ -162,7 +169,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage. Confirm every chosen runtime CLI (`codex` and/or `claude`) is installed and on `PATH`.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.sameRepoCardLimits` controls per-card fan-out inside each selected non-ship workspace/sweep candidate; defaults are spec/dev `4`, QA `1`, and ship forced to `1`. Set `maxNonShipDispatches` to `1` for serial workspace mode on smaller machines. ship-sweep is always serial.
-   `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `QA Passed`. Set it to false to require normal QA for every card. The human-only `Ready to Ship` move remains required.
+   `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `Signoff`. Set it to false to require normal QA for every card. The human-only `Ship` move remains required.
 
 2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
    ```bash
@@ -194,7 +201,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
 
-**Scheduling caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production merge/deploy path and only runs from the human-gated `Ready to Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
+**Scheduling caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production merge/deploy path and only runs from the human-gated `Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
 
 **If this is NOT the always-on machine** (or the user only wants manual runs): skip Step 11 entirely. The sweeps still work on demand via the Step 10 phrases; another machine can pick up any card because all work flows through origin (see each SKILL.md's "Machine-independence & handoff" section).
 

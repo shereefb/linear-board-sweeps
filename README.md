@@ -3,13 +3,13 @@
 A portable kit that installs a **Linear-driven, cross-runtime (Claude Code + Codex) feature workflow** into any repo. Four autonomous "board sweeps" carry work across a Linear board, with a human gate before anything ships:
 
 ```
-Needs Spec ─spec─▶ Ready for Dev ─dev─▶ In Review ─qa─▶ QA Passed ─[human]─▶ Ready to Ship ─ship─▶ Done
+Spec ─spec─▶ Dev ─dev─▶ QA ─qa─▶ Signoff ─[human]─▶ Ship ─ship─▶ Done
  (docs +            (code on a worktree,   (smoke-test as    (human           (merge, deploy,
   gated reviews)     review, push,          a user, fix UX,   reviews +         canary-verify)
                      no merge)              no merge)         approves)
 ```
 
-Reviewing and shipping are separate: qa-sweep tests but never merges, a human approves by moving the card to **Ready to Ship**, and only then does ship-sweep merge + deploy. A machine never ships to production without a person having approved that specific card.
+Reviewing and shipping are separate: qa-sweep tests but never merges, a human approves by moving the card to **Ship**, and only then does ship-sweep merge + deploy. A machine never ships to production without a person having approved that specific card.
 
 Point Claude or Codex at this repo from any project, on any machine, and it has everything it needs to set that project up for the workflow.
 
@@ -33,7 +33,7 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | `SETUP.md` | The agent-facing bootstrap procedure (what to prompt, where to put everything, exact commands). |
 | `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime scheduled sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec/dev/qa also run card-type-gated review lenses; ship-sweep is the only one that merges + deploys. |
 | `skills/unblock-sweep/SKILL.md` | Manual-only interactive workflow for resolving cards parked with blocking labels across registered anchors. It is copied to anchors but never scheduled. |
-| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `query`. |
+| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `retire-state`, `rename-states`, `query`. |
 | `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work, using the visible Linear column order — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
 | `templates/linear-sweep.json` | The per-repo config the skills read. Copied + filled into the target's `.claude/`. |
@@ -60,12 +60,12 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Unit = workspace, not repo.** One Linear project maps to one workspace (a container folder of N sibling git repos), anchored at the repo that holds `.claude/`. You `register` each anchor once; activation is a Linear **project label `auto-sweep`** you toggle in the UI.
 - **Cheap when idle.** Every ~10 min the launcher makes a few Linear API calls and a fast-forward `git pull` — **zero LLM tokens** — and dispatches a heavyweight agent pass only when a queue holds genuinely actionable work.
 - **Board order is priority.** Within a status column, the next card is the top visible card in Linear (`Issue.sortOrder`), after blocked/live-claimed cards are filtered. Sweeps move completed or bounced cards to the bottom of the destination column via `node scripts/linear.mjs move-card-bottom <KEY-###> "<State>"`.
-- **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `QA Passed`, scheduled tick failures create self-clearing `Todo` cards when Linear is reachable, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
+- **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, a holding-state reaper releases claims stranded in `Signoff`, scheduled tick failures create self-clearing `Todo` cards when Linear is reachable, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
 - **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
-- **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ready to Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
+- **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
 - **Bounded non-ship parallelism.** `parallel.maxNonShipDispatches` defaults to `2`, so one tick can dispatch a small batch of non-ship sweeps when their resolved repo paths do not overlap. Set it to `1` for serial mode; that workspace then runs alone or waits for the next tick. ship always stays serial.
 - **Same-repo card slots.** Inside a selected non-ship workspace/sweep candidate, `parallel.sameRepoCardLimits` defaults to `spec:4`, `dev:4`, `qa:1`, `ship:1`. The parent launcher claims exact cards with owner-token heartbeats, dispatches child agents with `AUTO_SWEEP_ISSUE` and isolated worktree/log/temp/port paths, and writes per-card run records. `maxNonShipDispatches` counts workspace candidates; `sameRepoCardLimits` counts child card slots.
-- **Default fast path.** `fastPath` is enabled by default; dev-sweep may mark tiny, high-confidence changes `fast-path:eligible`, and a human can then move the card from `In Review` straight to `Ready to Ship` to skip `QA Passed`. Set `fastPath.enabled` to `false` to require normal QA for every card.
+- **Default fast path.** `fastPath` is enabled by default; dev-sweep may mark tiny, high-confidence changes `fast-path:eligible`, and a human can then move the card from `QA` straight to `Ship` to skip `Signoff`. Set `fastPath.enabled` to `false` to require normal QA for every card.
 - **Runtime selection** lives in `linear-sweep.json`. The launcher resolves `runtimes.<sweep>` first, then falls back to legacy `runtime` + `models.<sweep>`, then to Codex defaults. The template defaults to Claude for spec/review/ship and Codex high-effort for dev/QA. `runtimes.review` is a reviewer role preference, not a scheduled sweep.
 
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
@@ -85,7 +85,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.
 Recent and planned launcher/workflow changes:
 
 - `COD-82`: bounded non-ship parallel dispatch across disjoint, non-overlapping workspace repo sets, while ship remains serial and single-runner.
-- `COD-83`: default-on fast-path eligibility markers for tiny, high-confidence changes; a human can then skip `QA Passed` by moving the card directly from `In Review` to `Ready to Ship`.
+- `COD-83`: default-on fast-path eligibility markers for tiny, high-confidence changes; a human can then skip `Signoff` by moving the card directly from `QA` to `Ship`.
 - `COD-84`: a manual, never-scheduled `unblock-sweep` workflow that finds user-blocked cards across registered anchors and helps the operator resolve them one at a time.
 - `COD-88`: Karpathy coding-skill routing in installed Codex instructions and code-writing sweep guardrails.
 - `COD-89`: dogfood retrospective landed under `docs/superpowers/reports/`, with timing, token, cadence, and user-interruption learnings plus follow-up cards.
@@ -93,7 +93,7 @@ Recent and planned launcher/workflow changes:
 - `COD-94`: structured scheduled-run records for sweep retrospectives, with explicit `unavailable` fields when runtimes do not expose usage.
 - `COD-97`: per-stage runtime overrides so scheduled sweeps can mix Claude and Codex while preserving legacy `runtime` + `models` configs.
 - `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
-- `COD-99`: retire the `In Progress` state from normal workflow; `Ready for Dev` plus `dev:in-progress` becomes the active-dev representation.
+- `COD-99`: retire the `In Progress` state from normal workflow; `Dev` plus `dev:in-progress` becomes the active-dev representation.
 - `COD-100`: same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, owner-token card claims, isolated child env, card-specific run records, and ship still serial.
 
 ## Requirements

@@ -1,11 +1,11 @@
 ---
 name: dev-sweep
-description: Develop the configured Linear project's "Ready for Dev" cards on isolated worktrees, run code review, then move to "In Review" and push the branch (no merge). Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "develop the ready-for-dev cards", "run the dev sweep", or on a schedule.
+description: Develop the configured Linear project's "Dev" cards on isolated worktrees, run code review, then move to "QA" and push the branch (no merge). Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "develop the Dev cards", "run the dev sweep", or on a schedule.
 ---
 
 # Dev Sweep
 
-Build features from "Ready for Dev" cards, one worktree per feature, with subagents/parallel work where it helps. Active development is represented by `Ready for Dev` plus the `dev:in-progress` claim label, not a separate board state. Land each at "In Review" with a pushed branch and a clean code review — **never merge, never deploy** (that's the QA sweep's job). Your baseline expectation is an **excellent spec** to build from; if a card isn't that, bounce it.
+Build features from "Dev" cards, one worktree per feature, with subagents/parallel work where it helps. Active development is represented by `Dev` plus the `dev:in-progress` claim label, not a separate board state. Land each at "QA" with a pushed branch and a clean code review — **never merge, never deploy** (that's the QA sweep's job). Your baseline expectation is an **excellent spec** to build from; if a card isn't that, bounce it.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`), detect worktree/branch state with read-only git first, and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. The code-review pass = the `code-review` skill on the diff plus one independent code-reviewer subagent (Claude: `feature-dev:code-reviewer`; Codex: a `spawn_agent` reviewer).
 
@@ -20,12 +20,12 @@ Build features from "Ready for Dev" cards, one worktree per feature, with subage
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
 
-**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other Ready-for-Dev card. Treat an existing fresh `dev:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_APP_PORT`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths or ports.
+**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other Dev card. Treat an existing fresh `dev:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_APP_PORT`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths or ports.
 
-List "Ready for Dev" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
-- **Read the comments FIRST.** A card can sit in "Ready for Dev" *after a review* with change requests — understand what's missing before writing code. Respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
+List "Dev" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
+- **Read the comments FIRST.** A card can sit in "Dev" *after a review* with change requests — understand what's missing before writing code. Respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
 - **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
-- **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Needs Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Needs Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
+- **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
 - **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify it from the spec/plan + diff surface and apply the matching domain labels to Linear (comment what you applied). This drives the gated quality lenses in §2. A human relabel always wins — never override one.
 - Process **at most 2 cards per run**. If none are actionable, exit cleanly (normal no-op).
@@ -38,17 +38,17 @@ List "Ready for Dev" cards **in `config.project`**, top-to-bottom as they appear
 4. **Gated quality lenses (by card type).** In addition to the always-on code review below: a **security-sensitive card** (auth / data / external input) → `/cso` on the actual diff (the plan-review caught design flaws; this catches implementation flaws). A **perf-sensitive card** → `/benchmark` in the worktree before landing. Fold findings in.
 5. **Code review — run BOTH.** Run `/code-review` (the code-review skill) on the diff AND the `code-reviewer` subagent (feature-dev:code-reviewer) for an independent pass. Fix every real finding until quality is genuinely great; re-review after fixes.
 6. **Verify green — observed, not asserted.** Confirm the build + tests are green (`npm run build`, `npm test`, `npm run lint` as applicable), and use the `verify` skill to exercise the change end-to-end so "it works" is something you watched happen, not a claim.
-7. **Optional fast-path eligibility.** Fast path is enabled by default; skip this evaluation only when `config.fastPath.enabled === false`. When enabled, evaluate it only after implementation, verification, code review, and independent review are complete. Add `fast-path:eligible` and an `[auto-sweep-fast-path <KEY>]` audit comment only when all configured gates pass: diff size under `maxChangedFiles` and `maxDiffLines`, no `disallowedLabels`, only allowed low-risk labels when `allowedLabels` is set, no data/schema/auth/external-input/deploy/API/CLI/SDK/UI/perf surface, all checks green, no unresolved review findings, and the independent reviewer explicitly says high confidence. If any gate fails, do not add the label; include the reason in the normal In Review handoff. The card still lands in **In Review** — a human may then move it directly to Ready to Ship to skip QA Passed.
+7. **Optional fast-path eligibility.** Fast path is enabled by default; skip this evaluation only when `config.fastPath.enabled === false`. When enabled, evaluate it only after implementation, verification, code review, and independent review are complete. Add `fast-path:eligible` and an `[auto-sweep-fast-path <KEY>]` audit comment only when all configured gates pass: diff size under `maxChangedFiles` and `maxDiffLines`, no `disallowedLabels`, only allowed low-risk labels when `allowedLabels` is set, no data/schema/auth/external-input/deploy/API/CLI/SDK/UI/perf surface, all checks green, no unresolved review findings, and the independent reviewer explicitly says high confidence. If any gate fails, do not add the label; include the reason in the normal QA handoff. The card still lands in **QA** — a human may then move it directly to Ship to skip Signoff.
 
-## 3. Land at "In Review" (no merge)
+## 3. Land at "QA" (no merge)
 
 - Push the worktree's branch to `origin` (open/refresh a PR if that's the repo's convention). **Do NOT merge to `main`. Do NOT deploy.** Do NOT delete the worktree/branch — it's unmerged and awaiting the QA sweep / human review.
-- Move the card to the **bottom of "In Review"** with a comment: what was built, the spec/plan followed, code-review outcome (both passes) + notable fixes, the branch name, fast-path eligibility/ineligibility if evaluated, and any residual risk. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "In Review"`) so the status and bottom rank update together.
+- Move the card to the **bottom of "QA"** with a comment: what was built, the spec/plan followed, code-review outcome (both passes) + notable fixes, the branch name, fast-path eligibility/ineligibility if evaluated, and any residual risk. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "QA"`) so the status and bottom rank update together.
 - Remove `dev:in-progress`.
 
 ## 4. Blocked / hand-offs
 
-- **Needs the user to continue *development*** (a product decision, missing credential/asset, an API only they can provision): add `blocked:needs-user`, **keep the card in "Ready for Dev"**, comment exactly what's needed, and leave it. Resume when they reply. Ask once.
+- **Needs the user to continue *development*** (a product decision, missing credential/asset, an API only they can provision): add `blocked:needs-user`, **keep the card in "Dev"**, comment exactly what's needed, and leave it. Resume when they reply. Ask once.
 - **Needs a human-only action you can't perform** (an env var / secret set in the hosting dashboard, a prod migration, a DNS record, a webhook registered in a third-party console, an OAuth app connected, a billing/plan approval, any platform deploy step you can't trigger — see `config.deploy` and the `Todo` lane in the board rules): don't block the dev — **create a new Linear card in status "Todo"** in `config.project` stating *what* to do, *where* (which dashboard/console), and *why* (which feature it unblocks); link it to the feature card, and continue. If the agent could do it itself, do it — don't make a `Todo`.
 
 ## Machine-independence & handoff (auto-sweep)
@@ -60,14 +60,14 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 - **Checkpoint WIP.** Commit + push the branch at natural checkpoints (after the build first goes green, before code review), not only at the end, so a crash strands as little as possible.
 - **Push discipline (never force).** For every push: `git fetch` → rebase your commits onto the updated remote ref → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment what happened on the card and stop. Never force-push.
 - **Worktrees are disposable; the branch is the truth.** `<PREFIX>-###` is deterministic from the card id. Picking up a card, in each relevant repo: `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree already exists (a prior crashed run, possibly dirty), `git reset --hard origin/<PREFIX>-###` before working. Prune worktrees whose remote branch is gone (`git worktree prune`).
-- **Re-read before the terminal move.** Right before moving the card to "In Review", re-fetch it. If a human (or another run) moved it out of "Ready for Dev", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
-- **Mark backward bounces.** When you send a card back to "Needs Spec", add a comment `[auto-sweep-bounce Ready for Dev→Needs Spec]`. Two backward bounces within 48h and the launcher parks the card with `blocked:needs-user` — so bounce only on a real spec-quality gate, and say exactly what's missing.
+- **Re-read before the terminal move.** Right before moving the card to "QA", re-fetch it. If a human (or another run) moved it out of "Dev", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
+- **Mark backward bounces.** When you send a card back to "Spec", add a comment `[auto-sweep-bounce Dev→Spec]`. Two backward bounces within 48h and the launcher parks the card with `blocked:needs-user` — so bounce only on a real spec-quality gate, and say exactly what's missing.
 
 ## Guardrails
 
-- Writes **code** (not docs-only) but **never merges and never deploys** — "In Review" + a pushed branch is the human/QA gate.
+- Writes **code** (not docs-only) but **never merges and never deploys** — "QA" + a pushed branch is the human/QA gate.
 - One worktree per card; ≤2 cards/run; top-of-column order; claim/release via `dev:in-progress`; stay within `config.project`.
-- Only build from excellent specs — a weak card goes to "Needs Spec", not into guesswork.
-- Both code reviews must run and their real findings be fixed before "In Review".
+- Only build from excellent specs — a weak card goes to "Spec", not into guesswork.
+- Both code reviews must run and their real findings be fixed before "QA".
 - Every question → a card comment (or a new Todo card for ship needs); never AskUserQuestion.
 - Card comments + the PR are the audit trail.
