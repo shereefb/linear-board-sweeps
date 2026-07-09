@@ -18,7 +18,7 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 - **Load repo config.** Read `.claude/linear-sweep.json` from the repo root. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.
 - **Require `LINEAR_API_KEY`.** Load it from the environment or the repo's gitignored `.env` (`set -a && . ./.env && set +a`). If unset, exit immediately with a clear one-line error — do not attempt to recover a key from transcripts. Confirm git push credentials and any other credentials named in `config.credentialsNote` if a card needs live data.
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
-- Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`.
+- Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded)
 
@@ -26,7 +26,7 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 
 List "Spec" cards **in `config.project`**, top-to-bottom as they appear in the Linear column, and for each decide:
 
-- **Skip** if it has `blocked:open-questions` AND its newest comment is not a human answer postdating your questions. Do NOT re-post questions — that is spam.
+- **Skip** if it has `sweep:manual-only`. **Skip** if it has `blocked:open-questions` AND its newest comment is not a human answer postdating your questions. Do NOT re-post questions — that is spam.
 - **Resume** if it has `blocked:open-questions` and the newest comment IS a human answer to your questions: remove the label, proceed to spec it.
 - **Skip** if it has a `spec:in-progress` label less than 45 min old (another run owns it). Reclaim it if the label is stale (≥45 min).
 - **Triage, don't manufacture:** if the card is already done, a duplicate, or too vague to be a real feature, do not invent a spec — comment your reasoning and move it (Done / Duplicate / leave with a note), then continue.

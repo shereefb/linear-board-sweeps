@@ -15,12 +15,12 @@ Take cards a human has approved into **"Ship"** and land them: merge to `main`, 
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials in `config.credentialsNote`.
 - **Coding guardrail.** Before merge-review debugging or any code change/refactor needed during shipping, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
-- Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`.
+- Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, drain queue, claimed)
 
 List "Ship" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
-- **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `ship:in-progress` < 120 min old (another run owns it — merge + deploy + canary is slow). Reclaim a stale claim.
+- **Skip** if `blocked:needs-user` or `sweep:manual-only` and no new human reply resolves it; **skip** if `ship:in-progress` < 120 min old (another run owns it — merge + deploy + canary is slow). Reclaim a stale claim.
 - **Claim** with `ship:in-progress` before starting; remove it when you finish, block, or bail.
 - Continue selecting and processing one actionable card at a time until no actionable "Ship" cards remain. This preserves one production deploy at a time without leaving approved cards waiting for a later run.
 - After each terminal transition or card-specific block, re-list the queue before choosing the next card. If a card is blocked, it is no longer actionable; keep draining any remaining unblocked cards.

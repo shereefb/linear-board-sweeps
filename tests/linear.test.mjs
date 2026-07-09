@@ -121,9 +121,9 @@ test("REQUIRED_STATES: new columns declared, Signoff created before Ship", () =>
   assert.equal(REQUIRED_STATES.find((s) => s.name === "Signoff").after, "QA");
   assert.equal(REQUIRED_STATES.find((s) => s.name === "Ship").after, "Signoff");
 });
-test("REQUIRED_LABELS: ship/qa taxonomy present", () => {
+test("REQUIRED_LABELS: ship/qa/manual-only taxonomy present", () => {
   const names = REQUIRED_LABELS.map((l) => l.name);
-  for (const n of ["qa:passed", "ship:in-progress", "ship:approved", "fast-path:eligible"]) assert.ok(names.includes(n), `missing ${n}`);
+  for (const n of ["qa:passed", "ship:in-progress", "ship:approved", "fast-path:eligible", "sweep:manual-only"]) assert.ok(names.includes(n), `missing ${n}`);
 });
 
 // ── workflow state rename migration ─────────────────────────────────────────

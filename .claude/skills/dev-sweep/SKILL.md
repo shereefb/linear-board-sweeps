@@ -16,7 +16,7 @@ Build features from "Dev" cards, one worktree per feature, with subagents/parall
 - **Load repo config.** Read `.claude/linear-sweep.json` (see spec-sweep §0 for fields). Missing file → exit with a one-line error.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
 - **Coding guardrail.** Before writing, reviewing, debugging, refactoring, or otherwise changing code, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
-- Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `dev:in-progress`, `blocked:needs-user`.
+- Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `dev:in-progress`, `blocked:needs-user`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
 
@@ -24,8 +24,9 @@ Build features from "Dev" cards, one worktree per feature, with subagents/parall
 
 List "Dev" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Read the comments FIRST.** A card can sit in "Dev" *after a review* with change requests — understand what's missing before writing code. Respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
-- **Skip** if `blocked:needs-user` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
+- **Skip** if `blocked:needs-user` or `sweep:manual-only` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
 - **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
+- **Manual/dedicated-work gate:** if a "Dev" card is intentionally ongoing human work, batch documentation enrichment, or otherwise does not fit the unattended feature-dev worktree/PR cycle, add `sweep:manual-only`, comment exactly why it is parked and what manual/dedicated path should continue it, and stop considering it actionable until a human clears the label with unblock-sweep. Do not leave it unlabeled in "Dev" after a no-op pass; that creates an infinite scheduled dispatch loop.
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
 - **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify it from the spec/plan + diff surface and apply the matching domain labels to Linear (comment what you applied). This drives the gated quality lenses in §2. A human relabel always wins — never override one.
 - Process **at most 2 cards per run**. If none are actionable, exit cleanly (normal no-op).

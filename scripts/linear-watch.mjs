@@ -46,6 +46,7 @@ export const BOUNCE_TAG = "[auto-sweep-bounce";
 export const FAILURE_TODO_TAG = "[auto-sweep-tick-failure";
 export const FAILURE_RECOVERED_TAG = "[auto-sweep-tick-recovered";
 export const FAILURE_DUPLICATE_NOTE = "Duplicate auto-sweep failure Todo";
+export const MANUAL_ONLY_LABEL = "sweep:manual-only";
 export const CRASH_ESCALATE_AFTER = 3; // reaps within the window before blocking
 export const BOUNCE_ESCALATE_AFTER = 2; // backward bounces within the window before blocking
 export const ESCALATE_WINDOW_H = 48;
@@ -62,10 +63,10 @@ export const CLAIM_CONFIRM_DELAY_MS = 1500;
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
 // bake + docs, so it gets the same generous window as qa.
 export const SWEEP_CFG = {
-  spec: { states: [WORKFLOW_STATES.spec], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 45 },
-  dev: { states: [WORKFLOW_STATES.dev], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
-  qa: { states: [WORKFLOW_STATES.qa], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user"], staleMin: 120 },
-  ship: { states: [WORKFLOW_STATES.ship], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 },
+  spec: { states: [WORKFLOW_STATES.spec], claim: "spec:in-progress", blocked: ["blocked:open-questions", MANUAL_ONLY_LABEL], staleMin: 45 },
+  dev: { states: [WORKFLOW_STATES.dev], claim: "dev:in-progress", blocked: ["blocked:needs-user", MANUAL_ONLY_LABEL], staleMin: 90 },
+  qa: { states: [WORKFLOW_STATES.qa], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user", MANUAL_ONLY_LABEL], staleMin: 120 },
+  ship: { states: [WORKFLOW_STATES.ship], claim: "ship:in-progress", blocked: ["blocked:needs-user", MANUAL_ONLY_LABEL], staleMin: 120 },
 };
 // Every list below derives from SWEEP_CFG so adding a sweep is a one-line change.
 export const SWEEPS = Object.keys(SWEEP_CFG); // spec, dev, qa, ship — iteration order
@@ -555,7 +556,7 @@ export function parseEnv(text) {
   return out;
 }
 
-export const BLOCKING_LABELS = ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes"];
+export const BLOCKING_LABELS = ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", MANUAL_ONLY_LABEL];
 
 export function blockingLabelsForIssue(labelNames) {
   return BLOCKING_LABELS.filter((name) => (labelNames || []).includes(name));
