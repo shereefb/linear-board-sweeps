@@ -104,18 +104,172 @@ function unattendedPrompt(sweep, issueIdentifier = null) {
 
 // ── Pure helpers (exported for tests) ────────────────────────────────────────
 
+function stablePathSlug(p) {
+  const resolved = path.resolve(p || ".");
+  const base = path.basename(resolved).replace(/[^a-zA-Z0-9._-]/g, "-") || "workspace";
+  const hash = crypto.createHash("sha256").update(resolved).digest("hex").slice(0, 8);
+  return `${base}-${hash}`;
+}
+
+export function managedWorkspaceRootFor(sourceAnchorPath, { homeDir = HOME } = {}) {
+  return path.join(homeDir, ".local", "share", "linear-board-sweeps", "workspaces", stablePathSlug(sourceAnchorPath));
+}
+
+function defaultRegistry() {
+  return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [], managedAnchors: {} };
+}
+
+export function normalizeRegistry(reg = {}, { now = () => new Date().toISOString(), homeDir = HOME } = {}) {
+  const out = { ...defaultRegistry(), ...(reg || {}) };
+  out.repos = Array.isArray(out.repos) ? [...out.repos] : [];
+  out.kitRef = out.kitRef || "main";
+  out.shipRunner = out.shipRunner === true;
+  out.managedAnchors = { ...(out.managedAnchors || {}) };
+  for (const sourceAnchorPath of out.repos) {
+    const existing = out.managedAnchors[sourceAnchorPath] || {};
+    const managedWorkspaceRoot = existing.managedWorkspaceRoot || managedWorkspaceRootFor(sourceAnchorPath, { homeDir });
+    const stamp = now();
+    out.managedAnchors[sourceAnchorPath] = {
+      sourceAnchorPath,
+      managedWorkspaceRoot,
+      managedAnchorPath: existing.managedAnchorPath || path.join(managedWorkspaceRoot, path.basename(sourceAnchorPath)),
+      repoMap: existing.repoMap || {},
+      createdAt: existing.createdAt || stamp,
+      updatedAt: existing.updatedAt || stamp,
+    };
+  }
+  for (const key of Object.keys(out.managedAnchors)) {
+    if (!out.repos.includes(key)) delete out.managedAnchors[key];
+  }
+  return out;
+}
+
+export function workspaceRecordForSourceAnchor(sourceAnchorPath, reg = {}) {
+  return normalizeRegistry(reg).managedAnchors?.[sourceAnchorPath] || null;
+}
+
 // Resolve config.repos to absolute paths. Folder names resolve under the
 // workspace root (the anchor's parent); absolute or ./ ../ entries are used as-is.
 export function resolveRepos(anchorPath, config) {
+  return resolveWorkspaceRepos(anchorPath, config, { mode: "source" });
+}
+
+export function resolveWorkspaceRepos(anchorPath, config, { mode = "source", workspaceRecord = null } = {}) {
   const workspaceRoot = path.dirname(anchorPath);
   const entries = Array.isArray(config?.repos) && config.repos.length ? config.repos : [path.basename(anchorPath)];
   return entries.map((entry) => {
-    let repoPath;
-    if (path.isAbsolute(entry)) repoPath = entry;
-    else if (entry.startsWith("./") || entry.startsWith("../")) repoPath = path.resolve(anchorPath, entry);
-    else repoPath = path.join(workspaceRoot, entry);
-    return { name: path.basename(repoPath), path: repoPath };
+    let sourcePath;
+    if (path.isAbsolute(entry)) sourcePath = entry;
+    else if (entry.startsWith("./") || entry.startsWith("../")) sourcePath = path.resolve(anchorPath, entry);
+    else sourcePath = path.join(workspaceRoot, entry);
+    if (mode !== "managed") return { name: path.basename(sourcePath), path: sourcePath, sourcePath };
+
+    if (!workspaceRecord) throw new Error("managed workspace resolution requires workspaceRecord");
+    const mapped = workspaceRecord.repoMap?.[sourcePath]?.managedPath;
+    const managedPath = mapped
+      || (path.resolve(sourcePath) === path.resolve(workspaceRecord.sourceAnchorPath)
+        ? workspaceRecord.managedAnchorPath
+        : path.join(workspaceRecord.managedWorkspaceRoot, stablePathSlug(sourcePath)));
+    return { name: path.basename(managedPath), path: managedPath, sourcePath };
   });
+}
+
+export function materializeManagedWorkspacePlan({
+  sourceAnchorPath,
+  config,
+  workspaceRecord,
+  existsFn = fs.existsSync,
+  gitFn = git,
+} = {}) {
+  const record = workspaceRecord || { sourceAnchorPath, managedWorkspaceRoot: managedWorkspaceRootFor(sourceAnchorPath), managedAnchorPath: path.join(managedWorkspaceRootFor(sourceAnchorPath), path.basename(sourceAnchorPath)), repoMap: {} };
+  const sourceRepos = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "source" });
+  const managedRepos = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord: record });
+  const nextRecord = { ...record, repoMap: { ...(record.repoMap || {}) }, updatedAt: new Date().toISOString() };
+  const operations = [];
+  const blockers = [];
+
+  for (let i = 0; i < sourceRepos.length; i += 1) {
+    const source = sourceRepos[i];
+    const managed = managedRepos[i];
+    const remote = gitFn(source.path, ["remote", "get-url", "origin"], { allowFail: true });
+    nextRecord.repoMap[source.path] = { sourcePath: source.path, managedPath: managed.path, remote: remote.out || record.repoMap?.[source.path]?.remote || null };
+    if (remote.status !== 0 || !remote.out) {
+      blockers.push({ kind: "missing-origin", sourcePath: source.path, managedPath: managed.path, message: `source repo ${source.path} has no origin remote` });
+      continue;
+    }
+    if (!existsFn(managed.path)) {
+      operations.push({ action: "clone", sourcePath: source.path, managedPath: managed.path, remote: remote.out });
+      continue;
+    }
+    const role = path.resolve(managed.path) === path.resolve(record.managedAnchorPath) ? "managed-anchor" : "managed-repo";
+    const dirty = dirtyCheckoutEvent({ sweep: "setup" }, { role, path: managed.path }, { gitFn });
+    if (dirty) {
+      blockers.push({ kind: dirty.kind, sourcePath: source.path, managedPath: managed.path, stableTarget: `${role}:${managed.path}`, message: dirty.message });
+      continue;
+    }
+    operations.push({ action: "fast-forward", sourcePath: source.path, managedPath: managed.path, remote: remote.out });
+  }
+
+  return { ok: blockers.length === 0, record: nextRecord, operations, blockers };
+}
+
+export function syncAllowedEnvFiles(sourceRepo, managedRepo, {
+  allowed = [".env"],
+  gitFn = git,
+  copyFn = fs.copyFileSync,
+  chmodFn = fs.chmodSync,
+  existsFn = fs.existsSync,
+} = {}) {
+  const copied = [];
+  for (const file of allowed) {
+    const source = path.join(sourceRepo, file);
+    if (!existsFn(source)) continue;
+    const ignored = gitFn(sourceRepo, ["check-ignore", "-q", file], { allowFail: true });
+    if (ignored.status !== 0) continue;
+    const dest = path.join(managedRepo, file);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    copyFn(source, dest);
+    chmodFn(dest, 0o600);
+    copied.push(file);
+  }
+  return copied;
+}
+
+export function materializeManagedWorkspace({
+  sourceAnchorPath,
+  config,
+  workspaceRecord,
+  existsFn = fs.existsSync,
+  mkdirFn = (p) => fs.mkdirSync(p, { recursive: true }),
+  gitFn = git,
+  syncEnvFn = syncAllowedEnvFiles,
+} = {}) {
+  const plan = materializeManagedWorkspacePlan({ sourceAnchorPath, config, workspaceRecord, existsFn, gitFn });
+  if (!plan.ok) return plan;
+
+  mkdirFn(plan.record.managedWorkspaceRoot);
+  for (const op of plan.operations) {
+    if (op.action === "clone") {
+      mkdirFn(path.dirname(op.managedPath));
+      const clone = gitFn(path.dirname(op.managedPath), ["clone", op.remote, op.managedPath], { allowFail: true });
+      if (clone.status !== 0) {
+        return { ...plan, ok: false, blockers: [{ kind: "clone-failed", sourcePath: op.sourcePath, managedPath: op.managedPath, message: clone.err || `clone exited ${clone.status}` }] };
+      }
+    } else if (op.action === "fast-forward") {
+      const fetch = gitFn(op.managedPath, ["fetch", "origin"], { allowFail: true });
+      if (fetch.status !== 0) {
+        return { ...plan, ok: false, blockers: [{ kind: "fetch-failed", sourcePath: op.sourcePath, managedPath: op.managedPath, message: fetch.err || `fetch exited ${fetch.status}` }] };
+      }
+      const branch = gitFn(op.managedPath, ["symbolic-ref", "--short", "HEAD"], { allowFail: true }).out || "main";
+      const merge = gitFn(op.managedPath, ["merge", "--ff-only", `origin/${branch}`], { allowFail: true });
+      if (merge.status !== 0) {
+        return { ...plan, ok: false, blockers: [{ kind: "fast-forward-failed", sourcePath: op.sourcePath, managedPath: op.managedPath, message: merge.err || `merge exited ${merge.status}` }] };
+      }
+    }
+    syncEnvFn(op.sourcePath, op.managedPath);
+  }
+
+  return plan;
 }
 
 // Deterministic worktree path so any machine rebuilds the same tree from a card.
@@ -815,6 +969,12 @@ function failureTodoScope(todo) {
   return m ? m[1] : "_";
 }
 
+function failureTodoStableTarget(todo) {
+  if (todo.stableTarget) return todo.stableTarget;
+  const m = String(todo.description || "").match(/Target:\s*`([^`]+)`/);
+  return m ? m[1] : null;
+}
+
 function failureTodoLastMessage(todo) {
   if (todo.lastMessage !== undefined) return String(todo.lastMessage);
   const matches = [...String(todo.description || "").matchAll(/Last error:\s*([\s\S]*?)(?:\n\nHow to clear:|$)/g)];
@@ -839,7 +999,7 @@ function shouldCommentDuplicate(todo, now) {
   return !last || now - last >= FAILURE_TODO_THROTTLE_MS;
 }
 
-export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [] } = {}) {
+export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [], recoveredTargets = new Set() } = {}) {
   const decisions = [];
   const byFingerprint = new Map();
   for (const todo of existingTodos || []) {
@@ -877,7 +1037,10 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
     if (current.has(fp)) continue;
     const primary = todos[0];
     const scope = failureTodoScope(primary);
-    if (checkedScopes && checkedScopes.has(scope)) decisions.push({ action: "close", fingerprint: fp, todo: primary });
+    const stableTarget = failureTodoStableTarget(primary);
+    if ((checkedScopes && checkedScopes.has(scope)) || (stableTarget && recoveredTargets?.has?.(stableTarget))) {
+      decisions.push({ action: "close", fingerprint: fp, todo: primary });
+    }
   }
 
   return decisions;
@@ -899,17 +1062,14 @@ function readRegistry() {
   // shipRunner (default false): only a host whose registry sets it true may
   // DISPATCH ship-sweep — the single-runner pin that closes the cross-host
   // double-deploy race. Set it on exactly one machine.
-  if (!fs.existsSync(REGISTRY_PATH)) return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [] };
+  if (!fs.existsSync(REGISTRY_PATH)) return normalizeRegistry(defaultRegistry());
   const r = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
-  r.repos = r.repos || [];
-  r.kitRef = r.kitRef || "main";
-  r.shipRunner = r.shipRunner === true;
-  return r;
+  return normalizeRegistry(r);
 }
 
 function writeRegistry(r) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(REGISTRY_PATH, JSON.stringify(r, null, 2) + "\n");
+  fs.writeFileSync(REGISTRY_PATH, JSON.stringify(normalizeRegistry(r), null, 2) + "\n");
 }
 
 function anchorConfig(anchorPath) {
@@ -1278,9 +1438,9 @@ async function commentDuplicateFailureTodo(apiKey, decision) {
   await addComment(apiKey, decision.todo.id, `${FAILURE_DUPLICATE_NOTE} for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
 }
 
-async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, { dryRun = false } = {}) {
+async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, { dryRun = false, recoveredTargets = new Set() } = {}) {
   const existing = await fetchFailureTodos(apiKey, config.teamKey, config.projectId);
-  const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues });
+  const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues, recoveredTargets });
   if (dryRun) return decisions;
   if (!decisions.length) return decisions;
   const meta = await teamMeta(apiKey, config.teamKey);
@@ -1325,9 +1485,9 @@ async function executeReap(apiKey, card, decision, labelMap, sweep) {
   }
 }
 
-function checkoutDirtyEvent(pick, checkout, { gitFn = git } = {}) {
+export function dirtyCheckoutEvent(pick, checkout, { gitFn = git } = {}) {
   if (!checkout?.path) return null;
-  const status = gitFn(checkout.path, ["status", "--porcelain"], { allowFail: true });
+  const status = gitFn(checkout.path, ["status", "--porcelain", "-uall"], { allowFail: true });
   const scope = `${pick.sweep}:dispatch`;
   const stableTarget = `${checkout.role}:${checkout.path}`;
   if (status.status !== 0) {
@@ -1339,23 +1499,162 @@ function checkoutDirtyEvent(pick, checkout, { gitFn = git } = {}) {
     };
   }
   if (!status.out) return null;
-  const changed = status.out.split("\n").filter(Boolean).length;
+  const paths = status.out.split("\n").filter(Boolean);
+  const changed = paths.length;
+  const sample = paths.slice(0, 25).map((line) => `  ${line}`).join("\n");
+  const overflow = changed > 25 ? `\n  ... and ${changed - 25} more path(s)` : "";
   return {
     scope,
     kind: "dirty-checkout",
     stableTarget,
-    message: `${checkout.role} checkout has ${changed} uncommitted path(s); refusing unattended ${pick.sweep}-sweep dispatch until committed, stashed, or reverted`,
+    message: [
+      `${checkout.role} checkout has ${changed} uncommitted path(s); refusing unattended ${pick.sweep}-sweep dispatch until committed, stashed, or reverted`,
+      "paths:",
+      `${sample}${overflow}`,
+    ].join("\n"),
   };
 }
 
 export function checkoutDispatchBlockers(pick, reg = {}, { gitFn = git } = {}) {
-  const checkouts = [{ role: "anchor", path: pick.anchorPath }];
-  if (reg.kitPath && path.resolve(reg.kitPath) !== path.resolve(pick.anchorPath)) {
+  const checkouts = [];
+  const managedRepoPaths = [...new Set((pick.managedRepoPaths || []).map((p) => path.resolve(p)))];
+  if (pick.issueIdentifier && pick.config) {
+    const worktree = pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier);
+    checkouts.push({ role: "worktree", path: worktree });
+  }
+  if (managedRepoPaths.length) {
+    for (const repoPath of managedRepoPaths) {
+      checkouts.push({ role: path.resolve(repoPath) === path.resolve(pick.anchorPath) ? "managed-anchor" : "managed-repo", path: repoPath });
+    }
+  } else {
+    checkouts.push({ role: "anchor", path: pick.anchorPath });
+  }
+  if (reg.kitPath && !checkouts.some((c) => path.resolve(c.path) === path.resolve(reg.kitPath))) {
     checkouts.push({ role: "kit", path: reg.kitPath });
   }
   return checkouts
-    .map((checkout) => checkoutDirtyEvent(pick, checkout, { gitFn }))
+    .map((checkout) => dirtyCheckoutEvent(pick, checkout, { gitFn }))
     .filter(Boolean);
+}
+
+function cleanManagedCheckoutTargets(pick, reg = {}, { gitFn = git } = {}) {
+  const targets = new Set();
+  const checkouts = [];
+  for (const repoPath of [...new Set((pick.managedRepoPaths || []).map((p) => path.resolve(p)))]) {
+    checkouts.push({ role: path.resolve(repoPath) === path.resolve(pick.anchorPath) ? "managed-anchor" : "managed-repo", path: repoPath });
+  }
+  if (reg.kitPath && !checkouts.some((c) => path.resolve(c.path) === path.resolve(reg.kitPath))) {
+    checkouts.push({ role: "kit", path: reg.kitPath });
+  }
+  for (const checkout of checkouts) {
+    if (!dirtyCheckoutEvent({ sweep: "doctor" }, checkout, { gitFn })) targets.add(`${checkout.role}:${checkout.path}`);
+  }
+  return targets;
+}
+
+export function recoveredTargetsForManagedWorkspace({ sourceAnchorPath, config, setupResult, reg = {}, gitFn = git } = {}) {
+  const record = setupResult?.record;
+  if (!sourceAnchorPath || !config || !record) return new Set();
+  let managedRepoPaths = [];
+  try {
+    managedRepoPaths = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord: record }).map((r) => r.path);
+  } catch {
+    managedRepoPaths = Object.values(record.repoMap || {}).map((entry) => entry?.managedPath).filter(Boolean);
+  }
+  return cleanManagedCheckoutTargets({ anchorPath: record.managedAnchorPath, managedRepoPaths }, reg, { gitFn });
+}
+
+export function handoffDirtyCheckoutFailures(candidate, reg = {}, { checkoutDispatchBlockersFn = checkoutDispatchBlockers } = {}) {
+  return checkoutDispatchBlockersFn(candidate, reg)
+    .map((b) => ({ ...b, anchorPath: candidate.anchorPath, config: candidate.config }));
+}
+
+function advisoryDirty(sourcePath, { gitFn = git } = {}) {
+  const event = dirtyCheckoutEvent({ sweep: "doctor" }, { role: "source-advisory", path: sourcePath }, { gitFn });
+  return event ? { ...event, kind: "source-advisory" } : null;
+}
+
+export function doctorReport({
+  registry = readRegistry(),
+  configsBySource = null,
+  existsFn = fs.existsSync,
+  gitFn = git,
+  registryPath = REGISTRY_PATH,
+} = {}) {
+  const reg = normalizeRegistry(registry);
+  const kitDirty = reg.kitPath && existsFn(reg.kitPath)
+    ? dirtyCheckoutEvent({ sweep: "doctor" }, { role: "kit", path: reg.kitPath }, { gitFn })
+    : null;
+  const report = {
+    ok: !kitDirty,
+    registryPath,
+    host: os.hostname(),
+    user: os.userInfo().username,
+    shipRunner: reg.shipRunner,
+    kit: {
+      path: reg.kitPath,
+      remote: reg.kitRemote || null,
+      ref: reg.kitRef || "main",
+      exists: reg.kitPath ? existsFn(reg.kitPath) : false,
+      dirty: kitDirty,
+    },
+    anchors: [],
+  };
+
+  for (const sourceAnchorPath of reg.repos || []) {
+    const record = workspaceRecordForSourceAnchor(sourceAnchorPath, reg);
+    let config = configsBySource instanceof Map ? configsBySource.get(sourceAnchorPath) : null;
+    if (!config && existsFn(sourceAnchorPath)) {
+      try { config = anchorConfig(sourceAnchorPath); } catch { config = null; }
+    }
+    const managedRepoPaths = record && config
+      ? resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord: record }).map((r) => r.path)
+      : (record ? [record.managedAnchorPath] : []);
+    const sourceDirty = existsFn(sourceAnchorPath) ? advisoryDirty(sourceAnchorPath, { gitFn }) : null;
+    const managedBlockers = record
+      ? checkoutDispatchBlockers({ anchorPath: record.managedAnchorPath, managedRepoPaths, sweep: "doctor" }, { kitPath: null }, { gitFn })
+      : [];
+    const envPath = record ? path.join(record.managedAnchorPath, ".env") : null;
+    const anchor = {
+      sourceAnchorPath,
+      sourceExists: existsFn(sourceAnchorPath),
+      sourceDirty,
+      managedWorkspaceRoot: record?.managedWorkspaceRoot || null,
+      managedAnchorPath: record?.managedAnchorPath || null,
+      managedExists: record ? existsFn(record.managedAnchorPath) : false,
+      managedRepoPaths,
+      managedBlockers,
+      env: envPath ? { path: envPath, exists: existsFn(envPath) } : null,
+    };
+    if (managedBlockers.length) report.ok = false;
+    report.anchors.push(anchor);
+  }
+  return report;
+}
+
+export function formatDoctorReport(report) {
+  const lines = [
+    `registry: ${report.registryPath}`,
+    `host: ${report.host} user: ${report.user}`,
+    `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
+    `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
+  ];
+  if (report.kit.dirty) lines.push(`  kit dirty: ${report.kit.dirty.message.replace(/\n/g, "\n  ")}`);
+  for (const anchor of report.anchors) {
+    lines.push("");
+    lines.push(path.basename(anchor.sourceAnchorPath));
+    lines.push(`  source:  ${anchor.sourceAnchorPath}${anchor.sourceExists ? "" : " (missing)"}`);
+    if (anchor.sourceDirty) lines.push(`  source advisory dirty: ${anchor.sourceDirty.message.replace(/\n/g, "\n    ")}`);
+    lines.push(`  managed: ${anchor.managedAnchorPath || "(missing metadata)"}${anchor.managedExists ? "" : " (missing)"}`);
+    if (anchor.env) lines.push(`  env:     ${anchor.env.path}${anchor.env.exists ? "" : " (missing)"}`);
+    if (anchor.managedBlockers.length) {
+      lines.push("  dispatch: BLOCKED");
+      for (const blocker of anchor.managedBlockers) lines.push(`    ${blocker.message.replace(/\n/g, "\n    ")}`);
+    } else {
+      lines.push("  dispatch: OK");
+    }
+  }
+  return lines.join("\n");
 }
 
 // Release orphaned/foreign claims (all of a card's, in one write) — no escalation;
@@ -1470,6 +1769,8 @@ export async function expandDispatchBatch(batch, {
     for (const slot of slots) {
       expanded.push(withCardDispatchEnv({
         anchorPath: pick.anchorPath,
+        sourceAnchorPath: pick.sourceAnchorPath,
+        managedRepoPaths: pick.managedRepoPaths,
         config: pick.config,
         sweep: pick.sweep,
         count: 1,
@@ -1573,6 +1874,8 @@ export async function buildSameRepoRefillDispatches({
 
   const batch = [{
     anchorPath: pick.anchorPath,
+    sourceAnchorPath: pick.sourceAnchorPath,
+    managedRepoPaths: pick.managedRepoPaths,
     config: pick.config,
     sweep,
     count: actionable.length,
@@ -1946,6 +2249,8 @@ async function tick({ dryRun = false } = {}) {
 
         const candidate = {
           anchorPath: pick.anchorPath,
+          sourceAnchorPath: pick.sourceAnchorPath,
+          managedRepoPaths: pick.managedRepoPaths,
           config: pick.config,
           sweep: nextSweep,
           count: 1,
@@ -1954,6 +2259,20 @@ async function tick({ dryRun = false } = {}) {
           cards: [issue],
           triggeredBy: { issue: issue.identifier, sweep: pick.sweep },
         };
+        const dirtyFailures = handoffDirtyCheckoutFailures(candidate, reg)
+          .map((b) => failureEventFor(candidate.anchorPath, candidate.config, b.scope, b.kind, b.stableTarget, b.message));
+        if (dirtyFailures.length) {
+          active.failures.push(...dirtyFailures);
+          for (const failure of dirtyFailures) logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: dirty-checkout ${failure.message}`);
+          try {
+            await reconcileFailureTodos(active.apiKey, candidate.config, candidate.anchorPath, dirtyFailures, new Set(), active.envValues, { dryRun: false });
+          } catch (e) {
+            logFor(candidate.anchorPath, "_", `FATAL failure-todo handoff dirty-checkout reconciliation failed: ${e.message}`);
+            recordLocalFailure(candidate.anchorPath, candidate.config, `${candidate.sweep}:dispatch`, "failure-todo", candidate.anchorPath, e.message);
+            writeLastTick();
+          }
+          return;
+        }
         const batch = selectDispatchBatch([candidate], { maxNonShipDispatches: 1 });
         if (!batch.length) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
@@ -2001,32 +2320,57 @@ async function tick({ dryRun = false } = {}) {
     // API error must never abort the whole tick — skip it and carry on.
     const labeledByKey = new Map();
     const anchors = [];
-    for (const anchorPath of reg.repos) {
+    for (const sourceAnchorPath of reg.repos) {
       let config, apiKey, envValues;
-      try { config = anchorConfig(anchorPath); apiKey = anchorKey(anchorPath); envValues = anchorEnvValues(anchorPath); } catch (e) { log(`FATAL config ${anchorPath}: ${e.message}`); recordLocalFailure(anchorPath, null, "config", "config", anchorPath, e.message); continue; }
-      if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(anchorPath)} (.env) — skipping`); recordLocalFailure(anchorPath, config, "config", "missing-env", path.join(anchorPath, ".env"), "LINEAR_API_KEY missing"); continue; }
+      try { config = anchorConfig(sourceAnchorPath); apiKey = anchorKey(sourceAnchorPath); envValues = anchorEnvValues(sourceAnchorPath); } catch (e) { log(`FATAL config ${sourceAnchorPath}: ${e.message}`); recordLocalFailure(sourceAnchorPath, null, "config", "config", sourceAnchorPath, e.message); continue; }
+      if (!apiKey) { log(`FATAL no LINEAR_API_KEY for ${anchorSlug(sourceAnchorPath)} (.env) — skipping`); recordLocalFailure(sourceAnchorPath, config, "config", "missing-env", path.join(sourceAnchorPath, ".env"), "LINEAR_API_KEY missing"); continue; }
       try {
         if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
       } catch (e) {
-        logFor(anchorPath, "_", `label query error — skipping this tick: ${e.message}`);
-        const event = failureEventFor(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+        logFor(sourceAnchorPath, "_", `label query error — skipping this tick: ${e.message}`);
+        const event = failureEventFor(sourceAnchorPath, config, "activation", "label-query", config.projectId, e.message);
         try {
-          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, [event], new Set(), envValues, { dryRun });
-          if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} activation failure Todo decision(s)`);
+          const decisions = await reconcileFailureTodos(apiKey, config, sourceAnchorPath, [event], new Set(), envValues, { dryRun });
+          if (dryRun && decisions.length) logFor(sourceAnchorPath, "_", `[dry-run] would reconcile ${decisions.length} activation failure Todo decision(s)`);
         } catch (reconcileError) {
-          logFor(anchorPath, "_", `FATAL failure-todo activation reconciliation failed: ${reconcileError.message}`);
-          recordLocalFailure(anchorPath, config, "activation", "label-query", config.projectId, e.message);
+          logFor(sourceAnchorPath, "_", `FATAL failure-todo activation reconciliation failed: ${reconcileError.message}`);
+          recordLocalFailure(sourceAnchorPath, config, "activation", "label-query", config.projectId, e.message);
         }
         continue;
       }
       if (!labeledByKey.get(apiKey).has(config.projectId)) {
-        logFor(anchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`);
+        logFor(sourceAnchorPath, "_", `paused (project not labeled ${AUTO_SWEEP_LABEL})`);
         continue;
       }
-      const active = { anchorPath, config, apiKey, envValues, failures: [], checkedScopes: new Set() };
+      const workspaceRecord = workspaceRecordForSourceAnchor(sourceAnchorPath, reg);
+      const setupResult = dryRun
+        ? materializeManagedWorkspacePlan({ sourceAnchorPath, config, workspaceRecord })
+        : materializeManagedWorkspace({ sourceAnchorPath, config, workspaceRecord });
+      if (!setupResult.ok) {
+        const failures = setupResult.blockers.map((b) => failureEventFor(sourceAnchorPath, config, "setup", b.kind, b.stableTarget || b.managedPath || b.sourcePath || sourceAnchorPath, b.message));
+        const recoveredTargets = recoveredTargetsForManagedWorkspace({ sourceAnchorPath, config, setupResult, reg });
+        for (const failure of failures) logFor(sourceAnchorPath, "_", `managed workspace blocked: ${failure.message}`);
+        try {
+          const decisions = await reconcileFailureTodos(apiKey, config, sourceAnchorPath, failures, new Set(["activation"]), envValues, { dryRun, recoveredTargets });
+          if (dryRun && decisions.length) logFor(sourceAnchorPath, "_", `[dry-run] would reconcile ${decisions.length} setup failure Todo decision(s)`);
+        } catch (e) {
+          logFor(sourceAnchorPath, "_", `FATAL failure-todo managed workspace reconciliation failed: ${e.message}`);
+          recordLocalFailure(sourceAnchorPath, config, "setup", "failure-todo", config.projectId, e.message);
+        }
+        continue;
+      }
+      if (!dryRun) {
+        reg.managedAnchors[sourceAnchorPath] = setupResult.record;
+        writeRegistry(reg);
+      }
+      const managedAnchorPath = setupResult.record.managedAnchorPath;
+      const managedRepoPaths = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord: setupResult.record }).map((r) => r.path);
+      const recoveredTargets = cleanManagedCheckoutTargets({ anchorPath: managedAnchorPath, managedRepoPaths }, reg);
+      const active = { anchorPath: managedAnchorPath, sourceAnchorPath, managedRepoPaths, workspaceRecord: setupResult.record, config, apiKey, envValues, failures: [], checkedScopes: new Set(), recoveredTargets };
       active.checkedScopes.add("activation");
+      active.checkedScopes.add("setup");
       anchors.push(active);
-      activeByAnchor.set(anchorPath, active);
+      activeByAnchor.set(managedAnchorPath, active);
     }
     for (const f of updateFailures) {
       const active = f.anchorPath ? activeByAnchor.get(f.anchorPath) : null;
@@ -2094,7 +2438,7 @@ async function tick({ dryRun = false } = {}) {
             if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
             continue;
           }
-          if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
+          if (actionable.length > 0) candidates.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
         }
 
         // Holding/legacy-state reaper: release claims stranded in states no sweep fetches
@@ -2115,7 +2459,7 @@ async function tick({ dryRun = false } = {}) {
         } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", CLAIM_CLEANUP_STATES.join(","), e.message); }
 
         try {
-          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });
+          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun, recoveredTargets: active.recoveredTargets });
           if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} failure Todo decision(s)`);
         } catch (e) {
           logFor(anchorPath, "_", `FATAL failure-todo reconciliation failed: ${e.message}`);
@@ -2229,18 +2573,33 @@ async function tick({ dryRun = false } = {}) {
 
 function cmdRegister(anchorPath) {
   const abs = path.resolve(anchorPath);
-  anchorConfig(abs); // throws if no .claude/linear-sweep.json
+  const config = anchorConfig(abs); // throws if no .claude/linear-sweep.json
   const reg = readRegistry();
   if (!reg.repos.includes(abs)) reg.repos.push(abs);
+  const normalized = normalizeRegistry(reg);
   // Auto-wire the kit clone for auto-update on first register (don't override a
   // value the user already set) so setup needs no hand-editing of the registry.
-  if (!reg.kitPath) { reg.kitPath = KIT_ROOT; console.log(`kitPath → ${KIT_ROOT}`); }
-  if (!reg.kitRemote) {
+  if (!normalized.kitPath) { normalized.kitPath = KIT_ROOT; console.log(`kitPath → ${KIT_ROOT}`); }
+  if (!normalized.kitRemote) {
     const url = git(KIT_ROOT, ["remote", "get-url", "origin"], { allowFail: true }).out;
-    if (url) { reg.kitRemote = url; console.log(`kitRemote → ${url}`); }
+    if (url) { normalized.kitRemote = url; console.log(`kitRemote → ${url}`); }
   }
-  writeRegistry(reg);
+  const record = normalized.managedAnchors[abs];
+  if (record) {
+    const setup = materializeManagedWorkspace({ sourceAnchorPath: abs, config, workspaceRecord: record });
+    if (!setup.ok) {
+      console.error(`managed workspace setup failed for ${abs}`);
+      for (const blocker of setup.blockers) console.error(`- ${blocker.kind}: ${blocker.message}`);
+      process.exit(1);
+    }
+    normalized.managedAnchors[abs] = setup.record;
+  }
+  writeRegistry(normalized);
   console.log(`registered ${abs}`);
+  if (normalized.managedAnchors[abs]) {
+    console.log(`managedWorkspace → ${normalized.managedAnchors[abs].managedWorkspaceRoot}`);
+    console.log(`managedAnchor → ${normalized.managedAnchors[abs].managedAnchorPath}`);
+  }
 }
 
 function cmdUnregister(anchorPath) {
@@ -2282,6 +2641,8 @@ async function cmdList() {
       const config = anchorConfig(anchorPath);
       const apiKey = anchorKey(anchorPath);
       line += `  project=${config.projectId}`;
+      const record = workspaceRecordForSourceAnchor(anchorPath, reg);
+      if (record) line += `  managed=${record.managedAnchorPath}`;
       if (apiKey) {
         if (!labeledByKey.has(apiKey)) labeledByKey.set(apiKey, await labeledProjectIds(apiKey));
         line += labeledByKey.get(apiKey).has(config.projectId) ? "  [auto-sweep: ON]" : "  [auto-sweep: off]";
@@ -2339,6 +2700,20 @@ function cmdHealth() {
   if (!status.ok) process.exit(1);
 }
 
+function cmdDoctor(args = []) {
+  const json = args.includes("--json");
+  const anchorArg = args.find((a) => a !== "--json");
+  let reg = readRegistry();
+  if (anchorArg) {
+    const wanted = path.resolve(anchorArg);
+    reg = { ...reg, repos: reg.repos.filter((p) => path.resolve(p) === wanted) };
+  }
+  const report = doctorReport({ registry: reg });
+  if (json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatDoctorReport(report));
+  if (!report.ok) process.exit(1);
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -2354,8 +2729,9 @@ async function main() {
     case "ship-runner": return cmdShipRunner(args[0]);
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
+    case "doctor": return cmdDoctor(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | tick [--dry-run] | health");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }

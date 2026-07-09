@@ -133,7 +133,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 - **Workspace** = one Linear project ↔ one **anchor repo** (the repo holding `.claude/linear-sweep.json`, i.e. `TARGET`) plus any sibling repos it lists in `config.repos`. One anchor per project.
 - **Activation** = a Linear **project label `auto-sweep`**. The launcher only sweeps a registered anchor whose project carries that label. `activate`/`deactivate` toggle it via the API.
 - **Manual-only issue label** = `sweep:manual-only`. Use it on cards created or moved by direct user conversations and non-sweep skills unless the card is meant to enter the unattended queue immediately. The scheduled launcher skips these cards in every sweep; `unblock-sweep` can clear the label after a human chooses to resume automation.
-- **`ANCHOR`** below = the absolute path to `TARGET` (the anchor repo). Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
+- **`ANCHOR`** below = the absolute path to `TARGET` (the source anchor repo). Registration creates managed workspace metadata under `~/.local/share/linear-board-sweeps/workspaces/<anchor>/`. Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
 
 1. **Ensure runtime selection exists** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has this. If not, add:
    ```jsonc
@@ -182,10 +182,11 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    "KIT/scripts/install-watch.sh"
    ```
 
-3. **Register the anchor.** The installer already wired `kitPath`/`kitRemote`; registration adds the workspace anchor:
+3. **Register the anchor.** The installer already wired `kitPath`/`kitRemote`; registration adds the source workspace anchor and managed clone paths:
    ```bash
    node "KIT/scripts/linear-watch.mjs" register "ANCHOR"
    ```
+   Source checkout dirtiness is advisory after this point; scheduled dispatch runs from managed clones populated from origin. Unpushed local commits are not visible to unattended sweeps.
 
 4. **Activate the project** (adds the `auto-sweep` label via the API; creates the label if it doesn't exist yet):
    ```bash
@@ -193,19 +194,28 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" list        # each anchor → projectId + [auto-sweep: ON]
    ```
 
-5. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
+5. **Validate the host and managed workspace**:
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" doctor
+   node "KIT/scripts/linear-watch.mjs" doctor --json
+   ```
+   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, and dirty managed dispatch blockers. It exits non-zero when scheduled dispatch is blocked by dirty managed state.
+
+6. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
    ```bash
    node "KIT/scripts/linear-watch.mjs" tick --dry-run
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
    Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch. With `parallel.sameRepoCardLimits`, dry-run also logs the exact card slots it would claim and dispatch without writing claim labels. `parallel.maxSameRepoRefillDispatches` is visible in live `refill-trigger` / `refill-skip` logs after a child completes; dry-run cannot simulate that mid-batch completion. With `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
 
-6. **Activate the schedule** (10-min timer) and confirm health:
+7. **Activate the schedule** (10-min timer) and confirm health:
    ```bash
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist
    node "KIT/scripts/linear-watch.mjs" health      # "last tick …" or "tick in progress"
    ```
    Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
+
+**Managed workspace notes.** Scheduled sweeps clone/fetch/ff-only every configured repo in `config.repos` into one managed workspace root. `.env` is copied only when it exists in the source repo and is gitignored there, then written in the managed clone with mode `0600`. Screenshots, logs, browser profiles, and temporary files should use the launcher-provided `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` paths under state/cache directories, not repo roots.
 
 **Scheduling caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production merge/deploy path and only runs from the human-gated `Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
 

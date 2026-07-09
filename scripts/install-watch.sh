@@ -44,7 +44,7 @@ const path = require("path");
 const [kitPath, kitRemote] = process.argv.slice(2);
 const configDir = path.join(process.env.HOME, ".config", "linear-board-sweeps");
 const registryPath = path.join(configDir, "registry.json");
-let registry = { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [] };
+let registry = { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [], managedAnchors: {} };
 if (fs.existsSync(registryPath)) registry = { ...registry, ...JSON.parse(fs.readFileSync(registryPath, "utf8")) };
 registry.kitPath = kitPath;
 registry.kitRemote = kitRemote || registry.kitRemote;
@@ -68,16 +68,26 @@ Installed. Nothing is scheduled yet.
      ~/.config/linear-board-sweeps/registry.json
      -> kitPath is $KIT
 
-3) Add the 'auto-sweep' project label in Linear to each project you want swept.
+3) Register creates managed workspace metadata under:
+     ~/.local/share/linear-board-sweeps/workspaces/<anchor>/
 
-4) Dry-run against the live board (spends NO tokens — logs what it would dispatch):
+   Scheduled dispatch uses those managed clones; source checkout dirtiness is
+   advisory after pushed commits are available on origin.
+
+4) Add the 'auto-sweep' project label in Linear to each project you want swept.
+
+5) Validate the host and managed workspaces:
+     node "$HERE/linear-watch.mjs" doctor
+
+6) Dry-run against the live board (spends NO tokens — logs what it would dispatch):
      node "$HERE/linear-watch.mjs" tick --dry-run
 
-5) Activate the 10-min schedule:
+7) Activate the 10-min schedule:
      launchctl bootstrap gui/\$(id -u) "$AGENTS/$PLIST"
      launchctl kickstart -k gui/\$(id -u)/com.linear-board-sweeps.watch   # run once now
 
    Health / stop:
      node "$HERE/linear-watch.mjs" health
+     node "$HERE/linear-watch.mjs" doctor --json
      launchctl bootout gui/\$(id -u)/com.linear-board-sweeps.watch
 EOF

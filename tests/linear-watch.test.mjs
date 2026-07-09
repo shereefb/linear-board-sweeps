@@ -3,8 +3,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
-  resolveRepos, worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
+  resolveRepos, resolveWorkspaceRepos, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
+  normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
+  recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures,
+  dirtyCheckoutEvent, doctorReport, formatDoctorReport,
+  worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, rotateNonShipCandidates,
@@ -41,6 +47,167 @@ test("resolveRepos: absolute and ./ entries are used as-is", () => {
 });
 test("resolveRepos: empty repos defaults to the anchor itself", () => {
   assert.deepEqual(resolveRepos("/ws/anchor", {}).map((r) => r.path), ["/ws/anchor"]);
+});
+test("normalizeRegistry: preserves source anchors and adds managed anchor metadata", () => {
+  const normalized = normalizeRegistry({
+    repos: ["/Users/jarvis/code/zomes_sdr"],
+    managedAnchors: {},
+  }, {
+    now: () => "2026-07-09T00:00:00.000Z",
+    homeDir: "/Users/jarvis",
+  });
+
+  assert.deepEqual(normalized.repos, ["/Users/jarvis/code/zomes_sdr"]);
+  assert.match(
+    normalized.managedAnchors["/Users/jarvis/code/zomes_sdr"].managedWorkspaceRoot,
+    /^\/Users\/jarvis\/\.local\/share\/linear-board-sweeps\/workspaces\/zomes_sdr-[a-f0-9]{8}$/,
+  );
+  assert.match(
+    normalized.managedAnchors["/Users/jarvis/code/zomes_sdr"].managedAnchorPath,
+    /^\/Users\/jarvis\/\.local\/share\/linear-board-sweeps\/workspaces\/zomes_sdr-[a-f0-9]{8}\/zomes_sdr$/,
+  );
+});
+test("normalizeRegistry: managed workspace roots include a path hash to avoid same-basename collisions", () => {
+  const normalized = normalizeRegistry({
+    repos: ["/teams/a/app", "/teams/b/app"],
+  }, {
+    now: () => "2026-07-09T00:00:00.000Z",
+    homeDir: "/Users/jarvis",
+  });
+
+  const roots = normalized.repos.map((repo) => normalized.managedAnchors[repo].managedWorkspaceRoot);
+  assert.equal(new Set(roots).size, 2);
+  assert.ok(roots.every((root) => /workspaces\/app-[a-f0-9]{8}$/.test(root)), roots.join(", "));
+});
+test("resolveWorkspaceRepos: managed mode maps relative and absolute repos under the managed workspace", () => {
+  const record = workspaceRecordForSourceAnchor("/src/app", {
+    repos: ["/src/app"],
+    managedAnchors: {
+      "/src/app": {
+        sourceAnchorPath: "/src/app",
+        managedWorkspaceRoot: "/managed/app",
+        managedAnchorPath: "/managed/app/app",
+        repoMap: {
+          "/src/external-api": { managedPath: "/managed/app/external-api" },
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(resolveWorkspaceRepos("/src/app", { repos: ["app", "worker"] }, { mode: "source" }).map((r) => r.path), ["/src/app", "/src/worker"]);
+  const managedPaths = resolveWorkspaceRepos("/src/app", { repos: ["app", "worker", "/src/external-api"] }, { mode: "managed", workspaceRecord: record }).map((r) => r.path);
+  assert.equal(managedPaths[0], "/managed/app/app");
+  assert.match(managedPaths[1], /^\/managed\/app\/worker-[a-f0-9]{8}$/);
+  assert.equal(managedPaths[2], "/managed/app/external-api");
+  assert.deepEqual(managedPaths.filter((p) => p === "/managed/app/external-api" || p === "/managed/app/app"), [
+    "/managed/app/app",
+    "/managed/app/external-api",
+  ]);
+});
+test("materializeManagedWorkspacePlan: missing source origin is a setup blocker", () => {
+  const gitFn = (repo, args) => {
+    if (args.join(" ") === "remote get-url origin" && repo === "/src/app") return { status: 1, out: "", err: "No such remote" };
+    return { status: 0, out: "", err: "" };
+  };
+  const plan = materializeManagedWorkspacePlan({
+    sourceAnchorPath: "/src/app",
+    config: { repos: ["app"] },
+    workspaceRecord: {
+      sourceAnchorPath: "/src/app",
+      managedWorkspaceRoot: "/managed/app",
+      managedAnchorPath: "/managed/app/app",
+      repoMap: {},
+    },
+    existsFn: () => false,
+    gitFn,
+  });
+
+  assert.equal(plan.ok, false);
+  assert.equal(plan.blockers[0].kind, "missing-origin");
+  assert.equal(plan.blockers[0].sourcePath, "/src/app");
+});
+test("recoveredTargetsForManagedWorkspace: setup failures recover clean managed targets independently", () => {
+  const record = {
+    sourceAnchorPath: "/src/app",
+    managedWorkspaceRoot: "/managed/app",
+    managedAnchorPath: "/managed/app/app",
+    repoMap: {},
+  };
+  const managedWorker = resolveWorkspaceRepos("/src/app", { repos: ["app", "worker"] }, { mode: "managed", workspaceRecord: record })[1].path;
+  const setupResult = {
+    ok: false,
+    record,
+    blockers: [{ kind: "dirty-checkout", managedPath: managedWorker, stableTarget: `managed-repo:${managedWorker}`, message: "worker dirty" }],
+  };
+  const gitFn = (repo, args) => {
+    if (args.join(" ") === "status --porcelain -uall" && repo === managedWorker) return { status: 0, out: " M package.json", err: "" };
+    if (args.join(" ") === "status --porcelain -uall") return { status: 0, out: "", err: "" };
+    return { status: 0, out: "", err: "" };
+  };
+
+  const targets = recoveredTargetsForManagedWorkspace({
+    sourceAnchorPath: "/src/app",
+    config: { repos: ["app", "worker"] },
+    setupResult,
+    reg: { kitPath: "/kit" },
+    gitFn,
+  });
+
+  assert.equal(targets.has("managed-anchor:/managed/app/app"), true);
+  assert.equal(targets.has(`managed-repo:${managedWorker}`), false);
+  assert.equal(targets.has("kit:/kit"), true);
+});
+test("materializeManagedWorkspace: clones missing managed repos and fast-forwards existing clean repos", () => {
+  const calls = [];
+  const existing = new Set(["/managed/app/worker-8cea2197"]);
+  const gitFn = (repo, args) => {
+    calls.push([repo, args.join(" ")]);
+    if (args.join(" ") === "remote get-url origin") return { status: 0, out: `git@example.com:${path.basename(repo)}.git`, err: "" };
+    if (args.join(" ") === "status --porcelain -uall") return { status: 0, out: "", err: "" };
+    return { status: 0, out: "", err: "" };
+  };
+
+  const result = materializeManagedWorkspace({
+    sourceAnchorPath: "/src/app",
+    config: { repos: ["app", "worker"] },
+    workspaceRecord: {
+      sourceAnchorPath: "/src/app",
+      managedWorkspaceRoot: "/managed/app",
+      managedAnchorPath: "/managed/app/app",
+      repoMap: {},
+    },
+    existsFn: (p) => existing.has(p),
+    mkdirFn: (p) => calls.push(["mkdir", p]),
+    gitFn,
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(calls.some(([repo, cmd]) => repo === "/managed/app" && cmd === "clone git@example.com:app.git /managed/app/app"));
+  assert.ok(calls.some(([repo, cmd]) => repo === "/managed/app/worker-8cea2197" && cmd === "fetch origin"));
+  assert.ok(calls.some(([repo, cmd]) => repo === "/managed/app/worker-8cea2197" && cmd === "merge --ff-only origin/main"));
+});
+test("syncAllowedEnvFiles: copies only gitignored env files with restrictive mode", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "linear-env-sync-"));
+  const source = path.join(root, "source");
+  const managed = path.join(root, "managed");
+  fs.mkdirSync(source);
+  fs.mkdirSync(managed);
+  fs.writeFileSync(path.join(source, ".env"), "LINEAR_API_KEY=lin_api_secret\n");
+  fs.writeFileSync(path.join(source, ".env.tracked"), "NOPE=1\n");
+  const checks = [];
+  const gitFn = (repo, args) => {
+    checks.push(args.join(" "));
+    if (args.join(" ") === "check-ignore -q .env") return { status: 0, out: "", err: "" };
+    return { status: 1, out: "", err: "" };
+  };
+
+  const copied = syncAllowedEnvFiles(source, managed, { allowed: [".env", ".env.tracked"], gitFn });
+
+  assert.deepEqual(copied, [".env"]);
+  assert.equal(fs.existsSync(path.join(managed, ".env")), true);
+  assert.equal(fs.existsSync(path.join(managed, ".env.tracked")), false);
+  assert.equal((fs.statSync(path.join(managed, ".env")).mode & 0o777), 0o600);
+  assert.deepEqual(checks, ["check-ignore -q .env", "check-ignore -q .env.tracked"]);
 });
 test("worktreePath is deterministic under the repo", () => {
   assert.equal(worktreePath("/ws/repo", "COD-42"), "/ws/repo/.worktrees/COD-42");
@@ -431,6 +598,30 @@ test("handoffTriggerKey: scopes duplicate suppression by issue and edge", () => 
   assert.equal(handoffTriggerKey("COD-1", "spec", "dev"), "COD-1:spec->dev");
   assert.notEqual(handoffTriggerKey("COD-1", "spec", "dev"), handoffTriggerKey("COD-1", "dev", "qa"));
 });
+test("handoffDirtyCheckoutFailures: handoff candidates use managed dirty-check failures before dispatch", () => {
+  const failures = handoffDirtyCheckoutFailures({
+    anchorPath: "/managed/app/app",
+    managedRepoPaths: ["/managed/app/app", "/managed/app/worker"],
+    issueIdentifier: "COD-22",
+    sweep: "qa",
+    config: { teamKey: "COD", projectId: "project-1", repos: ["app", "worker"] },
+  }, {}, {
+    checkoutDispatchBlockersFn: (candidate) => checkoutDispatchBlockers(candidate, {}, {
+      gitFn: (repo, args) => {
+        if (args.join(" ") === "status --porcelain -uall" && repo === "/managed/app/worker") {
+          return { status: 0, out: " M README.md", err: "" };
+        }
+        return { status: 0, out: "", err: "" };
+      },
+    }),
+  });
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].scope, "qa:dispatch");
+  assert.equal(failures[0].kind, "dirty-checkout");
+  assert.equal(failures[0].stableTarget, "managed-repo:/managed/app/worker");
+  assert.match(failures[0].message, /README\.md/);
+});
 test("selectCardSlots: chooses top actionable cards and assigns stable slot indexes", () => {
   const cards = [
     { id: "blocked", identifier: "COD-1", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
@@ -472,6 +663,9 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
+  for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
+    assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
+  }
   assert.equal(pick.sameRepoLimit, 4);
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
@@ -520,6 +714,20 @@ test("expandDispatchBatch: same-card handoff children get unique run paths", asy
   assert.notEqual(dev[0].tmpDir, qa[0].tmpDir);
   assert.notEqual(dev[0].browserProfileDir, qa[0].browserProfileDir);
   assert.notEqual(dev[0].childEnv.AUTO_SWEEP_APP_PORT, qa[0].childEnv.AUTO_SWEEP_APP_PORT);
+});
+test("expandDispatchBatch: child dispatches preserve managed repo metadata for later dirty checks", async () => {
+  const children = await expandDispatchBatch([{
+    anchorPath: "/managed/app/app",
+    sourceAnchorPath: "/source/app",
+    managedRepoPaths: ["/managed/app/app", "/managed/app/worker"],
+    config: { repos: ["app", "worker"] },
+    sweep: "dev",
+    count: 1,
+    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+  }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW });
+
+  assert.deepEqual(children[0].managedRepoPaths, ["/managed/app/app", "/managed/app/worker"]);
+  assert.equal(children[0].sourceAnchorPath, "/source/app");
 });
 test("same-repo active counts: successful child completion frees exactly one slot", () => {
   const active = createSameRepoActiveCounts();
@@ -701,6 +909,39 @@ test("buildSameRepoRefillDispatches: live board claims count against refill capa
   });
   assert.equal(result.reason, "no-capacity");
   assert.deepEqual(claimCalls, []);
+});
+test("buildSameRepoRefillDispatches: dirty checks include managed sibling paths from the completed child", async () => {
+  const seen = [];
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "COD-4",
+      pick: {
+        anchorPath: "/managed/app/app",
+        managedRepoPaths: ["/managed/app/app", "/managed/app/worker"],
+        sweep: "dev",
+        issueIdentifier: "COD-4",
+        config: { teamKey: "COD", projectId: "project-1", repos: ["app", "worker"], parallel: { sameRepoCardLimits: { dev: 4 } } },
+      },
+    },
+    activeByAnchor: new Map([["/managed/app/app", { apiKey: "lin" }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget: { remaining: 1 },
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-1"]),
+      checkoutDispatchBlockers: (pick) => {
+        seen.push(pick.managedRepoPaths);
+        return [{ kind: "dirty-checkout" }];
+      },
+      logFor: () => {},
+    },
+  });
+
+  assert.equal(result.reason, "dirty-checkout");
+  assert.deepEqual(seen[0], ["/managed/app/app", "/managed/app/worker"]);
 });
 test("selectDispatchBatch: defaults to bounded parallel non-ship dispatches", () => {
   const batch = selectDispatchBatch([
@@ -1130,6 +1371,15 @@ test("failureTodoDecisions: dispatch failures recover only after dispatch succee
   const dispatchCheck = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev:dispatch" })], new Set(["dev:dispatch"]), NOW);
   assert.equal(dispatchCheck[0].action, "close");
 });
+test("failureTodoDecisions: dirty-checkout Todos recover when the stable target is clean even if dispatch scope was not selected", () => {
+  const event = failureEvent({ scope: "dev:dispatch", kind: "dirty-checkout", stableTarget: "managed-anchor:/managed/app" });
+  const fp = failureFingerprint(event);
+  const todo = existingFailureTodo(fp, { scope: "dev:dispatch", description: failureTodoBody(event, fp) });
+
+  assert.deepEqual(failureTodoDecisions([], [todo], new Set(["dev"]), NOW), []);
+  const decisions = failureTodoDecisions([], [todo], new Set(["dev"]), NOW, { recoveredTargets: new Set(["managed-anchor:/managed/app"]) });
+  assert.equal(decisions[0].action, "close");
+});
 test("failureTodoDecisions: holding-state failures use the holding recovery scope", () => {
   const event = failureEvent({ scope: "holding", kind: "holding-state-fetch" });
   const fp = failureFingerprint(event);
@@ -1201,25 +1451,99 @@ test("pushWithRetry: gives up after maxRetries without forcing", () => {
   assert.equal(calls.filter((c) => c === "push").length, 3); // initial + 2 retries
   assert.ok(!calls.some((c) => c === "--force"));
 });
-test("checkoutDispatchBlockers: dirty anchor blocks unattended dispatch", () => {
+test("dirtyCheckoutEvent: reports exact dirty path samples with overflow", () => {
+  const paths = Array.from({ length: 30 }, (_, i) => `?? file-${i}.png`).join("\n");
+  const event = dirtyCheckoutEvent(
+    { sweep: "dev" },
+    { role: "managed-anchor", path: "/managed/app" },
+    { gitFn: () => ({ status: 0, out: paths, err: "" }) },
+  );
+
+  assert.equal(event.kind, "dirty-checkout");
+  assert.match(event.message, /30 uncommitted path/);
+  assert.match(event.message, /paths:\n  \?\? file-0\.png/);
+  assert.match(event.message, /\.\.\. and 5 more path/);
+});
+test("checkoutDispatchBlockers: dirty source anchor is advisory when managed checkouts are present", () => {
   const calls = [];
   const gitFn = (repo, args) => {
     calls.push([repo, args.join(" ")]);
-    return { status: 0, out: repo === "/anchor" ? " M scripts/linear-watch.mjs\n?? tmp" : "", err: "" };
+    return { status: 0, out: repo === "/source" ? " M local-note.md" : "", err: "" };
   };
-  const blockers = checkoutDispatchBlockers({ anchorPath: "/anchor", sweep: "ship" }, { kitPath: "/anchor" }, { gitFn });
-  assert.equal(blockers.length, 1);
-  assert.equal(blockers[0].scope, "ship:dispatch");
-  assert.equal(blockers[0].kind, "dirty-checkout");
-  assert.equal(blockers[0].stableTarget, "anchor:/anchor");
-  assert.match(blockers[0].message, /2 uncommitted path/);
-  assert.deepEqual(calls, [["/anchor", "status --porcelain"]]);
+  const blockers = checkoutDispatchBlockers({
+    anchorPath: "/managed/app",
+    sourceAnchorPath: "/source",
+    managedRepoPaths: ["/managed/app"],
+    issueIdentifier: "COD-10",
+    config: { repos: ["app"] },
+    sweep: "ship",
+  }, { kitPath: "/kit" }, { gitFn });
+  assert.equal(blockers.length, 0);
+  assert.deepEqual(calls, [
+    ["/managed/app/.worktrees/COD-10", "status --porcelain -uall"],
+    ["/managed/app", "status --porcelain -uall"],
+    ["/kit", "status --porcelain -uall"],
+  ]);
 });
-test("checkoutDispatchBlockers: dirty kit clone also blocks dispatch", () => {
-  const gitFn = (repo) => ({ status: 0, out: repo === "/kit" ? " M README.md" : "", err: "" });
-  const blockers = checkoutDispatchBlockers({ anchorPath: "/anchor", sweep: "dev" }, { kitPath: "/kit" }, { gitFn });
+test("checkoutDispatchBlockers: dirty ignored card worktree blocks dispatch", () => {
+  const gitFn = (repo) => ({ status: 0, out: repo === "/managed/app/.worktrees/COD-10" ? " M src/change.js" : "", err: "" });
+  const blockers = checkoutDispatchBlockers({
+    anchorPath: "/managed/app",
+    managedRepoPaths: ["/managed/app"],
+    issueIdentifier: "COD-10",
+    config: { repos: ["app"] },
+    sweep: "qa",
+  }, {}, { gitFn });
+
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].scope, "qa:dispatch");
+  assert.equal(blockers[0].kind, "dirty-checkout");
+  assert.equal(blockers[0].stableTarget, "worktree:/managed/app/.worktrees/COD-10");
+  assert.match(blockers[0].message, /src\/change\.js/);
+});
+test("checkoutDispatchBlockers: dirty managed repo and kit clone block dispatch", () => {
+  const gitFn = (repo) => ({ status: 0, out: repo === "/managed/sibling" || repo === "/kit" ? " M README.md" : "", err: "" });
+  const blockers = checkoutDispatchBlockers({
+    anchorPath: "/managed/anchor",
+    managedRepoPaths: ["/managed/anchor", "/managed/sibling"],
+    sweep: "dev",
+  }, { kitPath: "/kit" }, { gitFn });
+  assert.equal(blockers.length, 2);
+  assert.deepEqual(blockers.map((b) => b.stableTarget), ["managed-repo:/managed/sibling", "kit:/kit"]);
+});
+test("checkoutDispatchBlockers: legacy source-anchor dispatch still blocks dirty anchor", () => {
+  const gitFn = (repo) => ({ status: 0, out: repo === "/anchor" ? " M README.md" : "", err: "" });
+  const blockers = checkoutDispatchBlockers({ anchorPath: "/anchor", sweep: "dev" }, { kitPath: "/anchor" }, { gitFn });
   assert.equal(blockers.length, 1);
   assert.equal(blockers[0].scope, "dev:dispatch");
   assert.equal(blockers[0].kind, "dirty-checkout");
-  assert.equal(blockers[0].stableTarget, "kit:/kit");
+  assert.equal(blockers[0].stableTarget, "anchor:/anchor");
+});
+test("doctorReport: distinguishes source advisory dirtiness from managed blocking dirtiness", () => {
+  const registry = normalizeRegistry({
+    kitPath: "/kit",
+    shipRunner: true,
+    repos: ["/src/app"],
+    managedAnchors: {
+      "/src/app": {
+        sourceAnchorPath: "/src/app",
+        managedWorkspaceRoot: "/managed/app",
+        managedAnchorPath: "/managed/app/app",
+        repoMap: {},
+      },
+    },
+  });
+  const gitFn = (repo) => ({ status: 0, out: repo === "/src/app" || repo === "/managed/app/app" ? "?? screenshot.png" : "", err: "" });
+  const report = doctorReport({
+    registry,
+    configsBySource: new Map([["/src/app", { repos: ["app"] }]]),
+    existsFn: (p) => p === "/kit" || p === "/src/app" || p === "/managed/app/app",
+    gitFn,
+  });
+
+  assert.equal(report.ok, false);
+  assert.equal(report.anchors[0].sourceDirty.kind, "source-advisory");
+  assert.equal(report.anchors[0].managedBlockers[0].stableTarget, "managed-anchor:/managed/app/app");
+  assert.match(formatDoctorReport(report), /source advisory dirty/);
+  assert.match(formatDoctorReport(report), /dispatch: BLOCKED/);
 });
