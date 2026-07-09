@@ -22,7 +22,13 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { gql, WORKFLOW_STATES } from "./linear.mjs";
+import {
+  dependencyEligibility,
+  fetchIssueDependencies,
+  gql,
+  normalizeBlockingRelations,
+  WORKFLOW_STATES,
+} from "./linear.mjs";
 
 // The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
 const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -453,6 +459,7 @@ export function bounceDecisions(cards, cfg, now, windowH = ESCALATE_WINDOW_H) {
 export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
+    if (!dependencyEligibility(card.blockers, card.blockersComplete !== false).eligible) return false;
     const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
@@ -618,6 +625,7 @@ export function claimConfirmed(card, cfg, owner, expectedStates = []) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
+  if (!dependencyEligibility(card.blockers, card.blockersComplete !== false).eligible) return false;
   return latestHeartbeatOwner(card, cfg.claim) === owner;
 }
 
@@ -1186,7 +1194,98 @@ async function labeledProjectIds(apiKey) {
   return ids;
 }
 
+function unwrapGraphQlData(result, context) {
+  if (Array.isArray(result?.errors) && result.errors.length) {
+    throw new Error(`${context} returned partial GraphQL data: ${result.errors.map((error) => error.message || String(error)).join("; ")}`);
+  }
+  return result?.data || result;
+}
+
+function normalizeCardFields(node) {
+  return {
+    id: node.id,
+    identifier: node.identifier,
+    stateName: node.state?.name,
+    updatedAt: node.updatedAt,
+    sortOrder: node.sortOrder,
+    labelNames: node.labels.nodes.map((label) => label.name),
+    labelIds: Object.fromEntries(node.labels.nodes.map((label) => [label.name, label.id])),
+    comments: node.comments.nodes,
+  };
+}
+
+async function normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesFn }) {
+  const connection = node?.inverseRelations;
+  const pageInfo = connection?.pageInfo;
+  if (typeof pageInfo?.hasNextPage !== "boolean") {
+    throw new Error(`inverseRelations pageInfo missing for ${node?.identifier || node?.id || "unknown issue"}`);
+  }
+
+  let blockers = normalizeBlockingRelations(connection);
+  let blockersComplete = !pageInfo.hasNextPage;
+  if (!blockersComplete) {
+    const resolved = await fetchIssueDependenciesFn(apiKey, node.id, { gqlFn });
+    blockers = resolved?.blockers || [];
+    blockersComplete = resolved?.complete === true;
+    if (!blockersComplete) throw new Error(`incomplete relation pagination for ${node.identifier || node.id}`);
+  }
+
+  return {
+    ...normalizeCardFields(node),
+    blockers,
+    blockersComplete,
+    dependency: dependencyEligibility(blockers, blockersComplete),
+  };
+}
+
+export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, states, {
+  gqlFn = gql,
+  fetchIssueDependenciesFn = fetchIssueDependencies,
+} = {}) {
+  const requestedStates = [...new Set(states || [])];
+  const byState = new Map(requestedStates.map((state) => [state, []]));
+  const seenCursors = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($c:String,$states:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ id identifier updatedAt sortOrder
+           state{ name }
+           labels{ nodes{ id name } }
+           comments(last:100){ nodes{ body createdAt } }
+           inverseRelations(first:50){
+             pageInfo{ hasNextPage endCursor }
+             nodes{ id type issue{ id identifier state{ id name type } } }
+           } } } }`,
+      { c: cursor, states: requestedStates, teamKey, pid: projectId },
+      apiKey
+    );
+    const data = unwrapGraphQlData(result, "scheduled queue snapshot");
+    const connection = data?.issues;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("scheduled queue snapshot is missing issues data or pageInfo");
+    }
+    for (const node of connection.nodes) {
+      const card = await normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesFn });
+      if (!byState.has(card.stateName)) byState.set(card.stateName, []);
+      byState.get(card.stateName).push(card);
+    }
+    if (!connection.pageInfo.hasNextPage) return byState;
+    const nextCursor = connection.pageInfo.endCursor;
+    if (!nextCursor || seenCursors.has(nextCursor)) throw new Error("scheduled queue snapshot pagination is incomplete");
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+}
+
 async function fetchCards(apiKey, teamKey, projectId, states) {
+  const byState = await fetchScheduledQueueCards(apiKey, teamKey, projectId, states);
+  return [...new Set(states || [])].flatMap((state) => byState.get(state) || []);
+}
+
+async function fetchClaimCleanupCards(apiKey, teamKey, projectId, states) {
   const cards = [];
   let cursor = null;
   do {
@@ -1194,25 +1293,13 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
       `query($c:String,$states:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
          team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
          pageInfo{ hasNextPage endCursor }
-         nodes{ id identifier updatedAt sortOrder
-           state{ name }
+         nodes{ id identifier updatedAt sortOrder state{ name }
            labels{ nodes{ id name } }
            comments(last:100){ nodes{ body createdAt } } } } }`,
       { c: cursor, states, teamKey, pid: projectId },
-      apiKey
+      apiKey,
     );
-    for (const n of d.issues.nodes) {
-      cards.push({
-        id: n.id,
-        identifier: n.identifier,
-        stateName: n.state?.name,
-        updatedAt: n.updatedAt,
-        sortOrder: n.sortOrder,
-        labelNames: n.labels.nodes.map((l) => l.name),
-        labelIds: Object.fromEntries(n.labels.nodes.map((l) => [l.name, l.id])),
-        comments: n.comments.nodes,
-      });
-    }
+    cards.push(...d.issues.nodes.map(normalizeCardFields));
     cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
   } while (cursor);
   return cards;
@@ -1222,22 +1309,29 @@ async function fetchCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } } } }`,
+       comments(last:100){ nodes{ body createdAt } }
+       inverseRelations(first:50){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ id type issue{ id identifier state{ id name type } } }
+       } } }`,
     { id: issueId },
     apiKey
   );
   const n = d.issue;
   if (!n) throw new Error(`issue not found: ${issueId}`);
-  return {
-    id: n.id,
-    identifier: n.identifier,
-    stateName: n.state?.name,
-    updatedAt: n.updatedAt,
-    sortOrder: n.sortOrder,
-    labelNames: n.labels.nodes.map((l) => l.name),
-    labelIds: Object.fromEntries(n.labels.nodes.map((l) => [l.name, l.id])),
-    comments: n.comments.nodes,
-  };
+  return normalizeQueueCard(n, apiKey, { gqlFn: gql, fetchIssueDependenciesFn: fetchIssueDependencies });
+}
+
+async function fetchClaimCard(apiKey, issueId) {
+  const d = await gql(
+    `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
+       labels{ nodes{ id name } }
+       comments(last:100){ nodes{ body createdAt } } } }`,
+    { id: issueId },
+    apiKey,
+  );
+  if (!d.issue) throw new Error(`issue not found: ${issueId}`);
+  return normalizeCardFields(d.issue);
 }
 
 async function fetchBlockedIssues(apiKey, teamKey, projectId) {
@@ -1714,7 +1808,7 @@ async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parent
 async function releaseOwnedDispatchClaim(apiKey, pick, reason) {
   const cfg = SWEEP_CFG[pick.sweep];
   if (!cfg || !pick.issueId || !pick.ownerToken) return false;
-  const fresh = await fetchCard(apiKey, pick.issueId);
+  const fresh = await fetchClaimCard(apiKey, pick.issueId);
   if (!hasLabel(fresh, cfg.claim)) return false;
   if (latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
   await applyLabelEdit(apiKey, fresh, { remove: [cfg.claim] });
@@ -2391,14 +2485,25 @@ async function tick({ dryRun = false } = {}) {
       for (const active of anchors) {
         const { anchorPath, config, apiKey, envValues } = active;
         const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+        const scheduledStates = [...new Set(SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states))];
+        let scheduledCardsByState = null;
+        try {
+          scheduledCardsByState = await fetchScheduledQueueCards(apiKey, config.teamKey, config.projectId, scheduledStates);
+          for (const sweep of SWEEPS) active.checkedScopes.add(sweep);
+        } catch (e) {
+          for (const sweep of SWEEPS) {
+            logFor(anchorPath, sweep, `fetch error: ${e.message}`);
+            recordFailure(sweep, "fetch", scheduledStates.join(","), e.message);
+          }
+        }
         // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
         // an idle workspace never pays for it (keeps the idle path cheap).
         let _labelMap = null;
         const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
         for (const sweep of SWEEPS) {
           const cfg = SWEEP_CFG[sweep];
-          let cards;
-          try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); active.checkedScopes.add(sweep); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); recordFailure(sweep, "fetch", cfg.states.join(","), e.message); continue; }
+          if (!scheduledCardsByState) continue;
+          const cards = cfg.states.flatMap((state) => scheduledCardsByState.get(state) || []);
           const reaps = reapDecisions(cards, cfg, now);
           // Bounce-escalation is a backward-oscillation guard for the earlier stages.
           // Skip it for ship: a card in "Ship" was human-approved, and its
@@ -2448,7 +2553,7 @@ async function tick({ dryRun = false } = {}) {
         // Cheap; runs after the per-sweep loop. executeOrphanReap needs no
         // teamLabelMap (it removes by id from the card), so it is not gated on one.
         try {
-          const held = await fetchCards(apiKey, config.teamKey, config.projectId, CLAIM_CLEANUP_STATES);
+          const held = await fetchClaimCleanupCards(apiKey, config.teamKey, config.projectId, CLAIM_CLEANUP_STATES);
           active.checkedScopes.add("holding");
           const orphans = foreignClaimReleases(held, now);
           if (!dryRun) {

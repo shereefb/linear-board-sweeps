@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { dependencyEligibility } from "../scripts/linear.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
@@ -19,6 +20,7 @@ import {
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
@@ -445,6 +447,13 @@ test("actionableCards: allows cards with stale foreign in-progress claims after 
   };
   assert.deepEqual(actionableCards([card], SWEEP_CFG.ship, NOW).map((c) => c.id), ["ship"]);
 });
+test("actionableCards excludes unresolved and incomplete dependencies", () => {
+  const cfg = SWEEP_CFG.dev;
+  const ready = { id: "ready", labelNames: [], comments: [], blockers: [], blockersComplete: true };
+  const blocked = { id: "blocked", labelNames: [], comments: [], blockers: [{ identifier: "COD-1", stateName: "Dev" }], blockersComplete: true };
+  const partial = { id: "partial", labelNames: [], comments: [], blockers: [], blockersComplete: false };
+  assert.deepEqual(actionableCards([ready, blocked, partial], cfg, NOW).map((c) => c.id), ["ready"]);
+});
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
   const reapCard = { id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
@@ -658,6 +667,198 @@ test("owner-token claim confirmation uses latest matching heartbeat owner", () =
   assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), true);
   assert.equal(claimConfirmed({ ...card, stateName: "QA" }, SWEEP_CFG.dev, owner, ["Dev"]), false);
   assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, owner, ["Dev"]), false);
+});
+test("claimConfirmed rejects a blocker added after scan", () => {
+  const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
+  const card = {
+    id: "c",
+    identifier: "COD-5",
+    stateName: "Dev",
+    labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    blockers: [{ identifier: "COD-1", stateName: "QA" }],
+    blockersComplete: true,
+  };
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), false);
+});
+
+// ── dependency-aware queue snapshots ────────────────────────────────────────
+test("queue snapshot requests all scheduled states once and partitions dependency-normalized cards", async () => {
+  const states = SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states);
+  const calls = [];
+  const gqlFn = async (query, variables) => {
+    calls.push({ query, variables });
+    return {
+      issues: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [
+          {
+            id: "spec-id", identifier: "COD-1", updatedAt: minsAgo(1), sortOrder: 20,
+            state: { name: "Spec" }, labels: { nodes: [] }, comments: { nodes: [] },
+            inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+          },
+          {
+            id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
+            state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+            inverseRelations: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
+            },
+          },
+        ],
+      },
+    };
+  };
+
+  const byState = await fetchScheduledQueueCards("lin", "COD", "project-1", states, { gqlFn });
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].variables.states, states);
+  assert.match(calls[0].query, /inverseRelations\(first:50\)/);
+  assert.deepEqual(byState.get("Spec").map((card) => card.identifier), ["COD-1"]);
+  assert.deepEqual(byState.get("Dev").map((card) => card.identifier), ["COD-2"]);
+  assert.equal(byState.get("Dev")[0].blockersComplete, true);
+  assert.equal(byState.get("Dev")[0].dependency.eligible, true);
+});
+
+test("queue snapshot completes relation overflow before the card becomes eligible", async () => {
+  const overflowCalls = [];
+  const gqlFn = async () => ({
+    issues: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{
+        id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        inverseRelations: {
+          pageInfo: { hasNextPage: true, endCursor: "relations-1" },
+          nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
+        },
+      }],
+    },
+  });
+  const fetchIssueDependenciesFn = async (_apiKey, issueId) => {
+    overflowCalls.push(issueId);
+    return { issue: "COD-2", blockers: [], complete: true };
+  };
+
+  const byState = await fetchScheduledQueueCards("lin", "COD", "project-1", ["Dev"], { gqlFn, fetchIssueDependenciesFn });
+  const card = byState.get("Dev")[0];
+
+  assert.deepEqual(overflowCalls, ["dev-id"]);
+  assert.equal(card.blockersComplete, true);
+  assert.equal(card.dependency.eligible, true);
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((item) => item.id), ["dev-id"]);
+});
+
+test("queue snapshot rejects relation overflow that cannot be completed", async () => {
+  const gqlFn = async () => ({
+    issues: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{
+        id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        inverseRelations: { pageInfo: { hasNextPage: true, endCursor: "relations-1" }, nodes: [] },
+      }],
+    },
+  });
+
+  await assert.rejects(
+    fetchScheduledQueueCards("lin", "COD", "project-1", ["Dev"], {
+      gqlFn,
+      fetchIssueDependenciesFn: async () => ({ issue: "COD-2", blockers: [], complete: false }),
+    }),
+    /incomplete relation pagination.*COD-2/,
+  );
+});
+
+test("partial GraphQL queue snapshot fails closed before selecting returned cards", async () => {
+  const partial = {
+    data: {
+      issues: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [{
+          id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
+          state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+          inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+        }],
+      },
+    },
+    errors: [{ message: "relation field denied" }],
+  };
+
+  await assert.rejects(
+    fetchScheduledQueueCards("lin", "COD", "project-1", ["Dev"], { gqlFn: async () => partial }),
+    /partial GraphQL|relation field denied/,
+  );
+});
+
+// Synthetic minimal edges derived from the reviewed SafeTaper wave partition.
+// This verifies scheduling semantics, not a reconstruction of every historical
+// Linear relation. SAF-212 retains the directly verified historical blocker set.
+const SAFETAPER_REVIEWED_WAVE_FIXTURE = Object.freeze([
+  { identifier: "SAF-207", wave: 0, blockers: [] },
+  { identifier: "SAF-209", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-210", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-213", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-220", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-221", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-222", wave: 1, blockers: ["SAF-207"] },
+  { identifier: "SAF-211", wave: 2, blockers: ["SAF-209", "SAF-213"] },
+  { identifier: "SAF-212", wave: 2, blockers: ["SAF-207", "SAF-209", "SAF-213", "SAF-221"] },
+  { identifier: "SAF-217", wave: 2, blockers: ["SAF-210"] },
+  { identifier: "SAF-224", wave: 2, blockers: ["SAF-220"] },
+  { identifier: "SAF-214", wave: 3, blockers: ["SAF-211"] },
+  { identifier: "SAF-215", wave: 3, blockers: ["SAF-212"] },
+  { identifier: "SAF-225", wave: 3, blockers: ["SAF-224"], manualOnly: true },
+  { identifier: "SAF-216", wave: 4, blockers: ["SAF-214"] },
+  { identifier: "SAF-223", wave: 4, blockers: ["SAF-211", "SAF-212", "SAF-215"] },
+  { identifier: "SAF-218", wave: 5, blockers: ["SAF-216", "SAF-223"] },
+  { identifier: "SAF-219", wave: 6, blockers: ["SAF-218"] },
+].map((card) => Object.freeze({ ...card, blockers: Object.freeze(card.blockers) })));
+
+test("SafeTaper reviewed fixture releases the exact seven waves without scheduling later work early", () => {
+  const expectedWaves = [
+    ["SAF-207"],
+    ["SAF-209", "SAF-210", "SAF-213", "SAF-220", "SAF-221", "SAF-222"],
+    ["SAF-211", "SAF-212", "SAF-217", "SAF-224"],
+    ["SAF-214", "SAF-215", "SAF-225"],
+    ["SAF-216", "SAF-223"],
+    ["SAF-218"],
+    ["SAF-219"],
+  ];
+  const done = new Set();
+
+  for (const [waveIndex, expected] of expectedWaves.entries()) {
+    assert.deepEqual(
+      SAFETAPER_REVIEWED_WAVE_FIXTURE.filter((card) => card.wave === waveIndex).map((card) => card.identifier),
+      expected,
+    );
+    const cards = SAFETAPER_REVIEWED_WAVE_FIXTURE
+      .filter((fixture) => !done.has(fixture.identifier))
+      .map((fixture) => ({
+        id: fixture.identifier,
+        identifier: fixture.identifier,
+        labelNames: fixture.manualOnly ? ["sweep:manual-only"] : [],
+        comments: [],
+        blockersComplete: true,
+        blockers: fixture.blockers.map((identifier) => ({
+          identifier,
+          stateName: done.has(identifier) ? "Done" : "Dev",
+        })),
+      }));
+    const relationReady = cards
+      .filter((card) => dependencyEligibility(card.blockers, card.blockersComplete).eligible)
+      .map((card) => card.identifier);
+
+    assert.deepEqual(relationReady, expected);
+    assert.deepEqual(
+      actionableCards(cards, SWEEP_CFG.dev, NOW).map((card) => card.identifier),
+      expected.filter((identifier) => identifier !== "SAF-225"),
+    );
+    expected.forEach((identifier) => done.add(identifier));
+  }
+
+  assert.equal(done.size, SAFETAPER_REVIEWED_WAVE_FIXTURE.length);
 });
 test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(SAME_REPO_PORT_BASE, 47000);
