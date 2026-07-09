@@ -5,6 +5,7 @@
   "project": "<Linear project name, e.g. My App>",
   "projectId": "<project uuid — get it from: node scripts/linear.mjs ensure-project \"<team>\" \"<project>\">",
   "issuePrefix": "<team key used in card ids, e.g. COD>",
+  "$comment_repos": "Repo scope is ship scope. Default to one deployable repo per card. For true multi-repo cards, list every sibling repo the sweeps may touch and make deploy/canary instructions cover every production target; otherwise split work into per-repo cards.",
   "repos": ["<repo folder name(s) the sweeps may touch>"],
   "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
@@ -60,6 +61,6 @@
     "architecture": "CLAUDE.md",
     "schema": null
   },
-  "deploy": "<how this project reaches production — e.g. 'Vercel auto-deploys on push to main; some changes need a Vercel env var, a DB migration applied, or a platform CLI deploy'>",
+  "deploy": "<how this project reaches production for every repo in config.repos — e.g. 'web: Vercel auto-deploys on push to main; api: run ...; manual DB migration Todo required before deploy'>",
   "credentialsNote": "<where app + tooling secrets live — e.g. '.env.local for app secrets; Linear key in gitignored .env'>"
 }

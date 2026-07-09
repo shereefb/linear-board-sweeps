@@ -26,6 +26,7 @@ List "Dev" cards **in `config.project`**, top-to-bottom as they appear in the Li
 - **Read the comments FIRST.** A card can sit in "Dev" *after a review* with change requests — understand what's missing before writing code. Respect the 24h rule: if there's a human's active worktree/branch from the last 24h, leave it (comment + skip).
 - **Skip** if `blocked:needs-user` or `sweep:manual-only` and no new human reply resolves it; **skip** if `dev:in-progress` < 90 min old (another run owns it). Reclaim a stale claim.
 - **Spec-quality gate:** expect excellent specs. If a card is under-specified (no clear spec/plan, ambiguous acceptance, missing design decisions), **move it to the bottom of "Spec"** with a comment naming exactly what's under-specified, and leave it — do NOT develop from a weak spec. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Spec"`) so the status and bottom rank update together. (The spec-sweep loop re-specs it.)
+- **Repo-scope gate:** before coding, confirm the plan's repo scope is a subset of `config.repos`. Default to one deployable repo per card. If the plan or comments require a sibling repo that is not configured, bounce to "Spec" or block with `blocked:needs-user` and state the exact split/config needed. If it is a true configured multi-repo card, every touched repo must get a branch/PR, verification evidence, and ship/deploy note in the handoff.
 - **Manual/dedicated-work gate:** if a "Dev" card is intentionally ongoing human work, batch documentation enrichment, or otherwise does not fit the unattended feature-dev worktree/PR cycle, add `sweep:manual-only`, comment exactly why it is parked and what manual/dedicated path should continue it, and stop considering it actionable until a human clears the label with unblock-sweep. Do not leave it unlabeled in "Dev" after a no-op pass; that creates an infinite scheduled dispatch loop.
 - **Claim** with `dev:in-progress` before starting; remove it when you finish, block, or bounce.
 - **Label the card if it's bare** (generate-if-missing): if `config.reviewLenses` is set and the card carries none of its domain labels, classify it from the spec/plan + diff surface and apply the matching domain labels to Linear (comment what you applied). This drives the gated quality lenses in §2. A human relabel always wins — never override one.
@@ -68,6 +69,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 
 - Writes **code** (not docs-only) but **never merges and never deploys** — "QA" + a pushed branch is the human/QA gate.
 - One worktree per card; ≤2 cards/run; top-of-column order; claim/release via `dev:in-progress`; stay within `config.project`.
+- Keep repo and deploy scope honest: do not produce a branch in an unconfigured sibling repo unless the card has first been split or the config/runbook explicitly includes that repo.
 - Only build from excellent specs — a weak card goes to "Spec", not into guesswork.
 - Both code reviews must run and their real findings be fixed before "QA".
 - Every question → a card comment (or a new Todo card for ship needs); never AskUserQuestion.

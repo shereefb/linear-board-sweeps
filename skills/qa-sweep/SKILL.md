@@ -34,7 +34,7 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 
 ## 2. Per card — smoke test as a user
 
-1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior.
+1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior. If the only implementation evidence is in an unconfigured sibling repo, do not mark `qa:passed` for this ship path; block or bounce with the exact split/config update needed.
 2. **Stand up a dev environment:** check out the branch/worktree; start the app with the preview tooling. Seed data if the flow needs it.
 3. **Exercise the feature as a user, in detail — use `/qa` as the test engine** (or `/qa-only` for the report form) rather than ad-hoc clicking. Walk the actual user flows the card adds — happy path AND the obvious edge cases. Click through, fill forms, trigger the states. Watch console + network + server logs for errors. Use subagents/parallel work for independent flows. If a `/plan-eng-review` test plan exists for the branch, feed it in as primary test input.
 4. **Capture screenshots** of the key states (before/after, each important screen). Save them; you'll attach them to the card.
@@ -73,6 +73,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 
 - **Never merges, never deploys** — lands a green, smoke-tested feature at "Signoff" and stops. The human "Ship" move + ship-sweep own production. Now symmetric with dev-sweep; safe to auto-run.
 - Only pass a feature that passed a real smoke test with a green build. When in doubt, `qa:needs-changes` and stop.
+- QA evidence must match ship scope. A card cannot pass QA for a repo/deploy path that is not configured to ship it; split the card or require a multi-repo config/runbook first.
 - ≤2 cards/run; top-of-column order; claim/release via `qa:in-progress`; stay within `config.project`.
 - Fix scope = UX/UI + obvious bugs found during QA. A feature that's fundamentally broken or half-built goes back with `qa:needs-changes`, not "fixed" into a rewrite.
 - Every question → a card comment; never AskUserQuestion.
