@@ -139,17 +139,17 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```jsonc
    "runtime": "codex",                       // legacy fallback when runtimes.<sweep> is absent
    "models": {
-     "spec": { "model": "gpt-5.5", "effort": "high" },
-     "dev":  { "model": "gpt-5.5", "effort": "high" },
-     "qa":   { "model": "gpt-5.5", "effort": "high" },
-     "ship": { "model": "gpt-5.5", "effort": "high" }
+     "spec": { "model": "gpt-5.6-sol", "effort": "high" },
+     "dev":  { "model": "gpt-5.6-terra", "effort": "high" },
+     "qa":   { "model": "gpt-5.6-sol", "effort": "medium" },
+     "ship": { "model": "gpt-5.6-terra", "effort": "medium" }
    },
    "runtimes": {
-     "spec":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
-     "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+     "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
+     "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
      "review": { "runtime": "claude", "model": "claude-opus-4-8" },
-     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
-     "ship":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" }
+     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
    },
    "parallel": {
      "maxNonShipDispatches": 2,

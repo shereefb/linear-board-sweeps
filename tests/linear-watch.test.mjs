@@ -70,12 +70,20 @@ test("runtimeConfigForSweep: review is role config only and never scheduled", ()
     runtimes: { review: { runtime: "claude", model: "claude-opus-4-8" } },
   }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
 });
-test("default configs keep scheduled sweeps on the authenticated codex runtime", () => {
+test("default configs use the stage-specific GPT-5.6 models", () => {
+  const expected = {
+    spec: { runtime: "codex", model: "gpt-5.6-sol", effort: "high" },
+    dev: { runtime: "codex", model: "gpt-5.6-terra", effort: "high" },
+    qa: { runtime: "codex", model: "gpt-5.6-sol", effort: "medium" },
+    ship: { runtime: "codex", model: "gpt-5.6-terra", effort: "medium" },
+  };
   for (const file of ["templates/linear-sweep.json", ".claude/linear-sweep.json"]) {
     const config = JSON.parse(fs.readFileSync(file, "utf8"));
     for (const sweep of SWEEPS) {
-      assert.equal(runtimeConfigForSweep(config, sweep).runtime, "codex", `${file} ${sweep}`);
+      assert.deepEqual(runtimeConfigForSweep(config, sweep), expected[sweep], `${file} ${sweep}`);
+      assert.deepEqual({ runtime: config.runtime, ...config.models[sweep] }, expected[sweep], `${file} legacy ${sweep}`);
     }
+    assert.deepEqual(config.runtimes.review, { runtime: "claude", model: "claude-opus-4-8" }, `${file} review`);
   }
 });
 

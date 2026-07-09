@@ -10,17 +10,17 @@
   "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
   "models": {
-    "spec": { "model": "gpt-5.5", "effort": "high" },
-    "dev":  { "model": "gpt-5.5", "effort": "high" },
-    "qa":   { "model": "gpt-5.5", "effort": "high" },
-    "ship": { "model": "gpt-5.5", "effort": "high" }
+    "spec": { "model": "gpt-5.6-sol", "effort": "high" },
+    "dev":  { "model": "gpt-5.6-terra", "effort": "high" },
+    "qa":   { "model": "gpt-5.6-sol", "effort": "medium" },
+    "ship": { "model": "gpt-5.6-terra", "effort": "medium" }
   },
   "runtimes": {
-    "spec":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
-    "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
+    "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
     "review": { "runtime": "claude", "model": "claude-opus-4-8" },
-    "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
-    "ship":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" }
+    "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+    "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
   },
   "$comment_parallel": "Optional. maxNonShipDispatches defaults to 2, counts selected workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts active child slots inside each selected non-ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps same-repo child slots backfilled after successful child completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; ship-sweep always stays serial and is never handoff-triggered.",
   "parallel": {
