@@ -154,6 +154,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    "parallel": {
      "maxNonShipDispatches": 2,
      "maxDrainPasses": 5,
+     "maxSameRepoRefillDispatches": 8,
      "maxHandoffTriggerHops": 2,
      "sameRepoCardLimits": {
        "spec": 4,
@@ -172,8 +173,8 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    }
    ```
    The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. The default scheduled sweeps use Codex so unattended launchd ticks do not depend on a separate Claude login; only switch a scheduled sweep to Claude after confirming that `claude` is installed, logged in, and usable non-interactively. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage.
-   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.sameRepoCardLimits` controls per-card fan-out inside each selected non-ship workspace/sweep candidate; defaults are spec/dev `4`, QA `1`, and ship forced to `1`. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches` or `maxDrainPasses` to `1` for stricter serial/one-pass mode on smaller machines. ship-sweep is always serial.
-   `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick also spends at most `parallel.maxNonShipDispatches` follow-up dispatch slots, so same-repo batches cannot fan out unboundedly. QA still stops at the human signoff queue; ship is never handoff-triggered.
+   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.sameRepoCardLimits` controls active per-card slots inside each selected non-ship workspace/sweep candidate; defaults are spec/dev `4`, QA `1`, and ship forced to `1`. `parallel.maxSameRepoRefillDispatches` defaults to `8` and is clamped to `0..20`; it caps mid-batch same-repo backfills after successful child completion, and `0` disables refill. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches`, `maxSameRepoRefillDispatches`, or `maxDrainPasses` to `1` for stricter bounded mode on smaller machines. ship-sweep is always serial.
+   `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick spends at most `parallel.maxNonShipDispatches` handoff dispatch slots, while same-repo refill has its own `parallel.maxSameRepoRefillDispatches` budget. QA still stops at the human signoff queue; ship is never handoff-triggered.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `Signoff`. Set it to false to require normal QA for every card. The human-only `Ship` move remains required.
 
 2. **Install the launcher** (creates/updates a managed clean kit clone under `~/.local/share/linear-board-sweeps/kit`, symlinks the wrapper, materializes the launchd plist, and points `registry.json` at that managed clone — does NOT activate the schedule):
@@ -197,7 +198,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" tick --dry-run
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
-   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch. With `parallel.sameRepoCardLimits`, dry-run also logs the exact card slots it would claim and dispatch without writing claim labels. With `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
+   Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch. With `parallel.sameRepoCardLimits`, dry-run also logs the exact card slots it would claim and dispatch without writing claim labels. `parallel.maxSameRepoRefillDispatches` is visible in live `refill-trigger` / `refill-skip` logs after a child completes; dry-run cannot simulate that mid-batch completion. With `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
 
 6. **Activate the schedule** (10-min timer) and confirm health:
    ```bash
