@@ -54,6 +54,7 @@ export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
 export const DEFAULT_SAME_REPO_CARD_LIMITS = { spec: 4, dev: 4, qa: 1, ship: 1 };
+export const DEFAULT_MAX_HANDOFF_TRIGGER_HOPS = 2;
 export const SAME_REPO_PORT_BASE = 47000;
 export const CLAIM_CONFIRM_DELAY_MS = 1500;
 
@@ -355,6 +356,24 @@ export function sameRepoCardLimit(config, sweep) {
   const raw = config?.parallel?.sameRepoCardLimits?.[sweep];
   const n = Math.floor(Number(raw));
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+export function maxHandoffTriggerHops(config) {
+  const raw = config?.parallel?.maxHandoffTriggerHops;
+  if (raw === undefined || raw === null) return DEFAULT_MAX_HANDOFF_TRIGGER_HOPS;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n)) return DEFAULT_MAX_HANDOFF_TRIGGER_HOPS;
+  return Math.max(0, Math.min(3, n));
+}
+
+export function nextSweepForHandoff({ completedSweep, currentStateName, sweepCfg = SWEEP_CFG } = {}) {
+  if (completedSweep === "spec" && (sweepCfg.dev?.states || []).includes(currentStateName)) return "dev";
+  if (completedSweep === "dev" && (sweepCfg.qa?.states || []).includes(currentStateName)) return "qa";
+  return null;
+}
+
+export function handoffTriggerKey(issueIdentifier, fromSweep, toSweep) {
+  return `${issueIdentifier || "_"}:${fromSweep || "_"}->${toSweep || "_"}`;
 }
 
 export function selectCardSlots(cards, cfg, sweep, limit, now) {
@@ -1401,6 +1420,7 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, exitCode, started
     runtime: runtimeCfg.runtime || "codex",
     model: runtimeCfg.model,
     effort: runtimeCfg.effort,
+    triggeredBy: pick.triggeredBy,
     exitCode,
     startedAt,
     endedAt,
@@ -1467,8 +1487,25 @@ function dispatchAsync(anchorPath, sweep, config, pick = {}) {
   });
 }
 
-export async function dispatchBatch(batch, { dispatchFn = dispatchAsync } = {}) {
-  return Promise.all(batch.map((c) => dispatchFn(c.anchorPath, c.sweep, c.config, c)));
+export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResult } = {}) {
+  return Promise.all(batch.map(async (c) => {
+    const startedAt = new Date().toISOString();
+    const exitCode = await dispatchFn(c.anchorPath, c.sweep, c.config, c);
+    const completedAt = new Date().toISOString();
+    const result = {
+      anchorPath: c.anchorPath,
+      sweep: c.sweep,
+      issueIdentifier: c.issueIdentifier,
+      dispatchScope: c.issueIdentifier ? `${c.sweep}:${c.issueIdentifier}:dispatch` : `${c.sweep}:dispatch`,
+      exitCode,
+      success: exitCode === 0,
+      startedAt,
+      completedAt,
+      pick: c,
+    };
+    if (onResult) await onResult(result);
+    return result;
+  }));
 }
 
 // ── tick orchestration ───────────────────────────────────────────────────────
@@ -1493,6 +1530,140 @@ async function tick({ dryRun = false } = {}) {
       message: String(message || ""),
       seenAt: new Date().toISOString(),
     });
+    const reconcileDispatchResult = async (result) => {
+      const pick = result.pick;
+      const exitCode = result.exitCode;
+      const active = activeByAnchor.get(pick.anchorPath);
+      if (!active) return null;
+      const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
+      const runtime = runtimeSummary(runtimeCfg);
+      const dispatchScope = result.dispatchScope;
+      const stableTarget = pick.issueIdentifier ? JSON.stringify({
+        runtime,
+        issueIdentifier: pick.issueIdentifier,
+        worktreePath: pick.worktreePath,
+        logDir: pick.logDir,
+      }) : runtime;
+      const failures = exitCode === 0 ? [] : [
+        failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} exited ${exitCode}`),
+      ];
+      if (exitCode === 127 && pick.issueIdentifier) {
+        try {
+          const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
+          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
+        } catch (e) {
+          logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
+          writeLastTick();
+        }
+      }
+      try {
+        await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
+      } catch (e) {
+        const kind = exitCode === 0 ? "failure-todo-recovery" : "failure-todo";
+        logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+        recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
+        writeLastTick();
+      }
+      return active;
+    };
+    const runHandoffTriggers = async (initialResult, firedHandoffs, handoffBudget) => {
+      let current = initialResult;
+      let remaining = maxHandoffTriggerHops(current.pick.config);
+      if (remaining <= 0) {
+        logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: disabled`);
+        return;
+      }
+      while (remaining > 0 && current?.success && current.pick?.issueIdentifier) {
+        const pick = current.pick;
+        const active = activeByAnchor.get(pick.anchorPath);
+        if (!active) return;
+        let issue;
+        try {
+          issue = await fetchCard(active.apiKey, pick.issueId || pick.issueIdentifier);
+        } catch (e) {
+          logFor(pick.anchorPath, pick.sweep, `handoff-skip ${pick.issueIdentifier}: issue-fetch ${e.message}`);
+          return;
+        }
+        const nextSweep = nextSweepForHandoff({
+          completedSweep: pick.sweep,
+          currentStateName: issue.stateName,
+          sweepCfg: SWEEP_CFG,
+        });
+        if (!nextSweep) {
+          if (pick.sweep === "qa") logFor(pick.anchorPath, pick.sweep, `handoff-skip ${issue.identifier}: ship-gate`);
+          else logFor(pick.anchorPath, pick.sweep, `handoff-skip ${issue.identifier}: not-forward state=${issue.stateName}`);
+          return;
+        }
+        const key = handoffTriggerKey(issue.identifier, pick.sweep, nextSweep);
+        if (firedHandoffs.has(key)) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: duplicate ${key}`);
+          return;
+        }
+        let activeProjects;
+        try {
+          activeProjects = await labeledProjectIds(active.apiKey);
+        } catch (e) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: activation-query ${e.message}`);
+          return;
+        }
+        if (!activeProjects.has(pick.config.projectId)) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: inactive-project`);
+          return;
+        }
+        if (BLOCKING_LABELS.some((name) => hasLabel(issue, name))) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: blocked`);
+          return;
+        }
+        const nextCfg = SWEEP_CFG[nextSweep];
+        if (hasLabel(issue, nextCfg.claim) && liveClaimLabel(issue, Date.now()) === nextCfg.claim) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: live-claim`);
+          return;
+        }
+        if (!handoffBudget || handoffBudget.remaining <= 0) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
+          return;
+        }
+
+        const candidate = {
+          anchorPath: pick.anchorPath,
+          config: pick.config,
+          sweep: nextSweep,
+          count: 1,
+          topCard: issue,
+          topSortOrder: issue.sortOrder,
+          cards: [issue],
+          triggeredBy: { issue: issue.identifier, sweep: pick.sweep },
+        };
+        const batch = selectDispatchBatch([candidate], { maxNonShipDispatches: 1 });
+        if (!batch.length) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
+          return;
+        }
+        handoffBudget.remaining -= 1;
+        firedHandoffs.add(key);
+        logFor(pick.anchorPath, nextSweep, `handoff-trigger ${issue.identifier}: ${pick.sweep}->${nextSweep}`);
+        const downstream = (await expandDispatchBatch(batch, {
+          dryRun: false,
+          parentRunId,
+          activeByAnchor,
+          now: Date.now(),
+        })).map((d) => ({ ...d, triggeredBy: { issue: issue.identifier, sweep: pick.sweep } }));
+        if (!downstream.length) {
+          handoffBudget.remaining += 1;
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
+          return;
+        }
+        const results = await dispatchBatch(downstream, {
+          onResult: async (result) => { await reconcileDispatchResult(result); },
+        });
+        current = results.find((r) => r.issueIdentifier === issue.identifier) || results[0];
+        remaining -= 1;
+      }
+      if (remaining <= 0 && current?.success && current.pick?.issueIdentifier) {
+        logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: hop-limit`);
+      }
+    };
     const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
       localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
     };
@@ -1639,42 +1810,14 @@ async function tick({ dryRun = false } = {}) {
     } else {
       const dispatches = await expandDispatchBatch(batch, { dryRun: false, parentRunId, activeByAnchor, now });
       if (!dispatches.length) { log("no confirmed card slots — cheap tick"); return; }
-      const exitCodes = await dispatchBatch(dispatches);
-      for (const [index, pick] of dispatches.entries()) {
-        const exitCode = exitCodes[index];
-        const active = activeByAnchor.get(pick.anchorPath);
-        if (!active) continue;
-        const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
-        const runtime = runtimeSummary(runtimeCfg);
-        const dispatchScope = pick.issueIdentifier ? `${pick.sweep}:${pick.issueIdentifier}:dispatch` : `${pick.sweep}:dispatch`;
-        const stableTarget = pick.issueIdentifier ? JSON.stringify({
-          runtime,
-          issueIdentifier: pick.issueIdentifier,
-          worktreePath: pick.worktreePath,
-          logDir: pick.logDir,
-        }) : runtime;
-        const failures = exitCode === 0 ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} exited ${exitCode}`),
-        ];
-        if (exitCode === 127 && pick.issueIdentifier) {
-          try {
-            const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
-            if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
-          } catch (e) {
-            logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
-            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
-            writeLastTick();
-          }
-        }
-        try {
-          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
-        } catch (e) {
-          const kind = exitCode === 0 ? "failure-todo-recovery" : "failure-todo";
-          logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
-          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
-          writeLastTick();
-        }
-      }
+      const firedHandoffs = new Set();
+      const handoffBudget = { remaining: maxNonShipDispatches };
+      await dispatchBatch(dispatches, {
+        onResult: async (result) => {
+          await reconcileDispatchResult(result);
+          await runHandoffTriggers(result, firedHandoffs, handoffBudget);
+        },
+      });
     }
   } finally {
     if (!dryRun) releaseTickLock();

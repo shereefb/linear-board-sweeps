@@ -8,6 +8,7 @@ import {
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
+  maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
@@ -320,6 +321,30 @@ test("sameRepoCardLimit: defaults, invalid values, and forced ship serial limit"
   assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { dev: "many" } } }, "dev"), 4);
   assert.equal(sameRepoCardLimit({ parallel: { sameRepoCardLimits: { ship: 9 } } }, "ship"), 1);
 });
+test("maxHandoffTriggerHops: defaults, disables, and clamps to a small bound", () => {
+  assert.equal(maxHandoffTriggerHops({}), 2);
+  assert.equal(maxHandoffTriggerHops({ parallel: { maxHandoffTriggerHops: 0 } }), 0);
+  assert.equal(maxHandoffTriggerHops({ parallel: { maxHandoffTriggerHops: 2.9 } }), 2);
+  assert.equal(maxHandoffTriggerHops({ parallel: { maxHandoffTriggerHops: 99 } }), 3);
+  assert.equal(maxHandoffTriggerHops({ parallel: { maxHandoffTriggerHops: -1 } }), 0);
+  assert.equal(maxHandoffTriggerHops({ parallel: { maxHandoffTriggerHops: "bad" } }), 2);
+});
+test("nextSweepForHandoff: triggers only forward non-production handoffs via configured states", () => {
+  assert.equal(nextSweepForHandoff({ completedSweep: "spec", currentStateName: "Ready for Dev" }), "dev");
+  assert.equal(nextSweepForHandoff({ completedSweep: "dev", currentStateName: "In Review" }), "qa");
+  assert.equal(nextSweepForHandoff({ completedSweep: "qa", currentStateName: "QA Passed" }), null);
+  assert.equal(nextSweepForHandoff({ completedSweep: "ship", currentStateName: "Done" }), null);
+  assert.equal(nextSweepForHandoff({ completedSweep: "dev", currentStateName: "Needs Spec" }), null);
+  assert.equal(nextSweepForHandoff({
+    completedSweep: "spec",
+    currentStateName: "Dev",
+    sweepCfg: { ...SWEEP_CFG, dev: { ...SWEEP_CFG.dev, states: ["Dev"] } },
+  }), "dev");
+});
+test("handoffTriggerKey: scopes duplicate suppression by issue and edge", () => {
+  assert.equal(handoffTriggerKey("COD-1", "spec", "dev"), "COD-1:spec->dev");
+  assert.notEqual(handoffTriggerKey("COD-1", "spec", "dev"), handoffTriggerKey("COD-1", "dev", "qa"));
+});
 test("selectCardSlots: chooses top actionable cards and assigns stable slot indexes", () => {
   const cards = [
     { id: "blocked", identifier: "COD-1", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
@@ -439,19 +464,44 @@ test("dryRunDispatchMessages: reports expanded same-repo card slots when cards a
     "[dry-run] slot 2/2 dev COD-7 sortOrder=1",
   ]);
 });
-test("dispatchBatch: dispatches every selected child and returns exit codes", async () => {
+test("dispatchBatch: dispatches every selected child and returns structured results", async () => {
   const calls = [];
-  const statuses = await dispatchBatch([
-    { anchorPath: "/ws/a", sweep: "dev", config: {} },
+  const results = await dispatchBatch([
+    { anchorPath: "/ws/a", sweep: "dev", config: {}, issueIdentifier: "COD-1" },
     { anchorPath: "/ws/b", sweep: "spec", config: {} },
   ], {
-    dispatchFn: async (anchorPath, sweep, config) => {
-      calls.push({ anchorPath, sweep, config });
+    dispatchFn: async (anchorPath, sweep, config, pick) => {
+      calls.push({ anchorPath, sweep, config, pick });
       return sweep === "dev" ? 0 : 7;
     },
   });
-  assert.deepEqual(statuses, [0, 7]);
+  assert.deepEqual(results.map((r) => r.exitCode), [0, 7]);
+  assert.deepEqual(results.map((r) => r.success), [true, false]);
+  assert.equal(results[0].issueIdentifier, "COD-1");
+  assert.equal(results[0].dispatchScope, "dev:COD-1:dispatch");
+  assert.equal(results[1].dispatchScope, "spec:dispatch");
+  assert.ok(results[0].startedAt);
+  assert.ok(results[0].completedAt);
   assert.deepEqual(calls.map((c) => `${c.anchorPath}:${c.sweep}`), ["/ws/a:dev", "/ws/b:spec"]);
+});
+test("dispatchBatch: reports each child result as soon as that child completes", async () => {
+  let releaseSlow;
+  const slow = new Promise((resolve) => { releaseSlow = () => resolve(7); });
+  const seen = [];
+  const run = dispatchBatch([
+    { anchorPath: "/ws/fast", sweep: "dev", config: {}, issueIdentifier: "COD-1" },
+    { anchorPath: "/ws/slow", sweep: "spec", config: {}, issueIdentifier: "COD-2" },
+  ], {
+    dispatchFn: async (anchorPath, sweep) => (sweep === "spec" ? slow : 0),
+    onResult: async (result) => { seen.push(`${result.issueIdentifier}:${result.exitCode}`); },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(seen, ["COD-1:0"]);
+  releaseSlow();
+  const results = await run;
+  assert.deepEqual(seen, ["COD-1:0", "COD-2:7"]);
+  assert.deepEqual(results.map((r) => r.exitCode), [0, 7]);
 });
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────

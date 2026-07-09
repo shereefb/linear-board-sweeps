@@ -21,9 +21,10 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
-  "$comment_parallel": "Default bounded non-ship workspace parallelism plus same-repo per-card fan-out. maxNonShipDispatches counts selected workspace/sweep candidates; sameRepoCardLimits counts child card slots inside each selected non-ship candidate. ship-sweep always stays serial.",
+  "$comment_parallel": "Default bounded non-ship workspace parallelism plus same-repo per-card fan-out. maxNonShipDispatches counts selected workspace/sweep candidates and also caps follow-up handoff dispatches per parent tick; sameRepoCardLimits counts child card slots inside each selected non-ship candidate. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. ship-sweep always stays serial and is never handoff-triggered.",
   "parallel": {
     "maxNonShipDispatches": 2,
+    "maxHandoffTriggerHops": 2,
     "sameRepoCardLimits": {
       "spec": 4,
       "dev": 4,
