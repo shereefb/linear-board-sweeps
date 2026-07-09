@@ -16,7 +16,7 @@ After a sweep pass finishes, re-check the relevant queues and run another bounde
 
    - Export `drainPassLimit(configs)` or similar.
    - Read `config.parallel.maxDrainPasses`.
-   - Default to `2`, clamp to `1..5`.
+   - Default to `5`, clamp to `1..5`.
    - Use the maximum across active anchors for the tick, similar to `maxNonShipDispatches`.
 
 2. Extract one dispatch pass.
@@ -47,7 +47,7 @@ After a sweep pass finishes, re-check the relevant queues and run another bounde
    - `README.md`
    - `SETUP.md`
 
-   Add `parallel.maxDrainPasses` with default `2` and explain the tradeoff.
+   Add `parallel.maxDrainPasses` with default `5` and explain the tradeoff.
 
 5. Update tests.
 
@@ -96,7 +96,7 @@ The log should show pass numbering or equivalent repeated dry-run dispatch messa
 ## Failure Modes
 
 - Stale candidates reused across passes. Mitigation: re-fetch cards every pass.
-- Drain loop starves other scheduler runs. Mitigation: default budget 2 and clamp max 5.
+- Drain loop starves other scheduler runs. Mitigation: default budget 5 and clamp max 5.
 - Dry-run accidentally dispatches. Mitigation: keep dispatch behind the existing `dryRun` branch in every pass.
 - Dry-run stops early because no real dispatch occurred. Mitigation: continue based on selected batch metadata, not the dispatch boolean.
 - The loop is too hard to unit test. Mitigation: export an injectable orchestration helper and keep `tick()` as IO wiring.

@@ -53,6 +53,8 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
+export const DEFAULT_MAX_DRAIN_PASSES = 5;
+export const MAX_DRAIN_PASSES = 5;
 export const DEFAULT_SAME_REPO_CARD_LIMITS = { spec: 4, dev: 4, qa: 1, ship: 1 };
 export const DEFAULT_MAX_HANDOFF_TRIGGER_HOPS = 2;
 export const SAME_REPO_PORT_BASE = 47000;
@@ -364,6 +366,34 @@ export function maxHandoffTriggerHops(config) {
   const n = Math.floor(Number(raw));
   if (!Number.isFinite(n)) return DEFAULT_MAX_HANDOFF_TRIGGER_HOPS;
   return Math.max(0, Math.min(3, n));
+}
+
+export function drainPassLimit(configs = []) {
+  const values = (Array.isArray(configs) ? configs : [configs])
+    .map((config) => config?.parallel?.maxDrainPasses)
+    .filter((value) => value !== undefined)
+    .map((value) => Number(value))
+    .filter(Number.isFinite);
+  if (!values.length) return DEFAULT_MAX_DRAIN_PASSES;
+  const n = Math.floor(Math.max(...values));
+  return Math.min(MAX_DRAIN_PASSES, Math.max(1, n));
+}
+
+export async function runDrainLoop({ maxDrainPasses = DEFAULT_MAX_DRAIN_PASSES, runPass, log = () => {} } = {}) {
+  const limit = drainPassLimit({ parallel: { maxDrainPasses } });
+  const passes = [];
+  for (let pass = 1; pass <= limit; pass += 1) {
+    const result = await runPass(pass);
+    passes.push(result);
+    const selectedCount = result?.selectedBatch?.length || 0;
+    if (!selectedCount) return { passes, budgetExhausted: false };
+    if (result?.continueDraining === false) return { passes, budgetExhausted: false };
+    if (pass === limit) {
+      log(`drain budget exhausted after ${limit} pass(es); ${selectedCount} selected dispatch(es) in the final pass`);
+      return { passes, budgetExhausted: true };
+    }
+  }
+  return { passes, budgetExhausted: false };
 }
 
 export function nextSweepForHandoff({ completedSweep, currentStateName, sweepCfg = SWEEP_CFG } = {}) {
@@ -1716,109 +1746,127 @@ async function tick({ dryRun = false } = {}) {
       for (const active of anchors) active.checkedScopes.add("update");
     }
 
-    // Reap + count across every active (workspace, sweep). Cheap; always runs.
-    const now = Date.now();
-    const candidates = [];
-    for (const active of anchors) {
-      const { anchorPath, config, apiKey, envValues } = active;
-      const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
-      // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
-      // an idle workspace never pays for it (keeps the idle path cheap).
-      let _labelMap = null;
-      const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
-      for (const sweep of SWEEPS) {
-        const cfg = SWEEP_CFG[sweep];
-        let cards;
-        try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); active.checkedScopes.add(sweep); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); recordFailure(sweep, "fetch", cfg.states.join(","), e.message); continue; }
-        const reaps = reapDecisions(cards, cfg, now);
-        // Bounce-escalation is a backward-oscillation guard for the earlier stages.
-        // Skip it for ship: a card in "Ship" was human-approved, and its
-        // historical bounce markers (from earlier dev/qa churn) must not re-block it.
-        const bounces = sweep === "ship" ? [] : bounceDecisions(cards, cfg, now);
-        if (!dryRun && (reaps.length || bounces.length)) {
-          let labelMap;
-          try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); recordFailure(sweep, "label-map", config.teamKey, e.message); labelMap = null; }
-          if (labelMap) {
-            for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
-            for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); recordFailure(sweep, "bounce", d.identifier, e.message); } }
+    const runSweepPass = async (pass) => {
+      if (pass > 1) log(`drain pass ${pass}: rescanning queues`);
+      // Reap + count across every active (workspace, sweep). Cheap; always runs.
+      const now = Date.now();
+      const candidates = [];
+      for (const active of anchors) {
+        const { anchorPath, config, apiKey, envValues } = active;
+        const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+        // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
+        // an idle workspace never pays for it (keeps the idle path cheap).
+        let _labelMap = null;
+        const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
+        for (const sweep of SWEEPS) {
+          const cfg = SWEEP_CFG[sweep];
+          let cards;
+          try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); active.checkedScopes.add(sweep); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); recordFailure(sweep, "fetch", cfg.states.join(","), e.message); continue; }
+          const reaps = reapDecisions(cards, cfg, now);
+          // Bounce-escalation is a backward-oscillation guard for the earlier stages.
+          // Skip it for ship: a card in "Ship" was human-approved, and its
+          // historical bounce markers (from earlier dev/qa churn) must not re-block it.
+          const bounces = sweep === "ship" ? [] : bounceDecisions(cards, cfg, now);
+          if (!dryRun && (reaps.length || bounces.length)) {
+            let labelMap;
+            try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); recordFailure(sweep, "label-map", config.teamKey, e.message); labelMap = null; }
+            if (labelMap) {
+              for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
+              for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); recordFailure(sweep, "bounce", d.identifier, e.message); } }
+            }
+          } else if (dryRun && (reaps.length || bounces.length)) {
+            logFor(anchorPath, sweep, `[dry-run] would reap ${reaps.length}, escalate-bounce ${bounces.length}`);
           }
-        } else if (dryRun && (reaps.length || bounces.length)) {
-          logFor(anchorPath, sweep, `[dry-run] would reap ${reaps.length}, escalate-bounce ${bounces.length}`);
+          // Reflect the decisions in memory so the count is correct: a reaped card
+          // becomes actionable, an escalated (crash or bounce) card is now blocked.
+          applyDecisionsInMemory(cards, reaps, bounces);
+          // Release FOREIGN stale claims stranded in this sweep's states — a sweep's
+          // own reaper handles only its cfg.claim, so e.g. a ship:in-progress dragged
+          // into "QA" would otherwise leak forever. Reuses the fetched cards
+          // (no extra query). Runs on every host (cleanup, not dispatch).
+          const foreign = foreignClaimReleases(cards, now, cfg.claim);
+          if (!dryRun && foreign.length) {
+            for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
+          } else if (dryRun && foreign.length) {
+            logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
+          }
+          const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
+          const topCard = actionable[0] || null;
+          logFor(anchorPath, sweep, `${actionable.length} actionable${topCard ? `; top ${topCard.identifier} sortOrder=${topCard.sortOrder}` : ""}`);
+          // ship merges + deploys to prod. Only the single designated runner may
+          // DISPATCH it (closes the cross-host double-deploy race — the claim label
+          // alone is a check-then-set with no atomicity). Reaping above still runs
+          // on every host, so a stale ship claim is released regardless of runner.
+          if (sweep === "ship" && !reg.shipRunner) {
+            if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
+            continue;
+          }
+          if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
         }
-        // Reflect the decisions in memory so the count is correct: a reaped card
-        // becomes actionable, an escalated (crash or bounce) card is now blocked.
-        applyDecisionsInMemory(cards, reaps, bounces);
-        // Release FOREIGN stale claims stranded in this sweep's states — a sweep's
-        // own reaper handles only its cfg.claim, so e.g. a ship:in-progress dragged
-        // into "QA" would otherwise leak forever. Reuses the fetched cards
-        // (no extra query). Runs on every host (cleanup, not dispatch).
-        const foreign = foreignClaimReleases(cards, now, cfg.claim);
-        if (!dryRun && foreign.length) {
-          for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
-        } else if (dryRun && foreign.length) {
-          logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
+
+        // Holding/legacy-state reaper: release claims stranded in states no sweep fetches
+        // (e.g. qa:in-progress left on a "Signoff" card by a crash between the
+        // status move and the claim drop, or old dev claims left in retired
+        // "In Progress"). ownClaim=null → any stale claim here is orphaned.
+        // Cheap; runs after the per-sweep loop. executeOrphanReap needs no
+        // teamLabelMap (it removes by id from the card), so it is not gated on one.
+        try {
+          const held = await fetchCards(apiKey, config.teamKey, config.projectId, CLAIM_CLEANUP_STATES);
+          active.checkedScopes.add("holding");
+          const orphans = foreignClaimReleases(held, now);
+          if (!dryRun) {
+            for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
+          } else if (orphans.length) {
+            logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding/legacy states`);
+          }
+        } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", CLAIM_CLEANUP_STATES.join(","), e.message); }
+
+        try {
+          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });
+          if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} failure Todo decision(s)`);
+        } catch (e) {
+          logFor(anchorPath, "_", `FATAL failure-todo reconciliation failed: ${e.message}`);
+          recordLocalFailure(anchorPath, config, "_", "failure-todo", config.projectId, e.message);
         }
-        const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
-        const topCard = actionable[0] || null;
-        logFor(anchorPath, sweep, `${actionable.length} actionable${topCard ? `; top ${topCard.identifier} sortOrder=${topCard.sortOrder}` : ""}`);
-        // ship merges + deploys to prod. Only the single designated runner may
-        // DISPATCH it (closes the cross-host double-deploy race — the claim label
-        // alone is a check-then-set with no atomicity). Reaping above still runs
-        // on every host, so a stale ship claim is released regardless of runner.
-        if (sweep === "ship" && !reg.shipRunner) {
-          if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
-          continue;
-        }
-        if (actionable.length > 0) candidates.push({ anchorPath, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
       }
 
-      // Holding/legacy-state reaper: release claims stranded in states no sweep fetches
-      // (e.g. qa:in-progress left on a "Signoff" card by a crash between the
-      // status move and the claim drop, or old dev claims left in retired
-      // "In Progress"). ownClaim=null → any stale claim here is orphaned.
-      // Cheap; runs after the per-sweep loop. executeOrphanReap needs no
-      // teamLabelMap (it removes by id from the card), so it is not gated on one.
-      try {
-        const held = await fetchCards(apiKey, config.teamKey, config.projectId, CLAIM_CLEANUP_STATES);
-        active.checkedScopes.add("holding");
-        const orphans = foreignClaimReleases(held, now);
-        if (!dryRun) {
-          for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
-        } else if (orphans.length) {
-          logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding/legacy states`);
-        }
-      } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", CLAIM_CLEANUP_STATES.join(","), e.message); }
+      // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
+      // dispatch, so `health` doesn't read STALE during a legitimately long run.
+      writeLastTick();
 
-      try {
-        const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun });
-        if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} failure Todo decision(s)`);
-      } catch (e) {
-        logFor(anchorPath, "_", `FATAL failure-todo reconciliation failed: ${e.message}`);
-        recordLocalFailure(anchorPath, config, "_", "failure-todo", config.projectId, e.message);
+      const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
+      const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
+      if (!batch.length) {
+        log(pass === 1 ? "no actionable work — cheap tick" : `drain pass ${pass}: no actionable work — stop`);
+        return { candidates, selectedBatch: [], dispatched: false };
       }
-    }
+      if (dryRun) {
+        for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
+        return { candidates, selectedBatch: batch, dispatched: false };
+      }
 
-    // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
-    // dispatch, so `health` doesn't read STALE during a legitimately long run.
-    writeLastTick();
-
-    const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
-    const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
-    if (!batch.length) log("no actionable work — cheap tick");
-    else if (dryRun) {
-      for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
-    } else {
       const dispatches = await expandDispatchBatch(batch, { dryRun: false, parentRunId, activeByAnchor, now });
-      if (!dispatches.length) { log("no confirmed card slots — cheap tick"); return; }
+      if (!dispatches.length) {
+        log("no confirmed card slots — cheap tick");
+        return { candidates, selectedBatch: [], dispatched: false };
+      }
       const firedHandoffs = new Set();
       const handoffBudget = { remaining: maxNonShipDispatches };
-      await dispatchBatch(dispatches, {
+      const results = await dispatchBatch(dispatches, {
         onResult: async (result) => {
           await reconcileDispatchResult(result);
           await runHandoffTriggers(result, firedHandoffs, handoffBudget);
         },
       });
-    }
+      return {
+        candidates,
+        selectedBatch: dispatches,
+        dispatched: true,
+        continueDraining: results.every((result) => result.success),
+      };
+    };
+
+    await runDrainLoop({ maxDrainPasses: drainPassLimit(anchors.map((a) => a.config)), runPass: runSweepPass, log });
   } finally {
     if (!dryRun) releaseTickLock();
   }

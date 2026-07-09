@@ -21,9 +21,10 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
-  "$comment_parallel": "Optional. maxNonShipDispatches defaults to 2, counts selected workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts child card slots inside each selected non-ship candidate. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. Set maxNonShipDispatches to 1 for serial workspace mode; ship-sweep always stays serial and is never handoff-triggered.",
+  "$comment_parallel": "Optional. maxNonShipDispatches defaults to 2, counts selected workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts child card slots inside each selected non-ship candidate. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches or maxDrainPasses to 1 for stricter serial/one-pass mode; ship-sweep always stays serial and is never handoff-triggered.",
   "parallel": {
     "maxNonShipDispatches": 2,
+    "maxDrainPasses": 5,
     "maxHandoffTriggerHops": 2,
     "sameRepoCardLimits": {
       "spec": 4,
