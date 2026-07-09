@@ -20,7 +20,7 @@ import {
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
-  fetchScheduledQueueCards,
+  fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
@@ -37,6 +37,7 @@ import {
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const minsAgo = (m) => new Date(NOW - m * 60000).toISOString();
 const hoursAgo = (h) => new Date(NOW - h * 3600000).toISOString();
+const dependencyReadyCard = (card = {}) => ({ blockers: [], blockersComplete: true, ...card });
 
 // ── workspace resolution ─────────────────────────────────────────────────────
 test("resolveRepos: folder names resolve as siblings under the anchor's parent", () => {
@@ -407,44 +408,44 @@ test("countActionable: excludes blocked/manual-only and live-claimed, counts rel
     { id: "manual", updatedAt: minsAgo(1), labelNames: ["sweep:manual-only"], comments: [] },
     { id: "live", updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
     { id: "released", updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [] },
-  ];
+  ].map(dependencyReadyCard);
   // released id is in the released set (its claim was just dropped this tick)
   assert.equal(countActionable(cards, SWEEP_CFG.dev, now, new Set(["released"])), 2); // plain + released
 });
 test("countActionable: a stale-heartbeat claim that wasn't released still counts (it's not live)", () => {
-  const card = { id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  const card = dependencyReadyCard({ id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
   assert.equal(countActionable([card], SWEEP_CFG.dev, NOW, new Set()), 1);
 });
 test("actionableCards: live dev claim in Dev is not double-dispatched", () => {
-  const card = {
+  const card = dependencyReadyCard({
     id: "active",
     state: { name: "Dev" },
     updatedAt: minsAgo(1),
     labelNames: ["dev:in-progress"],
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }],
-  };
+  });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
 });
 test("actionableCards: stale dev claim in Dev becomes actionable", () => {
-  const card = { id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  const card = dependencyReadyCard({ id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
-  const card = {
+  const card = dependencyReadyCard({
     id: "ship",
     updatedAt: minsAgo(1),
     labelNames: ["fast-path:eligible", "dev:in-progress"],
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }],
-  };
+  });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.ship, NOW), []);
 });
 test("actionableCards: allows cards with stale foreign in-progress claims after reaper release", () => {
-  const card = {
+  const card = dependencyReadyCard({
     id: "ship",
     updatedAt: minsAgo(300),
     labelNames: ["fast-path:eligible", "dev:in-progress"],
     comments: [],
-  };
+  });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.ship, NOW).map((c) => c.id), ["ship"]);
 });
 test("actionableCards excludes unresolved and incomplete dependencies", () => {
@@ -454,11 +455,15 @@ test("actionableCards excludes unresolved and incomplete dependencies", () => {
   const partial = { id: "partial", labelNames: [], comments: [], blockers: [], blockersComplete: false };
   assert.deepEqual(actionableCards([ready, blocked, partial], cfg, NOW).map((c) => c.id), ["ready"]);
 });
+test("actionableCards rejects cards with absent relation metadata", () => {
+  const missing = { id: "missing", labelNames: [], comments: [] };
+  assert.deepEqual(actionableCards([missing], SWEEP_CFG.dev, NOW), []);
+});
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
-  const reapCard = { id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
-  const escCard = { id: "e", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [
-    { body: REAPER_TAG, createdAt: hoursAgo(2) }, { body: REAPER_TAG, createdAt: hoursAgo(4) } ] };
+  const reapCard = dependencyReadyCard({ id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
+  const escCard = dependencyReadyCard({ id: "e", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [
+    { body: REAPER_TAG, createdAt: hoursAgo(2) }, { body: REAPER_TAG, createdAt: hoursAgo(4) } ] });
   const cards = [reapCard, escCard];
   const reaps = reapDecisions(cards, SWEEP_CFG.dev, NOW);
   applyDecisionsInMemory(cards, reaps, []);
@@ -473,7 +478,7 @@ test("sortByBoardPosition: highest Linear sortOrder is top of column", () => {
     { id: "low", identifier: "COD-2", sortOrder: -20 },
     { id: "missing", identifier: "COD-3" },
     { id: "high", identifier: "COD-1", sortOrder: 5 },
-  ];
+  ].map(dependencyReadyCard);
   assert.deepEqual(sortByBoardPosition(cards).map((c) => c.id), ["high", "low", "missing"]);
   assert.equal(boardOrderValue(cards[2]), 5);
   assert.equal(boardOrderValue(cards[1]), Number.NEGATIVE_INFINITY);
@@ -485,7 +490,7 @@ test("sortByBoardPosition: applies after blocked and live-claim filtering", () =
     { id: "blocked-top", identifier: "COD-2", sortOrder: 100, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
     { id: "live-top", identifier: "COD-3", sortOrder: 90, updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
     { id: "top", identifier: "COD-4", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] },
-  ];
+  ].map(dependencyReadyCard);
   assert.deepEqual(sortByBoardPosition(actionableCards(cards, SWEEP_CFG.dev, NOW)).map((c) => c.id), ["top", "bottom"]);
 });
 
@@ -645,7 +650,7 @@ test("selectCardSlots: chooses top actionable cards and assigns stable slot inde
     { id: "live", identifier: "COD-2", sortOrder: 90, updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
     { id: "second", identifier: "COD-3", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] },
     { id: "first", identifier: "COD-4", sortOrder: 20, updatedAt: minsAgo(1), labelNames: [], comments: [] },
-  ];
+  ].map(dependencyReadyCard);
   const slots = selectCardSlots(cards, SWEEP_CFG.dev, "dev", 2, NOW);
   assert.deepEqual(slots.map((s) => `${s.slotIndex}:${s.identifier}`), ["0:COD-4", "1:COD-3"]);
 });
@@ -653,7 +658,7 @@ test("owner-token claim confirmation uses latest matching heartbeat owner", () =
   const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
   assert.equal(owner, "host_a:run:COD-5:0");
   assert.equal(heartbeatOwner(`${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}]`), owner);
-  const card = {
+  const card = dependencyReadyCard({
     id: "c",
     identifier: "COD-5",
     stateName: "Dev",
@@ -662,7 +667,7 @@ test("owner-token claim confirmation uses latest matching heartbeat owner", () =
       { body: `${HEARTBEAT_TAG} ${minsAgo(3)} owner=other] dev:in-progress`, createdAt: minsAgo(3) },
       { body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}] dev:in-progress`, createdAt: minsAgo(1) },
     ],
-  };
+  });
   assert.equal(latestHeartbeatOwner(card, "dev:in-progress"), owner);
   assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), true);
   assert.equal(claimConfirmed({ ...card, stateName: "QA" }, SWEEP_CFG.dev, owner, ["Dev"]), false);
@@ -678,6 +683,17 @@ test("claimConfirmed rejects a blocker added after scan", () => {
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
     blockers: [{ identifier: "COD-1", stateName: "QA" }],
     blockersComplete: true,
+  };
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), false);
+});
+test("claimConfirmed rejects cards with absent relation metadata", () => {
+  const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
+  const card = {
+    id: "c",
+    identifier: "COD-5",
+    stateName: "Dev",
+    labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
   };
   assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), false);
 });
@@ -792,6 +808,41 @@ test("partial GraphQL queue snapshot fails closed before selecting returned card
   );
 });
 
+test("scheduled pass falls back to relation-free stale-claim cleanup when dependency admission fails", async () => {
+  const cleanupQueries = [];
+  const result = await fetchScheduledPassCards("lin", "COD", "project-1", ["Dev"], {
+    fetchAdmissionFn: async () => { throw new Error("relation field denied"); },
+    cleanupGqlFn: async (query, variables) => {
+      cleanupQueries.push({ query, variables });
+      return {
+        issues: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{
+            id: "stale-id",
+            identifier: "COD-9",
+            updatedAt: minsAgo(300),
+            sortOrder: 1,
+            state: { name: "Dev" },
+            labels: { nodes: [{ id: "claim-id", name: "dev:in-progress" }] },
+            comments: { nodes: [] },
+          }],
+        },
+      };
+    },
+  });
+
+  assert.match(result.admissionError.message, /relation field denied/);
+  assert.equal(result.admissionByState, null);
+  assert.equal(result.cleanupError, null);
+  assert.equal(cleanupQueries.length, 1);
+  assert.equal(cleanupQueries[0].query.includes("inverseRelations"), false);
+  assert.deepEqual(cleanupQueries[0].variables.states, ["Dev"]);
+  const cleanupCard = result.cleanupByState.get("Dev")[0];
+  assert.equal(cleanupCard.blockersComplete, false);
+  assert.deepEqual(actionableCards([cleanupCard], SWEEP_CFG.dev, NOW), []);
+  assert.deepEqual(reapDecisions([cleanupCard], SWEEP_CFG.dev, NOW).map((decision) => decision.identifier), ["COD-9"]);
+});
+
 // Synthetic minimal edges derived from the reviewed SafeTaper wave partition.
 // This verifies scheduling semantics, not a reconstruction of every historical
 // Linear relation. SAF-212 retains the directly verified historical blocker set.
@@ -887,12 +938,12 @@ test("expandDispatchBatch: shared child-index allocator prevents refill/handoff 
   const first = await expandDispatchBatch([{
     ...base,
     sweep: "dev",
-    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+    cards: [dependencyReadyCard({ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
   }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
   const second = await expandDispatchBatch([{
     ...base,
     sweep: "qa",
-    cards: [{ id: "b", identifier: "COD-11", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+    cards: [dependencyReadyCard({ id: "b", identifier: "COD-11", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
   }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
 
   assert.equal(first[0].childEnv.AUTO_SWEEP_APP_PORT, "47000");
@@ -911,12 +962,12 @@ test("expandDispatchBatch: same-card handoff children get unique run paths", asy
   const dev = await expandDispatchBatch([{
     ...base,
     sweep: "dev",
-    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+    cards: [dependencyReadyCard({ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
   }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
   const qa = await expandDispatchBatch([{
     ...base,
     sweep: "qa",
-    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+    cards: [dependencyReadyCard({ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
   }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
 
   assert.notEqual(dev[0].cardRunId, qa[0].cardRunId);
@@ -932,7 +983,7 @@ test("expandDispatchBatch: child dispatches preserve managed repo metadata for l
     config: { repos: ["app", "worker"] },
     sweep: "dev",
     count: 1,
-    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+    cards: [dependencyReadyCard({ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
   }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW });
 
   assert.deepEqual(children[0].managedRepoPaths, ["/managed/app/app", "/managed/app/worker"]);
@@ -953,13 +1004,13 @@ test("same-repo active counts: successful child completion frees exactly one slo
 test("sameRepoAvailableSlots: live board claims and parent reservations share the same capacity", () => {
   const active = createSameRepoActiveCounts();
   active.increment({ anchorPath: "/ws/repo", sweep: "qa", issueIdentifier: "COD-1" });
-  const live = {
+  const live = dependencyReadyCard({
     id: "qa-live",
     identifier: "COD-2",
     updatedAt: minsAgo(1),
     labelNames: ["qa:in-progress"],
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=other claim=qa:in-progress]`, createdAt: minsAgo(1) }],
-  };
+  });
   assert.equal(sameRepoAvailableSlots({
     cards: [live],
     cfg: SWEEP_CFG.qa,
@@ -979,7 +1030,7 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
     { id: "blocked", identifier: "COD-99", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
     { id: "next", identifier: "COD-5", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] },
     { id: "later", identifier: "COD-6", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] },
-  ];
+  ].map(dependencyReadyCard);
   const logs = [];
   const refillBudget = { remaining: 8 };
   const result = await buildSameRepoRefillDispatches({
@@ -1238,7 +1289,7 @@ test("dryRunDispatchMessages: reports expanded same-repo card slots when cards a
       cards: [
         { id: "a", identifier: "COD-7", sortOrder: 1, updatedAt: minsAgo(1), labelNames: [], comments: [] },
         { id: "b", identifier: "COD-8", sortOrder: 5, updatedAt: minsAgo(1), labelNames: [], comments: [] },
-      ],
+      ].map(dependencyReadyCard),
     },
   ]);
   assert.deepEqual(messages.map((m) => m.body), [

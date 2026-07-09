@@ -459,7 +459,7 @@ export function bounceDecisions(cards, cfg, now, windowH = ESCALATE_WINDOW_H) {
 export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
-    if (!dependencyEligibility(card.blockers, card.blockersComplete !== false).eligible) return false;
+    if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) return false;
     const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
@@ -625,7 +625,7 @@ export function claimConfirmed(card, cfg, owner, expectedStates = []) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
-  if (!dependencyEligibility(card.blockers, card.blockersComplete !== false).eligible) return false;
+  if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) return false;
   return latestHeartbeatOwner(card, cfg.claim) === owner;
 }
 
@@ -1214,6 +1214,17 @@ function normalizeCardFields(node) {
   };
 }
 
+function normalizeRelationUnknownCard(node) {
+  const blockers = [];
+  const blockersComplete = false;
+  return {
+    ...normalizeCardFields(node),
+    blockers,
+    blockersComplete,
+    dependency: dependencyEligibility(blockers, blockersComplete),
+  };
+}
+
 async function normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesFn }) {
   const connection = node?.inverseRelations;
   const pageInfo = connection?.pageInfo;
@@ -1280,29 +1291,71 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
   }
 }
 
-async function fetchCards(apiKey, teamKey, projectId, states) {
-  const byState = await fetchScheduledQueueCards(apiKey, teamKey, projectId, states);
-  return [...new Set(states || [])].flatMap((state) => byState.get(state) || []);
-}
-
-async function fetchClaimCleanupCards(apiKey, teamKey, projectId, states) {
-  const cards = [];
+export async function fetchScheduledCleanupCards(apiKey, teamKey, projectId, states, { gqlFn = gql } = {}) {
+  const requestedStates = [...new Set(states || [])];
+  const byState = new Map(requestedStates.map((state) => [state, []]));
+  const seenCursors = new Set();
   let cursor = null;
-  do {
-    const d = await gql(
+  while (true) {
+    const result = await gqlFn(
       `query($c:String,$states:[String!],$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
          team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ in:$states } } }){
          pageInfo{ hasNextPage endCursor }
          nodes{ id identifier updatedAt sortOrder state{ name }
            labels{ nodes{ id name } }
            comments(last:100){ nodes{ body createdAt } } } } }`,
-      { c: cursor, states, teamKey, pid: projectId },
+      { c: cursor, states: requestedStates, teamKey, pid: projectId },
       apiKey,
     );
-    cards.push(...d.issues.nodes.map(normalizeCardFields));
-    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
-  } while (cursor);
-  return cards;
+    const data = unwrapGraphQlData(result, "scheduled cleanup snapshot");
+    const connection = data?.issues;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("scheduled cleanup snapshot is missing issues data or pageInfo");
+    }
+    for (const node of connection.nodes) {
+      const card = normalizeRelationUnknownCard(node);
+      if (!byState.has(card.stateName)) byState.set(card.stateName, []);
+      byState.get(card.stateName).push(card);
+    }
+    if (!connection.pageInfo.hasNextPage) return byState;
+    const nextCursor = connection.pageInfo.endCursor;
+    if (!nextCursor || seenCursors.has(nextCursor)) throw new Error("scheduled cleanup snapshot pagination is incomplete");
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+}
+
+export async function fetchScheduledPassCards(apiKey, teamKey, projectId, states, {
+  fetchAdmissionFn = fetchScheduledQueueCards,
+  fetchCleanupFn = fetchScheduledCleanupCards,
+  admissionGqlFn = gql,
+  cleanupGqlFn = gql,
+  fetchIssueDependenciesFn = fetchIssueDependencies,
+} = {}) {
+  try {
+    const admissionByState = await fetchAdmissionFn(apiKey, teamKey, projectId, states, {
+      gqlFn: admissionGqlFn,
+      fetchIssueDependenciesFn,
+    });
+    return { admissionByState, cleanupByState: admissionByState, admissionError: null, cleanupError: null };
+  } catch (admissionError) {
+    try {
+      const cleanupByState = await fetchCleanupFn(apiKey, teamKey, projectId, states, { gqlFn: cleanupGqlFn });
+      return { admissionByState: null, cleanupByState, admissionError, cleanupError: null };
+    } catch (cleanupError) {
+      return { admissionByState: null, cleanupByState: null, admissionError, cleanupError };
+    }
+  }
+}
+
+async function fetchCards(apiKey, teamKey, projectId, states) {
+  const byState = await fetchScheduledQueueCards(apiKey, teamKey, projectId, states);
+  return [...new Set(states || [])].flatMap((state) => byState.get(state) || []);
+}
+
+async function fetchClaimCleanupCards(apiKey, teamKey, projectId, states) {
+  const byState = await fetchScheduledCleanupCards(apiKey, teamKey, projectId, states);
+  return [...new Set(states || [])].flatMap((state) => byState.get(state) || []);
 }
 
 async function fetchCard(apiKey, issueId) {
@@ -1331,7 +1384,7 @@ async function fetchClaimCard(apiKey, issueId) {
     apiKey,
   );
   if (!d.issue) throw new Error(`issue not found: ${issueId}`);
-  return normalizeCardFields(d.issue);
+  return normalizeRelationUnknownCard(d.issue);
 }
 
 async function fetchBlockedIssues(apiKey, teamKey, projectId) {
@@ -2486,14 +2539,21 @@ async function tick({ dryRun = false } = {}) {
         const { anchorPath, config, apiKey, envValues } = active;
         const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
         const scheduledStates = [...new Set(SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states))];
-        let scheduledCardsByState = null;
-        try {
-          scheduledCardsByState = await fetchScheduledQueueCards(apiKey, config.teamKey, config.projectId, scheduledStates);
+        const scheduledPass = await fetchScheduledPassCards(apiKey, config.teamKey, config.projectId, scheduledStates);
+        const scheduledCardsByState = scheduledPass.admissionByState;
+        const cleanupCardsByState = scheduledPass.cleanupByState;
+        if (!scheduledPass.admissionError) {
           for (const sweep of SWEEPS) active.checkedScopes.add(sweep);
-        } catch (e) {
+        } else {
           for (const sweep of SWEEPS) {
-            logFor(anchorPath, sweep, `fetch error: ${e.message}`);
-            recordFailure(sweep, "fetch", scheduledStates.join(","), e.message);
+            logFor(anchorPath, sweep, `fetch error: ${scheduledPass.admissionError.message}`);
+            recordFailure(sweep, "fetch", scheduledStates.join(","), scheduledPass.admissionError.message);
+          }
+        }
+        if (scheduledPass.cleanupError) {
+          for (const sweep of SWEEPS) {
+            logFor(anchorPath, sweep, `cleanup fetch error: ${scheduledPass.cleanupError.message}`);
+            recordFailure(sweep, "cleanup-fetch", scheduledStates.join(","), scheduledPass.cleanupError.message);
           }
         }
         // teamLabelMap is only needed to execute a reap/bounce — fetch it lazily so
@@ -2502,8 +2562,8 @@ async function tick({ dryRun = false } = {}) {
         const getLabelMap = async () => (_labelMap ??= await teamLabelMap(apiKey, config.teamKey));
         for (const sweep of SWEEPS) {
           const cfg = SWEEP_CFG[sweep];
-          if (!scheduledCardsByState) continue;
-          const cards = cfg.states.flatMap((state) => scheduledCardsByState.get(state) || []);
+          if (!cleanupCardsByState) continue;
+          const cards = cfg.states.flatMap((state) => cleanupCardsByState.get(state) || []);
           const reaps = reapDecisions(cards, cfg, now);
           // Bounce-escalation is a backward-oscillation guard for the earlier stages.
           // Skip it for ship: a card in "Ship" was human-approved, and its
@@ -2531,6 +2591,10 @@ async function tick({ dryRun = false } = {}) {
             for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
           } else if (dryRun && foreign.length) {
             logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
+          }
+          if (!scheduledCardsByState) {
+            logFor(anchorPath, sweep, "0 actionable; dependency admission unavailable");
+            continue;
           }
           const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
           const topCard = actionable[0] || null;
