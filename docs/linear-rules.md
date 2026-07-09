@@ -55,6 +55,9 @@ Claim/release + blocked signals. The sweeps create these if missing.
 | `fast-path:eligible` | dev-sweep's conservative marker for tiny, high-confidence changes; lets a human skip `Signoff` by manually moving from `QA` to `Ship` |
 | `blocked:open-questions` | spec-sweep asked the owner questions; waiting on a reply |
 | `blocked:needs-user` | dev/qa/ship blocked on a human (decision, credential, deploy) |
+| `sweep:manual-only` | direct user conversation or another non-sweep skill owns the card; scheduled sweeps skip it until a human clears the label |
+
+Use `sweep:manual-only` whenever a card is created or moved outside the scheduled sweep pipeline — for example during a direct conversation with the user, a one-off implementation session, or another non-sweep skill. Omit it only when the explicit intent is to enqueue the card for unattended spec/dev/qa/ship automation immediately. Clear it with `unblock-sweep` or an explicit human handoff when the normal sweeps should resume.
 
 ## Fast-path eligibility
 
@@ -78,6 +81,7 @@ The launcher also writes/reads a few **audit-marker comments** on cards (you don
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.
 - Put the `<PREFIX>-###` key in the branch name / PR title / commit subjects where practical.
+- Cards created or moved by direct user conversation or non-sweep skills should carry `sweep:manual-only` unless the user explicitly wants unattended sweeps to pick them up right away.
 - Raw ideas → `Backlog`. Selected-but-underspecified → `Spec`. Designed/active → `Dev` (active work carries `dev:in-progress`). PR/review → `QA`. QA-passed, awaiting sign-off → `Signoff`. Tiny fast-path-eligible changes may be moved by a human from `QA` directly to `Ship`; otherwise human-approved shipping happens from `Signoff` → `Ship`. Shipped + verified → `Done`.
 - Work discovered after the fact → a `Done` card titled `Completed: …` with a short plain-English summary + evidence.
 - Every question during an unattended sweep run goes to a **card comment** — never block on interactive input.

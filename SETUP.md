@@ -121,6 +121,7 @@ Stage selectively (never `git add -A`): `.claude/skills/`, `.claude/linear-sweep
 - **Codex** (working in this repo): same natural-language phrases — Codex reads the AGENTS.md "Board sweeps" section and follows the named `SKILL.md`. Needs `LINEAR_API_KEY` in its env and `multi_agent = true` for dev-sweep; Step 8 should already have enabled it.
 - **Manual unblock:** say "run the unblock sweep" when blocked cards need your input. It is interactive, never scheduled, and removes blocking labels only after you choose a resolution.
 - Point them at `docs/linear-rules.md` for the board taxonomy, and remind them: **create cards for the actual features/bugs** and let the sweeps carry them across the board.
+- **Manual/non-sweep cards:** when an agent creates or moves a card during a direct user conversation, or from any non-sweep skill, add `sweep:manual-only` unless the user explicitly wants the scheduled sweeps to pick it up. This keeps launchd from racing user-directed work. Clear `sweep:manual-only` only when handing the card back to the normal sweep pipeline.
 
 ## Step 11 — Auto-sweep triggering (run the sweeps automatically)
 
@@ -131,6 +132,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 **Concepts you need (read once):**
 - **Workspace** = one Linear project ↔ one **anchor repo** (the repo holding `.claude/linear-sweep.json`, i.e. `TARGET`) plus any sibling repos it lists in `config.repos`. One anchor per project.
 - **Activation** = a Linear **project label `auto-sweep`**. The launcher only sweeps a registered anchor whose project carries that label. `activate`/`deactivate` toggle it via the API.
+- **Manual-only issue label** = `sweep:manual-only`. Use it on cards created or moved by direct user conversations and non-sweep skills unless the card is meant to enter the unattended queue immediately. The scheduled launcher skips these cards in every sweep; `unblock-sweep` can clear the label after a human chooses to resume automation.
 - **`ANCHOR`** below = the absolute path to `TARGET` (the anchor repo). Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
 
 1. **Ensure runtime selection exists** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has this. If not, add:

@@ -2,6 +2,7 @@
 // Run: node --test
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import {
   resolveRepos, worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
@@ -10,7 +11,7 @@ import {
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
-  dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry,
+  dryRunDispatchMessages, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -66,6 +67,14 @@ test("runtimeConfigForSweep: review is role config only and never scheduled", ()
   assert.deepEqual(runtimeConfigForSweep({
     runtimes: { review: { runtime: "claude", model: "claude-opus-4-8" } },
   }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
+});
+test("default configs keep scheduled sweeps on the authenticated codex runtime", () => {
+  for (const file of ["templates/linear-sweep.json", ".claude/linear-sweep.json"]) {
+    const config = JSON.parse(fs.readFileSync(file, "utf8"));
+    for (const sweep of SWEEPS) {
+      assert.equal(runtimeConfigForSweep(config, sweep).runtime, "codex", `${file} ${sweep}`);
+    }
+  }
 });
 
 test("SWEEP_CFG fetches concise board states", () => {
@@ -931,4 +940,26 @@ test("pushWithRetry: gives up after maxRetries without forcing", () => {
   assert.equal(r.ok, false);
   assert.equal(calls.filter((c) => c === "push").length, 3); // initial + 2 retries
   assert.ok(!calls.some((c) => c === "--force"));
+});
+test("checkoutDispatchBlockers: dirty anchor blocks unattended dispatch", () => {
+  const calls = [];
+  const gitFn = (repo, args) => {
+    calls.push([repo, args.join(" ")]);
+    return { status: 0, out: repo === "/anchor" ? " M scripts/linear-watch.mjs\n?? tmp" : "", err: "" };
+  };
+  const blockers = checkoutDispatchBlockers({ anchorPath: "/anchor", sweep: "ship" }, { kitPath: "/anchor" }, { gitFn });
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].scope, "ship:dispatch");
+  assert.equal(blockers[0].kind, "dirty-checkout");
+  assert.equal(blockers[0].stableTarget, "anchor:/anchor");
+  assert.match(blockers[0].message, /2 uncommitted path/);
+  assert.deepEqual(calls, [["/anchor", "status --porcelain"]]);
+});
+test("checkoutDispatchBlockers: dirty kit clone also blocks dispatch", () => {
+  const gitFn = (repo) => ({ status: 0, out: repo === "/kit" ? " M README.md" : "", err: "" });
+  const blockers = checkoutDispatchBlockers({ anchorPath: "/anchor", sweep: "dev" }, { kitPath: "/kit" }, { gitFn });
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].scope, "dev:dispatch");
+  assert.equal(blockers[0].kind, "dirty-checkout");
+  assert.equal(blockers[0].stableTarget, "kit:/kit");
 });

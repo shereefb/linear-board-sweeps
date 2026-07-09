@@ -18,5 +18,6 @@ test("Codex AGENTS instructions include the Karpathy coding guardrail", () => {
     assert.match(text, /before starting that work/, file);
     assert.match(text, /If the skill is unavailable/, file);
     assert.match(text, /apply its core checks manually/, file);
+    assert.match(text, /sweep:manual-only/, file);
   }
 });

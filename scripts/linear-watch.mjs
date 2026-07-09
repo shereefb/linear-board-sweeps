@@ -1222,6 +1222,39 @@ async function executeReap(apiKey, card, decision, labelMap, sweep) {
   }
 }
 
+function checkoutDirtyEvent(pick, checkout, { gitFn = git } = {}) {
+  if (!checkout?.path) return null;
+  const status = gitFn(checkout.path, ["status", "--porcelain"], { allowFail: true });
+  const scope = `${pick.sweep}:dispatch`;
+  const stableTarget = `${checkout.role}:${checkout.path}`;
+  if (status.status !== 0) {
+    return {
+      scope,
+      kind: "checkout-status",
+      stableTarget,
+      message: `${checkout.role} checkout status failed before dispatch: ${status.err || `exit ${status.status}`}`,
+    };
+  }
+  if (!status.out) return null;
+  const changed = status.out.split("\n").filter(Boolean).length;
+  return {
+    scope,
+    kind: "dirty-checkout",
+    stableTarget,
+    message: `${checkout.role} checkout has ${changed} uncommitted path(s); refusing unattended ${pick.sweep}-sweep dispatch until committed, stashed, or reverted`,
+  };
+}
+
+export function checkoutDispatchBlockers(pick, reg = {}, { gitFn = git } = {}) {
+  const checkouts = [{ role: "anchor", path: pick.anchorPath }];
+  if (reg.kitPath && path.resolve(reg.kitPath) !== path.resolve(pick.anchorPath)) {
+    checkouts.push({ role: "kit", path: reg.kitPath });
+  }
+  return checkouts
+    .map((checkout) => checkoutDirtyEvent(pick, checkout, { gitFn }))
+    .filter(Boolean);
+}
+
 // Release orphaned/foreign claims (all of a card's, in one write) — no escalation;
 // the card advanced and the owning sweep just crashed before dropping its claim.
 // Uses ORPHAN_TAG (not REAPER_TAG) so it does not inflate the crash-escalation count.
@@ -1846,7 +1879,30 @@ async function tick({ dryRun = false } = {}) {
         return { candidates, selectedBatch: batch, dispatched: false };
       }
 
-      const dispatches = await expandDispatchBatch(batch, { dryRun: false, parentRunId, activeByAnchor, now });
+      const cleanBatch = [];
+      for (const pick of batch) {
+        const active = activeByAnchor.get(pick.anchorPath);
+        const blockers = checkoutDispatchBlockers(pick, reg);
+        if (!active || !blockers.length) {
+          cleanBatch.push(pick);
+          continue;
+        }
+        const failures = blockers.map((b) => failureEventFor(pick.anchorPath, pick.config, b.scope, b.kind, b.stableTarget, b.message));
+        active.failures.push(...failures);
+        for (const failure of failures) logFor(pick.anchorPath, pick.sweep, `dispatch blocked: ${failure.message}`);
+        try {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set(), active.envValues, { dryRun: false });
+        } catch (e) {
+          logFor(pick.anchorPath, "_", `FATAL failure-todo dirty-checkout reconciliation failed: ${e.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, `${pick.sweep}:dispatch`, "failure-todo", pick.anchorPath, e.message);
+          writeLastTick();
+        }
+      }
+      if (!cleanBatch.length) {
+        log("dispatch blocked by dirty checkout(s)");
+        return { candidates, selectedBatch: [], dispatched: false };
+      }
+      const dispatches = await expandDispatchBatch(cleanBatch, { dryRun: false, parentRunId, activeByAnchor, now });
       if (!dispatches.length) {
         log("no confirmed card slots — cheap tick");
         return { candidates, selectedBatch: [], dispatched: false };
