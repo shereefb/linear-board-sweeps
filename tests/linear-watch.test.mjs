@@ -7,7 +7,7 @@ import {
   resolveRepos, worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch,
+  boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, rotateNonShipCandidates,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
@@ -716,6 +716,25 @@ test("selectDispatchBatch: dispatches disjoint anchors up to the configured non-
     { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
   ], { maxNonShipDispatches: 2 });
   assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
+});
+test("selectDispatchBatch: rotates non-ship anchors so later workspaces are not always leftovers", () => {
+  const candidates = [
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "qa", count: 1, topCard: { sortOrder: 30 } },
+    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "dev", count: 1, topCard: { sortOrder: 20 } },
+    { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "dev", count: 1, topCard: { sortOrder: 10 } },
+  ];
+  const first = selectDispatchBatch(candidates, { maxNonShipDispatches: 2, rotationSeed: 0 });
+  const rotated = selectDispatchBatch(candidates, { maxNonShipDispatches: 2, rotationSeed: 2 });
+  assert.deepEqual(first.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
+  assert.deepEqual(rotated.map((c) => c.anchorPath), ["/ws/c", "/ws/a"]);
+});
+test("rotateNonShipCandidates: preserves each anchor's internal sweep/card priority", () => {
+  const rotated = rotateNonShipCandidates([
+    { anchorPath: "/ws/a", sweep: "dev", topCard: { sortOrder: 10 } },
+    { anchorPath: "/ws/a", sweep: "spec", topCard: { sortOrder: 100 } },
+    { anchorPath: "/ws/b", sweep: "dev", topCard: { sortOrder: 20 } },
+  ], 1);
+  assert.deepEqual(rotated.map((c) => `${c.anchorPath}:${c.sweep}`), ["/ws/b:dev", "/ws/a:dev", "/ws/a:spec"]);
 });
 test("selectDispatchBatch: a serial candidate runs alone or waits for another tick", () => {
   const serialFirst = selectDispatchBatch([

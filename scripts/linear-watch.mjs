@@ -588,16 +588,17 @@ function overlapsAny(paths, usedPaths) {
   return false;
 }
 
-export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT_MAX_NON_SHIP_DISPATCHES } = {}) {
+export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT_MAX_NON_SHIP_DISPATCHES, rotationSeed = 0 } = {}) {
   const ranked = rankedDispatchCandidates(candidates);
   const ship = ranked.find((c) => c.sweep === "ship");
   if (ship) return [ship];
 
   let limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
+  const rotated = rotateNonShipCandidates(ranked.filter((candidate) => candidate.sweep !== "ship"), rotationSeed);
   const picked = [];
   const usedAnchors = new Set();
   const usedRepos = new Set();
-  for (const c of ranked.filter((candidate) => candidate.sweep !== "ship")) {
+  for (const c of rotated) {
     if (picked.length >= limit) break;
     const candidateLimit = parallelLimit(c.config);
     if (picked.length + 1 > Math.min(limit, candidateLimit)) continue;
@@ -610,6 +611,27 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT
     for (const repo of repos) usedRepos.add(repo);
   }
   return picked;
+}
+
+export function rotateNonShipCandidates(candidates, seed = 0) {
+  const ranked = candidates.filter((candidate) => candidate.sweep !== "ship");
+  const anchors = [];
+  const seen = new Set();
+  for (const candidate of ranked) {
+    if (seen.has(candidate.anchorPath)) continue;
+    seen.add(candidate.anchorPath);
+    anchors.push(candidate.anchorPath);
+  }
+  if (anchors.length <= 1) return ranked;
+  const offset = Math.abs(Math.floor(Number(seed)) || 0) % anchors.length;
+  const rotatedAnchors = [...anchors.slice(offset), ...anchors.slice(0, offset)];
+  const anchorRank = new Map(rotatedAnchors.map((anchor, index) => [anchor, index]));
+  return [...ranked].sort((a, b) => {
+    const ao = anchorRank.get(a.anchorPath) ?? Number.MAX_SAFE_INTEGER;
+    const bo = anchorRank.get(b.anchorPath) ?? Number.MAX_SAFE_INTEGER;
+    if (ao !== bo) return ao - bo;
+    return ranked.indexOf(a) - ranked.indexOf(b);
+  });
 }
 
 export function dryRunDispatchMessages(batch) {
@@ -2106,7 +2128,8 @@ async function tick({ dryRun = false } = {}) {
       writeLastTick();
 
       const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
-      const batch = selectDispatchBatch(candidates, { maxNonShipDispatches });
+      const rotationSeed = Math.floor(Date.now() / 600000);
+      const batch = selectDispatchBatch(candidates, { maxNonShipDispatches, rotationSeed });
       if (!batch.length) {
         log(pass === 1 ? "no actionable work — cheap tick" : `drain pass ${pass}: no actionable work — stop`);
         return { candidates, selectedBatch: [], dispatched: false };
