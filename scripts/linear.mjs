@@ -184,6 +184,7 @@ export async function gql(query, variables, apiKey = process.env.LINEAR_API_KEY)
 export async function fetchIssueDependencies(apiKey, issueId, { gqlFn = gql } = {}) {
   if (!issueId) throw new Error("usage: dependency-status <issueId>");
   const blockers = [];
+  const seenCursors = new Set();
   let cursor = null;
   let issue = issueId;
 
@@ -200,7 +201,8 @@ export async function fetchIssueDependencies(apiKey, issueId, { gqlFn = gql } = 
     const pageInfo = connection?.pageInfo;
     if (typeof pageInfo?.hasNextPage !== "boolean") throw new Error("inverseRelations pageInfo missing");
     if (!pageInfo.hasNextPage) return { issue, blockers, complete: true };
-    if (!pageInfo.endCursor || pageInfo.endCursor === cursor) return { issue, blockers, complete: false };
+    if (!pageInfo.endCursor || seenCursors.has(pageInfo.endCursor)) return { issue, blockers, complete: false };
+    seenCursors.add(pageInfo.endCursor);
     cursor = pageInfo.endCursor;
   }
 }

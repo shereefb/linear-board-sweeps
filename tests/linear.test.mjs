@@ -71,6 +71,28 @@ test("fetchIssueDependencies paginates inverse blocking relations to completion"
   assert.ok(calls.every((call) => call.apiKey === "key"));
 });
 
+test("fetchIssueDependencies fails closed when a continuation cursor cycles", async () => {
+  const calls = [];
+  const nextCursor = new Map([[null, "A"], ["A", "B"], ["B", "A"]]);
+  const gqlFn = async (_query, variables) => {
+    calls.push(variables.cursor);
+    if (calls.length > 3) throw new Error("pagination did not stop at the repeated cursor");
+    return {
+      issue: {
+        identifier: "COD-9",
+        inverseRelations: {
+          pageInfo: { hasNextPage: true, endCursor: nextCursor.get(variables.cursor) },
+          nodes: [],
+        },
+      },
+    };
+  };
+
+  const result = await fetchIssueDependencies("key", "COD-9", { gqlFn });
+  assert.deepEqual(calls, [null, "A", "B"]);
+  assert.equal(result.complete, false);
+});
+
 test("fetchIssueDependencies rejects query failures instead of returning an empty blocker set", async () => {
   const gqlFn = async () => { throw new Error("Linear query failed"); };
   await assert.rejects(fetchIssueDependencies("key", "COD-9", { gqlFn }), /Linear query failed/);
