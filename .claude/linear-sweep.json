@@ -21,9 +21,15 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
   },
-  "$comment_parallel": "Default bounded non-ship parallelism. Set maxNonShipDispatches to 1 for serial mode; that workspace runs alone or waits for the next tick. ship-sweep always stays serial.",
+  "$comment_parallel": "Default bounded non-ship workspace parallelism plus same-repo per-card fan-out. maxNonShipDispatches counts selected workspace/sweep candidates; sameRepoCardLimits counts child card slots inside each selected non-ship candidate. ship-sweep always stays serial.",
   "parallel": {
-    "maxNonShipDispatches": 2
+    "maxNonShipDispatches": 2,
+    "sameRepoCardLimits": {
+      "spec": 4,
+      "dev": 4,
+      "qa": 1,
+      "ship": 1
+    }
   },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
