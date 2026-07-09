@@ -386,8 +386,11 @@ export function maxSameRepoRefillDispatches(configs = []) {
   const values = (Array.isArray(configs) ? configs : [configs])
     .map((config) => config?.parallel?.maxSameRepoRefillDispatches)
     .filter((value) => value !== undefined)
-    .map((value) => Number(value))
-    .filter(Number.isFinite);
+    .map((value) => {
+      if (value === null) return DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES;
+    });
   if (!values.length) return DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES;
   const n = Math.floor(Math.max(...values));
   return Math.min(MAX_SAME_REPO_REFILL_DISPATCHES, Math.max(0, n));
@@ -476,7 +479,8 @@ export function cardWorktreePath(anchorPath, config, issueIdentifier) {
 export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, childIndex = slot.slotIndex || 0) {
   const issueIdentifier = slot.identifier;
   const logDir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep, issueIdentifier);
-  const tmpDir = path.join(CACHE_DIR, parentRunId, issueIdentifier, "tmp");
+  const childRunKey = `${sweep}-${issueIdentifier}-${childIndex}`;
+  const tmpDir = path.join(CACHE_DIR, parentRunId, childRunKey, "tmp");
   const portBase = SAME_REPO_PORT_BASE + childIndex * 10;
   return {
     worktreePath: cardWorktreePath(anchorPath, config, issueIdentifier),
@@ -485,7 +489,7 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
     portBase,
     appPort: portBase,
     screenshotDir: path.join(logDir, "screenshots"),
-    browserProfileDir: path.join(CACHE_DIR, parentRunId, issueIdentifier, "browser"),
+    browserProfileDir: path.join(CACHE_DIR, parentRunId, childRunKey, "browser"),
   };
 }
 
@@ -497,7 +501,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
   }, parentRunId, childIndex);
   return {
     ...pick,
-    cardRunId: `${parentRunId}:${pick.issueIdentifier}:${pick.slotIndex || 0}`,
+    cardRunId: `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`,
     sameRepoLimit: sameRepoCardLimit(pick.config, pick.sweep),
     ...paths,
     childEnv: {
@@ -556,6 +560,15 @@ export function createSameRepoActiveCounts() {
       return Math.max(0, Math.floor(Number(limit)) - this.get(anchorPath, sweep));
     },
   };
+}
+
+export function sameRepoAvailableSlots({ cards = [], cfg, anchorPath, sweep, activeSameRepo, limit, now = Date.now() } = {}) {
+  const claim = cfg?.claim;
+  const boardActiveClaims = claim ? (cards || []).filter((card) => (
+    hasLabel(card, claim) && liveClaimLabel(card, now) === claim
+  )).length : 0;
+  const parentActive = activeSameRepo?.get(anchorPath, sweep) || 0;
+  return Math.max(0, Math.floor(Number(limit)) - Math.max(parentActive, boardActiveClaims));
 }
 
 function repoSet(candidate) {
@@ -1471,6 +1484,10 @@ export async function buildSameRepoRefillDispatches({
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: ship`);
     return empty("ship");
   }
+  if (refillBudget?.disabled) {
+    logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: disabled`);
+    return empty("disabled");
+  }
   if (!refillBudget || refillBudget.remaining <= 0) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: budget`);
     return empty("budget");
@@ -1504,11 +1521,15 @@ export async function buildSameRepoRefillDispatches({
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: fetch ${e.message}`);
     return empty("fetch");
   }
-  const boardActiveClaims = (cards || []).filter((card) => (
-    hasLabel(card, SWEEP_CFG[sweep].claim) && liveClaimLabel(card, now) === SWEEP_CFG[sweep].claim
-  )).length;
-  const parentActive = activeSameRepo?.get(pick.anchorPath, sweep) || 0;
-  const availableByCapacity = Math.max(0, limit - Math.max(parentActive, boardActiveClaims));
+  const availableByCapacity = sameRepoAvailableSlots({
+    cards,
+    cfg: SWEEP_CFG[sweep],
+    anchorPath: pick.anchorPath,
+    sweep,
+    activeSameRepo,
+    limit,
+    now,
+  });
   const availableSlots = Math.min(availableByCapacity, refillBudget.remaining);
   if (availableSlots <= 0) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: no-capacity`);
@@ -1879,6 +1900,27 @@ async function tick({ dryRun = false } = {}) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
           return;
         }
+        let targetCards;
+        try {
+          targetCards = await fetchCards(active.apiKey, pick.config.teamKey, pick.config.projectId, nextCfg.states);
+        } catch (e) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: fetch ${e.message}`);
+          return;
+        }
+        const targetLimit = sameRepoCardLimit(pick.config, nextSweep);
+        const availableSlots = sameRepoAvailableSlots({
+          cards: targetCards,
+          cfg: nextCfg,
+          anchorPath: pick.anchorPath,
+          sweep: nextSweep,
+          activeSameRepo,
+          limit: targetLimit,
+          now: Date.now(),
+        });
+        if (availableSlots <= 0) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
+          return;
+        }
 
         const candidate = {
           anchorPath: pick.anchorPath,
@@ -1897,6 +1939,8 @@ async function tick({ dryRun = false } = {}) {
         }
         handoffBudget.remaining -= 1;
         firedHandoffs.add(key);
+        const reservation = { anchorPath: pick.anchorPath, sweep: nextSweep, issueIdentifier: issue.identifier };
+        activeSameRepo.increment(reservation);
         logFor(pick.anchorPath, nextSweep, `handoff-trigger ${issue.identifier}: ${pick.sweep}->${nextSweep}`);
         const downstream = (await expandDispatchBatch(batch, {
           dryRun: false,
@@ -1906,11 +1950,12 @@ async function tick({ dryRun = false } = {}) {
           childIndexAllocator,
         })).map((d) => ({ ...d, triggeredBy: { issue: issue.identifier, sweep: pick.sweep } }));
         if (!downstream.length) {
+          activeSameRepo.decrement(reservation);
           handoffBudget.remaining += 1;
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
           return;
         }
-        const results = await dispatchChildren(downstream);
+        const results = await dispatchChildren(downstream, { alreadyReserved: true });
         current = results.find((r) => r.issueIdentifier === issue.identifier) || results[0];
         remaining -= 1;
       }
@@ -1970,6 +2015,7 @@ async function tick({ dryRun = false } = {}) {
       for (const active of anchors) active.checkedScopes.add("update");
     }
     refillBudget.remaining = maxSameRepoRefillDispatches(anchors.map((a) => a.config));
+    refillBudget.disabled = refillBudget.remaining === 0;
 
     const runSweepPass = async (pass) => {
       if (pass > 1) log(`drain pass ${pass}: rescanning queues`);
@@ -2135,8 +2181,10 @@ async function tick({ dryRun = false } = {}) {
           })(),
         ]);
       };
-      dispatchChildren = async (children) => {
-        for (const child of children) activeSameRepo.increment(child);
+      dispatchChildren = async (children, { alreadyReserved = false } = {}) => {
+        if (!alreadyReserved) {
+          for (const child of children) activeSameRepo.increment(child);
+        }
         return dispatchBatch(children, { onResult: handleDispatchResult });
       };
       const results = await dispatchChildren(dispatches);

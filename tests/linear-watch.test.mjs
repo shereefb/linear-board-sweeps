@@ -12,7 +12,7 @@ import {
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  expandDispatchBatch, buildSameRepoRefillDispatches, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
@@ -349,6 +349,7 @@ test("maxSameRepoRefillDispatches: defaults, disables, clamps, and takes the act
   assert.equal(maxSameRepoRefillDispatches({ parallel: { maxSameRepoRefillDispatches: 3.8 } }), 3);
   assert.equal(maxSameRepoRefillDispatches({ parallel: { maxSameRepoRefillDispatches: 99 } }), 20);
   assert.equal(maxSameRepoRefillDispatches([{ parallel: { maxSameRepoRefillDispatches: 1 } }, { parallel: { maxSameRepoRefillDispatches: 4 } }]), 4);
+  assert.equal(maxSameRepoRefillDispatches([{ parallel: { maxSameRepoRefillDispatches: "many" } }, { parallel: { maxSameRepoRefillDispatches: 1 } }]), 8);
 });
 test("runDrainLoop: rescans until a pass selects no batch", async () => {
   const seen = [];
@@ -465,7 +466,7 @@ test("card run paths/env are isolated per issue and slot", () => {
   const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2);
   assert.equal(paths.worktreePath, "/ws/repo/.worktrees/COD-6");
   assert.match(paths.logDir, /linear-board-sweeps\/repo\/dev\/COD-6$/);
-  assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/COD-6\/tmp$/);
+  assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
   const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
@@ -497,6 +498,29 @@ test("expandDispatchBatch: shared child-index allocator prevents refill/handoff 
   assert.notEqual(first[0].tmpDir, second[0].tmpDir);
   assert.notEqual(first[0].cardRunId, second[0].cardRunId);
 });
+test("expandDispatchBatch: same-card handoff children get unique run paths", async () => {
+  const childIndexAllocator = createChildIndexAllocator();
+  const base = {
+    anchorPath: "/ws/repo",
+    config: { repos: ["repo"], parallel: { sameRepoCardLimits: { dev: 1, qa: 1 } } },
+    count: 1,
+  };
+  const dev = await expandDispatchBatch([{
+    ...base,
+    sweep: "dev",
+    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+  }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
+  const qa = await expandDispatchBatch([{
+    ...base,
+    sweep: "qa",
+    cards: [{ id: "a", identifier: "COD-10", sortOrder: 2, updatedAt: minsAgo(1), labelNames: [], comments: [] }],
+  }], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW, childIndexAllocator });
+
+  assert.notEqual(dev[0].cardRunId, qa[0].cardRunId);
+  assert.notEqual(dev[0].tmpDir, qa[0].tmpDir);
+  assert.notEqual(dev[0].browserProfileDir, qa[0].browserProfileDir);
+  assert.notEqual(dev[0].childEnv.AUTO_SWEEP_APP_PORT, qa[0].childEnv.AUTO_SWEEP_APP_PORT);
+});
 test("same-repo active counts: successful child completion frees exactly one slot", () => {
   const active = createSameRepoActiveCounts();
   const pick = (issueIdentifier) => ({ anchorPath: "/ws/repo", sweep: "dev", issueIdentifier });
@@ -508,6 +532,26 @@ test("same-repo active counts: successful child completion frees exactly one slo
   active.decrement(pick("COD-1"));
   assert.equal(active.get("/ws/repo", "dev"), 1);
   assert.equal(active.available("/ws/repo", "dev", 4), 3);
+});
+test("sameRepoAvailableSlots: live board claims and parent reservations share the same capacity", () => {
+  const active = createSameRepoActiveCounts();
+  active.increment({ anchorPath: "/ws/repo", sweep: "qa", issueIdentifier: "COD-1" });
+  const live = {
+    id: "qa-live",
+    identifier: "COD-2",
+    updatedAt: minsAgo(1),
+    labelNames: ["qa:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=other claim=qa:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  assert.equal(sameRepoAvailableSlots({
+    cards: [live],
+    cfg: SWEEP_CFG.qa,
+    anchorPath: "/ws/repo",
+    sweep: "qa",
+    activeSameRepo: active,
+    limit: 1,
+    now: NOW,
+  }), 0);
 });
 test("buildSameRepoRefillDispatches: successful dev completion claims the next top Dev card", async () => {
   const activeSameRepo = createSameRepoActiveCounts();
@@ -577,6 +621,13 @@ test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship su
     deps: { logFor: () => {} },
   };
   assert.equal((await buildSameRepoRefillDispatches(base)).reason, "budget");
+  const disabledLogs = [];
+  assert.equal((await buildSameRepoRefillDispatches({
+    ...base,
+    refillBudget: { remaining: 0, disabled: true },
+    deps: { logFor: (_anchorPath, _sweep, line) => disabledLogs.push(line) },
+  })).reason, "disabled");
+  assert.match(disabledLogs[0], /refill-skip dev: disabled/);
   assert.equal((await buildSameRepoRefillDispatches({
     ...base,
     refillBudget: { remaining: 1 },
