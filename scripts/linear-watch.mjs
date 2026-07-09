@@ -22,7 +22,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { gql } from "./linear.mjs";
+import { gql, WORKFLOW_STATES } from "./linear.mjs";
 
 // The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
 const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -62,10 +62,10 @@ export const CLAIM_CONFIRM_DELAY_MS = 1500;
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
 // bake + docs, so it gets the same generous window as qa.
 export const SWEEP_CFG = {
-  spec: { states: ["Needs Spec"], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 45 },
-  dev: { states: ["Ready for Dev"], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
-  qa: { states: ["In Review"], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user"], staleMin: 120 },
-  ship: { states: ["Ready to Ship"], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 },
+  spec: { states: [WORKFLOW_STATES.spec], claim: "spec:in-progress", blocked: ["blocked:open-questions"], staleMin: 45 },
+  dev: { states: [WORKFLOW_STATES.dev], claim: "dev:in-progress", blocked: ["blocked:needs-user"], staleMin: 90 },
+  qa: { states: [WORKFLOW_STATES.qa], claim: "qa:in-progress", blocked: ["qa:needs-changes", "blocked:needs-user"], staleMin: 120 },
+  ship: { states: [WORKFLOW_STATES.ship], claim: "ship:in-progress", blocked: ["blocked:needs-user"], staleMin: 120 },
 };
 // Every list below derives from SWEEP_CFG so adding a sweep is a one-line change.
 export const SWEEPS = Object.keys(SWEEP_CFG); // spec, dev, qa, ship — iteration order
@@ -78,12 +78,12 @@ export const SKILL_DIRS = SWEEPS.map((s) => `${s}-sweep`);
 export const MANUAL_SKILL_DIRS = ["unblock-sweep"];
 export const PROPAGATED_SKILL_DIRS = [...SKILL_DIRS, ...MANUAL_SKILL_DIRS];
 // Holding states can carry a stale claim but are fetched by NO sweep (a sweep's
-// own states are reaped in the main loop). qa moves a card to "QA Passed" and
+// own states are reaped in the main loop). qa moves a card to "Signoff" and
 // then drops qa:in-progress; a crash between those strands the claim here.
-export const HOLDING_STATES = ["QA Passed"];
+export const HOLDING_STATES = [WORKFLOW_STATES.signoff];
 // Legacy workflow states no sweep fetches after retirement, but which may still
 // carry old claim labels from previous runs or manual board moves.
-export const LEGACY_CLEANUP_STATES = ["In Progress"];
+export const LEGACY_CLEANUP_STATES = [WORKFLOW_STATES.legacyInProgress];
 export const CLAIM_CLEANUP_STATES = [...HOLDING_STATES, ...LEGACY_CLEANUP_STATES];
 export const ALL_CLAIMS = SWEEPS.map((s) => SWEEP_CFG[s].claim);
 export const MAX_STALE_MIN = Math.max(...SWEEPS.map((s) => SWEEP_CFG[s].staleMin));
@@ -237,9 +237,9 @@ export function reapDecisions(cards, cfg, now) {
 }
 
 // Release stale claims that no per-sweep reaper will handle: a claim stranded in
-// a HOLDING state (no sweep fetches it — e.g. qa:in-progress left in "QA Passed"),
+// a HOLDING state (no sweep fetches it — e.g. qa:in-progress left in "Signoff"),
 // or a FOREIGN claim in a sweep's state (a sweep reaps only its OWN cfg.claim, so
-// e.g. a ship:in-progress dragged into "In Review" is invisible to qa's reaper).
+// e.g. a ship:in-progress dragged into "QA" is invisible to qa's reaper).
 // Batches ALL of a card's releasable claims into ONE decision so a single write
 // clears them together — releasing per-claim with full-set overwrites would
 // re-add earlier removals. `ownClaim` (a sweep's cfg.claim, or null in a holding
@@ -1732,7 +1732,7 @@ async function tick({ dryRun = false } = {}) {
         try { cards = await fetchCards(apiKey, config.teamKey, config.projectId, cfg.states); active.checkedScopes.add(sweep); } catch (e) { logFor(anchorPath, sweep, `fetch error: ${e.message}`); recordFailure(sweep, "fetch", cfg.states.join(","), e.message); continue; }
         const reaps = reapDecisions(cards, cfg, now);
         // Bounce-escalation is a backward-oscillation guard for the earlier stages.
-        // Skip it for ship: a card in "Ready to Ship" was human-approved, and its
+        // Skip it for ship: a card in "Ship" was human-approved, and its
         // historical bounce markers (from earlier dev/qa churn) must not re-block it.
         const bounces = sweep === "ship" ? [] : bounceDecisions(cards, cfg, now);
         if (!dryRun && (reaps.length || bounces.length)) {
@@ -1750,7 +1750,7 @@ async function tick({ dryRun = false } = {}) {
         applyDecisionsInMemory(cards, reaps, bounces);
         // Release FOREIGN stale claims stranded in this sweep's states — a sweep's
         // own reaper handles only its cfg.claim, so e.g. a ship:in-progress dragged
-        // into "In Review" would otherwise leak forever. Reuses the fetched cards
+        // into "QA" would otherwise leak forever. Reuses the fetched cards
         // (no extra query). Runs on every host (cleanup, not dispatch).
         const foreign = foreignClaimReleases(cards, now, cfg.claim);
         if (!dryRun && foreign.length) {
@@ -1773,7 +1773,7 @@ async function tick({ dryRun = false } = {}) {
       }
 
       // Holding/legacy-state reaper: release claims stranded in states no sweep fetches
-      // (e.g. qa:in-progress left on a "QA Passed" card by a crash between the
+      // (e.g. qa:in-progress left on a "Signoff" card by a crash between the
       // status move and the claim drop, or old dev claims left in retired
       // "In Progress"). ownClaim=null → any stale claim here is orphaned.
       // Cheap; runs after the per-sweep loop. executeOrphanReap needs no

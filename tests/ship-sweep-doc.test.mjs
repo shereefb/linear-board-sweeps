@@ -9,12 +9,12 @@ const skillPaths = [
   ".claude/skills/ship-sweep/SKILL.md",
 ];
 
-test("ship-sweep drains Ready to Ship one card at a time until empty", () => {
+test("ship-sweep drains Ship one card at a time until empty", () => {
   for (const path of skillPaths) {
     const body = fs.readFileSync(path, "utf8");
     assert.doesNotMatch(body, /at most 1 card per run|≤1 card\/run/);
-    assert.match(body, /Continue selecting and processing one actionable card at a time until no actionable "Ready to Ship" cards remain/);
-    assert.match(body, /After the queue first appears empty, re-list "Ready to Ship" once more/);
+    assert.match(body, /Continue selecting and processing one actionable card at a time until no actionable "Ship" cards remain/);
+    assert.match(body, /After the queue first appears empty, re-list "Ship" once more/);
   }
 });
 
@@ -25,5 +25,5 @@ test("SETUP unattended activation guidance points production caution at ship-swe
   assert.doesNotMatch(caution, /QA caution/i);
   assert.match(caution, /`?ship-sweep`? is the only production merge\/deploy path/);
   assert.match(caution, /`?qa-sweep`? never merges or deploys/);
-  assert.match(caution, /human-gated `Ready to Ship` column/);
+  assert.match(caution, /human-gated `Ship` column/);
 });
