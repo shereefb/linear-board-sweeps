@@ -12,6 +12,7 @@ import path from "node:path";
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
 //   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
 //   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
+//   node linear.mjs dependency-status "<Issue>"             # JSON; exits 0 ready, 3 blocked, 2 unreadable
 //   node linear.mjs query '{ viewer { name } }'            # raw GraphQL
 //
 export const WORKFLOW_STATE_RENAMES = [
@@ -28,8 +29,33 @@ export const WORKFLOW_STATES = Object.freeze({
   qa: "QA",
   signoff: "Signoff",
   ship: "Ship",
+  done: "Done",
   legacyInProgress: "In Progress",
 });
+
+export function normalizeBlockingRelations(connection) {
+  const nodes = connection?.nodes;
+  if (!Array.isArray(nodes)) throw new Error("inverseRelations nodes missing");
+  return nodes.filter((relation) => relation.type === "blocks").map((relation) => {
+    if (!relation.issue?.id || !relation.issue?.state?.name) {
+      throw new Error(`blocking relation ${relation.id || "unknown"} has no readable issue`);
+    }
+    return {
+      relationId: relation.id,
+      id: relation.issue.id,
+      identifier: relation.issue.identifier,
+      stateId: relation.issue.state.id,
+      stateName: relation.issue.state.name,
+      stateType: relation.issue.state.type,
+    };
+  });
+}
+
+export function dependencyEligibility(blockers, complete = true) {
+  if (!complete) return { eligible: false, reason: "incomplete-relations", unresolved: blockers || [] };
+  const unresolved = (blockers || []).filter((blocker) => blocker.stateName !== WORKFLOW_STATES.done);
+  return { eligible: unresolved.length === 0, reason: unresolved.length ? "blocked" : "ready", unresolved };
+}
 
 // The canonical board definition the sweeps depend on:
 export const REQUIRED_STATES = [
@@ -153,6 +179,30 @@ export async function gql(query, variables, apiKey = process.env.LINEAR_API_KEY)
   const json = await res.json();
   if (json.errors) throw new Error("Linear API error: " + JSON.stringify(json.errors));
   return json.data;
+}
+
+export async function fetchIssueDependencies(apiKey, issueId, { gqlFn = gql } = {}) {
+  if (!issueId) throw new Error("usage: dependency-status <issueId>");
+  const blockers = [];
+  let cursor = null;
+  let issue = issueId;
+
+  while (true) {
+    const d = await gqlFn(
+      `query($issueId:String!,$cursor:String){ issue(id:$issueId){ identifier inverseRelations(first:50, after:$cursor){ pageInfo { hasNextPage endCursor } nodes { id type issue { id identifier state { id name type } } } } } }`,
+      { issueId, cursor },
+      apiKey,
+    );
+    if (!d?.issue) throw new Error(`Issue "${issueId}" not found or unreadable.`);
+    issue = d.issue.identifier || issue;
+    const connection = d.issue.inverseRelations;
+    blockers.push(...normalizeBlockingRelations(connection));
+    const pageInfo = connection?.pageInfo;
+    if (typeof pageInfo?.hasNextPage !== "boolean") throw new Error("inverseRelations pageInfo missing");
+    if (!pageInfo.hasNextPage) return { issue, blockers, complete: true };
+    if (!pageInfo.endCursor || pageInfo.endCursor === cursor) return { issue, blockers, complete: false };
+    cursor = pageInfo.endCursor;
+  }
 }
 
 async function findTeam(nameOrKey) {
@@ -419,10 +469,26 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     "retire-state": () => retireState(args[0], args[1], args[2]),
     "rename-states": () => renameWorkflowStates(args[0]),
+    "dependency-status": async () => {
+      try {
+        const result = await fetchIssueDependencies(KEY, args[0]);
+        const eligibility = dependencyEligibility(result.blockers, result.complete);
+        console.log(JSON.stringify({
+          issue: result.issue,
+          eligible: eligibility.eligible,
+          reason: eligibility.reason,
+          blockers: eligibility.unresolved.map(({ identifier, stateName }) => ({ identifier, stateName })),
+        }));
+        process.exitCode = eligibility.eligible ? 0 : eligibility.reason === "blocked" ? 3 : 2;
+      } catch (error) {
+        console.error(String(error.message || error));
+        process.exitCode = 2;
+      }
+    },
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | dependency-status <Issue> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

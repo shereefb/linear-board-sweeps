@@ -2,11 +2,112 @@
 // Run: node --test
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   positionAfter, reviewLensLabels, bottomSortOrder, issueUpdateToStateBottomInput,
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
+  WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
 } from "../scripts/linear.mjs";
+
+test("dependency eligibility releases only exact Done blockers", () => {
+  assert.equal(WORKFLOW_STATES.done, "Done");
+  const connection = {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: "r1", type: "blocks", issue: { id: "b1", identifier: "COD-1", state: { id: "s1", name: "Done", type: "completed" } } },
+      { id: "r2", type: "related", issue: { id: "x", identifier: "COD-2", state: { id: "s2", name: "Done", type: "completed" } } },
+    ],
+  };
+  const blockers = normalizeBlockingRelations(connection);
+  assert.deepEqual(blockers.map((b) => b.identifier), ["COD-1"]);
+  assert.deepEqual(dependencyEligibility(blockers, true), { eligible: true, reason: "ready", unresolved: [] });
+});
+
+test("dependency eligibility fails closed for terminal non-Done and incomplete pages", () => {
+  const canceled = [{ relationId: "r", id: "b", identifier: "COD-3", stateId: "s", stateName: "Canceled", stateType: "canceled" }];
+  assert.equal(dependencyEligibility(canceled, true).eligible, false);
+  assert.equal(dependencyEligibility([], false).reason, "incomplete-relations");
+});
+
+test("dependency normalization fails closed when a blocks relation has no issue", () => {
+  assert.throws(
+    () => normalizeBlockingRelations({ pageInfo: { hasNextPage: false }, nodes: [{ id: "r", type: "blocks", issue: null }] }),
+    /blocking relation r has no readable issue/,
+  );
+});
+
+test("fetchIssueDependencies paginates inverse blocking relations to completion", async () => {
+  const calls = [];
+  const gqlFn = async (query, variables, apiKey) => {
+    calls.push({ query, variables, apiKey });
+    assert.match(query, /inverseRelations\(first:50,\s*after:\$cursor\)/);
+    const firstPage = variables.cursor === null;
+    return {
+      issue: {
+        identifier: "COD-9",
+        inverseRelations: {
+          pageInfo: { hasNextPage: firstPage, endCursor: firstPage ? "next" : null },
+          nodes: [{
+            id: firstPage ? "r1" : "r2",
+            type: "blocks",
+            issue: {
+              id: firstPage ? "b1" : "b2",
+              identifier: firstPage ? "COD-1" : "COD-2",
+              state: { id: firstPage ? "s1" : "s2", name: firstPage ? "Dev" : "Done", type: firstPage ? "unstarted" : "completed" },
+            },
+          }],
+        },
+      },
+    };
+  };
+
+  const result = await fetchIssueDependencies("key", "COD-9", { gqlFn });
+  assert.deepEqual(result.blockers.map((b) => b.identifier), ["COD-1", "COD-2"]);
+  assert.equal(result.complete, true);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.variables.cursor), [null, "next"]);
+  assert.ok(calls.every((call) => call.apiKey === "key"));
+});
+
+test("fetchIssueDependencies rejects query failures instead of returning an empty blocker set", async () => {
+  const gqlFn = async () => { throw new Error("Linear query failed"); };
+  await assert.rejects(fetchIssueDependencies("key", "COD-9", { gqlFn }), /Linear query failed/);
+});
+
+const linearCli = fileURLToPath(new URL("../scripts/linear.mjs", import.meta.url));
+function runDependencyStatusCli(inverseRelations) {
+  const response = { data: { issue: { identifier: "COD-9", inverseRelations } } };
+  const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
+  const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "dependency-status", "COD-9"], {
+    encoding: "utf8",
+    env: { ...process.env, LINEAR_API_KEY: "key" },
+  });
+}
+
+test("dependency-status CLI emits blocker JSON and maps readiness to exit status", () => {
+  const blocked = runDependencyStatusCli({
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: "r1", type: "blocks", issue: { id: "b1", identifier: "COD-1", state: { id: "s1", name: "Dev", type: "unstarted" } } }],
+  });
+  assert.equal(blocked.status, 3, blocked.stderr);
+  assert.deepEqual(JSON.parse(blocked.stdout), {
+    issue: "COD-9",
+    eligible: false,
+    reason: "blocked",
+    blockers: [{ identifier: "COD-1", stateName: "Dev" }],
+  });
+
+  const ready = runDependencyStatusCli({ pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] });
+  assert.equal(ready.status, 0, ready.stderr);
+  assert.equal(JSON.parse(ready.stdout).eligible, true);
+
+  const incomplete = runDependencyStatusCli({ pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] });
+  assert.equal(incomplete.status, 2, incomplete.stderr);
+  assert.equal(JSON.parse(incomplete.stdout).reason, "incomplete-relations");
+});
 
 // ── board position ───────────────────────────────────────────────────────────
 test("positionAfter: midpoint between the anchor and its next-higher neighbor", () => {
