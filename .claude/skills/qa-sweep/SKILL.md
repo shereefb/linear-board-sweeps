@@ -19,6 +19,11 @@ Act as a user: exercise each "QA" feature in a real dev environment, in as much 
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials in `config.credentialsNote`.
 - **Coding guardrail.** Before any code-fix, debugging, refactoring, or review work, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - Confirm you can run the app. Use your runtime's dev-server method: **Claude Code** → the `preview_*` tools (never Bash for servers); **Codex** → start `npm run dev` via `shell` in the background and read its logs. Capture console/network/server output either way to catch errors. For authenticated flows, `/connect-chrome` + `/setup-browser-cookies` give a real-user session.
+- **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
+  ```bash
+  node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
+  ```
+  Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`qa:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`qa:in-progress`), and stop. Never infer readiness from partial output.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `qa:in-progress`, `qa:needs-changes`, `qa:passed`, `blocked:needs-user`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
@@ -34,7 +39,7 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 
 ## 2. Per card — smoke test as a user
 
-1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior.
+1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior. If the only implementation evidence is in an unconfigured sibling repo, do not mark `qa:passed` for this ship path; block or bounce with the exact split/config update needed.
 2. **Stand up a dev environment:** check out the branch/worktree; start the app with the preview tooling. Seed data if the flow needs it.
 3. **Exercise the feature as a user, in detail — use `/qa` as the test engine** (or `/qa-only` for the report form) rather than ad-hoc clicking. Walk the actual user flows the card adds — happy path AND the obvious edge cases. Click through, fill forms, trigger the states. Watch console + network + server logs for errors. Use subagents/parallel work for independent flows. If a `/plan-eng-review` test plan exists for the branch, feed it in as primary test input.
 4. **Capture screenshots** of the key states (before/after, each important screen). Save them; you'll attach them to the card.
@@ -57,7 +62,19 @@ A human reviews the "Signoff" column and moves approved cards to "Ship"; ship-sw
 
 ## Blocked / needs-user
 
-If you can't finish without the owner (ambiguous intended behavior, missing credentials/data, a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "QA", remove `qa:in-progress`. Ask once; resume when they reply.
+If you need a direct owner answer that is not its own completable task (ambiguous intended behavior, a credential value/data input, or a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "QA", remove `qa:in-progress`. Ask once; resume when they reply.
+
+### Retry-safe prerequisite blockers
+
+When a prerequisite can be completed as its own issue, use only a `blockedBy` relation from the dependent to that blocker. Follow this exact mini-workflow so retries converge:
+
+1. **Search for the stable audit marker** `[auto-sweep-dependency <dependent> blocked-by <blocker>]` and for an existing matching or orphaned blocker before creating anything.
+2. **Create or reuse the blocker issue**; never create a duplicate when a matching issue already exists.
+3. **Create the `blockedBy` relation only if it is absent.**
+4. **Add the audit comment only if the stable marker is absent.**
+5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `qa:in-progress` claim.
+
+A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`). Preserve `qa:needs-changes` for actual QA failures; a prerequisite relation alone does not replace or create that gate.
 
 ## Machine-independence & handoff (auto-sweep)
 
@@ -73,6 +90,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 
 - **Never merges, never deploys** — lands a green, smoke-tested feature at "Signoff" and stops. The human "Ship" move + ship-sweep own production. Now symmetric with dev-sweep; safe to auto-run.
 - Only pass a feature that passed a real smoke test with a green build. When in doubt, `qa:needs-changes` and stop.
+- QA evidence must match ship scope. A card cannot pass QA for a repo/deploy path that is not configured to ship it; split the card or require a multi-repo config/runbook first.
 - ≤2 cards/run; top-of-column order; claim/release via `qa:in-progress`; stay within `config.project`.
 - Fix scope = UX/UI + obvious bugs found during QA. A feature that's fundamentally broken or half-built goes back with `qa:needs-changes`, not "fixed" into a rewrite.
 - Every question → a card comment; never AskUserQuestion.

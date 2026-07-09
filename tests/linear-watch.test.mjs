@@ -921,12 +921,24 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(paths.portBase, 47020);
   const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
+  assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(new URL("..", import.meta.url).pathname));
+  assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
   assert.equal(pick.sameRepoLimit, 4);
+});
+test("card dispatch env prefers the original source anchor for managed workspaces", () => {
+  const pick = withCardDispatchEnv({
+    anchorPath: "/managed/repo",
+    sourceAnchorPath: "/source/repo",
+    config: { repos: ["repo"] },
+    sweep: "qa",
+    issueIdentifier: "COD-7",
+  }, "run-id");
+  assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();

@@ -668,6 +668,8 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
     ...paths,
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
+      AUTO_SWEEP_KIT_PATH: KIT_ROOT,
+      AUTO_SWEEP_SOURCE_ANCHOR: pick.sourceAnchorPath || pick.anchorPath,
       AUTO_SWEEP_SLOT_INDEX: String(pick.slotIndex || 0),
       AUTO_SWEEP_WORKTREE: paths.worktreePath,
       AUTO_SWEEP_LOG_DIR: paths.logDir,

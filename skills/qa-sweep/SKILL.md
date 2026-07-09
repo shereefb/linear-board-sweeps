@@ -19,11 +19,16 @@ Act as a user: exercise each "QA" feature in a real dev environment, in as much 
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials in `config.credentialsNote`.
 - **Coding guardrail.** Before any code-fix, debugging, refactoring, or review work, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - Confirm you can run the app. Use your runtime's dev-server method: **Claude Code** → the `preview_*` tools (never Bash for servers); **Codex** → start `npm run dev` via `shell` in the background and read its logs. Capture console/network/server output either way to catch errors. For authenticated flows, `/connect-chrome` + `/setup-browser-cookies` give a real-user session.
+- **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
+  ```bash
+  node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
+  ```
+  Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`qa:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`qa:in-progress`), and stop. Never infer readiness from partial output.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `qa:in-progress`, `qa:needs-changes`, `qa:passed`, `blocked:needs-user`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
 
-**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other QA card. Treat an existing fresh `qa:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_APP_PORT`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths, ports, screenshot directories, or browser profiles.
+**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other QA card. Treat an existing fresh `qa:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_APP_PORT`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths, ports, screenshot directories, or browser profiles. Store screenshots, generated evidence, browser profiles, and scratch files under those env paths, never in repo roots.
 
 List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Skip** if `blocked:needs-user`, `qa:needs-changes`, or `sweep:manual-only` and no new human reply resolves it; **skip** if `qa:in-progress` < 120 min old (another run owns it — QA is slow). Reclaim a stale claim.
@@ -57,7 +62,19 @@ A human reviews the "Signoff" column and moves approved cards to "Ship"; ship-sw
 
 ## Blocked / needs-user
 
-If you can't finish without the owner (ambiguous intended behavior, missing credentials/data, a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "QA", remove `qa:in-progress`. Ask once; resume when they reply.
+If you need a direct owner answer that is not its own completable task (ambiguous intended behavior, a credential value/data input, or a product decision): comment the specifics, add `blocked:needs-user`, leave the card in "QA", remove `qa:in-progress`. Ask once; resume when they reply.
+
+### Retry-safe prerequisite blockers
+
+When a prerequisite can be completed as its own issue, use only a `blockedBy` relation from the dependent to that blocker. Follow this exact mini-workflow so retries converge:
+
+1. **Search for the stable audit marker** `[auto-sweep-dependency <dependent> blocked-by <blocker>]` and for an existing matching or orphaned blocker before creating anything.
+2. **Create or reuse the blocker issue**; never create a duplicate when a matching issue already exists.
+3. **Create the `blockedBy` relation only if it is absent.**
+4. **Add the audit comment only if the stable marker is absent.**
+5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `qa:in-progress` claim.
+
+A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`). Preserve `qa:needs-changes` for actual QA failures; a prerequisite relation alone does not replace or create that gate.
 
 ## Machine-independence & handoff (auto-sweep)
 

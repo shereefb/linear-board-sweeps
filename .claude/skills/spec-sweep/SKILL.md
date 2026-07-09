@@ -18,6 +18,12 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 - **Load repo config.** Read `.claude/linear-sweep.json` from the repo root. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.
 - **Require `LINEAR_API_KEY`.** Load it from the environment or the repo's gitignored `.env` (`set -a && . ./.env && set +a`). If unset, exit immediately with a clear one-line error — do not attempt to recover a key from transcripts. Confirm git push credentials and any other credentials named in `config.credentialsNote` if a card needs live data.
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
+- **Repo ownership gate.** Decide which configured repo(s) the card truly needs before writing the plan. Default to one deployable repo per card. If the outcome needs sibling repos with separate ship/deploy paths, either write a parent/product spec plus explicit per-repo child cards, or proceed as a true multi-repo card only when every repo is listed in `config.repos` and `config.deploy` names the production path for each. Never plan implementation in a repo that is not in `config.repos`; ask/block or create/split the appropriate card instead.
+- **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
+  ```bash
+  node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
+  ```
+  Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`spec:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`spec:in-progress`), and stop. Never infer readiness from partial output.
 - Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded)
@@ -45,7 +51,7 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
    - **API / CLI / SDK card** → `/plan-devex-review`
    - **Security-sensitive card** (auth / data / external input) → `/cso` on the plan
    A card matching no lens runs only step 3. Each lens catches its defect class now, at the cheapest stage, instead of at QA or never.
-5. **Write the implementation plan.**
+5. **Write the implementation plan.** Include a **Repo scope** section naming the owning repo(s). For multi-repo work, list each repo's branch naming expectation, QA evidence required, deploy target, and ship order. If any required repo is outside `config.repos` or has no deploy path in `config.deploy`, stop and comment the split/config update needed instead of sending the card to Dev.
 6. **Update canonical architecture/schema docs** per `config.canonicalDocs`. If the config names an `architecture` and/or `schema` doc, and the spec changes data shape / subsystems, update those docs to reflect the design, marking not-yet-built items as *planned* (e.g. "(planned, <PREFIX>-###)"). Add a short "Schema & architecture impact" summary to the spec itself. If `config.canonicalDocs.schema` is null (single-repo project), just keep the architecture doc (e.g. `CLAUDE.md`) accurate.
 
 ## 3. Land it (docs only; auto-merge to main)
@@ -60,6 +66,18 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 
 When the spec genuinely can't be finished without answers only the owner can give: post them as a **single numbered comment** on the card, add `blocked:open-questions`, remove `spec:in-progress`, and **leave it in "Spec"** (do not move to Dev). A later run resumes it once the owner replies (see §1). Ask each question once — never re-post.
 
+### Retry-safe prerequisite blockers
+
+When a prerequisite can be completed as its own issue, use only a `blockedBy` relation from the dependent to that blocker. Follow this exact mini-workflow so retries converge:
+
+1. **Search for the stable audit marker** `[auto-sweep-dependency <dependent> blocked-by <blocker>]` and for an existing matching or orphaned blocker before creating anything.
+2. **Create or reuse the blocker issue**; never create a duplicate when a matching issue already exists.
+3. **Create the `blockedBy` relation only if it is absent.**
+4. **Add the audit comment only if the stable marker is absent.**
+5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `spec:in-progress` claim.
+
+A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:open-questions`).
+
 ## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
@@ -73,6 +91,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 ## Guardrails (unattended)
 
 - Docs/specs only. No app code, no migrations, no deploys, no prod writes beyond reads needed to design.
+- Do not send a card to Dev with implementation assigned to an unconfigured sibling repo or an unspecified deploy path. Split it or block with a concrete config/runbook request.
 - ≤3 cards per run; top-of-column order; claim/release via `spec:in-progress`; stay within `config.project`.
 - Every question goes to a card comment — never wait on interactive input, never use AskUserQuestion (meaningless unattended).
 - Prefer parallel subagents for independent cards and for the per-card reviews.
