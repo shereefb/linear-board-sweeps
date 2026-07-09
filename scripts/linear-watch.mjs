@@ -1057,9 +1057,20 @@ async function setProjectLabels(apiKey, projectId, ids) {
 }
 
 async function teamLabelMap(apiKey, teamKey) {
-  const d = await gql(`query($k:String!){ teams(filter:{ key:{ eq:$k } }){ nodes{ labels(first:250){ nodes{ id name } } } } }`, { k: teamKey }, apiKey);
-  const team = d.teams.nodes[0];
-  return team ? Object.fromEntries(team.labels.nodes.map((l) => [l.name, l.id])) : {};
+  const labels = [];
+  let after = null;
+  do {
+    const d = await gql(
+      `query($k:String!,$after:String){ teams(filter:{ key:{ eq:$k } }){ nodes{ labels(first:50, after:$after){ nodes{ id name } pageInfo{ hasNextPage endCursor } } } } }`,
+      { k: teamKey, after },
+      apiKey
+    );
+    const team = d.teams.nodes[0];
+    if (!team) return {};
+    labels.push(...team.labels.nodes);
+    after = team.labels.pageInfo.hasNextPage ? team.labels.pageInfo.endCursor : null;
+  } while (after);
+  return Object.fromEntries(labels.map((l) => [l.name, l.id]));
 }
 
 async function teamMeta(apiKey, teamKey) {
