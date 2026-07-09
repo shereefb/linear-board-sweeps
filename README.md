@@ -98,6 +98,7 @@ Recent and planned launcher/workflow changes:
 - `COD-98`: bounded drain-after-dispatch so sweeps can catch cards added while a pass was running without waiting for the next timer tick.
 - `COD-99`: retire the `In Progress` state from normal workflow; `Dev` plus `dev:in-progress` becomes the active-dev representation.
 - `COD-100`: same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, owner-token card claims, isolated child env, card-specific run records, and ship still serial.
+- `COD-113` (planned): same-repo capacity refill so a Dev slot freed by a child moving to QA can be backfilled before the whole batch or next timer tick.
 
 ## Requirements
 
