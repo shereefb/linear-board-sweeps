@@ -80,6 +80,8 @@ The launcher also writes/reads a few **audit-marker comments** on cards (you don
 ## Tracking rules (going forward)
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.
+- Default to **one deployable repo per card**. If the user outcome spans sibling repos with independent deploy paths, create one parent/product card plus per-repo implementation cards, or split the original card before Dev so each child owns exactly one repo branch, QA surface, and ship path.
+- A true multi-repo card is allowed only when the workspace config is multi-repo on purpose: every touched repo is listed in `config.repos`, `config.deploy` names each production target and the required order, and the card's handoff comments name the branch/PR and verification evidence for every repo. Without that, do not let a sibling-repo implementation ride a single-repo ship path; block or split it before Ship.
 - Put the `<PREFIX>-###` key in the branch name / PR title / commit subjects where practical.
 - Cards created or moved by direct user conversation or non-sweep skills should carry `sweep:manual-only` unless the user explicitly wants unattended sweeps to pick them up right away.
 - Raw ideas → `Backlog`. Selected-but-underspecified → `Spec`. Designed/active → `Dev` (active work carries `dev:in-progress`). PR/review → `QA`. QA-passed, awaiting sign-off → `Signoff`. Tiny fast-path-eligible changes may be moved by a human from `QA` directly to `Ship`; otherwise human-approved shipping happens from `Signoff` → `Ship`. Shipped + verified → `Done`.

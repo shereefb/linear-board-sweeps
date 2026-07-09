@@ -18,6 +18,7 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 - **Load repo config.** Read `.claude/linear-sweep.json` from the repo root. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.
 - **Require `LINEAR_API_KEY`.** Load it from the environment or the repo's gitignored `.env` (`set -a && . ./.env && set +a`). If unset, exit immediately with a clear one-line error — do not attempt to recover a key from transcripts. Confirm git push credentials and any other credentials named in `config.credentialsNote` if a card needs live data.
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
+- **Repo ownership gate.** Decide which configured repo(s) the card truly needs before writing the plan. Default to one deployable repo per card. If the outcome needs sibling repos with separate ship/deploy paths, either write a parent/product spec plus explicit per-repo child cards, or proceed as a true multi-repo card only when every repo is listed in `config.repos` and `config.deploy` names the production path for each. Never plan implementation in a repo that is not in `config.repos`; ask/block or create/split the appropriate card instead.
 - Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded)
@@ -45,7 +46,7 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
    - **API / CLI / SDK card** → `/plan-devex-review`
    - **Security-sensitive card** (auth / data / external input) → `/cso` on the plan
    A card matching no lens runs only step 3. Each lens catches its defect class now, at the cheapest stage, instead of at QA or never.
-5. **Write the implementation plan.**
+5. **Write the implementation plan.** Include a **Repo scope** section naming the owning repo(s). For multi-repo work, list each repo's branch naming expectation, QA evidence required, deploy target, and ship order. If any required repo is outside `config.repos` or has no deploy path in `config.deploy`, stop and comment the split/config update needed instead of sending the card to Dev.
 6. **Update canonical architecture/schema docs** per `config.canonicalDocs`. If the config names an `architecture` and/or `schema` doc, and the spec changes data shape / subsystems, update those docs to reflect the design, marking not-yet-built items as *planned* (e.g. "(planned, <PREFIX>-###)"). Add a short "Schema & architecture impact" summary to the spec itself. If `config.canonicalDocs.schema` is null (single-repo project), just keep the architecture doc (e.g. `CLAUDE.md`) accurate.
 
 ## 3. Land it (docs only; auto-merge to main)
@@ -73,6 +74,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 ## Guardrails (unattended)
 
 - Docs/specs only. No app code, no migrations, no deploys, no prod writes beyond reads needed to design.
+- Do not send a card to Dev with implementation assigned to an unconfigured sibling repo or an unspecified deploy path. Split it or block with a concrete config/runbook request.
 - ≤3 cards per run; top-of-column order; claim/release via `spec:in-progress`; stay within `config.project`.
 - Every question goes to a card comment — never wait on interactive input, never use AskUserQuestion (meaningless unattended).
 - Prefer parallel subagents for independent cards and for the per-card reviews.

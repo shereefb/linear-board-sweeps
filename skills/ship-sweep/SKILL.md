@@ -16,6 +16,7 @@ Take cards a human has approved into **"Ship"** and land them: merge to `main`, 
 - **Coding guardrail.** Before merge-review debugging or any code change/refactor needed during shipping, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`, `sweep:manual-only`.
+- **Repo/deploy scope is part of the ship gate.** Default expectation: one card ships one deployable repo. A multi-repo card may ship only when every touched repo is listed in `config.repos`, every implementation branch/PR is present, and `config.deploy` describes each production target and canary expectation. If QA/dev evidence points to an unconfigured sibling repo, do not merge the configured repo as a partial product ship; comment the mismatch and require a split card, a per-repo ship, or an updated multi-repo config/runbook.
 
 ## 1. Select cards (top-of-column order, drain queue, claimed)
 
@@ -41,7 +42,7 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in a reconstructed worktree; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
 
 ## 3. Optional final security gate
 
@@ -86,6 +87,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 ## Guardrails
 
 - **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and a human moved to "Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive enabled fast-path eligibility.
+- Never treat a docs/spec merge in the anchor repo as proof that sibling app code shipped. If implementation/QA evidence is in another repo, that repo must be configured and shipped, or the card must be split/manual-shipped with explicit audit comments.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - One card at a time, but keep draining until the actionable "Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.
 - No autonomous rollback — a red canary flags a human, it does not revert prod.
