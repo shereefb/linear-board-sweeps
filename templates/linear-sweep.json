@@ -39,9 +39,9 @@
     "perf":     { "labels": ["performance"] },
     "research": { "labels": ["integration", "research"] }
   },
-  "$comment_requireShipApproval": "Optional (default false). When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ready to Ship' before it will merge — a second deliberate act that hardens against an accidental bulk-drag. (The single-runner ship pin lives in the launcher registry: `node scripts/linear-watch.mjs ship-runner on`.)",
+  "$comment_requireShipApproval": "Optional (default false). When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge — a second deliberate act that hardens against an accidental bulk-drag. (The single-runner ship pin lives in the launcher registry: `node scripts/linear-watch.mjs ship-runner on`.)",
   "requireShipApproval": false,
-  "$comment_fastPath": "Enabled by default. Dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from In Review directly to Ready to Ship to skip QA Passed. Set enabled to false to require normal QA Passed for every card. ship-sweep still merges only from human-moved Ready to Ship.",
+  "$comment_fastPath": "Enabled by default. Dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from QA directly to Ship to skip Signoff. Set enabled to false to require normal Signoff for every card. ship-sweep still merges only from human-moved Ship.",
   "fastPath": {
     "enabled": true,
     "maxChangedFiles": 2,

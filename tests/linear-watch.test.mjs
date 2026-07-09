@@ -66,8 +66,14 @@ test("runtimeConfigForSweep: review is role config only and never scheduled", ()
   }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
 });
 
-test("SWEEP_CFG.dev fetches Ready for Dev only; active dev is the claim label", () => {
-  assert.deepEqual(SWEEP_CFG.dev.states, ["Ready for Dev"]);
+test("SWEEP_CFG fetches concise board states", () => {
+  assert.deepEqual(SWEEP_CFG.spec.states, ["Spec"]);
+  assert.deepEqual(SWEEP_CFG.dev.states, ["Dev"]);
+  assert.deepEqual(SWEEP_CFG.qa.states, ["QA"]);
+  assert.deepEqual(SWEEP_CFG.ship.states, ["Ship"]);
+});
+
+test("SWEEP_CFG.dev fetches Dev only; active dev is the claim label", () => {
   assert.equal(SWEEP_CFG.dev.claim, "dev:in-progress");
 });
 
@@ -192,13 +198,13 @@ test("bounceDecisions: one bounce does not escalate; already-blocked is skipped"
 });
 test("bounceDecisions: two DIFFERENT state-pairs do NOT escalate (only same-pair oscillation does)", () => {
   const card = { id: "c", identifier: "COD-5", labelNames: [], comments: [
-    { body: `${BOUNCE_TAG} Ready for Dev→Needs Spec]`, createdAt: hoursAgo(1) },
-    { body: `${BOUNCE_TAG} In Review→Ready for Dev]`, createdAt: hoursAgo(2) },
+    { body: `${BOUNCE_TAG} Dev→Spec]`, createdAt: hoursAgo(1) },
+    { body: `${BOUNCE_TAG} QA→Dev]`, createdAt: hoursAgo(2) },
   ] };
   assert.deepEqual(bounceDecisions([card], SWEEP_CFG.dev, NOW), []);
 });
 test("bouncePairKey: parses <from>→<to> (with spaces) into an unordered pair; A→B == B→A", () => {
-  assert.equal(bouncePairKey(`${BOUNCE_TAG} Ready for Dev→Needs Spec]`), bouncePairKey(`${BOUNCE_TAG} Needs Spec→Ready for Dev]`));
+  assert.equal(bouncePairKey(`${BOUNCE_TAG} Dev→Spec]`), bouncePairKey(`${BOUNCE_TAG} Spec→Dev]`));
   assert.equal(bouncePairKey("no marker here"), null);
 });
 
@@ -218,18 +224,18 @@ test("countActionable: a stale-heartbeat claim that wasn't released still counts
   const card = { id: "x", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
   assert.equal(countActionable([card], SWEEP_CFG.dev, NOW, new Set()), 1);
 });
-test("actionableCards: live dev claim in Ready for Dev is not double-dispatched", () => {
+test("actionableCards: live dev claim in Dev is not double-dispatched", () => {
   const card = {
     id: "active",
-    state: { name: "Ready for Dev" },
+    state: { name: "Dev" },
     updatedAt: minsAgo(1),
     labelNames: ["dev:in-progress"],
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }],
   };
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
 });
-test("actionableCards: stale dev claim in Ready for Dev becomes actionable", () => {
-  const card = { id: "stale", state: { name: "Ready for Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+test("actionableCards: stale dev claim in Dev becomes actionable", () => {
+  const card = { id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
@@ -337,7 +343,7 @@ test("owner-token claim confirmation uses latest matching heartbeat owner", () =
   const card = {
     id: "c",
     identifier: "COD-5",
-    stateName: "Ready for Dev",
+    stateName: "Dev",
     labelNames: ["dev:in-progress"],
     comments: [
       { body: `${HEARTBEAT_TAG} ${minsAgo(3)} owner=other] dev:in-progress`, createdAt: minsAgo(3) },
@@ -345,9 +351,9 @@ test("owner-token claim confirmation uses latest matching heartbeat owner", () =
     ],
   };
   assert.equal(latestHeartbeatOwner(card, "dev:in-progress"), owner);
-  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Ready for Dev"]), true);
-  assert.equal(claimConfirmed({ ...card, stateName: "In Review" }, SWEEP_CFG.dev, owner, ["Ready for Dev"]), false);
-  assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, owner, ["Ready for Dev"]), false);
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), true);
+  assert.equal(claimConfirmed({ ...card, stateName: "QA" }, SWEEP_CFG.dev, owner, ["Dev"]), false);
+  assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, owner, ["Dev"]), false);
 });
 test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(SAME_REPO_PORT_BASE, 47000);
@@ -456,7 +462,7 @@ test("dispatchBatch: dispatches every selected child and returns exit codes", as
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────
 test("SWEEP_CFG.ship exists and the derived lists include it", () => {
-  assert.deepEqual(SWEEP_CFG.ship.states, ["Ready to Ship"]);
+  assert.deepEqual(SWEEP_CFG.ship.states, ["Ship"]);
   assert.equal(SWEEP_CFG.ship.claim, "ship:in-progress");
   assert.ok(SWEEP_CFG.ship.blocked.includes("blocked:needs-user")); // parked cards aren't re-dispatched
   assert.equal(SWEEP_CFG.ship.staleMin, 120);
@@ -510,15 +516,15 @@ test("foreignClaimReleases: batches TWO stale claims on one card into a single d
 });
 test("foreignClaimReleases: excludes ownClaim so the sweep's own reaper (with escalation) handles it", () => {
   const card = { id: "o", identifier: "COD-11", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], comments: [] };
-  const d = foreignClaimReleases([card], NOW, "qa:in-progress"); // processing the qa sweep's In Review cards
+  const d = foreignClaimReleases([card], NOW, "qa:in-progress"); // processing the qa sweep's QA cards
   assert.deepEqual(d[0].releaseClaims, ["ship:in-progress"]); // only the foreign ship claim, not qa's own
 });
 test("foreignClaimReleases: an unclaimed card is ignored; holding-state constants sane", () => {
   const card = { id: "u", identifier: "COD-9", updatedAt: minsAgo(300), labelNames: [], comments: [] };
   assert.deepEqual(foreignClaimReleases([card], NOW), []);
-  assert.deepEqual(HOLDING_STATES, ["QA Passed"]); // the state qa lands in but no sweep fetches
+  assert.deepEqual(HOLDING_STATES, ["Signoff"]); // the state qa lands in but no sweep fetches
   assert.deepEqual(LEGACY_CLEANUP_STATES, ["In Progress"]); // retired dev state still gets orphan cleanup
-  assert.deepEqual(CLAIM_CLEANUP_STATES, ["QA Passed", "In Progress"]);
+  assert.deepEqual(CLAIM_CLEANUP_STATES, ["Signoff", "In Progress"]);
   assert.equal(MAX_STALE_MIN, 120);
 });
 test("foreignClaimReleases: stale dev claim in legacy In Progress is released by cleanup pass", () => {
@@ -548,7 +554,7 @@ test("normalizeBlockedIssue: captures anchor, active state, issue context, and n
     title: "Blocked card",
     url: "https://linear.app/x/COD-9",
     updatedAt: "2026-07-08T10:00:00Z",
-    state: { name: "Ready for Dev" },
+    state: { name: "Dev" },
     labels: { nodes: [{ id: "l1", name: "blocked:open-questions" }, { id: "l2", name: "cli" }] },
     comments: { nodes: [
       { body: "older note", createdAt: "2026-07-08T09:00:00Z", user: { name: "A" } },

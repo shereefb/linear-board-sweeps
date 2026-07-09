@@ -10,21 +10,40 @@ import path from "node:path";
 //   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
 //   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
-//   node linear.mjs retire-state "<projectId>" "In Progress" "Ready for Dev"
+//   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
+//   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
 //   node linear.mjs query '{ viewer { name } }'            # raw GraphQL
 //
+export const WORKFLOW_STATE_RENAMES = [
+  { from: "Needs Spec", to: "Spec" },
+  { from: "Ready for Dev", to: "Dev" },
+  { from: "In Review", to: "QA" },
+  { from: "QA Passed", to: "Signoff" },
+  { from: "Ready to Ship", to: "Ship" },
+];
+
+export const WORKFLOW_STATES = Object.freeze({
+  spec: "Spec",
+  dev: "Dev",
+  qa: "QA",
+  signoff: "Signoff",
+  ship: "Ship",
+  legacyInProgress: "In Progress",
+});
+
 // The canonical board definition the sweeps depend on:
 export const REQUIRED_STATES = [
-  { name: "Needs Spec", type: "unstarted", color: "#9b59b6" },
-  { name: "Ready for Dev", type: "unstarted", color: "#4ea7fc" },
-  // The review/ship split adds two `started` columns BETWEEN In Review and Done.
+  { name: WORKFLOW_STATES.spec, type: "unstarted", color: "#9b59b6" },
+  { name: WORKFLOW_STATES.dev, type: "unstarted", color: "#4ea7fc" },
+  { name: WORKFLOW_STATES.qa, type: "started", color: "#27ae60", after: WORKFLOW_STATES.dev },
+  // The review/ship split adds two `started` columns BETWEEN QA and Done.
   // `after` names the state they should follow; setup-team computes a board
   // position so they render in pipeline order (Linear appends without one).
-  // Order matters: QA Passed is created before Ready to Ship, which follows it.
-  { name: "QA Passed", type: "started", color: "#f2c94c", after: "In Review" },
-  { name: "Ready to Ship", type: "started", color: "#5e6ad2", after: "QA Passed" },
+  // Order matters: Signoff is created before Ship, which follows it.
+  { name: WORKFLOW_STATES.signoff, type: "started", color: "#f2c94c", after: WORKFLOW_STATES.qa },
+  { name: WORKFLOW_STATES.ship, type: "started", color: "#5e6ad2", after: WORKFLOW_STATES.signoff },
   { name: "Archived", type: "completed", color: "#95a2b3" },
-  // Backlog / Todo / In Review / Done / Canceled / Duplicate are Linear defaults —
+  // Backlog / Todo / Done / Canceled / Duplicate are Linear defaults —
   // In Progress is a legacy default state; COD-99 stops using it for active dev.
   // setup-team only creates the ones above if missing.
 ];
@@ -90,6 +109,33 @@ export function retireStateIssueUpdateInput(destinationStateId, destinationCards
   return issueUpdateToStateBottomInput(destinationStateId, destinationCards);
 }
 
+export function planWorkflowStateRenames(states, renames = WORKFLOW_STATE_RENAMES) {
+  const byName = new Map((states || []).map((s) => [s.name, s]));
+  const presentSources = renames.filter((r) => byName.has(r.from));
+  const presentTargets = renames.filter((r) => byName.has(r.to));
+
+  if (presentSources.length === renames.length && presentTargets.length === 0) {
+    return renames.map((r) => ({ id: byName.get(r.from).id, from: r.from, to: r.to }));
+  }
+  if (presentSources.length === 0 && presentTargets.length === renames.length) return [];
+
+  const details = renames.map((r) => {
+    const source = byName.has(r.from) ? "source-present" : "source-missing";
+    const target = byName.has(r.to) ? "target-present" : "target-missing";
+    return `${r.from} -> ${r.to}: ${source}, ${target}`;
+  }).join("; ");
+  throw new Error(`Cannot safely rename workflow states from a partial or colliding board state: ${details}`);
+}
+
+export function shouldDeferRequiredStateForRename(targetName, haveStates, renames = WORKFLOW_STATE_RENAMES) {
+  const names = haveStates instanceof Set ? haveStates : new Set(haveStates || []);
+  const rename = renames.find((r) => r.to === targetName);
+  if (!rename || !names.has(rename.from)) return false;
+  // Fresh Linear teams have a default "In Review" state. Only defer target-state
+  // creation when this looks like an installed pre-COD-102 board, not a fresh team.
+  return renames.some((r) => r.from !== "In Review" && names.has(r.from));
+}
+
 export const API = "https://api.linear.app/graphql";
 const KEY = process.env.LINEAR_API_KEY;
 
@@ -132,12 +178,16 @@ async function setupTeam(nameOrKey) {
   const haveStates = new Set(d.team.states.nodes.map((s) => s.name));
   const haveLabels = new Set(d.team.labels.nodes.map((l) => l.name));
   // Live, ordered view of the board so `after`-positioned states slot in
-  // correctly — and so a second new state (Ready to Ship) sees the first
-  // (QA Passed) once it's been added this run.
+  // correctly — and so later new states see earlier ones once added this run.
   const stateList = d.team.states.nodes.map((s) => ({ name: s.name, position: s.position }));
 
   for (const s of REQUIRED_STATES) {
     if (haveStates.has(s.name)) { console.log(`state "${s.name}": exists`); continue; }
+    if (shouldDeferRequiredStateForRename(s.name, haveStates)) {
+      const legacyName = WORKFLOW_STATE_RENAMES.find((r) => r.to === s.name).from;
+      console.log(`state "${s.name}": pending rename from "${legacyName}"`);
+      continue;
+    }
     const position = s.after ? positionAfter(stateList, s.after) : undefined;
     const input = { teamId: team.id, name: s.name, type: s.type, color: s.color };
     if (typeof position === "number") input.position = position;
@@ -267,6 +317,37 @@ async function projectStateIdsWith(gqlFn, projectId) {
   return Object.fromEntries(states.map((s) => [s.name, s.id]));
 }
 
+async function projectStatesWith(gqlFn, projectId) {
+  const d = await gqlFn(
+    `query($id:String!){ project(id:$id){ teams(first:1){ nodes{ states(first:100){ nodes{ id name } } } } } }`,
+    { id: projectId }
+  );
+  return d.project?.teams?.nodes?.[0]?.states?.nodes || [];
+}
+
+export async function renameWorkflowStates(projectId, { gqlFn = gql, log = console.log } = {}) {
+  if (!projectId) throw new Error("usage: rename-states <projectId>");
+  const states = await projectStatesWith(gqlFn, projectId);
+  const operations = planWorkflowStateRenames(states);
+  if (!operations.length) {
+    log("Workflow state rename already complete.");
+    return [];
+  }
+
+  const renamed = [];
+  for (const op of operations) {
+    const r = await gqlFn(
+      `mutation($id:String!,$input:WorkflowStateUpdateInput!){ workflowStateUpdate(id:$id,input:$input){ success workflowState { id name } } }`,
+      { id: op.id, input: { name: op.to } }
+    );
+    const state = r.workflowStateUpdate.workflowState;
+    renamed.push({ ...op, result: state });
+    log(`${op.from} -> ${state.name}`);
+  }
+  log(`Renamed ${renamed.length} workflow state(s).`);
+  return renamed;
+}
+
 async function cardsInState(projectId, stateName) {
   return cardsInStateWith(gql, projectId, stateName);
 }
@@ -336,10 +417,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     "retire-state": () => retireState(args[0], args[1], args[2]),
+    "rename-states": () => renameWorkflowStates(args[0]),
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

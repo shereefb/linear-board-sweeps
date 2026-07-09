@@ -4,23 +4,23 @@ The sweeps assume this board shape. `scripts/linear.mjs setup-team` creates anyt
 
 ## Statuses (workflow states)
 
-The pipeline flows left → right. Linear ships most of these by default; the sweeps add five (`Needs Spec`, `Ready for Dev`, `QA Passed`, `Ready to Ship`, `Archived`). `QA Passed` and `Ready to Ship` are positioned between `In Review` and `Done`. **`Ready to Ship` is the human gate: only a person moves a card into it, and ship-sweep merges + deploys only from there.**
+The pipeline flows left → right. Linear ships most of these by default; the sweeps add six (`Spec`, `Dev`, `QA`, `Signoff`, `Ship`, `Archived`). `Signoff` and `Ship` are positioned between `QA` and `Done`. **`Ship` is the human gate: only a person moves a card into it, and ship-sweep merges + deploys only from there.**
 
 | Status | Type | Meaning | Who moves it here |
 |--------|------|---------|-------------------|
 | `Backlog` | backlog | Raw idea, not yet selected | human |
-| `Needs Spec` | unstarted | Selected but under-specified | human, or dev-sweep bouncing a weak card |
-| `Ready for Dev` | unstarted | Designed + spec'd + eng-reviewed | **spec-sweep** |
-| `In Review` | started | Built, pushed, awaiting QA | **dev-sweep** |
-| `QA Passed` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** |
-| `Ready to Ship` | started | Human reviewed and approved shipping after `QA Passed`, or after a dev-marked fast path | **human, manually (only)** |
+| `Spec` | unstarted | Selected but under-specified | human, or dev-sweep bouncing a weak card |
+| `Dev` | unstarted | Designed + spec'd + eng-reviewed | **spec-sweep** |
+| `QA` | started | Built, pushed, awaiting QA | **dev-sweep** |
+| `Signoff` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** |
+| `Ship` | started | Human reviewed and approved shipping after `Signoff`, or after a dev-marked fast path | **human, manually (only)** |
 | `Done` | completed | Merged + deployed + canary-verified | **ship-sweep** |
 | `Todo` | unstarted | **A human action item the agent can't do** (see below) | dev/qa-sweep (or any sweep) spins these off |
 | `Canceled` | canceled | Won't do | human |
 | `Duplicate` | duplicate | Superseded by another card | anyone |
 | `Archived` | completed | Recorded for history; superseded/retired work | anyone |
 
-`In Progress` is a legacy state retained for history and stale-claim cleanup only. Normal active development stays in `Ready for Dev` and carries `dev:in-progress`.
+`In Progress` is a legacy state retained for history and stale-claim cleanup only. Normal active development stays in `Dev` and carries `dev:in-progress`.
 
 ### The `Todo` lane — things only the user can do
 
@@ -52,15 +52,15 @@ Claim/release + blocked signals. The sweeps create these if missing.
 | `qa:passed` | qa-sweep's green signal; ship-sweep's pre-merge evidence |
 | `ship:in-progress` | ship-sweep owns this card (stale after 120 min) |
 | `ship:approved` | *(optional)* deliberate human ship approval, required only when `config.requireShipApproval` is true |
-| `fast-path:eligible` | dev-sweep's conservative marker for tiny, high-confidence changes; lets a human skip `QA Passed` by manually moving from `In Review` to `Ready to Ship` |
+| `fast-path:eligible` | dev-sweep's conservative marker for tiny, high-confidence changes; lets a human skip `Signoff` by manually moving from `QA` to `Ship` |
 | `blocked:open-questions` | spec-sweep asked the owner questions; waiting on a reply |
 | `blocked:needs-user` | dev/qa/ship blocked on a human (decision, credential, deploy) |
 
 ## Fast-path eligibility
 
-Fast path is enabled by default in `linear-sweep.json`. Dev-sweep may add `fast-path:eligible` only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. Set `fastPath.enabled` to `false` to require normal QA for every card. Dev-sweep still moves the card to `In Review`; it never moves a card to `Ready to Ship`.
+Fast path is enabled by default in `linear-sweep.json`. Dev-sweep may add `fast-path:eligible` only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. Set `fastPath.enabled` to `false` to require normal QA for every card. Dev-sweep still moves the card to `QA`; it never moves a card to `Ship`.
 
-A human can then either leave the card in `In Review` for normal qa-sweep, or manually move it directly to `Ready to Ship` to skip `QA Passed`. ship-sweep accepts `qa:passed` or enabled `fast-path:eligible` evidence, but only after the card is already in the human-gated `Ready to Ship` column and has no live foreign `*:in-progress` claim. If `fastPath.enabled` is `false`, ship-sweep requires `qa:passed`.
+A human can then either leave the card in `QA` for normal qa-sweep, or manually move it directly to `Ship` to skip `Signoff`. ship-sweep accepts `qa:passed` or enabled `fast-path:eligible` evidence, but only after the card is already in the human-gated `Ship` column and has no live foreign `*:in-progress` claim. If `fastPath.enabled` is `false`, ship-sweep requires `qa:passed`.
 
 Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity, and domain labels are optional and team-specific — the sweeps don't require them.
 
@@ -78,6 +78,6 @@ The launcher also writes/reads a few **audit-marker comments** on cards (you don
 
 - One card = one product/engineering feature, bug, or user outcome. **Not** meta-cards like "design X" or "write the plan" — attach the design doc, plan, review notes, and verification evidence to the feature card instead.
 - Put the `<PREFIX>-###` key in the branch name / PR title / commit subjects where practical.
-- Raw ideas → `Backlog`. Selected-but-underspecified → `Needs Spec`. Designed/active → `Ready for Dev` (active work carries `dev:in-progress`). PR/review → `In Review`. QA-passed, awaiting sign-off → `QA Passed`. Tiny fast-path-eligible changes may be moved by a human from `In Review` directly to `Ready to Ship`; otherwise human-approved shipping happens from `QA Passed` → `Ready to Ship`. Shipped + verified → `Done`.
+- Raw ideas → `Backlog`. Selected-but-underspecified → `Spec`. Designed/active → `Dev` (active work carries `dev:in-progress`). PR/review → `QA`. QA-passed, awaiting sign-off → `Signoff`. Tiny fast-path-eligible changes may be moved by a human from `QA` directly to `Ship`; otherwise human-approved shipping happens from `Signoff` → `Ship`. Shipped + verified → `Done`.
 - Work discovered after the fact → a `Done` card titled `Completed: …` with a short plain-English summary + evidence.
 - Every question during an unattended sweep run goes to a **card comment** — never block on interactive input.

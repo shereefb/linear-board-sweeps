@@ -46,7 +46,7 @@ Resolution semantics:
 
 - `blocked:open-questions`: clear the label and leave the current state unchanged so the next sweep resumes.
 - `blocked:needs-user`: clear only when the user supplied a concrete resolution; leave state unchanged unless the user explicitly asks to move it.
-- `qa:needs-changes`: record the fix notes. Leave it for dev-sweep, or move it back to `Ready for Dev` only if the human explicitly chooses that queue.
+- `qa:needs-changes`: record the fix notes. Leave it for dev-sweep, or move it back to `Dev` only if the human explicitly chooses that queue.
 
 ## 3. Finish
 
