@@ -32,6 +32,7 @@ test("spec-sweep reassesses monotonically after plan generation", () => {
   assert.ok(planAt < reassessAt && reassessAt < landAt);
   assert.match(body, /may stay the same or increase[^]*never decrease/i);
   assert.match(body, /run every newly required review/i);
+  assert.match(body, /Tier 1 plan target[^]*after plan generation[^]*plan pass[^]*independent adversarial reviewer/i);
   assert.match(body, /final tier[^]*clear[^]*no unresolved decisions/i);
 });
 
@@ -39,6 +40,7 @@ test("spec-sweep keeps safety floors and material lens gating", () => {
   const body = read(canonicalPath);
   assert.match(body, /Tier 0[^]*no material[^]*(auth|security)[^]*data integrity[^]*external input[^]*concurrency/i);
   assert.match(body, /security[^]*performance[^]*mandatory regardless of engineering-review tier/i);
+  assert.match(body, /performance-sensitive work[^]*cannot be Tier 0[^]*plan-eng-review[^]*performance[^]*benchmark/i);
   assert.match(body, /domain labels[^]*candidate[^]*material/i);
   assert.match(body, /pure copy[^]*spacing[^]*skip[^]*plan-design-review/i);
 });
