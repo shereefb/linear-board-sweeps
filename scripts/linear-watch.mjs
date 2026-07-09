@@ -52,7 +52,7 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
-export const DEFAULT_MAX_DRAIN_PASSES = 2;
+export const DEFAULT_MAX_DRAIN_PASSES = 5;
 export const MAX_DRAIN_PASSES = 5;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the

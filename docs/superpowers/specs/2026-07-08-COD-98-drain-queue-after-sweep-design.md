@@ -54,9 +54,9 @@ tick
 
 Default drain budget:
 
-- `maxDrainPasses: 2` per tick, including the first dispatch pass.
+- `maxDrainPasses: 5` per tick, including the first dispatch pass.
 - Configurable under `parallel.maxDrainPasses`.
-- Minimum `1`, default `2`, maximum clamp `5`.
+- Minimum `1`, default `5`, maximum clamp `5`.
 
 This catches cards added during a long sweep without letting one queue monopolize the host all day.
 
@@ -64,11 +64,11 @@ This catches cards added during a long sweep without letting one queue monopoliz
 
 ### D1 - Drain budget
 
-ELI10: The choice is whether to drain until empty or drain once more. Draining forever feels complete, but it can starve other work and make launchd runs overlap. A small budget catches the common case while keeping scheduler behavior predictable.
+ELI10: The choice is whether to drain until empty or drain for a few bounded passes. Draining forever feels complete, but it can starve other work and make launchd runs overlap. A small budget catches the common case while keeping scheduler behavior predictable.
 
 Recommendation: A because it improves latency without turning a tick into an unbounded worker.
 
-A) Add a bounded drain budget, default 2 passes (recommended). Completeness: 10/10. It catches newly arrived work after the first pass and prevents runaway loops.
+A) Add a bounded drain budget, default 5 passes (recommended). Completeness: 10/10. It catches newly arrived work after the first pass and prevents runaway loops.
 
 B) Drain until empty. Completeness: 7/10. It minimizes queue wait time but risks monopolizing the host when new cards keep arriving.
 
@@ -121,7 +121,7 @@ Run `node --test` after implementation.
 
 ### Performance Review
 
-Each extra drain pass repeats Linear queue fetches. The default single extra pass is acceptable because it runs only after a real dispatch, not on idle ticks. Clamp the budget to avoid accidental API churn.
+Each extra drain pass repeats Linear queue fetches. The default four extra passes are acceptable because they run only after real dispatched passes, not on idle ticks. Clamp the budget to avoid accidental API churn.
 
 ## Adversarial Review Targets
 
@@ -135,7 +135,7 @@ The independent reviewer should verify:
 
 ## Schema & Architecture Impact
 
-`linear-sweep.json` gains optional `parallel.maxDrainPasses`, defaulting to 2. README should mark COD-98 as planned queue-latency improvement.
+`linear-sweep.json` gains optional `parallel.maxDrainPasses`, defaulting to 5. README should mark COD-98 as planned queue-latency improvement.
 
 ## Acceptance Criteria
 

@@ -284,10 +284,10 @@ test("parallelLimit: defaults invalid and missing config to the bounded parallel
   assert.equal(parallelLimit({ parallel: { maxNonShipDispatches: 2.8 } }), 2);
 });
 test("drainPassLimit: defaults, clamps, and takes the active-anchor maximum", () => {
-  assert.equal(DEFAULT_MAX_DRAIN_PASSES, 2);
+  assert.equal(DEFAULT_MAX_DRAIN_PASSES, 5);
   assert.equal(MAX_DRAIN_PASSES, 5);
-  assert.equal(drainPassLimit({}), 2);
-  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: "many" } }), 2);
+  assert.equal(drainPassLimit({}), 5);
+  assert.equal(drainPassLimit({ parallel: { maxDrainPasses: "many" } }), 5);
   assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 0 } }), 1);
   assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 3.8 } }), 3);
   assert.equal(drainPassLimit({ parallel: { maxDrainPasses: 99 } }), 5);
