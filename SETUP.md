@@ -176,12 +176,12 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick also spends at most `parallel.maxNonShipDispatches` follow-up dispatch slots, so same-repo batches cannot fan out unboundedly. QA still stops at the human signoff queue; ship is never handoff-triggered.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `Signoff`. Set it to false to require normal QA for every card. The human-only `Ship` move remains required.
 
-2. **Install the launcher** (symlinks the wrapper, materializes the launchd plist — does NOT activate the schedule):
+2. **Install the launcher** (creates/updates a managed clean kit clone under `~/.local/share/linear-board-sweeps/kit`, symlinks the wrapper, materializes the launchd plist, and points `registry.json` at that managed clone — does NOT activate the schedule):
    ```bash
    "KIT/scripts/install-watch.sh"
    ```
 
-3. **Register the anchor.** This also auto-wires the kit clone for auto-update (`kitPath`/`kitRemote`) on first run — no registry editing needed:
+3. **Register the anchor.** The installer already wired `kitPath`/`kitRemote`; registration adds the workspace anchor:
    ```bash
    node "KIT/scripts/linear-watch.mjs" register "ANCHOR"
    ```

@@ -62,7 +62,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Board order is priority.** Within a status column, the next card is the top visible card in Linear (`Issue.sortOrder`), after blocked/live-claimed cards are filtered. Sweeps move completed or bounced cards to the bottom of the destination column via `node scripts/linear.mjs move-card-bottom <KEY-###> "<State>"`.
 - **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer), poison/oscillating cards escalate to `blocked:needs-user`, manual/dedicated work can be parked with `sweep:manual-only`, a holding-state reaper releases claims stranded in `Signoff`, scheduled tick failures create self-clearing `Todo` cards when Linear is reachable, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
 - **Manual work stays manual.** Cards created or moved during direct user conversations, or by non-sweep skills, should carry `sweep:manual-only` unless the user explicitly wants launchd to pick them up. Clear that label only when handing the card back to the scheduled sweep pipeline.
-- **Machine-independent.** All work and tooling flow through origin; skills auto-update by the launcher fast-forwarding your kit clone and pushing refreshed skills to each anchor.
+- **Machine-independent.** All work and tooling flow through origin; launchd runs from a managed clean kit clone so day-to-day edits in this checkout do not block scheduled dispatch, and skills auto-update by fast-forwarding that managed kit clone and pushing refreshed skills to each anchor.
 - **Shipping is single-runner.** Production merge + deploy happens only in ship-sweep, only from the human-gated `Ship` column. Pin ship dispatch to one host (`node scripts/linear-watch.mjs ship-runner on`) so two machines can never deploy the same card.
 - **Bounded non-ship parallelism.** `parallel.maxNonShipDispatches` defaults to `2`, so one tick can dispatch a small batch of non-ship sweeps when their resolved repo paths do not overlap. Set it to `1` for serial mode; that workspace then runs alone or waits for the next tick. ship always stays serial.
 - **Same-repo card slots.** Inside a selected non-ship workspace/sweep candidate, `parallel.sameRepoCardLimits` defaults to `spec:4`, `dev:4`, `qa:1`, `ship:1`. The parent launcher claims exact cards with owner-token heartbeats, dispatches child agents with `AUTO_SWEEP_ISSUE` and isolated worktree/log/temp/port paths, and writes per-card run records. `maxNonShipDispatches` counts workspace candidates; `sameRepoCardLimits` counts child card slots.
@@ -74,8 +74,8 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 Setup is a few idempotent commands per workspace (full agent-runnable procedure in [SETUP.md](SETUP.md) Step 11):
 
 ```bash
-scripts/install-watch.sh                                 # symlink wrapper + install plist (no activation)
-node scripts/linear-watch.mjs register <anchor-repo>     # register; auto-wires kitPath for self-update
+scripts/install-watch.sh                                 # create managed kit clone + install wrapper/plist (no activation)
+node scripts/linear-watch.mjs register <anchor-repo>     # register the workspace anchor
 node scripts/linear-watch.mjs activate <anchor-repo>     # add the auto-sweep label to the project (API)
 node scripts/linear-watch.mjs tick --dry-run             # validate live, spends no tokens
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist  # turn on the 10-min timer
