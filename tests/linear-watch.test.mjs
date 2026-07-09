@@ -211,11 +211,12 @@ test("bouncePairKey: parses <from>→<to> (with spaces) into an unordered pair; 
 });
 
 // ── actionable count ─────────────────────────────────────────────────────────
-test("countActionable: excludes blocked and live-claimed, counts released + plain", () => {
+test("countActionable: excludes blocked/manual-only and live-claimed, counts released + plain", () => {
   const now = NOW;
   const cards = [
     { id: "plain", updatedAt: minsAgo(1), labelNames: [], comments: [] },
     { id: "blocked", updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
+    { id: "manual", updatedAt: minsAgo(1), labelNames: ["sweep:manual-only"], comments: [] },
     { id: "live", updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] },
     { id: "released", updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], comments: [] },
   ];
@@ -576,6 +577,9 @@ test("SWEEP_CFG.ship exists and the derived lists include it", () => {
   assert.ok(SWEEPS.includes("ship"));
   assert.ok(SKILL_DIRS.includes("ship-sweep")); // auto-updater propagates the new skill
 });
+test("SWEEP_CFG: every scheduled sweep treats manual-only cards as blocked", () => {
+  for (const sweep of SWEEPS) assert.ok(SWEEP_CFG[sweep].blocked.includes("sweep:manual-only"), `${sweep} missing manual-only blocker`);
+});
 test("manual unblock skill propagates but is never scheduled", () => {
   assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep"]);
   assert.ok(PROPAGATED_SKILL_DIRS.includes("unblock-sweep"));
@@ -650,9 +654,9 @@ test("parseEnv: strips quotes, ignores comments/blanks", () => {
 
 // ── manual unblock workflow helpers ─────────────────────────────────────────
 test("blockingLabelsForIssue: detects only unblockable blocking labels", () => {
-  assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes"]);
-  const labels = ["Feature", "blocked:needs-user", "qa:passed", "qa:needs-changes"];
-  assert.deepEqual(blockingLabelsForIssue(labels), ["blocked:needs-user", "qa:needs-changes"]);
+  assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]);
+  const labels = ["Feature", "blocked:needs-user", "qa:passed", "qa:needs-changes", "sweep:manual-only"];
+  assert.deepEqual(blockingLabelsForIssue(labels), ["blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]);
 });
 test("normalizeBlockedIssue: captures anchor, active state, issue context, and newest blocking comment", () => {
   const issue = {

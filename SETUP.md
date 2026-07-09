@@ -143,11 +143,11 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "ship": { "model": "gpt-5.5", "effort": "high" }
    },
    "runtimes": {
-     "spec":   { "runtime": "claude", "model": "claude-opus-4-8" },
+     "spec":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
      "dev":    { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
      "review": { "runtime": "claude", "model": "claude-opus-4-8" },
      "qa":     { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" },
-     "ship":   { "runtime": "claude", "model": "claude-sonnet-5" }
+     "ship":   { "runtime": "codex",  "model": "gpt-5.5", "effort": "high" }
    },
    "parallel": {
      "maxNonShipDispatches": 2,
@@ -169,7 +169,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "requireReviewerConfidence": "high"
    }
    ```
-   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage. Confirm every chosen runtime CLI (`codex` and/or `claude`) is installed and on `PATH`.
+   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. The default scheduled sweeps use Codex so unattended launchd ticks do not depend on a separate Claude login; only switch a scheduled sweep to Claude after confirming that `claude` is installed, logged in, and usable non-interactively. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.sameRepoCardLimits` controls per-card fan-out inside each selected non-ship workspace/sweep candidate; defaults are spec/dev `4`, QA `1`, and ship forced to `1`. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches` or `maxDrainPasses` to `1` for stricter serial/one-pass mode on smaller machines. ship-sweep is always serial.
    `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick also spends at most `parallel.maxNonShipDispatches` follow-up dispatch slots, so same-repo batches cannot fan out unboundedly. QA still stops at the human signoff queue; ship is never handoff-triggered.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `Signoff`. Set it to false to require normal QA for every card. The human-only `Ship` move remains required.
