@@ -3130,15 +3130,51 @@ export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
   fetchClaimCardFn = fetchClaimCard,
   applyLabelEditFn = applyLabelEdit,
   addCommentFn = addComment,
+  expectedStates = [],
 } = {}) {
   const cfg = SWEEP_CFG[pick.sweep];
   if (!cfg || !pick.issueId || !pick.ownerToken) return false;
   const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+  if (expectedStates.length && !expectedStates.includes(fresh.stateName)) return false;
   if (!hasLabel(fresh, cfg.claim)) return false;
   if (latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
   await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
-  await addCommentFn(apiKey, fresh.id, `${ORPHAN_TAG} Released launch pre-claim \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Will retry on a later tick.`);
+  await addCommentFn(apiKey, fresh.id, `${ORPHAN_TAG} Released launcher-owned \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Eligible for retry/backfill.`);
   return true;
+}
+
+export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
+  releaseOwnedDispatchClaimFn = releaseOwnedDispatchClaim,
+} = {}) {
+  const pick = result?.pick || {};
+  const cfg = SWEEP_CFG[pick.sweep];
+  if (!cfg || !pick.issueIdentifier) return { attempted: false, released: false, reasonKind: null };
+  const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
+  const dependencyDeferred = result.kind === "dependency-deferred";
+  const routingDeferred = result.kind === "repo-routing-deferred";
+  const successfulCompletion = result.kind === "success";
+  const interrupted = result.kind === "interrupted";
+  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted) {
+    return { attempted: false, released: false, reasonKind: null };
+  }
+  const reasonKind = successfulCompletion
+    ? "successful same-state completion"
+    : dependencyDeferred
+      ? "dependency deferral"
+      : routingDeferred
+        ? "repository deferral"
+        : "dispatch-start failure";
+  const reason = dependencyDeferred
+    ? "dependency preflight deferred material work"
+    : routingDeferred
+      ? "repository preflight deferred material work"
+      : successfulCompletion
+        ? `successful child via ${runtime} exited while the card remained in ${cfg.states.join("/")}`
+        : `dispatcher via ${runtime} could not start`;
+  const released = await releaseOwnedDispatchClaimFn(apiKey, pick, reason, {
+    expectedStates: successfulCompletion ? cfg.states : [],
+  });
+  return { attempted: true, released, reasonKind };
 }
 
 export async function expandDispatchBatch(batch, {
@@ -3262,10 +3298,6 @@ export async function buildSameRepoRefillDispatches({
   const logFn = deps.logFor || logFor;
   const empty = (reason) => ({ dispatches: [], reason });
   if (!result?.success || !pick.issueIdentifier) return empty("ineligible");
-  if (sweep === "ship") {
-    logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: ship`);
-    return empty("ship");
-  }
   if (refillBudget?.disabled) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: disabled`);
     return empty("disabled");
@@ -3303,7 +3335,7 @@ export async function buildSameRepoRefillDispatches({
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: fetch ${e.message}`);
     return empty("fetch");
   }
-  const routed = routeCardsByRepo(cards, pick.config, active.repoPairs || pick.repoPairs || [], {
+  const routed = routeCardsByRepo(cards, pick.config, active.repoPairs || pick.repoPairs || [], sweep === "ship" ? {} : {
     managedRepoPath: pick.repoRoute?.managedRepoPath || null,
   });
   for (const failure of routed.failures) logFn(pick.anchorPath, sweep, `refill-skip ${failure.identifier}: ${failure.message}`);
@@ -3872,7 +3904,6 @@ async function tick({ dryRun = false } = {}) {
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
       const dependencyDeferred = result.kind === "dependency-deferred";
       const routingDeferred = result.kind === "repo-routing-deferred";
-      const releaseClaim = startFailure || result.kind === "interrupted" || dependencyDeferred || routingDeferred;
       const detail = result.signal || result.code || result.exitCode;
       const failures = routingDeferred
         ? [failureEventFor(
@@ -3903,17 +3934,12 @@ async function tick({ dryRun = false } = {}) {
           writeCurrentTick();
         }
       }
-      if (releaseClaim && pick.issueIdentifier) {
+      if (pick.issueIdentifier) {
         try {
-          const releaseReason = dependencyDeferred
-            ? "dependency preflight deferred material work"
-            : routingDeferred
-              ? "repository preflight deferred material work"
-              : `dispatcher via ${runtime} could not start`;
-          const released = await releaseOwnedDispatchClaim(active.apiKey, pick, releaseReason);
-          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after ${dependencyDeferred ? "dependency deferral" : routingDeferred ? "repository deferral" : "dispatch-start failure"} ${pick.issueIdentifier}`);
+          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime);
+          if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
-          logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
+          logFor(pick.anchorPath, pick.sweep, `owned claim release failed ${pick.issueIdentifier}: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
           writeCurrentTick();
         }

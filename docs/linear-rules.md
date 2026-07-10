@@ -45,6 +45,8 @@ A dependent card may run only when every current visible `blockedBy` relation po
 
 For an independently completable prerequisite, create or reuse its issue, create the relation, and leave the dependent unclaimed. Use the relation alone: never add `blocked:needs-user` merely because a `blockedBy` relation exists. Keep `blocked:needs-user` for a direct human answer without a separate issue and for the existing crash/bounce protections. When the final blocker reaches exact `Done`, the dependent becomes eligible on the next fresh read without a dependency-label edit.
 
+An in-progress claim means a child process owns the card. After a successful child exit, the launcher re-reads the card. If the card remains in that sweep's workflow state and the latest heartbeat owner still matches the completed child, the launcher removes only that owned claim before discovering refill work. Forward progress, another owner's newer heartbeat, or an unreadable issue leaves the label untouched. A freed Ship slot may refill from any correctly routed Ship card in the same registered source workspace, while the capacity ledger continues to allow only one active Ship child for that workspace.
+
 Bounded cycle detection is an operational limitation, not a full graph crawl: diagnosis is only as complete as the active registered queue and relations returned to the service account. Multi-hop cycles through other workflow states, projects, teams, or invisible relations may not be diagnosed, and cross-team token visibility can omit data the launcher cannot know exists. This is not an organization-wide guarantee; operators must inspect persistent waits and access boundaries rather than assuming no reported cycle means no cycle.
 
 ## Workflow labels
@@ -93,7 +95,7 @@ Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity,
 
 `auto-sweep` is a **project-level** label (not an issue label), and it is the on/off switch for the auto-sweep launcher (`scripts/linear-watch.mjs`). A registered workspace is swept automatically **iff its Linear project carries this label** — add it in the Linear UI to activate a project, remove it to pause, without touching the machine that runs the launcher. Projects without it are ignored even if their anchor is registered.
 
-The launcher also writes/reads a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO>]` (a running sweep proving it's alive), `[auto-sweep-reaper]` (a stale claim it auto-released), `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`), `[auto-sweep-tick-failure <fingerprint>]` (a self-clearing scheduled launcher failure Todo), and `[auto-sweep-tick-recovered <fingerprint> <ISO>]` (the launcher observed recovery and moved that Todo to Done).
+The launcher also writes/reads a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO>]` (a running sweep proving it's alive), `[auto-sweep-reaper]` (a stale claim it auto-released), `[auto-sweep-orphan]` (a launcher-owned claim released after a start/defer failure or a successful same-state child exit), `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`), `[auto-sweep-tick-failure <fingerprint>]` (a self-clearing scheduled launcher failure Todo), and `[auto-sweep-tick-recovered <fingerprint> <ISO>]` (the launcher observed recovery and moved that Todo to Done).
 
 ## Manual unblock workflow
 
