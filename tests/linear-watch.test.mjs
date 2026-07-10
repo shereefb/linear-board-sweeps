@@ -4821,6 +4821,7 @@ test("doctor learning diagnostics default disabled without affecting ordinary he
   assert.equal(report.ok, true);
   assert.equal(report.learning.enabled, false);
   assert.equal(report.learning.healthy, true);
+  assert.equal(Object.values(report.learning.lenses).some((lens) => lens.due), false);
   assert.match(formatDoctorReport(report), /learning: disabled, non-runner, idle, OK/);
 });
 

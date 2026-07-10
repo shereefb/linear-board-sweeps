@@ -1020,7 +1020,14 @@ function readLearningStateSafe(statePath = LEARNING_STATE_PATH) {
 }
 
 export function buildLearningCyclePreview({ registry, workspaces, state, snapshot, now = new Date().toISOString() } = {}) {
-  const due = learningDueDecisions({ state, snapshot, workspaces, now });
+  const calculatedDue = learningDueDecisions({ state, snapshot, workspaces, now });
+  const due = registry?.learning?.enabled === true ? calculatedDue : {
+    ...calculatedDue,
+    lenses: Object.fromEntries(Object.entries(calculatedDue.lenses || {}).map(([lens, decision]) => [lens, { ...decision, due: false, reason: "registry-disabled" }])),
+    evaluations: { due: [] },
+    due: false,
+    anyDue: false,
+  };
   const workspaceConfigs = workspaces || [];
   const detectorConfig = {
     coreProjectId: workspaceConfigs.find((item) => item.sourceAnchorPath === registry?.learning?.coreSourceAnchor)?.config?.projectId,
@@ -3881,12 +3888,19 @@ export function doctorReport({
     snapshot = indexed.snapshot;
     indexGaps = indexed.coverageGaps || [];
   }
-  const due = learningDueDecisions({
+  const calculatedLearningDue = learningDueDecisions({
     state: learningStateResult.state,
     snapshot,
     workspaces: workspaceResult.workspaces,
     now: learningNow,
   });
+  const due = reg.learning.enabled === true ? calculatedLearningDue : {
+    ...calculatedLearningDue,
+    lenses: Object.fromEntries(Object.entries(calculatedLearningDue.lenses || {}).map(([lens, decision]) => [lens, { ...decision, due: false, reason: "registry-disabled" }])),
+    evaluations: { due: [] },
+    due: false,
+    anyDue: false,
+  };
   const coverageGaps = [...new Map([
     ...(snapshot?.coverage?.gaps || []),
     ...indexGaps,
