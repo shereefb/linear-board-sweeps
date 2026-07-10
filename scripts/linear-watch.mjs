@@ -1161,6 +1161,18 @@ export function parseEnv(text) {
 }
 
 export const BLOCKING_LABELS = ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", MANUAL_ONLY_LABEL];
+export const UNBLOCK_STATE_ORDER = Object.freeze(["Signoff", "QA", "Dev", "Spec"]);
+
+export function orderUnblockCards(cards) {
+  const priority = new Map(UNBLOCK_STATE_ORDER.map((state, index) => [state, index]));
+  return (cards || [])
+    .filter((card) => priority.has(card.state))
+    .sort((a, b) => {
+      const stateDelta = priority.get(a.state) - priority.get(b.state);
+      if (stateDelta) return stateDelta;
+      return Date.parse(a.updatedAt) - Date.parse(b.updatedAt);
+    });
+}
 
 export function blockingLabelsForIssue(labelNames) {
   return BLOCKING_LABELS.filter((name) => (labelNames || []).includes(name));
@@ -2399,8 +2411,7 @@ export async function scanBlockedIssues({ registry = readRegistry(), isProjectAc
       warnings.push({ anchorPath, message: `blocked issue query failed: ${e.message}` });
     }
   }
-  cards.sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));
-  return { cards, warnings };
+  return { cards: orderUnblockCards(cards), warnings };
 }
 
 // Project-label activation (the auto-sweep on/off switch). find-or-create the

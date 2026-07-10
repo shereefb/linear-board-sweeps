@@ -10,7 +10,7 @@ The pipeline flows left → right. Linear ships most of these by default; the sw
 |--------|------|---------|-------------------|
 | `Backlog` | backlog | Raw idea, not yet selected | human |
 | `Spec` | unstarted | Selected but under-specified | human, or dev-sweep bouncing a weak card |
-| `Dev` | unstarted | Designed + spec'd + eng-reviewed | **spec-sweep** |
+| `Dev` | unstarted | Designed + spec'd + reviewed to its final adaptive tier | **spec-sweep** |
 | `QA` | started | Built, pushed, awaiting QA | **dev-sweep** |
 | `Signoff` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** |
 | `Ship` | started | Human reviewed and approved shipping after `Signoff`, or after a dev-marked fast path | **human, manually (only)** |
@@ -66,6 +66,20 @@ Claim/release + blocked signals. The sweeps create these if missing.
 | `sweep:manual-only` | direct user conversation or another non-sweep skill owns the card; scheduled sweeps skip it until a human clears the label |
 
 Use `sweep:manual-only` whenever a card is created or moved outside the scheduled sweep pipeline — for example during a direct conversation with the user, a one-off implementation session, or another non-sweep skill. Omit it only when the explicit intent is to enqueue the card for unattended spec/dev/qa/ship automation immediately. Clear it with `unblock-sweep` or an explicit human handoff when the normal sweeps should resume.
+
+## Adaptive spec-review depth
+
+spec-sweep records an initial review tier after codebase exploration and brainstorming:
+
+- **Tier 0 — Mechanical:** zero engineering reviews for genuinely localized work with objective acceptance and no meaningful behavior, state, persistence, contract, dependency, migration, rollout, or material risk change.
+- **Tier 1 — Bounded:** exactly one `/plan-eng-review` pass. The sweep targets the spec when requirements or architecture carry the uncertainty, or the implementation plan when execution, ordering, failure handling, or tests carry it.
+- **Tier 2 — Material:** both passes. The spec review clears before plan generation, and the completed implementation plan is reviewed afterward.
+
+Tier 0 cannot include material auth/security, data-integrity, external-input, concurrency, performance, accessibility, destructive-operation, or cross-repo risk. Destructive data migrations, auth-boundary changes, concurrency/locking, cross-repo production changes, and irreversible rollouts require Tier 2. Major public contract changes and unfamiliar external integrations default to Tier 2 unless concrete evidence supports a bounded Tier 1 classification.
+
+Domain labels make specialized review lenses candidates, not automatic work. Pure copy, token, spacing, or icon changes may skip design review with a recorded rationale; material interaction/accessibility, public developer experience, security, and performance surfaces run their relevant lens. Security and performance gates remain mandatory whenever their material surface is present, regardless of the engineering-review tier.
+
+After writing the implementation plan, spec-sweep reassesses the concrete file map, interfaces, dependency graph, task order, tests, failure modes, and rollout work. The final tier may stay level or increase, never decrease. Before moving the card to Dev, the spec and plan audit must record the initial and final tiers, predicted footprint, risk surfaces, selected and skipped reviews, any escalation, and outcomes. Every review required by the final tier and every materially applicable specialized lens must be clear, the two artifacts must agree, and no unresolved decisions may remain.
 
 ## Fast-path eligibility
 

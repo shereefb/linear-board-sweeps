@@ -37,6 +37,7 @@ import {
   LEGACY_CLEANUP_STATES, CLAIM_CLEANUP_STATES, MAX_STALE_MIN,
   REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
+  UNBLOCK_STATE_ORDER, orderUnblockCards,
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
@@ -2765,6 +2766,27 @@ test("parseEnv: strips quotes, ignores comments/blanks", () => {
 });
 
 // ── manual unblock workflow helpers ─────────────────────────────────────────
+test("orderUnblockCards: keeps pipeline states downstream-first and oldest-first within a state", () => {
+  const cards = [
+    { identifier: "SPEC", state: "Spec", updatedAt: "2026-07-01T00:00:00Z" },
+    { identifier: "BACKLOG", state: "Backlog", updatedAt: "2026-06-01T00:00:00Z" },
+    { identifier: "SIGNOFF-NEW", state: "Signoff", updatedAt: "2026-07-04T00:00:00Z" },
+    { identifier: "DEV", state: "Dev", updatedAt: "2026-07-02T00:00:00Z" },
+    { identifier: "QA", state: "QA", updatedAt: "2026-07-03T00:00:00Z" },
+    { identifier: "SIGNOFF-OLD", state: "Signoff", updatedAt: "2026-07-01T00:00:00Z" },
+    { identifier: "SHIP", state: "Ship", updatedAt: "2026-05-01T00:00:00Z" },
+    { identifier: "UNKNOWN", state: "Custom", updatedAt: "2026-04-01T00:00:00Z" },
+  ];
+
+  assert.deepEqual(UNBLOCK_STATE_ORDER, ["Signoff", "QA", "Dev", "Spec"]);
+  assert.deepEqual(
+    orderUnblockCards(cards).map((card) => card.identifier),
+    ["SIGNOFF-OLD", "SIGNOFF-NEW", "QA", "DEV", "SPEC"],
+  );
+  assert.deepEqual(cards.map((card) => card.identifier), [
+    "SPEC", "BACKLOG", "SIGNOFF-NEW", "DEV", "QA", "SIGNOFF-OLD", "SHIP", "UNKNOWN",
+  ]);
+});
 test("blockingLabelsForIssue: detects only unblockable blocking labels", () => {
   assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]);
   const labels = ["Feature", "blocked:needs-user", "qa:passed", "qa:needs-changes", "sweep:manual-only"];
