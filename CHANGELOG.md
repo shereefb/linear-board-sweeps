@@ -2,6 +2,12 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.1.3] - 2026-07-09
+
+### Fixed
+
+- Reuse an existing clean worktree that already owns `main` when propagating sweep skills, instead of failing while trying to create a competing `main` checkout. Dirty owner worktrees remain untouched and fail closed.
+
 ## [1.1.2] - 2026-07-09
 
 ### Fixed

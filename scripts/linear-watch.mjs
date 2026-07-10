@@ -3215,16 +3215,39 @@ function commitAndPushSkillRefresh(root, marker, successReason) {
   return { ok: pushed.ok, reason: pushed.ok ? successReason : "push failed" };
 }
 
+function checkedOutBranchWorktree(anchor, branch) {
+  const listed = git(anchor, ["worktree", "list", "--porcelain"], { allowFail: true });
+  if (listed.status !== 0) {
+    return { ok: false, path: null, reason: sanitizeFailureMessage(`cannot inspect existing worktrees: ${listed.err || listed.out || `exit ${listed.status}`}`) };
+  }
+  const branchRef = `branch refs/heads/${branch}`;
+  for (const block of listed.out.split(/\n\n+/)) {
+    const lines = block.split("\n");
+    const worktreeLine = lines.find((line) => line.startsWith("worktree "));
+    if (worktreeLine && lines.includes(branchRef)) return { ok: true, path: worktreeLine.slice("worktree ".length), reason: null };
+  }
+  return { ok: true, path: null, reason: null };
+}
+
 // Refresh an anchor's committed skills, ALWAYS landing the commit on `main`.
-// If `main` is checked out clean in the primary tree, commit there; otherwise use
-// a dedicated throwaway worktree checked out on `main`, so a stray feature branch
-// in the primary tree never receives the skills commit.
+// If `main` is checked out clean anywhere, commit there; otherwise use a dedicated
+// throwaway worktree checked out on `main`, so a stray feature branch in the
+// primary tree never receives the skills commit.
 export function refreshAnchorSkills(anchor, kit, marker) {
   const head = git(anchor, ["symbolic-ref", "--short", "HEAD"], { allowFail: true }).out;
   if (head === "main") {
     if (git(anchor, ["status", "--porcelain"], { allowFail: true }).out) return { ok: false, reason: "main dirty — skipped" };
     copySkillsInto(anchor, kit, marker);
     return commitAndPushSkillRefresh(anchor, marker, "committed on main");
+  }
+  const existingMain = checkedOutBranchWorktree(anchor, "main");
+  if (!existingMain.ok) return { ok: false, reason: existingMain.reason };
+  if (existingMain.path) {
+    const status = git(existingMain.path, ["status", "--porcelain"], { allowFail: true });
+    if (status.status !== 0) return { ok: false, reason: sanitizeFailureMessage(`existing main worktree status failed: ${status.err || status.out || `exit ${status.status}`}`) };
+    if (status.out) return { ok: false, reason: "existing main worktree dirty — skipped" };
+    copySkillsInto(existingMain.path, kit, marker);
+    return commitAndPushSkillRefresh(existingMain.path, marker, "committed on existing main worktree");
   }
   // Primary tree is elsewhere — commit to main via a dedicated worktree.
   const wt = path.join(anchor, ".worktrees", ".skills-update");
