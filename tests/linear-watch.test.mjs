@@ -1912,6 +1912,38 @@ test("claimCardSlots: cleanup read/write failures remain truthful and never remo
   assert.equal(removalAttempts, 1);
 });
 
+test("claimCardSlots: heartbeat creation failure surfaces an unprovable applied claim", async () => {
+  let removals = 0;
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-92", sortOrder: 10, labelNames: [], comments: [] });
+  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+  }, {
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
+    addCommentFn: async () => { throw new Error("heartbeat comment unavailable"); },
+    sleepFn: async () => {},
+    fetchClaimCardFn: async () => ({ ...card, labelNames: ["dev:in-progress"], comments: [] }),
+  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /ownership is not provable/.test(error.message));
+  assert.equal(removals, 0);
+});
+
+test("claimCardSlots: another worker's latest owner is preserved and this attempt fails truthfully", async () => {
+  let removals = 0;
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-93", sortOrder: 10, labelNames: [], comments: [] });
+  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+  }, {
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
+    addCommentFn: async () => { throw new Error("heartbeat comment unavailable"); },
+    sleepFn: async () => {},
+    fetchClaimCardFn: async () => ({
+      ...card,
+      labelNames: ["dev:in-progress"],
+      comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=other-worker claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    }),
+  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /latest owner is other-worker/.test(error.message));
+  assert.equal(removals, 0);
+});
+
 test("releaseOwnedDispatchClaim: dependency deferral removes only the matching owned claim", async () => {
   assert.equal(typeof watchModule.releaseOwnedDispatchClaim, "function");
   const edits = [];

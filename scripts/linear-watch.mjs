@@ -2926,8 +2926,14 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       if (!claimApplied) continue;
       try {
         const latest = await fetchClaimCardFn(apiKey, card.id);
-        if (hasLabel(latest, cfg.claim) && latestHeartbeatOwner(latest, cfg.claim) === owner) {
+        if (!hasLabel(latest, cfg.claim)) continue;
+        const latestOwner = latestHeartbeatOwner(latest, cfg.claim);
+        if (latestOwner === owner) {
           await applyLabelEditFn(apiKey, latest, { remove: [cfg.claim] });
+        } else {
+          throw new Error(latestOwner
+            ? `claim remains but latest owner is ${latestOwner}`
+            : "claim remains but ownership is not provable because no heartbeat exists");
         }
       } catch (cleanupError) {
         logFor(anchorPath, sweep, `claim-cleanup-unverified ${card.identifier}: ${cleanupError.message}`);
@@ -3175,6 +3181,28 @@ function copySkillsInto(root, kit, marker) {
   fs.writeFileSync(path.join(root, ".claude", "skills", ".sweep-version"), marker + "\n");
 }
 
+function commitAndPushSkillRefresh(root, marker, successReason) {
+  const add = git(root, ["add", ".claude/skills"], { allowFail: true });
+  if (add.status !== 0) {
+    return { ok: false, reason: sanitizeFailureMessage(`git add failed: ${add.err || add.out || `exit ${add.status}`}`) };
+  }
+  const staged = git(root, ["diff", "--cached", "--quiet", "--", ".claude/skills"], { allowFail: true });
+  if (staged.status === 0) return { ok: true, reason: `already current ${successReason}` };
+  if (staged.status !== 1) {
+    return { ok: false, reason: sanitizeFailureMessage(`could not verify staged skill changes: ${staged.err || staged.out || `exit ${staged.status}`}`) };
+  }
+  const commit = git(root, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
+  if (commit.status !== 0) {
+    return { ok: false, reason: sanitizeFailureMessage(`commit failed: ${commit.err || commit.out || `exit ${commit.status}`}`) };
+  }
+  const committedMarker = git(root, ["show", "HEAD:.claude/skills/.sweep-version"], { allowFail: true });
+  if (committedMarker.status !== 0 || committedMarker.out !== marker) {
+    return { ok: false, reason: `commit completed without expected sweep marker ${marker}` };
+  }
+  const pushed = pushWithRetry(root, "main");
+  return { ok: pushed.ok, reason: pushed.ok ? successReason : "push failed" };
+}
+
 // Refresh an anchor's committed skills, ALWAYS landing the commit on `main`.
 // If `main` is checked out clean in the primary tree, commit there; otherwise use
 // a dedicated throwaway worktree checked out on `main`, so a stray feature branch
@@ -3184,10 +3212,7 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   if (head === "main") {
     if (git(anchor, ["status", "--porcelain"], { allowFail: true }).out) return { ok: false, reason: "main dirty — skipped" };
     copySkillsInto(anchor, kit, marker);
-    git(anchor, ["add", ".claude/skills"], { allowFail: true });
-    git(anchor, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
-    const p = pushWithRetry(anchor, "main");
-    return { ok: p.ok, reason: p.ok ? "committed on main" : "push failed" };
+    return commitAndPushSkillRefresh(anchor, marker, "committed on main");
   }
   // Primary tree is elsewhere — commit to main via a dedicated worktree.
   const wt = path.join(anchor, ".worktrees", ".skills-update");
@@ -3196,10 +3221,7 @@ export function refreshAnchorSkills(anchor, kit, marker) {
   if (add.status !== 0) return { ok: false, reason: `cannot check out main in a worktree (already checked out elsewhere?): ${add.err}` };
   try {
     copySkillsInto(wt, kit, marker);
-    git(wt, ["add", ".claude/skills"], { allowFail: true });
-    git(wt, ["commit", "-m", `chore(sweeps): update skills to ${marker}`], { allowFail: true });
-    const p = pushWithRetry(wt, "main");
-    return { ok: p.ok, reason: p.ok ? "committed on main via worktree" : "push failed" };
+    return commitAndPushSkillRefresh(wt, marker, "committed on main via worktree");
   } finally {
     git(anchor, ["worktree", "remove", "--force", wt], { allowFail: true });
   }

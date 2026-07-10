@@ -55,6 +55,41 @@ test("refreshAnchorSkills: commits to main even when a feature branch is checked
   }
 });
 
+for (const primaryBranch of ["main", "COD-2-feature"]) {
+  test(`refreshAnchorSkills: commit-hook failure is reported on ${primaryBranch} without a false push success`, () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-hook-fail-"));
+    try {
+      const origin = path.join(root, "origin.git");
+      const anchor = path.join(root, "anchor");
+      g(root, "init", "--bare", "-b", "main", origin);
+      g(root, "clone", origin, anchor);
+      g(anchor, "config", "user.email", "t@t.t");
+      g(anchor, "config", "user.name", "t");
+      fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+      fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "0.0.1\n");
+      g(anchor, "add", "-A");
+      g(anchor, "commit", "-m", "seed");
+      g(anchor, "push", "origin", "main");
+      if (primaryBranch !== "main") g(anchor, "checkout", "-b", primaryBranch);
+      const hook = path.join(anchor, ".git", "hooks", "pre-commit");
+      fs.writeFileSync(hook, "#!/bin/sh\necho hook-secret-token >&2\nexit 1\n", { mode: 0o755 });
+
+      const before = g(anchor, "rev-parse", "main");
+      const result = refreshAnchorSkills(anchor, KIT, "9.9.8");
+
+      assert.equal(result.ok, false);
+      assert.match(result.reason, /commit failed/i);
+      assert.match(result.reason, /hook-secret-token/);
+      assert.equal(g(anchor, "rev-parse", "main"), before);
+      assert.equal(g(anchor, "show", "main:.claude/skills/.sweep-version"), "0.0.1");
+      assert.equal(g(anchor, "rev-parse", "origin/main"), before);
+      assert.ok(!fs.existsSync(path.join(anchor, ".worktrees", ".skills-update")));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("runUpdate: failed kit fetch is reported before merging stale refs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
   try {
