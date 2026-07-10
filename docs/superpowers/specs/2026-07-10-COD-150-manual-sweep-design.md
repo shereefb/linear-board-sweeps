@@ -36,9 +36,12 @@ scheduled launcher behavior for ordinary cards.
    Spec design and plan. Where `plan-eng-review` is required, it uses the
    existing prose fallback and automatically records the recommended decision.
 4. After the Spec is approved, it asks once whether to fast-track shipping.
-5. A `yes` adds `manual-sweep:fast-track-requested` and posts a dated Linear
-   comment recording the user's authorization for automated Ship handoff if
-   every gate passes. A `no` leaves the card in the normal manual-only flow.
+5. A `yes` adds `manual-sweep:fast-track-requested` and posts one immutable
+   approval marker: `[manual-sweep-ship-approval <issue-id> <spec-path>
+   <spec-commit> <nonce>]`. The marker must be human-authored, postdate the
+   final approved spec, and be unique for the issue. Missing, malformed,
+   agent-authored, stale, superseded, or revoked markers fail closed. A `no`
+   leaves the card in the normal manual-only flow.
 6. For a confirmed request, the orchestrator invokes the canonical sweeps in
    order: Spec, Dev, QA, then Ship when the required terminal conditions hold.
 
@@ -50,11 +53,24 @@ next canonical sweep. Each existing sweep continues to own its established
 claim labels, artifacts, reviews, state moves, branches, testing, and recovery
 protocols.
 
+It invokes a canonical sweep through a **direct-manual-handoff contract**, not
+by clearing `sweep:manual-only`. The named stage receives the exact issue key,
+expected source state, an opaque handoff ID, and deterministic worktree/log
+paths. Before its first mutation it performs the scheduled single-card
+dependency and repository-routing preflights, verifies the expected state and
+absence of a live foreign claim, and writes a stage-specific handoff marker.
+Only that named invocation may ignore `sweep:manual-only`; scheduled selection
+continues to reject it. Resume reads the marker and authoritative post-state
+before continuing, so it cannot repeat a completed stage or make a parallel
+claim.
+
 The required state is intentionally explicit:
 
 - `sweep:manual-only` keeps the card out of unattended scheduled selection.
 - `manual-sweep:fast-track-requested` means a user has asked for the exception
-  and its approval comment is present.
+  and its approval marker is present. `scripts/linear.mjs setup-team` must
+  provision it, and the manual skill must propagate to registered anchors while
+  remaining outside scheduled `SWEEPS`.
 - `fast-path:eligible` remains Dev's evidence that the implementation cleared
   its fast-track gate; it is never applied when the request is created.
 - `qa:passed` remains QA's evidence before automatic Ship handoff.
@@ -65,10 +81,10 @@ recreating the issue, replaying a completed sweep, or duplicating a Ship move.
 
 ## Dev fast-track request policy
 
-When Dev sees `manual-sweep:fast-track-requested`, it should treat it as a
-user-approved override of the normal fast-path **size and allowed-label**
-thresholds. It must not grant `fast-path:eligible` merely because the request
-exists. It still requires:
+When Dev sees `manual-sweep:fast-track-requested` through the direct-manual
+handoff contract, it treats it as a user-approved override of the normal
+fast-path **size and allowed-label** thresholds. It must not grant
+`fast-path:eligible` merely because the request exists. It still requires:
 
 - green implementation verification;
 - the required code and independent reviews with no unresolved findings;
@@ -81,22 +97,33 @@ on the card and follows the normal QA/Signoff path rather than adding
 `fast-path:eligible`. The request label remains as the user's stated intent,
 not as evidence that the exception was safe.
 
+Precedence is strict: `factory:learning-generated` remains ineligible;
+`fastPath.enabled: false` disables the exception; a final-tier review or
+specialized-lens failure denies it; and every material risk surface denies it.
+Only the configured size and allowed-label checks are bypassed. Dev removes a
+stale eligibility label whenever these conditions fail.
+
 ## Automatic Ship handoff
 
-After QA completes, `/manual-sweep` may move the card to `Ship` and invoke
-`ship-sweep` only when all of the following are true:
+After QA completes, `/manual-sweep` may move the card from `Signoff` to `Ship`
+and invoke `ship-sweep` only when all of the following are true:
 
 1. The fast-track approval audit comment exists.
 2. `manual-sweep:fast-track-requested` is present.
 3. Dev added `fast-path:eligible`.
 4. QA added `qa:passed`.
-5. The card is still in the expected post-QA state and carries no live foreign
-   in-progress claim.
+5. The card is still in `Signoff`, carries no blocking label or live foreign
+   in-progress claim, and has no unresolved dependency.
+6. If `config.requireShipApproval` is true, `ship:approved` is present; the
+   manual authorization never weakens this optional hardened gate.
 
 This explicit, user-recorded approval is the manual workflow's authorization
-for the Ship transition. `ship-sweep` retains every one of its existing
-pre-merge sanity checks, single-runner behavior, merge/deploy execution, and
-canary verification. A failed condition stops rather than forcing a Ship move.
+for the otherwise human-only Ship transition. The transition is validate the
+full predicate, establish the Ship direct-handoff marker, move `Signoff` to
+`Ship`, re-read the exact state/labels/claim, then invoke the named single Ship
+runner. `ship-sweep` retains every existing pre-merge sanity check,
+single-runner behavior, merge/deploy execution, and canary verification. A
+failed condition stops rather than forcing a Ship move.
 
 ## Error handling and recovery
 
@@ -128,6 +155,16 @@ lenses are not initially material, but the engineering reviews must validate
 the Ship-authorization trust boundary. Reassess after the concrete plan;
 tier may increase but not decrease.
 
+**Pre-plan review outcome:** clear after corrections. The independent review
+found that retaining `sweep:manual-only` would otherwise make every canonical
+handoff ineligible, that a free-form dated comment could not safely authorize
+Ship, and that the optional `ship:approved` hardening was unspecified. The
+direct-handoff contract, immutable human approval marker, hardened-config
+predicate, label provisioning, and Dev precedence rules above resolve those
+findings. No separate DevEx, security, or performance lens is materially
+applicable; the review targets are policy/state correctness, not a public API,
+untrusted external input, or a performance-sensitive runtime path.
+
 ## Verification
 
 Focused tests and documentation checks must prove:
@@ -135,15 +172,18 @@ Focused tests and documentation checks must prove:
 1. `/manual-sweep` creates the correct project card in `Spec` with
    `sweep:manual-only`.
 2. The fast-track question is asked only after initial Spec brainstorming.
-3. A positive response writes the approval comment and request label; a
-   negative response does neither.
+3. A positive response writes the provisioned request label and a unique,
+   human-authored, current approval marker; a negative response does neither.
 4. Normal cards retain current fast-path behavior.
 5. Requested cards may bypass only size/allowed-label thresholds, never the
    verification, review, specialized-lens, or material-risk gates.
-6. Automatic Ship handoff requires the exact approval, request, eligibility,
-   and QA-passed evidence and is idempotent on resume.
-7. A Dev refusal routes the card to normal Signoff instead of Ship.
-8. Canonical and installed skill copies remain byte-identical where the repo
+6. Ordinary scheduled selection still excludes manual-only/requested cards;
+   named direct handoffs reject wrong state, foreign claims, and blockers.
+7. Automatic Ship handoff requires exact approval, request, eligibility,
+   QA-passed, Signoff-state, dependency, and optional `ship:approved` evidence
+   and is idempotent on resume.
+8. A Dev refusal routes the card to normal Signoff instead of Ship.
+9. Canonical and installed skill copies remain byte-identical where the repo
    requires synchronized copies.
 
 ## Schema and architecture impact
