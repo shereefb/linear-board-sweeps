@@ -3416,6 +3416,36 @@ test("dirtyCheckoutEvent: reports exact dirty path samples with overflow", () =>
   assert.match(event.message, /paths:\n  \?\? file-0\.png/);
   assert.match(event.message, /\.\.\. and 5 more path/);
 });
+test("dirtyCheckoutEvent: a removed card worktree is clean after a successful child", () => {
+  let gitCalls = 0;
+  const event = dirtyCheckoutEvent(
+    { sweep: "spec" },
+    { role: "worktree", path: "/managed/app/.worktrees/COD-117" },
+    {
+      existsFn: () => false,
+      gitFn: () => {
+        gitCalls += 1;
+        return { status: 1, out: "", err: "No such file or directory" };
+      },
+    },
+  );
+
+  assert.equal(event, null);
+  assert.equal(gitCalls, 1);
+});
+test("dirtyCheckoutEvent: an inaccessible worktree still fails closed", () => {
+  const event = dirtyCheckoutEvent(
+    { sweep: "qa" },
+    { role: "worktree", path: "/managed/app/.worktrees/COD-118" },
+    {
+      existsFn: () => false,
+      gitFn: () => ({ status: 1, out: "", err: "Permission denied" }),
+    },
+  );
+
+  assert.equal(event.kind, "checkout-status");
+  assert.match(event.message, /Permission denied/);
+});
 test("checkoutDispatchBlockers: dirty source anchor is advisory when managed checkouts are present", () => {
   const calls = [];
   const gitFn = (repo, args) => {

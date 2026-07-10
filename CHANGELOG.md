@@ -2,6 +2,12 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.1.2] - 2026-07-09
+
+### Fixed
+
+- Treat an absent disposable card worktree as clean after a successful child, so same-repository refill does not create a false checkout failure after the child removes its worktree. Existing dirty worktrees and missing managed repositories still fail closed.
+
 ## [1.1.1] - 2026-07-09
 
 ### Fixed
