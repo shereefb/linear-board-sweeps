@@ -39,6 +39,18 @@ test("scheduled sweep instructions require the dependency preflight and relation
       const labelCreation = text.search(/Ensure (?:these )?labels exist[^\n]*create (?:any that are |if )?missing/);
       assert.ok(labelCreation >= 0, `${file}: missing label-creation instruction`);
       assert.ok(text.indexOf("dependency-status") < labelCreation, `${file}: dependency preflight must precede label creation`);
+      if (sweep === "spec") {
+        assert.ok(
+          text.indexOf("dependency-status") < text.indexOf("Repo ownership gate"),
+          `${file}: dependency preflight must precede the repo ownership gate`,
+        );
+      }
+      if (sweep === "qa") {
+        assert.ok(
+          text.indexOf("dependency-status") < text.indexOf("Confirm you can run the app"),
+          `${file}: dependency preflight must precede app startup`,
+        );
+      }
 
       const steps = [
         "Search for the stable audit marker",

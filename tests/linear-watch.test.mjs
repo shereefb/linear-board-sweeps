@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -921,7 +922,7 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(paths.portBase, 47020);
   const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
-  assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(new URL("..", import.meta.url).pathname));
+  assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
@@ -929,6 +930,10 @@ test("card run paths/env are isolated per issue and slot", () => {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
   assert.equal(pick.sameRepoLimit, 4);
+});
+test("kit root test expectation decodes spaces in file URLs", () => {
+  const encodedTestUrl = new URL("file:///tmp/linear%20board/tests/linear-watch.test.mjs");
+  assert.equal(path.resolve(fileURLToPath(new URL("..", encodedTestUrl))), "/tmp/linear board");
 });
 test("card dispatch env prefers the original source anchor for managed workspaces", () => {
   const pick = withCardDispatchEnv({
