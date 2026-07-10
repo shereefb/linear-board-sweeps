@@ -1957,6 +1957,7 @@ test("card dispatch env prefers the original source anchor for managed workspace
     issueIdentifier: "COD-7",
   }, "run-id");
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
+  assert.equal(pick.childEnv.AUTO_SWEEP_ANCHOR, "/managed/repo");
 });
 test("card dispatch env uses the routed managed sibling for worktrees and exports both repo paths", () => {
   const repoRoute = {
