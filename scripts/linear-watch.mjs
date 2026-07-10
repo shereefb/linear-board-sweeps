@@ -29,6 +29,7 @@ import {
   normalizeBlockingRelations,
   WORKFLOW_STATES,
 } from "./linear.mjs";
+import { normalizeLearningRegistry } from "./learning.mjs";
 
 // The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
 const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -132,11 +133,11 @@ export function managedWorkspaceRootFor(sourceAnchorPath, { homeDir = HOME } = {
 }
 
 function defaultRegistry() {
-  return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, capacity: { maxActiveChildren: DEFAULT_MAX_ACTIVE_CHILDREN }, repos: [], managedAnchors: {} };
+  return normalizeLearningRegistry({ autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, capacity: { maxActiveChildren: DEFAULT_MAX_ACTIVE_CHILDREN }, repos: [], managedAnchors: {} });
 }
 
 export function normalizeRegistry(reg = {}, { now = () => new Date().toISOString(), homeDir = HOME } = {}) {
-  const out = { ...defaultRegistry(), ...(reg || {}) };
+  const out = normalizeLearningRegistry({ ...defaultRegistry(), ...(reg || {}) });
   out.repos = Array.isArray(out.repos) ? [...out.repos] : [];
   out.kitRef = out.kitRef || "main";
   out.shipRunner = out.shipRunner === true;

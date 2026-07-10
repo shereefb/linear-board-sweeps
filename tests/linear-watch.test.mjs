@@ -209,6 +209,17 @@ test("capacity registry: legacy registries default to exactly ten and configured
   assert.equal(MAX_ACTIVE_CHILDREN, 32);
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 1_000_000 } }).capacity.maxActiveChildren, 32);
 });
+test("learning registry: legacy output gains disabled defaults and preserves unrelated fields", () => {
+  const normalized = normalizeRegistry({ customSetting: { keep: true } });
+  assert.deepEqual(normalized.learning, {
+    enabled: false,
+    runner: false,
+    coreSourceAnchor: null,
+    maxNewCardsPerRun: 6,
+    runtime: null,
+  });
+  assert.deepEqual(normalized.customSetting, { keep: true });
+});
 test("capacity installation: persists ten without deleting existing registry settings", () => {
   const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/install-watch.sh"), "utf8");
   assert.match(source, /capacity:\s*\{\s*maxActiveChildren:\s*10\s*\}/);
