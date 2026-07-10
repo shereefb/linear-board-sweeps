@@ -27,7 +27,7 @@ import {
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
-  latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
+  latestHeartbeat, latestHeartbeatOwner, retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
@@ -40,7 +40,7 @@ import {
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
   LEGACY_CLEANUP_STATES, CLAIM_CLEANUP_STATES, MAX_STALE_MIN,
-  REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
+  REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG, RETRY_TAG, ORPHAN_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
   UNBLOCK_STATE_ORDER, orderUnblockCards,
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
@@ -1374,6 +1374,44 @@ test("actionableCards: live dev claim in Dev is not double-dispatched", () => {
 test("actionableCards: stale dev claim in Dev becomes actionable", () => {
   const card = dependencyReadyCard({ id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
+});
+test("retryCooldown requires an anchored current-claim marker owned by the latest heartbeat", () => {
+  const owner = "owner-1";
+  const heartbeat = { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) };
+  const retry = { id: "retry", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}] ${ORPHAN_TAG} terminal failure observed`, createdAt: minsAgo(1) };
+  const card = dependencyReadyCard({ id: "cooling", updatedAt: minsAgo(1), labelNames: [], comments: [heartbeat, retry] });
+  assert.equal(latestHeartbeat(card, "dev:in-progress").owner, owner);
+  assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW).active, true);
+  assert.equal(retryCooldown(card, SWEEP_CFG.spec, NOW), null);
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
+});
+test("retryCooldown rejects malformed, forged, stale, and future markers", () => {
+  const owner = "owner-1";
+  const heartbeat = { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) };
+  const valid = (id, body, createdAt) => dependencyReadyCard({ id, updatedAt: minsAgo(1), labelNames: [], comments: [heartbeat, { id, body, createdAt }] });
+  const cases = [
+    valid("quoted", `>${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(1)),
+    valid("wrong-claim", `${RETRY_TAG} claim=qa:in-progress owner=${owner}]`, minsAgo(1)),
+    valid("wrong-owner", `${RETRY_TAG} claim=dev:in-progress owner=other]`, minsAgo(1)),
+    valid("old", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(3)),
+    valid("future", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, new Date(NOW + 60_000).toISOString()),
+    valid("expired", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(91)),
+  ];
+  for (const card of cases) assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW), null, card.id);
+});
+test("retryCooldown uses a stable comment-id tie break and claim confirmation refuses cooling cards", () => {
+  const owner = "owner-1";
+  const createdAt = minsAgo(1);
+  const card = dependencyReadyCard({
+    id: "tie", stateName: "Dev", labelNames: ["dev:in-progress"], updatedAt: createdAt,
+    comments: [
+      { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) },
+      { id: "b", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, createdAt },
+      { id: "a", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, createdAt },
+    ],
+  });
+  assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW).commentId, "a");
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"], NOW), false);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
   const card = dependencyReadyCard({

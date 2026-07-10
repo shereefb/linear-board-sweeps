@@ -77,6 +77,7 @@ export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
+export const RETRY_TAG = "[auto-sweep-retry";
 export const REAPER_TAG = "[auto-sweep-reaper]"; // crash-reap audit marker — COUNTED by the escalate-crash counter
 export const ORPHAN_TAG = "[auto-sweep-orphan]"; // foreign/orphan claim release — distinct so it doesn't inflate the crash count
 export const PARK_TAG = "[auto-sweep-parked]"; // bounce-escalation park — distinct from REAPER_TAG and BOUNCE_TAG
@@ -809,6 +810,7 @@ export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
     if (!cardDependencyEligibility(card).eligible) return false;
+    if (retryCooldown(card, cfg, now)?.active) return false;
     const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
@@ -1290,6 +1292,10 @@ export function heartbeatOwner(body) {
 }
 
 export function latestHeartbeatOwner(card, claim = null) {
+  return latestHeartbeat(card, claim)?.owner || null;
+}
+
+export function latestHeartbeat(card, claim = null) {
   const beats = (card?.comments || [])
     .map((c) => {
       const body = c.body || "";
@@ -1297,18 +1303,36 @@ export function latestHeartbeatOwner(card, claim = null) {
       if (claim && !body.includes(claim)) return null;
       const owner = heartbeatOwner(body);
       const t = Date.parse(c.createdAt);
-      return owner && !Number.isNaN(t) ? { owner, t } : null;
+      return owner && !Number.isNaN(t) ? { owner, createdAt: c.createdAt, timestamp: t, commentId: c.id || "" } : null;
     })
     .filter(Boolean)
-    .sort((a, b) => b.t - a.t);
-  return beats[0]?.owner || null;
+    .sort((a, b) => b.timestamp - a.timestamp || String(a.commentId).localeCompare(String(b.commentId)));
+  return beats[0] || null;
 }
 
-export function claimConfirmed(card, cfg, owner, expectedStates = []) {
+export function retryCooldown(card, cfg, now = Date.now()) {
+  if (!cfg?.claim) return null;
+  const claimNames = ALL_CLAIMS.map((claim) => claim.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const pattern = new RegExp(`^\\[auto-sweep-retry claim=(${claimNames}) owner=([A-Za-z0-9._:-]+)\\]`);
+  const heartbeat = latestHeartbeat(card, cfg.claim);
+  if (!heartbeat) return null;
+  const valid = (card?.comments || []).map((comment) => {
+    const match = String(comment.body || "").match(pattern);
+    const timestamp = Date.parse(comment.createdAt);
+    if (!match || match[1] !== cfg.claim || match[2] !== heartbeat.owner || Number.isNaN(timestamp)) return null;
+    const ageMin = (now - timestamp) / 60000;
+    if (timestamp < heartbeat.timestamp || ageMin < 0 || ageMin > cfg.staleMin) return null;
+    return { active: true, owner: match[2], createdAt: comment.createdAt, timestamp, ageMin, commentId: comment.id || "" };
+  }).filter(Boolean).sort((a, b) => b.timestamp - a.timestamp || String(a.commentId).localeCompare(String(b.commentId)));
+  return valid[0] || null;
+}
+
+export function claimConfirmed(card, cfg, owner, expectedStates = [], now = Date.now()) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
   if (!cardDependencyEligibility(card).eligible) return false;
+  if (retryCooldown(card, cfg, now)?.active) return false;
   return latestHeartbeatOwner(card, cfg.claim) === owner;
 }
 
