@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn as spawnProcess, spawnSync as spawnProcessSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
+import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -20,10 +22,13 @@ import {
   annotateBoundedDependencyCycles, dependencyCycleFailureEvents,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
   compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, dependencyDeferredIssue, admitDemand,
+  withCapacityLedgerMutationLock, shouldStartPostDeliveryLearning,
+  dispatchLearningAsync,
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
+  buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
@@ -41,7 +46,15 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
-  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
+  failureTodoTitle, failureTodoBody, failureTodoDecisions, reconcileFailureTodos, healthStatus, atomicWriteJson, finalizeTickState,
+  rotateLearningRunIndexes,
+  rotateLearningEventFiles,
+  buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
+  filterLearningFindingsForRun,
+  resolveRegisteredLearningWorkspaces, readLearningRunIndex, runPostDeliveryLearning,
+  fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
+  executeLearningCycleWrites,
+  buildLiveLearningDryRunPlan, learningRunExecutionDecision,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -208,6 +221,38 @@ test("capacity registry: legacy registries default to exactly ten and configured
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: "invalid" } }).capacity.maxActiveChildren, 10);
   assert.equal(MAX_ACTIVE_CHILDREN, 32);
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 1_000_000 } }).capacity.maxActiveChildren, 32);
+});
+test("learning registry: legacy output gains disabled defaults and preserves unrelated fields", () => {
+  const normalized = normalizeRegistry({ customSetting: { keep: true } });
+  assert.deepEqual(normalized.learning, {
+    enabled: false,
+    runner: false,
+    coreSourceAnchor: null,
+    maxNewCardsPerRun: 6,
+    runtime: null,
+  });
+  assert.deepEqual(normalized.customSetting, { keep: true });
+});
+test("registered learning workspaces are resolved before delivery activation and retain named gaps", () => {
+  const reads = [];
+  const result = resolveRegisteredLearningWorkspaces({ repos: ["/paused", "/active", "/broken"] }, {
+    configFn: (anchor) => {
+      reads.push(["config", anchor]);
+      if (anchor === "/broken") throw new Error("bad config");
+      return { projectId: anchor.slice(1), learning: { enabled: anchor === "/paused" } };
+    },
+    keyFn: (anchor) => {
+      reads.push(["key", anchor]);
+      return anchor === "/paused" ? null : "key";
+    },
+    canonicalFn: (anchor) => anchor,
+  });
+  assert.deepEqual(result.workspaces.map((item) => item.sourceAnchorPath), ["/paused"]);
+  assert.equal(result.workspaces[0].apiKey, null);
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/paused" && /LINEAR_API_KEY/.test(gap.reason)));
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/broken" && /bad config/.test(gap.reason)));
+  assert.deepEqual(reads.filter(([kind]) => kind === "config").map(([, anchor]) => anchor), ["/paused", "/active", "/broken"]);
+  assert.deepEqual(reads.filter(([kind]) => kind === "key").map(([, anchor]) => anchor), ["/paused", "/active"]);
 });
 test("capacity installation: persists ten without deleting existing registry settings", () => {
   const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/install-watch.sh"), "utf8");
@@ -787,6 +832,37 @@ test("capacity ledger: UUID collision retries without overwriting an existing re
   assert.equal(createCapacityLedger({ maxActiveChildren: null }).maxActiveChildren, 10);
   assert.equal(reservation.token, "unique");
   assert.deepEqual(stored.entries.map((entry) => entry.token), ["collision", "unique"]);
+});
+test("capacity ledger: cross-process mutation lock defers a concurrent reserve and recovers a dead owner", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-capacity-lock-"));
+  const ledgerPath = path.join(dir, "capacity.json");
+  const readyPath = path.join(dir, "ready");
+  const moduleUrl = new URL("../scripts/linear-watch.mjs", import.meta.url).href;
+  const childCode = `
+    import fs from "node:fs";
+    import { withCapacityLedgerMutationLock } from ${JSON.stringify(moduleUrl)};
+    const [ledgerPath, readyPath] = process.argv.slice(1);
+    withCapacityLedgerMutationLock(ledgerPath, () => {
+      fs.writeFileSync(readyPath, String(process.pid));
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+    }, { timeoutMs: 100 });
+  `;
+  const child = spawnProcess(process.execPath, ["--input-type=module", "-e", childCode, ledgerPath, readyPath], { stdio: ["ignore", "pipe", "pipe"] });
+  const childExit = new Promise((resolve) => child.once("exit", resolve));
+  const deadline = Date.now() + 3_000;
+  while (!fs.existsSync(readyPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(fs.existsSync(readyPath), true, "lock-holder child did not become ready");
+
+  const contended = createCapacityLedger({ ledgerPath, maxActiveChildren: 2, lockTimeoutMs: 20 });
+  assert.equal(contended.reserve({ stage: "learning", trigger: "learning-due", workspace: "registry:test", issueIdentifier: "factory-learning:test" }), null);
+
+  child.kill("SIGKILL");
+  await childExit;
+  const restarted = createCapacityLedger({ ledgerPath, maxActiveChildren: 2 });
+  const reservation = restarted.reserve({ stage: "learning", trigger: "learning-due", workspace: "registry:test", issueIdentifier: "factory-learning:test" });
+  assert.ok(reservation, "dead lock owner should be reclaimed after restart");
+  assert.equal(JSON.parse(fs.readFileSync(ledgerPath, "utf8")).entries.length, 1);
+  assert.equal(reservation.release(), true);
 });
 test("queue observations: first capacity wait survives restart and accumulates", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-observations-"));
@@ -1484,6 +1560,936 @@ test("admission priority: a lower-stage handoff never leapfrogs a higher stage",
     { stage: "qa", trigger: "refill", issueIdentifier: "COD-2" },
   ) > 0);
 });
+test("learning admission is explicitly lower than Spec and demand identity is registry-scoped", () => {
+  const stages = ["learning", "spec", "dev", "qa", "ship"].map((stage) => ({
+    stage,
+    trigger: stage === "learning" ? "learning-due" : "initial",
+    issueIdentifier: stage,
+  }));
+  assert.deepEqual(stages.sort(compareAdmissionDemand).map((item) => item.stage), ["ship", "qa", "dev", "spec", "learning"]);
+  const a = buildLearningDemand({ repos: ["/a"] }, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  const b = buildLearningDemand({ repos: ["/a", "/b"] }, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  assert.equal(a.issueIdentifier, b.issueIdentifier);
+  assert.deepEqual({ stage: a.stage, trigger: a.trigger }, { stage: "learning", trigger: "learning-due" });
+});
+
+test("capacity ledger accepts only the exact learning pair and enforces one live registry singleton", () => {
+  let stored = null;
+  let id = 0;
+  const ledger = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => `learning-${++id}`,
+  });
+  const demand = buildLearningDemand({}, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  const first = ledger.reserve(demand);
+  assert.ok(first);
+  assert.equal(ledger.reserve(demand), null);
+  assert.throws(() => ledger.reserve({ ...demand, trigger: "initial" }), /invalid trigger|learning/i);
+  assert.throws(() => ledger.reserve({ ...demand, stage: "dev" }), /invalid trigger|learning/i);
+  first.release();
+  assert.ok(ledger.reserve(demand));
+});
+
+test("capacity restart keeps a live learning child and prunes a dead singleton", () => {
+  const entry = {
+    token: "learning-live", parentPid: 10, childPid: 20,
+    issueIdentifier: "factory-learning:registry", workspace: "/state/registry.json",
+    stage: "learning", trigger: "learning-due", reservedAt: "2026-07-10T00:00:00.000Z",
+  };
+  let stored = { version: 1, entries: [entry] };
+  const live = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: (pid) => pid === 20,
+  }).reconcile();
+  assert.deepEqual(live.entries, [entry]);
+  const dead = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => false,
+  }).reconcile();
+  assert.equal(dead.active, 0);
+});
+
+test("learning synthesis commands and child env deny capabilities for Codex and Claude", () => {
+  const common = {
+    tempDir: "/isolated/tmp", evidencePath: "/isolated/tmp/evidence.json",
+    schemaPath: "/isolated/tmp/schema.json", outputPath: "/isolated/tmp/output.json",
+  };
+  const codex = buildLearningSynthesisCommand({ ...common, runtime: "codex" });
+  assert.equal(codex.cwd, common.tempDir);
+  for (const pair of [["--cd", common.tempDir], ["--sandbox", "read-only"], ["--output-schema", common.schemaPath], ["--output-last-message", common.outputPath]]) {
+    const index = codex.args.indexOf(pair[0]);
+    assert.equal(codex.args[index + 1], pair[1]);
+  }
+  for (const flag of ["--ephemeral", "--ignore-user-config", "--skip-git-repo-check"]) assert.ok(codex.args.includes(flag), flag);
+  const claude = buildLearningSynthesisCommand({ ...common, runtime: "claude", emptyMcpPath: "/isolated/tmp/mcp.json" });
+  for (const flag of ["--safe-mode", "--bare", "--strict-mcp-config", "--no-session-persistence"]) assert.ok(claude.args.includes(flag), flag);
+  assert.equal(claude.args[claude.args.indexOf("--mcp-config") + 1], "/isolated/tmp/mcp.json");
+  assert.equal(claude.args[claude.args.indexOf("--tools") + 1], "");
+  assert.equal(claude.args[claude.args.indexOf("--json-schema") + 1], common.schemaPath);
+  const env = learningChildEnvironment({
+    PATH: "/bin", LANG: "en_US.UTF-8", LC_ALL: "C", SSL_CERT_FILE: "/certs.pem",
+    LINEAR_API_KEY: "secret", OPENAI_API_KEY: "secret", CUSTOM_TOKEN: "secret", REPO_VALUE: "secret",
+  }, { tempDir: common.tempDir });
+  assert.deepEqual(env, {
+    PATH: "/bin", LANG: "en_US.UTF-8", LC_ALL: "C", SSL_CERT_FILE: "/certs.pem",
+    HOME: common.tempDir, TMPDIR: common.tempDir,
+  });
+});
+
+test("bounded learning index reports malformed and truncated evidence", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "learning-read-index-"));
+  fs.writeFileSync(path.join(dir, "20260710.jsonl"), [
+    JSON.stringify({ cardRunId: "one", endedAt: "2026-07-10T10:00:00.000Z" }),
+    "malformed",
+    JSON.stringify({ cardRunId: "two", endedAt: "2026-07-10T11:00:00.000Z" }),
+  ].join("\n") + "\n");
+  const result = readLearningRunIndex(dir, { maxRecords: 1, maxFiles: 1, maxBytesPerFile: 10_000 });
+  assert.equal(result.runRecords.length, 1);
+  assert.ok(result.coverageGaps.some((gap) => /malformed/.test(gap.reason)));
+  assert.ok(result.coverageGaps.some((gap) => /record count/.test(gap.reason)));
+});
+
+test("post-delivery learning reserves directly without same-repo or observation seams and releases in finally", async () => {
+  let reserved = 0;
+  let released = 0;
+  const result = await runPostDeliveryLearning({
+    registry: { learning: { enabled: true, runner: true } },
+    dueDecisions: { due: true },
+    findings: [{ fingerprint: "known", confidence: "medium" }],
+    ledger: {
+      reserve: (demand) => {
+        reserved += 1;
+        assert.equal(demand.stage, "learning");
+        return { attachChildPid: () => true, release: () => { released += 1; } };
+      },
+    },
+    dispatchFn: async (_input, { onSpawn }) => {
+      onSpawn(123);
+      throw new Error("model unavailable");
+    },
+    deterministicFn: (findings, error) => ({ mode: "deterministic", findings, synthesisUnavailable: error.message }),
+  });
+  assert.equal(reserved, 1);
+  assert.equal(released, 1);
+  assert.equal(result.mode, "deterministic");
+  assert.match(result.synthesisUnavailable, /model unavailable/);
+});
+
+test("post-delivery learning skips optional synthesis when unconfigured and applies bounded annotations when enabled", async () => {
+  const base = {
+    registry: { learning: { enabled: true, runner: true } },
+    dueDecisions: { due: true },
+    findings: [{ rootFingerprint: "root-a", confidence: "high" }],
+    ledger: { reserve: () => ({ attachChildPid: () => true, release: () => {} }) },
+  };
+  let written;
+  const deterministic = await runPostDeliveryLearning({
+    ...base,
+    dispatchFn: null,
+    writerFn: async ({ findings }) => { written = findings; return { confirmed: 0 }; },
+  });
+  assert.equal(deterministic.mode, "deterministic");
+  assert.equal(written[0].synthesisAnnotation, undefined);
+
+  const synthesized = await runPostDeliveryLearning({
+    ...base,
+    dispatchFn: async () => ({ mode: "synthesized", available: true, annotations: [{ rootFingerprint: "root-a", summary: "Check the shared retry path." }] }),
+    writerFn: async ({ findings }) => { written = findings; return { confirmed: 0 }; },
+  });
+  assert.equal(synthesized.mode, "synthesized");
+  assert.equal(written[0].synthesisAnnotation, "Check the shared retry path.");
+});
+
+test("learning issue comments paginate past 100 and fail closed on cursor cycles or partial data", async () => {
+  const pages = [
+    { comments: { nodes: Array.from({ length: 100 }, (_, index) => ({ id: `c${index}`, body: "ordinary" })), pageInfo: { hasNextPage: true, endCursor: "next" } } },
+    { comments: { nodes: [{ id: "marker", body: "[factory-learning root=root-a generation=0]\nFresh occurrences: e1" }], pageInfo: { hasNextPage: false, endCursor: null } } },
+  ];
+  let call = 0;
+  const comments = await fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({ issue: pages[call++] }) });
+  assert.equal(comments.length, 101);
+  assert.equal(comments.at(-1).id, "marker");
+
+  await assert.rejects(fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({
+    issue: { comments: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "same" } } },
+  }) }), /pagination.*incomplete|cursor/i);
+  await assert.rejects(fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({
+    data: { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } },
+    errors: [{ message: "partial" }],
+  }) }), /partial GraphQL/i);
+});
+
+test("learning recurrence relations paginate and fail closed on incomplete confirmation", async () => {
+  let page = 0;
+  assert.equal(await learningRelationExists("key", "new", "done", { gqlFn: async () => {
+    page += 1;
+    return { issue: { inverseRelations: page === 1
+      ? { nodes: [{ type: "related", issue: { id: "other" } }], pageInfo: { hasNextPage: true, endCursor: "next" } }
+      : { nodes: [{ type: "related", issue: { id: "new" } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+  } }), true);
+
+  await assert.rejects(learningRelationExists("key", "new", "done", { gqlFn: async () => ({
+    issue: { inverseRelations: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "same" } } },
+  }) }), /pagination incomplete|cursor cycle/i);
+});
+
+test("learning issue discovery paginates, scans stable markers, and rejects incomplete pages", async () => {
+  let page = 0;
+  const result = await fetchLearningIssues("key", { teamKey: "COD", projectId: "project-1" }, {
+    gqlFn: async (query) => {
+      if (query.includes("comments(first:100")) return { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+      page += 1;
+      return { issues: {
+        nodes: page === 1 ? [{ id: "one", identifier: "COD-1", description: "[factory-learning root=root-a generation=0]", state: { name: "Dev" }, labels: { nodes: [] } }] : [],
+        pageInfo: page === 1 ? { hasNextPage: true, endCursor: "p2" } : { hasNextPage: false, endCursor: null },
+      } };
+    },
+  });
+  assert.equal(result[0].rootFingerprint, "root-a");
+  assert.equal(result[0].generation, 0);
+  assert.deepEqual(result[0].occurrenceIds, []);
+});
+
+test("learning issue discovery restores deterministic evaluation metadata and confirmed outcomes", async () => {
+  const description = [
+    "## Acceptance metric", JSON.stringify({ name: "failureRate", direction: "decrease", target: 0.2 }),
+    "## Baseline", JSON.stringify({ value: 0.8, unit: "ratio" }),
+    "## Evaluation window", JSON.stringify({ durationDays: 7 }),
+    "[factory-learning root=root-a generation=0]",
+  ].join("\n\n");
+  const result = await fetchLearningIssues("key", { teamKey: "COD", projectId: "project-1" }, {
+    gqlFn: async (query) => query.includes("comments(first:100")
+      ? { issue: { comments: { nodes: [{ id: "outcome", body: "[factory-learning outcome root=root-a generation=0 status=verified-improvement]", createdAt: "2026-07-09T00:00:00.000Z" }], pageInfo: { hasNextPage: false, endCursor: null } } } }
+      : { issues: { nodes: [{ id: "one", identifier: "COD-1", description, completedAt: "2026-07-01T00:00:00.000Z", state: { name: "Done" }, labels: { nodes: [{ id: "prov", name: "factory:learning-generated" }] } }], pageInfo: { hasNextPage: false, endCursor: null } } },
+  });
+  assert.deepEqual(result[0].evaluationMetadata, {
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+    baseline: { value: 0.8, unit: "ratio" },
+    evaluationWindow: { durationDays: 7 },
+  });
+  assert.equal(result[0].completedAt, "2026-07-01T00:00:00.000Z");
+  assert.deepEqual(result[0].outcome, { status: "verified-improvement", evaluatedAt: "2026-07-09T00:00:00.000Z" });
+  assert.equal(result[0].outcomeStatus, "verified-improvement");
+});
+
+test("learning evaluations persist active windows and confirm exactly one terminal outcome after timeout", async () => {
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app" }] };
+  const issue = {
+    id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
+    rootFingerprint: "root-a", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["e1"], comments: [],
+    evaluationMetadata: {
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
+      baseline: { value: 0.8, unit: "ratio" },
+      evaluationWindow: { durationDays: 7 },
+    },
+  };
+  const firstState = new Map();
+  const firstStore = { setEvaluation: (id, value) => { firstState.set(id, structuredClone(value)); return value; } };
+  const early = await executeLearningEvaluations({
+    issues: [issue], stateStore: firstStore,
+    snapshot: { capturedThrough: "2026-07-05T00:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, { fetchIssuesFn: async () => [issue], addCommentFn: async () => assert.fail("not due must not comment") });
+  assert.equal(early.active, 1);
+  assert.equal(firstState.get("root-a:0").status, "active");
+  assert.equal(firstState.get("root-a:0").windowEndsAt, "2026-07-08T00:00:00.000Z");
+
+  let commentAttempts = 0;
+  const dueSnapshot = {
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    observations: [{ at: "2026-07-07T12:00:00.000Z", sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.1 } }],
+    qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+  };
+  const due = await executeLearningEvaluations({ issues: [issue], stateStore: firstStore, snapshot: dueSnapshot }, {
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      commentAttempts += 1;
+      const status = body.match(/status=([^\]]+)/)[1];
+      issue.comments.push({ body, createdAt: dueSnapshot.capturedThrough });
+      issue.outcome = { status, evaluatedAt: dueSnapshot.capturedThrough };
+      issue.outcomeStatus = status;
+      throw new Error("comment timeout after success");
+    },
+  });
+  assert.equal(due.confirmed, 1);
+  assert.equal(commentAttempts, 1);
+  assert.equal(firstState.get("root-a:0").status, "verified-improvement");
+
+  const restored = new Map();
+  const restoredResult = await executeLearningEvaluations({
+    issues: [issue], stateStore: { setEvaluation: (id, value) => { restored.set(id, structuredClone(value)); return value; } }, snapshot: dueSnapshot,
+  }, { fetchIssuesFn: async () => [issue], addCommentFn: async () => assert.fail("confirmed outcome must not duplicate") });
+  assert.equal(restoredResult.restored, 1);
+  assert.equal(restored.get("root-a:0").status, "verified-improvement");
+  assert.equal(commentAttempts, 1);
+});
+
+test("production learning cycle evaluates generated Done cards even when no detector finding remains", async () => {
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app" }] };
+  const issue = {
+    id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
+    rootFingerprint: "fixed-root", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["old"], comments: [],
+    evaluationMetadata: {
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
+      baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
+    },
+  };
+  const evaluations = new Map();
+  const stateStore = {
+    setEvaluation: (id, value) => { evaluations.set(id, structuredClone(value)); return value; },
+    stageWindow: () => assert.fail("no finding means no mutation WAL"),
+    confirmMutation: () => assert.fail("no finding means no mutation confirmation"),
+    commitLens: () => assert.fail("no finding means no lens commit"),
+  };
+  let comments = 0;
+  const result = await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } },
+    stateStore,
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    snapshot: {
+      capturedThrough: "2026-07-09T00:00:00.000Z",
+      observations: [{ at: "2026-07-07T00:00:00.000Z", sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.1 } }],
+      qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+    },
+  }, {
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      comments += 1;
+      issue.comments.push({ body, createdAt: "2026-07-09T00:00:00.000Z" });
+      issue.outcomeStatus = "verified-improvement";
+      issue.outcome = { status: "verified-improvement", evaluatedAt: "2026-07-09T00:00:00.000Z" };
+    },
+  });
+  assert.equal(result.evaluations.confirmed, 1);
+  assert.equal(result.mutations, 0);
+  assert.equal(comments, 1);
+  assert.equal(evaluations.get("fixed-root:0").status, "verified-improvement");
+});
+
+test("production learning cycle advances a due zero-mutation lens watermark", async () => {
+  const calls = [];
+  const stateStore = {
+    setEvaluation: () => assert.fail("no generated Done issue to evaluate"),
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.length, window.capturedThrough]),
+    confirmMutation: () => assert.fail("zero mutations have nothing to confirm"),
+    commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  const result = await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    snapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+    dueDecisions: { lenses: { quality: { due: true } } },
+  }, { fetchIssuesFn: async () => [] });
+  assert.equal(result.mutations, 0);
+  assert.deepEqual(calls, [
+    ["stage", "quality", 0, "2026-07-10T12:00:00.000Z"],
+    ["commit", "quality"],
+  ]);
+});
+
+test("cross-lens learning mutation uses one Linear write and every lens WAL", async () => {
+  const calls = [];
+  const live = [];
+  const stateStore = {
+    setEvaluation: () => assert.fail("no generated Done issue to evaluate"),
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.map((mutation) => mutation.mutationId)]),
+    confirmMutation: (lens, mutationId) => calls.push(["confirm", lens, mutationId]),
+    commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  let creates = 0;
+  const result = await executeLearningCycleWrites({
+    findings: [learningFindingForWatcher({ lenses: ["quality", "reliability"] })],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    snapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      creates += 1;
+      const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
+      const created = { id: "created", identifier: "COD-2", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"] };
+      live.push(created);
+      return created;
+    },
+  });
+  assert.equal(creates, 1);
+  assert.equal(result.confirmed, 1);
+  assert.deepEqual(calls.filter(([kind]) => kind === "stage").map(([, lens, ids]) => [lens, ids.length]), [["quality", 1], ["reliability", 1]]);
+  assert.deepEqual(calls.filter(([kind]) => kind === "confirm").map(([, lens]) => lens), ["quality", "reliability"]);
+  assert.deepEqual(calls.filter(([kind]) => kind === "commit").map(([, lens]) => lens), ["quality", "reliability"]);
+});
+
+test("live learning dry-run plans exact updates, creates, recurrences, caps, and evaluations without writes", async () => {
+  const workspace = {
+    sourceAnchorPath: "/source/app", apiKey: "key",
+    config: { teamKey: "COD", projectId: "project-1", repoRouting: { byLabel: { "app:main": "app" } } },
+  };
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: workspace.sourceAnchorPath, projectId: "project-1", repoEntry: "app" }] };
+  const metadata = {
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
+    baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
+  };
+  const done = (rootFingerprint, generation, outcomeStatus = null) => ({
+    id: `${rootFingerprint}-${generation}`, identifier: `COD-${generation}`, stateName: "Done",
+    labelNames: ["factory:learning-generated"], rootFingerprint, generation,
+    completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: [`old-${rootFingerprint}`], comments: [],
+    evaluationMetadata: metadata,
+    ...(outcomeStatus ? { outcomeStatus, outcome: { status: outcomeStatus, evaluatedAt: "2026-07-09T00:00:00.000Z" } } : {}),
+  });
+  const live = [
+    { id: "active", identifier: "COD-10", stateName: "Dev", rootFingerprint: "active-root", generation: 0, occurrenceIds: ["old-active"], labelNames: ["factory:learning-generated"] },
+    done("recur-root", 0),
+    done("verified-root", 0, "verified-improvement"),
+    done("cap-root", 3, "regression"),
+  ];
+  const finding = (rootFingerprint, occurrenceIds) => learningFindingForWatcher({
+    rootFingerprint,
+    occurrenceIds,
+    occurrences: occurrenceIds.map((id) => ({ id, occurredAt: "2026-07-08T00:00:00.000Z" })),
+    firstSeenAt: "2026-07-08T00:00:00.000Z",
+    lastSeenAt: "2026-07-08T00:00:00.000Z",
+    sourceWorkspaces: [workspace.sourceAnchorPath],
+  });
+  const snapshot = {
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    observations: [{ at: "2026-07-07T00:00:00.000Z", sourceWorkspace: workspace.sourceAnchorPath, projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.7 } }],
+    coverage: { complete: true, gaps: [] },
+  };
+  const result = await buildLiveLearningDryRunPlan({
+    findings: [
+      finding("active-root", ["old-active", "new-active"]),
+      finding("create-root", ["new-create"]),
+      finding("recur-root", ["old-recur-root", "new-recur"]),
+      finding("verified-root", ["old-verified-root", "new-verified"]),
+      finding("cap-root", ["old-cap-root", "new-cap"]),
+    ],
+    workspaces: [workspace, { sourceAnchorPath: "/missing", apiKey: null, config: { teamKey: "COD", projectId: "missing-project" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, snapshot,
+  }, { fetchIssuesFn: async (destination) => destination.sourceAnchorPath === workspace.sourceAnchorPath ? live : [] });
+
+  assert.deepEqual(result.mutations.map((mutation) => [mutation.action, mutation.rootFingerprint, mutation.generation]), [
+    ["append-evidence", "active-root", 0],
+    ["block-generation-cap", "cap-root", 3],
+    ["create", "create-root", 0],
+    ["create", "recur-root", 1],
+  ]);
+  assert.ok(result.deferred.some((item) => item.finding?.rootFingerprint === "verified-root" && item.reason === "evaluation-not-recurrence-eligible"));
+  assert.deepEqual(result.evaluations.map((evaluation) => [evaluation.rootFingerprint, evaluation.status, evaluation.action]), [
+    ["cap-root", "regression", "restore"],
+    ["recur-root", "no-measurable-change", "append-outcome"],
+    ["verified-root", "verified-improvement", "restore"],
+  ]);
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/missing" && /credential/.test(gap.reason)));
+});
+
+test("live learning dry-run reports route gaps and manual runs override cadence only when attended", async () => {
+  const workspace = {
+    sourceAnchorPath: "/source/app", apiKey: "key",
+    config: { teamKey: "COD", projectId: "project-1", repoRouting: { byLabel: { "app:main": "app" } } },
+  };
+  const result = await buildLiveLearningDryRunPlan({
+    findings: [learningFindingForWatcher({ repoEntry: "unknown", sourceWorkspaces: [workspace.sourceAnchorPath] })],
+    workspaces: [workspace], registry: { learning: { maxNewCardsPerRun: 6 } },
+    snapshot: { capturedThrough: "2026-07-10T00:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, { fetchIssuesFn: async () => [] });
+  assert.ok(result.coverageGaps.some((gap) => /route/.test(gap.reason)));
+  assert.equal(learningRunExecutionDecision({ dryRun: true, automatic: false, due: false }), "dry-run");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: true, due: false }), "idle");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: false, due: false }), "run");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: true, due: true }), "run");
+});
+
+test("learning writer fails closed without provenance and confirms retry-safe create at bottom of Spec", async () => {
+  const mutation = {
+    mutationId: "create:root-a:0", action: "create", rootFingerprint: "root-a", generation: 0,
+    routeLabel: "app:main", finding: learningFindingForWatcher(),
+  };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => ({ "app:main": "route-id" }),
+  }), /factory:learning-generated/);
+
+  const calls = [];
+  let live = [];
+  const stateStore = {
+    stageWindow: (_lens, value) => calls.push(["stage", value.mutations.map((item) => item.mutationId)]),
+    confirmMutation: (_lens, id) => calls.push(["confirm", id]),
+    commitLens: () => true,
+  };
+  const executed = await executeLearningMutations({
+    mutations: [mutation], lens: "reliability", capturedThrough: "2026-07-10T12:00:00.000Z", stateStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov-id", "app:main": "route-id", "sweep:manual-only": "manual-id" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec-id" } }),
+    fetchSpecCardsFn: async () => [{ sortOrder: 5 }, { sortOrder: -2 }],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async (input) => {
+      calls.push(["create", input]);
+      live = [{ id: "new", identifier: "COD-10", stateName: "Spec", sortOrder: -3, rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], labelNames: ["factory:learning-generated", "app:main"] }];
+      return live[0];
+    },
+  });
+  const input = calls.find(([kind]) => kind === "create")[1];
+  assert.equal(input.stateId, "spec-id");
+  assert.equal(input.sortOrder, -3);
+  assert.deepEqual(input.labelIds.sort(), ["prov-id", "route-id"]);
+  assert.equal(input.labelIds.includes("manual-id"), false);
+  assert.deepEqual(calls.filter(([kind]) => kind === "confirm").map(([, id]) => id), [mutation.mutationId]);
+  assert.equal(executed.confirmed, 1);
+});
+
+test("learning writer treats timeout-after-success as confirmed and updates by comments only", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  let live = [];
+  const create = { mutationId: "m-create", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const createResult = await executeLearningMutations({ mutations: [create] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => [],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async () => {
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1", "e2"], labelNames: ["factory:learning-generated"] }];
+      throw new Error("timeout");
+    },
+  });
+  assert.equal(createResult.confirmed, 1);
+
+  const before = { id: "active", identifier: "COD-11", title: "Human title", description: "Human body", stateName: "Ship", labelNames: ["factory:learning-generated", "human"], rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] };
+  let current = [structuredClone(before)];
+  const calls = [];
+  await executeLearningMutations({ mutations: [{ mutationId: "m-update", action: "append-evidence", issueId: "active", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e2"], finding }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => current,
+    addCommentFn: async (issueId, body) => {
+      calls.push({ issueId, body });
+      current[0].occurrenceIds.push("e2");
+      throw new Error("comment timeout after success");
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ title: current[0].title, description: current[0].description, stateName: current[0].stateName, labelNames: current[0].labelNames }, {
+    title: before.title, description: before.description, stateName: before.stateName, labelNames: before.labelNames,
+  });
+});
+
+test("learning writer rejects unproven marker collisions and accepts a human-advanced generated create", async () => {
+  const finding = learningFindingForWatcher({ repoEntry: "app" });
+  const mutation = { mutationId: "create-root", action: "create", rootFingerprint: finding.rootFingerprint, generation: 0, routeLabel: "app:main", finding };
+  const labels = { "factory:learning-generated": "prov", "app:main": "route" };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => labels,
+    fetchIssuesFn: async () => [{ id: "human", stateName: "Ship", rootFingerprint: finding.rootFingerprint, generation: 0, labelNames: ["app:main"] }],
+  }), /provenance collision/i);
+  const result = await executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => labels,
+    fetchIssuesFn: async () => [{ id: "advanced", stateName: "Dev", rootFingerprint: finding.rootFingerprint, generation: 0, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated", "app:main"] }],
+  });
+  assert.equal(result.confirmed, 1);
+});
+
+test("learning create race converges every intended occurrence before WAL confirmation", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  const mutation = { mutationId: "create-race", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const live = [{
+    id: "raced", identifier: "COD-12", stateName: "Dev", rootFingerprint: "root-a", generation: 0,
+    occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"],
+  }];
+  const calls = [];
+  const stateStore = {
+    stageWindow: () => {},
+    confirmMutation: (_lens, mutationId) => calls.push(["confirm", mutationId]),
+    commitLens: () => true,
+  };
+  const result = await executeLearningMutations({ mutations: [mutation], stateStore }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => live,
+    addCommentFn: async (_issueId, body) => {
+      calls.push(["comment", body]);
+      assert.match(body, /Fresh occurrences:\s*e2/);
+      live[0].occurrenceIds.push("e2");
+      throw new Error("timeout after comment success");
+    },
+  });
+  assert.equal(result.confirmed, 1);
+  assert.deepEqual(live[0].occurrenceIds, ["e1", "e2"]);
+  assert.deepEqual(calls.map(([kind]) => kind), ["comment", "confirm"]);
+});
+
+test("learning create race does not confirm its WAL when evidence append is a no-op", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  const mutation = { mutationId: "create-race-noop", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const live = [{
+    id: "raced", identifier: "COD-12", stateName: "Dev", rootFingerprint: "root-a", generation: 0,
+    occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"],
+  }];
+  const stateStore = {
+    stageWindow: () => {},
+    confirmMutation: () => assert.fail("unconfirmed create race must not confirm"),
+    commitLens: () => assert.fail("unconfirmed create race must not commit"),
+  };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation], stateStore }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => live,
+    addCommentFn: async () => {},
+  }), /occurrences were not confirmed/);
+});
+
+test("automatic learning admits only due contributing lenses while attended learning forces all", () => {
+  const findings = [
+    learningFindingForWatcher({ rootFingerprint: "quality", lenses: ["quality"] }),
+    learningFindingForWatcher({ rootFingerprint: "reliability", lenses: ["reliability"] }),
+    learningFindingForWatcher({ rootFingerprint: "cross", lenses: ["quality", "reliability"] }),
+  ];
+  const due = { lenses: { quality: { due: false }, reliability: { due: true }, throughput: { due: false } } };
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: true }).map((finding) => [finding.rootFingerprint, finding.lenses]), [["reliability", ["reliability"]]]);
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: false }).map((finding) => finding.rootFingerprint), ["quality", "reliability", "cross"]);
+});
+
+test("automatic due-lens filtering rebuilds every aggregate field from due contributors only", () => {
+  const reliability = learningFindingForWatcher({
+    rootFingerprint: "cross", fingerprint: "reliability-fingerprint", lenses: ["reliability"],
+    detectorId: "stale-claim-pattern", detectorVersion: "r1", occurrenceIds: ["r1"],
+    occurrences: [{ id: "r1", occurredAt: "2026-07-08T00:00:00.000Z" }], occurrenceCount: 1,
+    evidenceReferences: ["ref:r1"], baseline: { value: 1, unit: "reaps" },
+    acceptanceMetric: { name: "staleClaimCount", direction: "decrease", target: 0 },
+  });
+  const quality = learningFindingForWatcher({
+    rootFingerprint: "cross", fingerprint: "quality-fingerprint", lenses: ["quality"],
+    detectorId: "repeated-review-finding", detectorVersion: "q1", occurrenceIds: ["q1", "q2"],
+    occurrences: [
+      { id: "q1", occurredAt: "2026-07-08T00:01:00.000Z" },
+      { id: "q2", occurredAt: "2026-07-08T00:02:00.000Z" },
+    ], occurrenceCount: 2, evidenceReferences: ["ref:q1", "ref:q2"],
+    baseline: { value: 2, unit: "reviews" },
+    acceptanceMetric: { name: "reviewFindingCount", direction: "decrease", target: 0 },
+  });
+  const aggregate = aggregateLearningFindings([reliability, quality])[0];
+  const due = { lenses: { quality: { due: false }, reliability: { due: true }, throughput: { due: false } } };
+  const [filtered] = filterLearningFindingsForRun([aggregate], due, { automatic: true });
+  assert.deepEqual(filtered.lenses, ["reliability"]);
+  assert.deepEqual(filtered.occurrenceIds, ["r1"]);
+  assert.deepEqual(filtered.occurrences, reliability.occurrences);
+  assert.equal(filtered.occurrenceCount, 1);
+  assert.deepEqual(filtered.evidenceReferences, ["ref:r1"]);
+  assert.deepEqual(filtered.detectorProvenance, ["stale-claim-pattern/r1"]);
+  assert.equal(filtered.measurementContracts.length, 1);
+  assert.equal(filtered.measurementContracts[0].detector, "stale-claim-pattern/r1");
+  assert.equal(filtered.detectorId, "stale-claim-pattern");
+  assert.equal(filtered.detectorVersion, "r1");
+  assert.deepEqual(filtered.baseline, reliability.baseline);
+  assert.deepEqual(filtered.acceptanceMetric, reliability.acceptanceMetric);
+  assert.doesNotMatch(JSON.stringify(filtered), /q1|q2|quality-fingerprint|reviewFindingCount/);
+});
+
+test("core detector routing selects the anchor repo entry with one label and fails closed when ambiguous", () => {
+  const stale = Array.from({ length: 2 }, (_, index) => ({
+    evidenceId: `stale-${index}`, signal: "stale-claim", occurredAt: `2026-07-10T11:0${index}:00.000Z`,
+    sourceWorkspace: "/source/app", projectId: "app-project", repoEntry: "app", runId: `run-${index}`,
+    stage: "dev", subsystem: "launcher", fingerprint: "claim-reaper", metrics: {},
+  }));
+  const snapshot = { capturedThrough: "2026-07-10T12:00:00.000Z", observations: stale, events: [], runRecords: [], coverage: { complete: true, gaps: [] } };
+  const workspace = (byLabel) => ({
+    sourceAnchorPath: "/source/core", apiKey: "key", learning: { enabled: true },
+    config: { projectId: "core-project", repos: ["core", "worker"], repoRouting: { byLabel } },
+  });
+  const registry = { learning: { enabled: true, coreSourceAnchor: "/source/core", maxNewCardsPerRun: 6 } };
+  const valid = watchModule.buildLearningCyclePreview({
+    registry, workspaces: [workspace({ "app:core": "core", "app:worker": "worker" })], state: {}, snapshot,
+  });
+  assert.equal(valid.findings[0].scope, "core");
+  assert.equal(valid.findings[0].projectId, "core-project");
+  assert.equal(valid.findings[0].repoEntry, "core");
+  assert.equal(valid.findings[0].actionable, true);
+
+  const ambiguous = watchModule.buildLearningCyclePreview({
+    registry, workspaces: [workspace({ "app:core": "core", "app:also-core": "core", "app:worker": "worker" })], state: {}, snapshot,
+  });
+  assert.equal(ambiguous.findings[0].scope, "core");
+  assert.equal(ambiguous.findings[0].repoEntry, undefined);
+  assert.equal(ambiguous.findings[0].actionable, false);
+
+  const singleRepo = watchModule.buildLearningCyclePreview({
+    registry,
+    workspaces: [{ sourceAnchorPath: "/source/core", apiKey: "key", learning: { enabled: true }, config: { projectId: "core-project", repos: ["core"] } }],
+    state: {}, snapshot,
+  });
+  assert.equal(singleRepo.coreRoute.error, null);
+  assert.equal(singleRepo.coreRoute.repoEntry, "core");
+  assert.equal(singleRepo.coreRoute.routeLabel, null);
+  assert.equal(singleRepo.findings[0].actionable, true);
+});
+
+test("production learning replays persisted pending WAL before staging a new evidence window", async () => {
+  const finding = learningFindingForWatcher({ rootFingerprint: "resume-root", lenses: ["quality"] });
+  const mutation = {
+    mutationId: "resume-create", action: "create", rootFingerprint: "resume-root", generation: 0, finding,
+    destination: { sourceAnchorPath: "/source/app", projectId: "project-1", teamKey: "COD" }, lenses: ["quality"], status: "pending",
+  };
+  const state = { version: 1, lenses: {
+    reliability: { accumulated: {}, pending: null },
+    quality: { accumulated: {}, pending: { capturedThrough: "2026-07-09T00:00:00.000Z", mutations: { [mutation.mutationId]: mutation } } },
+    throughput: { accumulated: {}, pending: null },
+  }, evaluations: {} };
+  const calls = [];
+  const live = [];
+  const stateStore = {
+    snapshot: () => structuredClone(state),
+    setEvaluation: () => {},
+    stageWindow: () => assert.fail("recovery must replay before staging a new window"),
+    confirmMutation: (lens, id) => { calls.push(["confirm", lens, id]); state.lenses[lens].pending.mutations[id].status = "confirmed"; },
+    commitLens: (lens) => { calls.push(["commit", lens]); state.lenses[lens].pending = null; return true; },
+    updateAccumulated: () => {},
+  };
+  const result = await executeLearningCycleWrites({
+    findings: [], workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore, capturedThrough: "2026-07-10T00:00:00.000Z",
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }), fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      const created = { id: "created", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: "resume-root", generation: 0, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated"] };
+      live.push(created); return created;
+    },
+  });
+  assert.equal(result.resumed, 1);
+  assert.deepEqual(calls, [["confirm", "quality", "resume-create"], ["commit", "quality"]]);
+});
+
+test("deferred and low-confidence learning findings accumulate and are not discarded by watermark commits", async () => {
+  const accumulated = { reliability: {}, quality: {}, throughput: {} };
+  const calls = [];
+  const stateStore = {
+    snapshot: () => ({ version: 1, lenses: Object.fromEntries(Object.entries(accumulated).map(([lens, values]) => [lens, { accumulated: values, pending: null }])), evaluations: {} }),
+    setEvaluation: () => {},
+    updateAccumulated: (lens, { upsert = [], remove = [] }) => {
+      for (const finding of upsert) accumulated[lens][finding.rootFingerprint] = structuredClone(finding);
+      for (const root of remove) delete accumulated[lens][root];
+      calls.push(["accumulate", lens, upsert.map((item) => item.rootFingerprint), remove]);
+    },
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.length]),
+    confirmMutation: () => {}, commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  const low = learningFindingForWatcher({ rootFingerprint: "low-root", lenses: ["quality"], confidence: "low" });
+  const missing = learningFindingForWatcher({ rootFingerprint: "missing-root", lenses: ["quality"], projectId: "missing-project" });
+  const result = await executeLearningCycleWrites({
+    findings: [low, missing], workspaces: [], registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T00:00:00.000Z", dueDecisions: { lenses: { quality: { due: true } } },
+  });
+  assert.equal(result.confirmed, 0);
+  assert.deepEqual(Object.keys(accumulated.quality).sort(), ["low-root", "missing-root"]);
+  assert.deepEqual(calls.slice(-2), [["stage", "quality", 0], ["commit", "quality"]]);
+});
+
+test("resolved accumulated roots clear only their processed contributing due lens", async () => {
+  const root = "shared-root";
+  const accumulated = {
+    quality: { [root]: learningFindingForWatcher({ rootFingerprint: root, lenses: ["quality"], occurrenceIds: ["known"] }) },
+    reliability: { [root]: learningFindingForWatcher({ rootFingerprint: root, lenses: ["reliability"], occurrenceIds: ["deferred-reliability"] }) },
+    throughput: {},
+  };
+  const stateStore = {
+    snapshot: () => ({ version: 1, lenses: Object.fromEntries(Object.entries(accumulated).map(([lens, values]) => [lens, { accumulated: values, pending: null }])), evaluations: {} }),
+    setEvaluation: () => {},
+    updateAccumulated: (lens, { remove = [] }) => { for (const key of remove) delete accumulated[lens][key]; },
+    stageWindow: () => {}, confirmMutation: () => {}, commitLens: () => true,
+  };
+  await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    dueDecisions: { lenses: { quality: { due: true }, reliability: { due: false } } },
+  }, { fetchIssuesFn: async () => [{
+    id: "generated", stateName: "Dev", rootFingerprint: root, generation: 0,
+    occurrenceIds: ["known"], labelNames: ["factory:learning-generated"], comments: [],
+  }] });
+  assert.equal(accumulated.quality[root], undefined);
+  assert.ok(accumulated.reliability[root], "unprocessed reliability evidence must remain accumulated");
+});
+
+test("comment-only duplicate and generation-cap mutations fail closed when writes are no-ops", async () => {
+  const duplicate = { id: "duplicate", stateName: "Dev", rootFingerprint: "root-a", generation: 0, occurrenceIds: [], comments: [], labelNames: ["factory:learning-generated"] };
+  const duplicateStore = { stageWindow: () => {}, confirmMutation: () => assert.fail("unconfirmed duplicate must not confirm"), commitLens: () => assert.fail("unconfirmed duplicate must not commit") };
+  await assert.rejects(executeLearningMutations({
+    mutations: [{ mutationId: "audit", action: "audit-duplicate", issueId: duplicate.id, primaryIssueId: "primary", rootFingerprint: "root-a", generation: 0 }],
+    stateStore: duplicateStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }), fetchIssuesFn: async () => [duplicate], addCommentFn: async () => {},
+  }), /duplicate.*not confirmed/i);
+
+  const capped = { id: "done", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" } };
+  const capStore = { stageWindow: () => {}, confirmMutation: () => assert.fail("unconfirmed cap must not confirm"), commitLens: () => assert.fail("unconfirmed cap must not commit") };
+  await assert.rejects(executeLearningMutations({
+    mutations: [{ mutationId: "cap", action: "block-generation-cap", issueId: capped.id, rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }) }],
+    stateStore: capStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }),
+    fetchIssuesFn: async () => [capped], addCommentFn: async () => {},
+    setLabelsFn: async () => { capped.labelNames.push("blocked:needs-user"); },
+  }), /generation cap.*not confirmed/i);
+});
+
+test("comment-only duplicate and generation-cap mutations reconcile timeout-after-success", async () => {
+  const duplicateMarker = "[factory-learning duplicate root=root-a primary=primary]";
+  const duplicate = { id: "duplicate", stateName: "Dev", rootFingerprint: "root-a", generation: 0, occurrenceIds: [], comments: [], labelNames: ["factory:learning-generated"] };
+  const duplicateResult = await executeLearningMutations({ mutations: [{ mutationId: "audit", action: "audit-duplicate", issueId: duplicate.id, primaryIssueId: "primary", rootFingerprint: "root-a", generation: 0 }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }), fetchIssuesFn: async () => [duplicate],
+    addCommentFn: async () => { duplicate.comments.push({ body: duplicateMarker }); throw new Error("timeout"); },
+  });
+  assert.equal(duplicateResult.confirmed, 1);
+
+  const capped = { id: "done", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" } };
+  const capResult = await executeLearningMutations({ mutations: [{ mutationId: "cap", action: "block-generation-cap", issueId: capped.id, rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }) }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }), fetchIssuesFn: async () => [capped],
+    addCommentFn: async (_id, body) => {
+      capped.comments.push({ body });
+      for (const id of body.match(/Fresh occurrences:\s*([^\n]+)/)?.[1]?.split(",").map((item) => item.trim()) || []) capped.occurrenceIds.push(id);
+      throw new Error("timeout");
+    },
+    setLabelsFn: async () => { capped.labelNames.push("blocked:needs-user"); throw new Error("timeout"); },
+  });
+  assert.equal(capResult.confirmed, 1);
+});
+
+test("learning writer confirms recurrence links and reconciles timeout-after-success", async () => {
+  const finding = learningFindingForWatcher();
+  const mutation = {
+    mutationId: "create:root-a:1", action: "create", rootFingerprint: "root-a", generation: 1,
+    relatedIssueId: "done", finding,
+  };
+  let live = [];
+  let linked = false;
+  let relationWrites = 0;
+  const result = await executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => [],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async () => {
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 1, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated"] }];
+      return live[0];
+    },
+    relationExistsFn: async () => linked,
+    createRelationFn: async () => {
+      relationWrites += 1;
+      linked = true;
+      throw new Error("timeout");
+    },
+  });
+  assert.equal(result.confirmed, 1);
+  assert.equal(relationWrites, 1);
+});
+
+test("production learning cycle stages one WAL and globally caps creates across its qualified set", async () => {
+  const live = [];
+  const wal = [];
+  const confirmed = new Set();
+  const stateStore = {
+    stageWindow: (lens, value) => wal.push(["stage", lens, value.mutations.length]),
+    confirmMutation: (lens, mutationId) => { wal.push(["confirm", lens, mutationId]); confirmed.add(mutationId); },
+    commitLens: (lens) => { wal.push(["commit", lens]); return true; },
+  };
+  const findings = Array.from({ length: 8 }, (_, index) => learningFindingForWatcher({
+    rootFingerprint: `root-${index}`, occurrenceIds: [`e-${index}`], lenses: ["reliability"],
+  }));
+  const result = await executeLearningCycleWrites({
+    findings,
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } },
+    stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
+      const issue = { id: `issue-${live.length}`, identifier: `COD-${live.length}`, stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [`e-${marker[1].slice("root-".length)}`], labelNames: ["factory:learning-generated"] };
+      live.push(issue);
+      return issue;
+    },
+  });
+  assert.equal(result.confirmed, 6);
+  assert.equal(result.deferred.length, 2);
+  assert.deepEqual(wal.filter(([kind]) => kind === "stage").map((entry) => entry.slice(1)), [["reliability", 6]]);
+  assert.equal(confirmed.size, 6);
+  assert.deepEqual(wal.at(-1), ["commit", "reliability"]);
+});
+
+test("production learning cycle routes same-project findings to their exact source workspace", async () => {
+  const finding = learningFindingForWatcher({ sourceWorkspaces: ["/z-source"] });
+  const visited = [];
+  const result = await executeLearningCycleWrites({
+    findings: [finding],
+    registry: { learning: { maxNewCardsPerRun: 0 } },
+    workspaces: [
+      { sourceAnchorPath: "/a-source", apiKey: "a", config: { teamKey: "COD", projectId: finding.projectId } },
+      { sourceAnchorPath: "/z-source", apiKey: "z", config: { teamKey: "COD", projectId: finding.projectId } },
+    ],
+    stateStore: { stageWindow: () => {}, confirmMutation: () => {}, commitLens: () => true },
+  }, {
+    fetchIssuesFn: async (destination) => { visited.push(destination.sourceAnchorPath); return []; },
+  });
+  assert.deepEqual(visited, ["/a-source", "/z-source"], "evaluation discovery scans every registered learning workspace");
+  assert.deepEqual(result.plannedDestinations, ["/z-source"]);
+});
+
+test("generation cap appends fresh evidence and one blocker audit while preserving Done", async () => {
+  const issue = {
+    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3,
+    occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" },
+  };
+  const commentBodies = [];
+  const deps = {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }),
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      commentBodies.push(body);
+      issue.comments.push({ body });
+      for (const id of body.match(/Fresh occurrences:\s*([^\n]+)/)?.[1]?.split(",").map((item) => item.trim()) || []) issue.occurrenceIds.push(id);
+    },
+    setLabelsFn: async (_issueId, ids) => {
+      assert.deepEqual(new Set(ids), new Set(["prov", "blocked"]));
+      issue.labelIds["blocked:needs-user"] = "blocked";
+      issue.labelNames.push("blocked:needs-user");
+    },
+  };
+  const mutation = {
+    mutationId: "cap", action: "block-generation-cap", issueId: issue.id,
+    rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }),
+  };
+  await executeLearningMutations({ mutations: [mutation] }, deps);
+  assert.equal(issue.stateName, "Done");
+  assert.equal(commentBodies.filter((body) => body.includes("generation-cap")).length, 1);
+  assert.equal(commentBodies.filter((body) => body.includes("Fresh occurrences: e2")).length, 1);
+  const countAfterFirst = commentBodies.length;
+  await executeLearningMutations({ mutations: [mutation] }, deps);
+  assert.equal(commentBodies.length, countAfterFirst);
+});
+
+function learningFindingForWatcher(overrides = {}) {
+  return {
+    rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], occurrenceCount: 1,
+    occurrences: [{ id: "e1", occurredAt: "2026-07-08T00:00:00.000Z" }],
+    firstSeenAt: "2026-07-08T00:00:00.000Z", lastSeenAt: "2026-07-08T00:00:00.000Z",
+    confidence: "high", severity: "high", impact: "Repeated failures", actionable: true,
+    projectId: "project-1", repoEntry: "app", lenses: ["reliability"], coverage: { complete: true, gaps: [] },
+    rootCauseHypothesis: "A factory condition may recur.", desiredOutcome: "Reduce failures.",
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0 }, baseline: { value: 2, unit: "occurrences" },
+    evaluationWindow: { durationDays: 7 }, exclusions: ["Keep safety gates."], detectorId: "test", detectorVersion: "v1", ...overrides,
+  };
+}
 test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
   assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);
   assert.equal(parallelLimit({}), 2);
@@ -1558,6 +2564,11 @@ test("runDrainLoop: stops after a selected pass opts out of continued draining",
   });
   assert.equal(calls, 1);
   assert.equal(result.budgetExhausted, false);
+});
+test("automatic post-delivery learning waits when the delivery drain budget is exhausted", () => {
+  assert.equal(shouldStartPostDeliveryLearning({ budgetExhausted: true }), false);
+  assert.equal(shouldStartPostDeliveryLearning({ budgetExhausted: false }), true);
+  assert.equal(shouldStartPostDeliveryLearning(null), true);
 });
 test("sameRepoCardLimit: defaults, invalid values, and forced ship serial limit", () => {
   assert.deepEqual(DEFAULT_SAME_REPO_CARD_LIMITS, { spec: 4, dev: 4, qa: 1, ship: 1 });
@@ -1947,18 +2958,27 @@ test("SafeTaper reviewed fixture releases the exact seven waves without scheduli
 test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(SAME_REPO_PORT_BASE, 47000);
   assert.equal(cardWorktreePath("/ws/repo", { repos: ["repo"] }, "COD-6"), "/ws/repo/.worktrees/COD-6");
-  const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  const globalRunsDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-test-global-runs-"));
+  const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2, { globalRunsDir });
   assert.equal(paths.worktreePath, "/ws/repo/.worktrees/COD-6");
   assert.match(paths.logDir, /linear-board-sweeps\/repo\/dev\/COD-6$/);
   assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
-  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "run-id", 2);
+  assert.equal(paths.globalRunsDir, globalRunsDir);
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "run-id", 2, { globalRunsDir });
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
   assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-6");
+  assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
+  assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
+  assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
+  assert.match(pick.learningEventsPath, /learning-events-[a-f0-9]{16}\.jsonl$/);
+  assert.equal(pick.globalRunsDir, globalRunsDir);
+  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "later-run-id", 2, { globalRunsDir });
+  assert.notEqual(laterPick.learningEventsPath, pick.learningEventsPath);
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
@@ -1967,6 +2987,86 @@ test("card run paths/env are isolated per issue and slot", () => {
 test("card dispatch env omits owner token when the pick has none", () => {
   const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6" }, "run-id");
   assert.equal(Object.hasOwn(pick.childEnv, "AUTO_SWEEP_OWNER_TOKEN"), false);
+});
+
+test("run records embed structured events and mirror the exact record into the global daily index", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-index-"));
+  const logDir = path.join(anchorPath, "logs");
+  const globalRunsDir = path.join(anchorPath, "global-runs");
+  const learningEventsPath = path.join(logDir, "learning-events.jsonl");
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.writeFileSync(learningEventsPath, `${JSON.stringify({
+    version: 1,
+    eventId: "event-1",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    kind: "review",
+    category: "correctness",
+    summary: "Null case",
+    metrics: { projectId: "spoofed", repoEntry: "spoofed" },
+    identity: { cardRunId: "run-1", issueIdentifier: "COD-143", sweep: "dev", sourceAnchor: fs.realpathSync.native(anchorPath) },
+  })}\nmalformed\n`);
+  const child = new EventEmitter();
+  child.pid = 456;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-143",
+    cardRunId: "run-1",
+    sweep: "dev",
+    sourceAnchorPath: anchorPath,
+    config: { projectId: "project-1", repos: ["app"] },
+    repoRoute: { repoEntry: "app" },
+    logDir,
+    learningEventsPath,
+    globalRunsDir,
+    runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: () => child });
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
+
+  const localFile = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  const globalFile = fs.readdirSync(globalRunsDir).find((name) => name.endsWith(".jsonl"));
+  const localRecord = JSON.parse(fs.readFileSync(path.join(logDir, localFile), "utf8").trim());
+  const globalRecord = JSON.parse(fs.readFileSync(path.join(globalRunsDir, globalFile), "utf8").trim());
+  assert.deepEqual(globalRecord, localRecord);
+  assert.equal(localRecord.learningEvents.length, 1);
+  assert.equal(localRecord.learningEventCoverageGaps.length, 1);
+  assert.equal(localRecord.projectId, "project-1");
+  assert.equal(localRecord.repoEntry, "app");
+});
+
+test("global learning run indexes use the log retention window", () => {
+  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-retention-"));
+  const oldFile = path.join(runsDir, "20260601.jsonl");
+  const freshFile = path.join(runsDir, "20260710.jsonl");
+  const unrelated = path.join(runsDir, "README.txt");
+  fs.writeFileSync(oldFile, "{}\n");
+  fs.writeFileSync(freshFile, "{}\n");
+  fs.writeFileSync(unrelated, "keep");
+  const now = Date.parse("2026-07-10T12:00:00.000Z");
+  fs.utimesSync(oldFile, new Date(now - 20 * 86400000), new Date(now - 20 * 86400000));
+  fs.utimesSync(freshFile, new Date(now), new Date(now));
+  rotateLearningRunIndexes(runsDir, { nowMs: now });
+  assert.equal(fs.existsSync(oldFile), false);
+  assert.equal(fs.existsSync(freshFile), true);
+  assert.equal(fs.existsSync(unrelated), true);
+});
+
+test("unique per-run learning event files use the log retention window", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-event-retention-"));
+  const nested = path.join(stateDir, "repo", "dev", "COD-143");
+  fs.mkdirSync(nested, { recursive: true });
+  const oldFile = path.join(nested, "learning-events-deadbeefdeadbeef.jsonl");
+  const freshFile = path.join(nested, "learning-events-cafebabecafebabe.jsonl");
+  const runRecord = path.join(nested, "run-records-20260710.jsonl");
+  fs.writeFileSync(oldFile, "{}\n");
+  fs.writeFileSync(freshFile, "{}\n");
+  fs.writeFileSync(runRecord, "{}\n");
+  const now = Date.parse("2026-07-10T12:00:00.000Z");
+  fs.utimesSync(oldFile, new Date(now - 20 * 86400000), new Date(now - 20 * 86400000));
+  fs.utimesSync(freshFile, new Date(now), new Date(now));
+  rotateLearningEventFiles(stateDir, { nowMs: now });
+  assert.equal(fs.existsSync(oldFile), false);
+  assert.equal(fs.existsSync(freshFile), true);
+  assert.equal(fs.existsSync(runRecord), true);
 });
 test("kit root test expectation decodes spaces in file URLs", () => {
   const encodedTestUrl = new URL("file:///tmp/linear%20board/tests/linear-watch.test.mjs");
@@ -1982,6 +3082,21 @@ test("card dispatch env prefers the original source anchor for managed workspace
   }, "run-id");
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_ANCHOR, "/managed/repo");
+});
+test("card dispatch env canonicalizes the trusted source workspace identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-anchor-"));
+  const real = path.join(root, "real");
+  const alias = path.join(root, "alias");
+  fs.mkdirSync(real);
+  fs.symlinkSync(real, alias);
+  const pick = withCardDispatchEnv({
+    anchorPath: alias,
+    sourceAnchorPath: alias,
+    config: { repos: [alias] },
+    sweep: "dev",
+    issueIdentifier: "COD-143",
+  }, "run-id");
+  assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, fs.realpathSync.native(real));
 });
 test("card dispatch env uses the routed managed sibling for worktrees and exports both repo paths", () => {
   const repoRoute = {
@@ -2011,9 +3126,17 @@ test("card dispatch env uses the routed managed sibling for worktrees and export
 });
 test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
+  const globalRunsDir = path.join(anchorPath, "global-runs");
+  const productionRunsDir = path.join(os.homedir(), ".local", "state", "linear-board-sweeps", "runs");
+  const snapshotProductionIndex = () => Object.fromEntries((fs.existsSync(productionRunsDir) ? fs.readdirSync(productionRunsDir) : []).sort().map((name) => {
+    const stat = fs.statSync(path.join(productionRunsDir, name));
+    return [name, { size: stat.size, mtimeMs: stat.mtimeMs }];
+  }));
+  const productionBefore = snapshotProductionIndex();
   const [pick] = await expandDispatchBatch([{
     anchorPath,
     sourceAnchorPath: "/source/repo",
+    globalRunsDir,
     config: { repos: [anchorPath] },
     sweep: "ship",
     count: 1,
@@ -2038,8 +3161,11 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   assert.equal((await run).kind, "success");
   assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
   assert.equal(spawnedEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
+  assert.equal(pick.globalRunsDir, globalRunsDir);
   const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
+  assert.equal(fs.readdirSync(globalRunsDir).some((name) => name.endsWith(".jsonl")), true);
+  assert.deepEqual(snapshotProductionIndex(), productionBefore);
 });
 test("expandDispatchBatch: Ship route-label races fail before child expansion", async () => {
   const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
@@ -2280,6 +3406,7 @@ test("claimCardSlots: cleanup read/write failures remain truthful and never remo
   assert.equal(typeof watchModule.claimCardSlots, "function");
   let removalAttempts = 0;
   let owner;
+  const safetyEvidence = [];
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-89", sortOrder: 10, labelNames: [], comments: [] });
   await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
       parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
@@ -2294,8 +3421,11 @@ test("claimCardSlots: cleanup read/write failures remain truthful and never remo
         labelNames: ["dev:in-progress"],
         comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
       }),
+      onSafetyInvariant: (value) => safetyEvidence.push(value),
     }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /cleanup write unavailable/.test(error.message));
   assert.equal(removalAttempts, 1);
+  assert.equal(safetyEvidence.length, 1);
+  assert.equal(safetyEvidence[0].evidence.type, "proven-safety-invariant");
 });
 
 test("claimCardSlots: heartbeat creation failure surfaces an unprovable applied claim", async () => {
@@ -2350,6 +3480,55 @@ test("releaseOwnedDispatchClaim: dependency deferral removes only the matching o
   assert.equal(await watchModule.releaseOwnedDispatchClaim("key", {
     sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "other-owner",
   }, "dependency deferred", { fetchClaimCardFn: async () => fresh }), false);
+});
+test("releaseOwnedDispatchClaim: successful completion only releases a claim while the card remains in the completed sweep", async () => {
+  const edits = [];
+  const base = {
+    id: "issue-141",
+    identifier: "COD-141",
+    labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-141 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  const pick = { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" };
+
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child stopped in Dev", {
+    expectedStates: ["Dev"],
+    fetchClaimCardFn: async () => ({ ...base, stateName: "Dev" }),
+    applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
+    addCommentFn: async () => {},
+  }), true);
+  assert.deepEqual(edits, [{ remove: ["dev:in-progress"] }]);
+
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child advanced", {
+    expectedStates: ["Dev"],
+    fetchClaimCardFn: async () => ({ ...base, stateName: "QA" }),
+    applyLabelEditFn: async () => { throw new Error("advanced claims must be left to the child/holding-state cleanup"); },
+    addCommentFn: async () => {},
+  }), false);
+});
+test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
+  assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
+  const calls = [];
+  const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "success",
+    pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
+  }, "codex / gpt-5.6", {
+    releaseOwnedDispatchClaimFn: async (...args) => { calls.push(args); return true; },
+  });
+
+  assert.deepEqual(result, { attempted: true, released: true, reasonKind: "successful same-state completion" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "key");
+  assert.deepEqual(calls[0][1], { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" });
+  assert.match(calls[0][2], /successful child via codex \/ gpt-5\.6 exited/);
+  assert.deepEqual(calls[0][3], { expectedStates: ["Dev"] });
+
+  assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "exit",
+    pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
+  }, "codex", {
+    releaseOwnedDispatchClaimFn: async () => { throw new Error("ordinary child failures keep their claim for stale-run handling"); },
+  }), { attempted: false, released: false, reasonKind: null });
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
@@ -2550,7 +3729,7 @@ test("buildSameRepoRefillDispatches: refill stays on the completed card's primar
   assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-3"]);
   assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
 });
-test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship suppress refill", async () => {
+test("buildSameRepoRefillDispatches: budget, capacity, and failed child suppress refill", async () => {
   const base = {
     result: {
       success: true,
@@ -2583,12 +3762,6 @@ test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship su
     refillBudget: { remaining: 1 },
     result: { ...base.result, success: false },
   })).reason, "ineligible");
-  assert.equal((await buildSameRepoRefillDispatches({
-    ...base,
-    refillBudget: { remaining: 1 },
-    result: { ...base.result, pick: { ...base.result.pick, sweep: "ship" } },
-  })).reason, "ship");
-
   const full = createSameRepoActiveCounts();
   full.increment({ anchorPath: "/ws/repo", sweep: "dev", issueIdentifier: "COD-1" });
   assert.equal((await buildSameRepoRefillDispatches({
@@ -2602,6 +3775,59 @@ test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship su
       checkoutDispatchBlockers: () => [],
     },
   })).reason, "no-capacity");
+});
+test("buildSameRepoRefillDispatches: completed Ship immediately offers the next eligible card in its workspace", async () => {
+  const refillBudget = { remaining: 3 };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const config = {
+    teamKey: "SAF",
+    projectId: "project-safe",
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+  };
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "SAF-200",
+      pick: {
+        anchorPath: "/managed/safe",
+        sourceAnchorPath: "/source/safe",
+        sweep: "ship",
+        issueId: "issue-200",
+        issueIdentifier: "SAF-200",
+        config,
+        repoPairs,
+        repoRoute: repoPairs[0],
+      },
+    },
+    activeByAnchor: new Map([["/managed/safe", { apiKey: "lin", repoPairs }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget,
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    deferClaim: true,
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-safe"]),
+      checkoutDispatchBlockers: () => [],
+      fetchCards: async () => [
+        dependencyReadyCard({ id: "issue-200", identifier: "SAF-200", sortOrder: 100, updatedAt: minsAgo(1), labelNames: ["app:coach", "blocked:needs-user"], comments: [] }),
+        dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", sortOrder: 50, updatedAt: minsAgo(1), labelNames: ["app:guide"], comments: [] }),
+      ],
+      logFor: () => {},
+    },
+  });
+
+  assert.equal(result.reason, "triggered");
+  assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-207"]);
+  assert.equal(result.dispatches[0].workspace, "/source/safe");
+  assert.equal(result.dispatches[0].stage, "ship");
+  assert.equal(result.dispatches[0].trigger, "refill");
+  assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
+  assert.equal(refillBudget.remaining, 2);
 });
 test("buildSameRepoRefillDispatches: live board claims count against refill capacity", async () => {
   const activeSameRepo = createSameRepoActiveCounts();
@@ -3428,6 +4654,14 @@ test("orderUnblockCards: keeps pipeline states downstream-first and oldest-first
     "SPEC", "BACKLOG", "SIGNOFF-NEW", "DEV", "QA", "SIGNOFF-OLD", "SHIP", "UNKNOWN",
   ]);
 });
+test("unblock ordering includes only capped generated Done cards after normal states", () => {
+  const cards = [
+    { identifier: "DONE-GENERATED", state: "Done", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["factory:learning-generated", "blocked:needs-user"] },
+    { identifier: "DONE-PLAIN", state: "Done", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["blocked:needs-user"] },
+    { identifier: "SPEC", state: "Spec", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["blocked:needs-user"] },
+  ];
+  assert.deepEqual(orderUnblockCards(cards).map((card) => card.identifier), ["SPEC", "DONE-GENERATED"]);
+});
 test("blockingLabelsForIssue: detects only unblockable blocking labels", () => {
   assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]);
   const labels = ["Feature", "blocked:needs-user", "qa:passed", "qa:needs-changes", "sweep:manual-only"];
@@ -3745,6 +4979,46 @@ test("failureTodoDecisions: dirty-checkout Todos recover when the stable target 
   const decisions = failureTodoDecisions([], [todo], new Set(["dev"]), NOW, { recoveredTargets: new Set(["managed-anchor:/managed/app"]) });
   assert.equal(decisions[0].action, "close");
 });
+test("failure Todo recovery emits open-after-healthy only after a fresh read proves the exact healthy card remains Todo", async () => {
+  const event = failureEvent({ scope: "dev:dispatch", kind: "dirty-checkout", stableTarget: "managed-anchor:/managed/app" });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, {
+    scope: "dev:dispatch",
+    description: failureTodoBody(event, fingerprint),
+  });
+  const emitted = [];
+  let freshReads = 0;
+  await assert.rejects(reconcileFailureTodos("key", { teamKey: "COD", projectId: "project-1" }, "/managed/app", [], new Set(), [], {
+    recoveredTargets: new Set(["managed-anchor:/managed/app"]),
+    fetchFailureTodosFn: async () => [todo],
+    teamMetaFn: async () => ({ stateIds: { Done: "done" } }),
+    closeFailureTodoFn: async () => {},
+    fetchClaimCardFn: async () => {
+      freshReads += 1;
+      return { ...todo, stateName: "Todo", labelNames: [] };
+    },
+    onLauncherEvidence: (evidence) => emitted.push(evidence),
+  }), /remained Todo/);
+  assert.equal(freshReads, 1);
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.state, "open-after-healthy");
+  assert.equal(emitted[0].evidence.reason, "recovered-target:managed-anchor:/managed/app");
+});
+test("failure Todo recovery does not fabricate open-after-healthy for an unchecked scope", async () => {
+  const event = failureEvent({ scope: "dev:dispatch", stableTarget: null });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, { scope: "dev:dispatch", description: failureTodoBody(event, fingerprint) });
+  const emitted = [];
+  let freshReads = 0;
+  const decisions = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "project-1" }, "/managed/app", [], new Set(["qa:dispatch"]), [], {
+    fetchFailureTodosFn: async () => [todo],
+    fetchClaimCardFn: async () => { freshReads += 1; return { ...todo, stateName: "Todo" }; },
+    onLauncherEvidence: (evidence) => emitted.push(evidence),
+  });
+  assert.deepEqual(decisions, []);
+  assert.equal(freshReads, 0);
+  assert.deepEqual(emitted, []);
+});
 test("failureTodoDecisions: holding-state failures use the holding recovery scope", () => {
   const event = failureEvent({ scope: "holding", kind: "holding-state-fetch" });
   const fp = failureFingerprint(event);
@@ -3978,6 +5252,91 @@ test("doctor telemetry: malformed observations surface as a metrics gap without 
   assert.deepEqual(report.metricsUnavailable, ["observation schema is malformed"]);
   assert.match(formatDoctorReport(report), /metrics unavailable: observation schema is malformed/);
 });
+test("doctor learning diagnostics expose due lenses, WAL, evaluations, coverage, and synthesis independently", () => {
+  const now = "2026-07-10T12:00:00.000Z";
+  const state = {
+    version: 1,
+    lenses: {
+      reliability: { lastSuccessfulCapturedThrough: "2026-07-09T00:00:00.000Z", pending: null, error: "detector timeout" },
+      quality: { lastSuccessfulCapturedThrough: "2026-07-08T00:00:00.000Z", pending: { mutations: { a: {}, b: {} } } },
+      throughput: { lastSuccessfulCapturedThrough: "2026-07-01T00:00:00.000Z", pending: null },
+    },
+    evaluations: {
+      due: { status: "active", evaluateAfter: "2026-07-10T11:00:00.000Z" },
+      later: { status: "active", evaluateAfter: "2026-07-11T11:00:00.000Z" },
+      done: { status: "verified-improvement", evaluateAfter: "2026-07-01T00:00:00.000Z" },
+    },
+  };
+  const snapshot = {
+    capturedThrough: now,
+    events: [{ occurredAt: "2026-07-10T10:00:00.000Z", kind: "terminal", category: "failed" }],
+    observations: [],
+    runRecords: Array.from({ length: 20 }, (_, index) => ({ endedAt: `2026-07-10T10:${String(index).padStart(2, "0")}:00.000Z` })),
+    coverage: { complete: false, gaps: [{ source: "runs", reason: "one malformed line" }] },
+  };
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, learning: { enabled: true, runner: true } },
+    capacityState: { healthy: true, active: 1, max: 10, errors: [], entries: [{ stage: "learning", trigger: "learning-due" }] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: state,
+    learningSnapshot: snapshot,
+    learningWorkspaces: [{ learning: { enabled: true, lenses: { reliability: true, quality: true, throughput: true } } }],
+    learningSynthesisState: { runtime: "codex", available: false, reason: "runtime missing" },
+    now: Date.parse(now),
+  });
+
+  assert.equal(report.ok, true, "learning red must not flip ordinary doctor health");
+  assert.deepEqual({ enabled: report.learning.enabled, runner: report.learning.runner, active: report.learning.active, healthy: report.learning.healthy }, {
+    enabled: true, runner: true, active: true, healthy: false,
+  });
+  assert.deepEqual(report.learning.lenses.reliability, {
+    lastSuccess: "2026-07-09T00:00:00.000Z", due: true, reason: "cadence-and-evidence", sampleCount: 1, pending: 0, error: "detector timeout",
+  });
+  assert.equal(report.learning.lenses.quality.pending, 2);
+  assert.equal(report.learning.lenses.quality.due, true);
+  assert.equal(report.learning.lenses.throughput.sampleCount, 20);
+  assert.deepEqual(report.learning.evaluations, { active: 2, due: 1, dueRoots: ["due"] });
+  assert.deepEqual(report.learning.coverage.gaps, [{ source: "runs", reason: "one malformed line" }]);
+  assert.deepEqual(report.learning.synthesis, { runtime: "codex", available: false, reason: "runtime missing" });
+
+  const human = formatDoctorReport(report);
+  assert.match(human, /learning: enabled, runner, active, RED/);
+  assert.match(human, /reliability: due=yes last=2026-07-09T00:00:00.000Z samples=1 pending=0 error=detector timeout/);
+  assert.match(human, /quality: due=yes .*pending=2/);
+  assert.match(human, /evaluations: active=2 due=1/);
+  assert.match(human, /coverage gap: runs: one malformed line/);
+  assert.match(human, /synthesis: codex unavailable \(runtime missing\)/);
+});
+
+test("doctor learning diagnostics default disabled without affecting ordinary health", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [], entries: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: { version: 1, lenses: {}, evaluations: {} },
+    learningSnapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", events: [], observations: [], runRecords: [], coverage: { complete: true, gaps: [] } },
+    learningWorkspaces: [],
+    learningSynthesisState: { runtime: null, available: null, reason: "disabled" },
+  });
+  assert.equal(report.ok, true);
+  assert.equal(report.learning.enabled, false);
+  assert.equal(report.learning.healthy, true);
+  assert.equal(Object.values(report.learning.lenses).some((lens) => lens.due), false);
+  assert.match(formatDoctorReport(report), /learning: disabled, non-runner, idle, OK/);
+});
+
+test("doctor reports optional synthesis as not configured without making learning red", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, learning: { enabled: true, runner: true, runtime: null } },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [], entries: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: { version: 1, lenses: {}, evaluations: {} },
+    learningSnapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", events: [], observations: [], runRecords: [], coverage: { complete: true, gaps: [] } },
+    learningWorkspaces: [],
+  });
+  assert.deepEqual(report.learning.synthesis, { runtime: null, available: null, reason: "not-configured" });
+  assert.equal(report.learning.healthy, true);
+});
 test("doctor preserves exact dependency-cycle evidence after the tick completes", () => {
   const lastTick = {
     at: new Date(NOW).toISOString(),
@@ -4118,6 +5477,133 @@ test("checkoutDispatchBlockers: legacy source-anchor dispatch still blocks dirty
   assert.equal(blockers[0].kind, "dirty-checkout");
   assert.equal(blockers[0].stableTarget, "anchor:/anchor");
 });
+
+test("launcher evidence records are deterministically routed and durably appended", () => {
+  const input = {
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: [] },
+    sweep: "dev",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    evidence: { type: "stale-claim", key: "dev:dev:in-progress" },
+  };
+  const first = buildLauncherEvidenceRunRecord(input);
+  const second = buildLauncherEvidenceRunRecord(input);
+  assert.equal(first.cardRunId, second.cardRunId);
+  assert.equal(first.sourceWorkspace, "/source/app");
+  assert.equal(first.projectId, "project-1");
+  assert.equal(first.repoEntry, "app");
+  assert.equal(first.issueIdentifier, "COD-1");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-evidence-"));
+  appendLauncherEvidenceRun(input, { runsDir: dir });
+  const [persisted] = fs.readFileSync(path.join(dir, "20260710.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(persisted, first);
+
+  appendLauncherEvidenceRun({
+    ...input,
+    config: { ...input.config, repos: ["app", "worker"], repoRouting: { byLabel: { "app:main": "app", "app:worker": "worker" } } },
+    card: { ...input.card, identifier: "COD-2", labelNames: [] },
+  }, { runsDir: dir });
+  const indexed = readLearningRunIndex(dir, { capturedThrough: "2026-07-11T00:00:00.000Z" });
+  assert.ok(indexed.coverageGaps.some((gap) => /trusted identity and routing fields/.test(gap.reason)));
+});
+
+test("launcher reap evidence is emitted only after the Linear mutation is confirmed", async () => {
+  const base = {
+    apiKey: "key",
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: ["dev:in-progress"] },
+    decision: { action: "reap", releaseClaim: "dev:in-progress" },
+    sweep: "dev",
+  };
+  const emitted = [];
+  await assert.rejects(recordConfirmedReapEvidence(base, {
+    fetchClaimCardFn: async () => base.card,
+    appendEvidenceFn: (value) => emitted.push(value),
+  }), /still carries/);
+  assert.equal(emitted.length, 0);
+
+  await recordConfirmedReapEvidence(base, {
+    fetchClaimCardFn: async () => ({ ...base.card, labelNames: [] }),
+    appendEvidenceFn: (value) => emitted.push(value),
+  });
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.type, "stale-claim");
+});
+
+test("launcher poison-card evidence requires every orphaned claim to be absent", async () => {
+  const base = {
+    apiKey: "key",
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: ["qa:in-progress"] },
+    decision: { releaseClaims: ["qa:in-progress", "dev:in-progress"] },
+    sweep: "qa",
+  };
+  const emitted = [];
+  await assert.rejects(recordConfirmedOrphanEvidence(base, {
+    fetchClaimCardFn: async () => base.card,
+    appendEvidenceFn: (value) => emitted.push(value),
+  }), /still carries/);
+  assert.equal(emitted.length, 0);
+
+  await recordConfirmedOrphanEvidence(base, {
+    fetchClaimCardFn: async () => ({ ...base.card, labelNames: [] }),
+    appendEvidenceFn: (value) => emitted.push(value),
+  });
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.type, "machine-correctable-poison-card");
+});
+
+test("route-less failure Todo recovery uses the launcher's trusted anchor repo in routed workspaces", () => {
+  const sourceAnchorPath = "/source/app";
+  const config = {
+    projectId: "project-1",
+    repos: ["app", "worker"],
+    repoRouting: { byLabel: { "app:main": "app", "app:worker": "worker" } },
+  };
+  const repoPairs = [
+    { repoEntry: "app", sourceRepoPath: sourceAnchorPath, managedRepoPath: "/managed/app" },
+    { repoEntry: "worker", sourceRepoPath: "/source/worker", managedRepoPath: "/managed/worker" },
+  ];
+  const repoEntry = trustedLauncherSourceRepoEntry(sourceAnchorPath, config, repoPairs);
+  assert.equal(repoEntry, "app");
+  assert.equal(trustedLauncherSourceRepoEntry("/source/unknown", config, repoPairs), null);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "routed-recovery-evidence-"));
+  appendLauncherEvidenceRun({
+    sourceAnchorPath,
+    config,
+    repoPairs,
+    repoEntry,
+    card: { id: "todo-1", identifier: "COD-50", labelNames: [] },
+    sweep: "launcher",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    evidence: {
+      type: "recovery-transition",
+      state: "open-after-healthy",
+      key: "failure-fingerprint",
+      occurredAt: "2026-07-10T12:00:00.000Z",
+    },
+  }, { runsDir: dir });
+  const indexed = readLearningRunIndex(dir, { capturedThrough: "2026-07-11T00:00:00.000Z" });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-11T00:00:00.000Z",
+    runRecords: indexed.runRecords,
+    coverageGaps: indexed.coverageGaps,
+  });
+  assert.equal(snapshot.coverage.complete, true);
+  assert.equal(snapshot.observations.length, 1);
+  assert.equal(snapshot.observations[0].signal, "failure-recovery");
+  assert.equal(snapshot.observations[0].repoEntry, "app");
+  assert.equal(snapshot.observations[0].recoveryState, "open-after-healthy");
+});
+
 test("doctorReport: distinguishes source advisory dirtiness from managed blocking dirtiness", () => {
   const registry = normalizeRegistry({
     kitPath: "/kit",
@@ -4145,4 +5631,153 @@ test("doctorReport: distinguishes source advisory dirtiness from managed blockin
   assert.equal(report.anchors[0].managedBlockers[0].stableTarget, "managed-anchor:/managed/app/app");
   assert.match(formatDoctorReport(report), /source advisory dirty/);
   assert.match(formatDoctorReport(report), /dispatch: BLOCKED/);
+});
+
+function runIsolatedWatcherCli(args, { registry = null, prepare = null } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watcher-cli-"));
+  const preparedRegistry = prepare ? prepare(home) : registry;
+  if (preparedRegistry) {
+    const configDir = path.join(home, ".config", "linear-board-sweeps");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "registry.json"), `${JSON.stringify(preparedRegistry)}\n`);
+  }
+  const script = fileURLToPath(new URL("../scripts/linear-watch.mjs", import.meta.url));
+  const result = spawnProcessSync(process.execPath, [script, ...args], {
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  });
+  return { ...result, home };
+}
+
+function prepareCredentiallessLearningWorkspace(home) {
+  const anchor = path.join(home, "app");
+  fs.mkdirSync(path.join(anchor, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(anchor, ".claude", "linear-sweep.json"), JSON.stringify({
+    team: "Codex", teamKey: "COD", project: "Linear Sweep", projectId: "project-1",
+    repos: ["app"], learning: { enabled: true },
+  }));
+  return {
+    repos: [anchor], capacity: { maxActiveChildren: 10 },
+    learning: { enabled: true, runner: true, coreSourceAnchor: anchor, maxNewCardsPerRun: 6, runtime: null },
+  };
+}
+
+test("learning CLI status and dry-run operate without credentials in an isolated empty registry", () => {
+  const status = runIsolatedWatcherCli(["learning-status", "--json"]);
+  assert.equal(status.status, 0, status.stderr);
+  const report = JSON.parse(status.stdout);
+  assert.equal(report.enabled, false);
+  assert.deepEqual(report.workspaces, []);
+  assert.equal(report.coverage.complete, true);
+  assert.equal(report.due.due, false);
+
+  const dryRun = runIsolatedWatcherCli(["learning-run", "--dry-run"]);
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.equal(plan.mode, "dry-run");
+  assert.deepEqual(plan.mutations, []);
+  assert.deepEqual(plan.evaluations, []);
+});
+
+test("learning CLI reports registered workspace credential gaps without attempting Linear writes", () => {
+  const status = runIsolatedWatcherCli(["learning-status", "--json"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(status.status, 0, status.stderr);
+  const report = JSON.parse(status.stdout);
+  assert.equal(report.workspaces.length, 1);
+  assert.equal(report.workspaces[0].hasApiKey, false);
+  assert.equal(report.coverage.complete, false);
+  assert.ok(report.coverage.gaps.some((gap) => /LINEAR_API_KEY missing/.test(gap.reason)));
+
+  const dryRun = runIsolatedWatcherCli(["learning-run", "--dry-run"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.ok(plan.coverageGaps.some((gap) => /destination credential is missing/.test(gap.reason)));
+  assert.deepEqual(plan.mutations, []);
+});
+
+test("learning CLI refuses attended writes when this host is not the configured runner", () => {
+  const result = runIsolatedWatcherCli(["learning-run"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /learning runner is not enabled on this host/);
+});
+
+test("attended learning CLI uses the deterministic writer under the runner singleton", () => {
+  const registry = {
+    repos: [],
+    capacity: { maxActiveChildren: 10 },
+    learning: { enabled: true, runner: true, coreSourceAnchor: null, maxNewCardsPerRun: 6, runtime: null },
+  };
+  const result = runIsolatedWatcherCli(["learning-run"], { registry });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.mode, "deterministic");
+  assert.deepEqual(report.findings, []);
+  assert.equal(report.writes.mutations, 0);
+  assert.deepEqual(report.writes.plannedDestinations, []);
+  assert.equal(fs.existsSync(path.join(result.home, ".local", "state", "linear-board-sweeps", "capacity-ledger.json")), true);
+});
+
+test("learning synthesis subprocess accepts only known bounded annotations and cleans temporary evidence", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "learning-synthesis-"));
+  let spawnedPid = null;
+  const result = await dispatchLearningAsync({
+    findings: [{ rootFingerprint: "known-root", impact: "bounded" }],
+    runtimeConfig: { runtime: "codex" },
+    tempRoot,
+  }, {
+    resolveExecutableFn: () => "/fake/codex",
+    onSpawn: (pid) => { spawnedPid = pid; },
+    spawnFn: (_executable, args) => {
+      const child = new EventEmitter();
+      child.pid = 4321;
+      const outputPath = args.find((value) => String(value).endsWith("output.json"));
+      queueMicrotask(() => {
+        fs.writeFileSync(outputPath, JSON.stringify({ annotations: [
+          { rootFingerprint: "known-root", summary: "useful\u0000annotation" },
+          { rootFingerprint: "unknown-root", summary: "must be ignored" },
+        ] }));
+        child.emit("close", 0, null);
+      });
+      return child;
+    },
+  });
+  assert.equal(spawnedPid, 4321);
+  assert.deepEqual(result, {
+    mode: "synthesized",
+    available: true,
+    annotations: [{ rootFingerprint: "known-root", summary: "useful annotation" }],
+  });
+  assert.deepEqual(fs.readdirSync(tempRoot), []);
+});
+
+test("learning synthesis subprocess fails closed on spawn errors and still removes temporary files", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "learning-synthesis-failure-"));
+  const result = await dispatchLearningAsync({
+    findings: [{ rootFingerprint: "root" }],
+    runtimeConfig: { runtime: "codex" },
+    tempRoot,
+  }, {
+    resolveExecutableFn: () => "/fake/codex",
+    spawnFn: () => { throw new Error("spawn unavailable"); },
+  });
+  assert.equal(result.mode, "deterministic");
+  assert.equal(result.available, false);
+  assert.match(result.reason, /spawn unavailable/);
+  assert.deepEqual(fs.readdirSync(tempRoot), []);
+});
+
+test("scheduled dry-run traverses delivery and learning orchestration without mutating an empty registry", () => {
+  const result = runIsolatedWatcherCli(["tick", "--dry-run"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /no actionable work/);
+  assert.match(result.stderr, /\[dry-run\] learning due=false admitted=0 deferred=0/);
+  assert.equal(fs.existsSync(path.join(result.home, ".local", "state", "linear-board-sweeps", "last-tick")), false);
+});
+
+test("scheduled dry-run isolates a registered workspace with missing credentials and still previews learning", () => {
+  const result = runIsolatedWatcherCli(["tick", "--dry-run"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /FATAL no LINEAR_API_KEY/);
+  assert.match(result.stderr, /no actionable work/);
+  assert.match(result.stderr, /\[dry-run\] learning due=false admitted=0 deferred=0/);
 });

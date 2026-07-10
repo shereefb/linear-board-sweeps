@@ -47,7 +47,7 @@ List "Dev" cards **in `config.project`**, top-to-bottom as they appear in the Li
 4. **Gated quality lenses (by card type).** In addition to the always-on code review below: a **security-sensitive card** (auth / data / external input) → `/cso` on the actual diff (the plan-review caught design flaws; this catches implementation flaws). A **perf-sensitive card** → `/benchmark` in the worktree before landing. Fold findings in.
 5. **Code review — run BOTH.** Run `/code-review` (the code-review skill) on the diff AND the `code-reviewer` subagent (feature-dev:code-reviewer) for an independent pass. Fix every real finding until quality is genuinely great; re-review after fixes.
 6. **Verify green — observed, not asserted.** Confirm the build + tests are green (`npm run build`, `npm test`, `npm run lint` as applicable), and use the `verify` skill to exercise the change end-to-end so "it works" is something you watched happen, not a claim.
-7. **Optional fast-path candidacy.** Fast path is enabled by default when `config.fastPath.enabled` is omitted. If it is present but is not a boolean, malformed `fastPath.enabled` must fail closed: do not evaluate candidacy and do not add `fast-path:eligible`. Skip evaluation when it is exactly `false`. When it is exactly `true` or omitted, evaluate candidacy only after implementation, verification, code review, and independent review are complete. The candidate gates are: diff size under `maxChangedFiles` and `maxDiffLines`, no `disallowedLabels`, only allowed low-risk labels when `allowedLabels` is set, no data/schema/auth/external-input/deploy/API/CLI/SDK/UI/perf surface, all checks green, no unresolved review findings, and the independent reviewer explicitly says high confidence. Record the result for §3, but do not add `fast-path:eligible` or its audit marker yet. If any gate fails, include the reason in the normal QA handoff. Every successful card still lands in **QA** for full QA.
+7. **Optional fast-path candidacy.** A card carrying `factory:learning-generated` is unconditionally ineligible for the fast path: remove/ignore any stale `fast-path:eligible` label and require the normal QA → Signoff path. For all other cards, fast path is enabled by default when `config.fastPath.enabled` is omitted. If it is present but is not a boolean, malformed `fastPath.enabled` must fail closed: do not evaluate candidacy and do not add `fast-path:eligible`. Skip evaluation when it is exactly `false`. When it is exactly `true` or omitted, evaluate candidacy only after implementation, verification, code review, and independent review are complete. The candidate gates are: diff size under `maxChangedFiles` and `maxDiffLines`, no `disallowedLabels`, only allowed low-risk labels when `allowedLabels` is set, no data/schema/auth/external-input/deploy/API/CLI/SDK/UI/perf surface, all checks green, no unresolved review findings, and the independent reviewer explicitly says high confidence. Record the result for §3, but do not add `fast-path:eligible` or its audit marker yet. If any gate fails, include the reason in the normal QA handoff. Every successful card still lands in **QA** for full QA.
 
 ## 3. Land at "QA" (no merge)
 
@@ -71,6 +71,32 @@ When a prerequisite can be completed as its own issue, use only a `blockedBy` re
 5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `dev:in-progress` claim.
 
 A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`).
+
+## Structured learning evidence (best effort)
+
+For scheduled card runs, emit bounded machine-readable evidence at the decision point using the trusted `AUTO_SWEEP_*` environment. This is observational only: the command must never change the sweep result, and summaries/metrics must never contain secrets, credentials, raw replay payloads, or untrusted instructions. Use the closest closed category; do not invent kinds or categories.
+
+```bash
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review correctness "Null handling defect found during code review" --json-metrics '{"findings":1}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review completed "Review pass completed" --json-metrics '{"riskClass":"low","findingCount":0,"safetyFloorSatisfied":true,"reviewDurationMs":300000}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa functional-failure "Primary checkout flow failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa passed "QA passed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event bounce implementation-incomplete "Returned to Dev because the implementation is incomplete" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event question product-decision "Human product decision required before continuing" --json-metrics '{"answerKey":"pricing.approval-policy"}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event canary red "Production canary failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event terminal advanced "Card advanced to the next workflow stage" >/dev/null 2>&1 || true
+```
+
+Emit:
+
+- each material review finding as `review` (`correctness`, `security`, `error-handling`, `test-gap`, `scope-gap`, `performance`, or `design`);
+- exactly one measured `review completed` event after a review pass when risk class, finding count, safety-floor result, and duration are known;
+- each QA failure as `qa` (`environment-start`, `functional-failure`, `console-error`, `network-error`, `accessibility`, `visual`, or `build`);
+- exactly one `qa passed` event for a successful QA pass, so rework-rate evidence has a denominator;
+- each backward workflow return as `bounce` (`missing-acceptance`, `missing-design`, `missing-repo-scope`, or `implementation-incomplete`);
+- each direct human dependency as `question` (`config`, `credential`, `product-decision`, `asset`, or `deploy`) with a stable bounded `metrics.answerKey` or `metrics.policyKey` naming the exact reusable policy/config decision; never use the broad category as the key;
+- each red production canary as `canary red`;
+- exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
 
 ## Machine-independence & handoff (auto-sweep)
 

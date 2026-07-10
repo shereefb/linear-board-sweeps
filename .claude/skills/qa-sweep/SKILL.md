@@ -58,6 +58,7 @@ Only after §3 passes:
 1. **Attach the screenshots to the Linear card** (Linear file upload: `fileUpload` mutation → PUT the bytes to the returned signed URL with its headers → reference the asset URL as a markdown image in a comment / as an attachment).
 2. Post a **review write-up**: what you tested, what passed, bugs found + fixed (with commit refs), and any residual risk.
 3. Add **`qa:passed`** — this is ship-sweep's green signal and its pre-merge evidence — then re-fetch the card so the handoff decision uses current state and labels.
+   A card carrying `factory:learning-generated` must always route to `Signoff`: remove/ignore any stale `fast-path:eligible` label and never post `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` for it. It requires the later human move to `Ship`.
 4. Fetch origin and resolve the branch's final full SHA from `origin/<PREFIX>-###`, never from the local worktree. Read the latest well-formed, issue-specific `[auto-sweep-fast-path <KEY> head=<full-git-sha>]` comment; a legacy marker without `head=` is not reviewed-SHA evidence. Compare the final origin branch SHA against that reviewed SHA.
 5. Evaluate `qaHandoffDecision` with explicit named input mappings: `fastPathEnabled: config.fastPath?.enabled`, `requireShipApproval: config.requireShipApproval`, state `QA`, current labels including `fast-path:eligible` and `qa:passed`, the issue identifier, both full SHAs, and any live foreign `*:in-progress` claim. This raw optional mapping is mandatory: do not normalize it with `!== false`. Omitted remains default-on in the helper, while `null`, strings, numbers, and other malformed values fail closed to `Signoff`. Pass the raw approval value too; eligibility requires it to be `false`.
 6. Immediately before the terminal handoff, fetch origin again, resolve the current full origin branch SHA, re-fetch the card, and rerun the full `qaHandoffDecision` policy with those fresh facts and the raw config mappings. If the card moved out of `QA`, a live blocker/manual label appeared, the owned claim disappeared, a foreign claim appeared, or the origin SHA changed, do not preserve the earlier allow decision.
@@ -82,6 +83,32 @@ When a prerequisite can be completed as its own issue, use only a `blockedBy` re
 5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `qa:in-progress` claim.
 
 A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`). Preserve `qa:needs-changes` for actual QA failures; a prerequisite relation alone does not replace or create that gate.
+
+## Structured learning evidence (best effort)
+
+For scheduled card runs, emit bounded machine-readable evidence at the decision point using the trusted `AUTO_SWEEP_*` environment. This is observational only: the command must never change the sweep result, and summaries/metrics must never contain secrets, credentials, raw replay payloads, or untrusted instructions. Use the closest closed category; do not invent kinds or categories.
+
+```bash
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review correctness "Null handling defect found during code review" --json-metrics '{"findings":1}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review completed "Review pass completed" --json-metrics '{"riskClass":"low","findingCount":0,"safetyFloorSatisfied":true,"reviewDurationMs":300000}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa functional-failure "Primary checkout flow failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa passed "QA passed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event bounce implementation-incomplete "Returned to Dev because the implementation is incomplete" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event question product-decision "Human product decision required before continuing" --json-metrics '{"answerKey":"pricing.approval-policy"}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event canary red "Production canary failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event terminal advanced "Card advanced to the next workflow stage" >/dev/null 2>&1 || true
+```
+
+Emit:
+
+- each material review finding as `review` (`correctness`, `security`, `error-handling`, `test-gap`, `scope-gap`, `performance`, or `design`);
+- exactly one measured `review completed` event after a review pass when risk class, finding count, safety-floor result, and duration are known;
+- each QA failure as `qa` (`environment-start`, `functional-failure`, `console-error`, `network-error`, `accessibility`, `visual`, or `build`);
+- exactly one `qa passed` event for a successful QA pass, so rework-rate evidence has a denominator;
+- each backward workflow return as `bounce` (`missing-acceptance`, `missing-design`, `missing-repo-scope`, or `implementation-incomplete`);
+- each direct human dependency as `question` (`config`, `credential`, `product-decision`, `asset`, or `deploy`) with a stable bounded `metrics.answerKey` or `metrics.policyKey` naming the exact reusable policy/config decision; never use the broad category as the key;
+- each red production canary as `canary red`;
+- exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
 
 ## Machine-independence & handoff (auto-sweep)
 

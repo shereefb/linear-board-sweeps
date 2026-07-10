@@ -29,6 +29,20 @@ test("ship-sweep checks dependencies before its merge and deploy gates", () => {
   }
 });
 
+test("generated learning cards cannot fast-path and require qa:passed at Ship", () => {
+  for (const path of ["skills/dev-sweep/SKILL.md", ".claude/skills/dev-sweep/SKILL.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /factory:learning-generated[^\n]*unconditionally ineligible[^\n]*fast path/i, path);
+  }
+  for (const path of skillPaths) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /factory:learning-generated[^\n]*require `qa:passed`/i, path);
+    assert.match(body, /never accept `fast-path:eligible`/i, path);
+    assert.match(body, /factory:learning-generated[^\n]*auto-ship marker[^\n]*block/i, `${path}: generated auto-marker must block Ship`);
+    assert.match(body, /factory:learning-generated[^\n]*human[^\n]*Ship/i, `${path}: generated cards must require human Ship`);
+  }
+});
+
 test("SETUP unattended activation guidance points production caution at ship-sweep", () => {
   const body = fs.readFileSync("SETUP.md", "utf8");
   const caution = body.match(/\*\*Scheduling caution[^]*?(?=\n\n\*\*If this is NOT the always-on machine)/)?.[0] || "";

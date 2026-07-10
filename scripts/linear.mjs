@@ -98,6 +98,7 @@ export function qaHandoffDecision(input = {}) {
   if (facts.fastPathEnabled === false) return deny("fast-path-disabled");
   if (facts.requireShipApproval !== undefined && typeof facts.requireShipApproval !== "boolean") return deny("invalid-ship-approval");
   if (facts.requireShipApproval === true) return deny("ship-approval-required");
+  if (labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
   if (facts.stateName !== WORKFLOW_STATES.qa) return deny("not-in-qa");
   if (!labels.has("fast-path:eligible")) return deny("missing-fast-path-label");
   if (!labels.has("qa:passed")) return deny("missing-qa-pass");
@@ -139,6 +140,7 @@ export const REQUIRED_LABELS = [
   { name: "blocked:open-questions", color: "#eb5757" },
   { name: "blocked:needs-user", color: "#eb5757" },
   { name: "sweep:manual-only", color: "#95a2b3" },
+  { name: "factory:learning-generated", color: "#5e6ad2" },
 ];
 
 // Compute a board position that slots a new state directly after `afterName`:
@@ -220,6 +222,9 @@ export function guardedTerminalMoveDecision(input = {}) {
   if (facts.stateName !== facts.expectedState) return deny("source-state-changed");
   if (!labels.has(facts.ownedClaim)) return deny("owned-claim-missing");
   if ([...TERMINAL_MOVE_BLOCKING_LABELS].some((label) => labels.has(label))) return deny("blocking-label");
+  if (facts.expectedState === WORKFLOW_STATES.qa
+    && facts.destinationState === WORKFLOW_STATES.ship
+    && labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
   if ([...labels].some((label) => label.endsWith(":in-progress") && label !== facts.ownedClaim)) return deny("foreign-claim");
   if (typeof facts.ownerToken !== "string" || !facts.ownerToken) return deny("missing-owner-token");
   if (facts.heartbeatMalformed === true) return deny("malformed-heartbeat");
@@ -537,6 +542,7 @@ export async function moveCardBottomIfCurrent(
   const decision = guardedTerminalMoveDecision({
     stateName: finalIssue.state.name,
     expectedState,
+    destinationState,
     labelNames: labels.map((label) => label.name),
     ownedClaim,
     ownerToken,

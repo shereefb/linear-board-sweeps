@@ -103,3 +103,22 @@ test("fast-path config comments describe automatic unchanged-SHA routing", () =>
     assert.match(config.$comment_fastPath, /full[^.]*SHA/i, `${path}: missing full-SHA binding`);
   }
 });
+
+test("Factory Learning cards never use the automatic QA-to-Ship marker path", () => {
+  for (const path of [".claude/skills/qa-sweep/SKILL.md", "skills/qa-sweep/SKILL.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /factory:learning-generated[^\n]*Signoff/i, `${path}: generated cards must route to Signoff`);
+    assert.match(body, /factory:learning-generated[^\n]*never[^\n]*\[auto-sweep-auto-ship/i, `${path}: generated cards must never post the auto-ship marker`);
+  }
+  for (const path of configPaths) {
+    const config = JSON.parse(fs.readFileSync(path, "utf8"));
+    assert.match(config.$comment_fastPath, /factory:learning-generated[^.]*never[^.]*auto-ship marker/i, `${path}: generated-card marker exclusion missing`);
+  }
+});
+
+test("operator docs preserve the Factory Learning human Ship gate", () => {
+  for (const path of operatorDocs) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /factory:learning-generated[^\n]*(?:never auto-ships|never uses the auto-ship marker)[^\n]*human[^\n]*Ship/i, `${path}: generated-card human Ship contract missing`);
+  }
+});

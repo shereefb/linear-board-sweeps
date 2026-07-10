@@ -38,6 +38,7 @@ test("QA handoff sends an eligible fast path to Ship", () => {
 const QA_HANDOFF_DENIALS = [
   [{ fastPathEnabled: false }, "fast-path-disabled"],
   [{ requireShipApproval: true }, "ship-approval-required"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "qa:in-progress", "factory:learning-generated"] }, "factory-learning-requires-signoff"],
   [{ stateName: "Signoff" }, "not-in-qa"],
   [{ labelNames: ["qa:passed"] }, "missing-fast-path-label"],
   [{ labelNames: ["fast-path:eligible"] }, "missing-qa-pass"],
@@ -131,6 +132,7 @@ test("QA handoff does not mutate the input or labels", () => {
 const GUARDED_MOVE_BASE = Object.freeze({
   stateName: "QA",
   expectedState: "QA",
+  destinationState: "Ship",
   labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress"],
   ownedClaim: "qa:in-progress",
   ownerToken: "owner-142",
@@ -153,11 +155,20 @@ for (const [override, reason] of [
   [{ heartbeatOwner: null }, "missing-owner-heartbeat"],
   [{ heartbeatOwner: "newer-owner" }, "owner-mismatch"],
   [{ heartbeatOwner: null, heartbeatMalformed: true }, "malformed-heartbeat"],
+  [{ labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress", "factory:learning-generated"] }, "factory-learning-requires-signoff"],
 ]) {
   test(`guarded terminal move denies ${reason}`, () => {
     assert.deepEqual(guardedTerminalMoveDecision({ ...GUARDED_MOVE_BASE, ...override }), { eligible: false, reason });
   });
 }
+
+test("guarded terminal move allows a generated learning card to move from QA to Signoff", () => {
+  assert.deepEqual(guardedTerminalMoveDecision({
+    ...GUARDED_MOVE_BASE,
+    destinationState: "Signoff",
+    labelNames: [...GUARDED_MOVE_BASE.labelNames, "factory:learning-generated"],
+  }), { eligible: true, reason: "ready" });
+});
 
 test("latestClaimHeartbeat selects the newest exact-claim owner", () => {
   assert.deepEqual(latestClaimHeartbeat([
@@ -254,6 +265,9 @@ for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["d
   });
 }
 
+test("required setup taxonomy includes the exact learning provenance label", () => {
+  assert.equal(REQUIRED_LABELS.filter((label) => label.name === "factory:learning-generated").length, 1);
+});
 test("dependency eligibility releases only exact Done blockers", () => {
   assert.equal(WORKFLOW_STATES.done, "Done");
   const connection = {

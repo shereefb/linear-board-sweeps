@@ -29,7 +29,7 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
   },
-  "$comment_parallel": "Optional repo-local demand limits beneath the host ceiling. maxNonShipDispatches defaults to 2, counts selected non-Ship workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. Ship is one child per source workspace and may coexist with every stage. sameRepoCardLimits defaults to spec/dev=4, qa=1 and counts active child slots inside each selected non-Ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps same-repo child slots backfilled after successful child completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; Ship is never handoff-triggered.",
+  "$comment_parallel": "Optional repo-local demand limits beneath the host ceiling. maxNonShipDispatches defaults to 2, counts selected non-Ship workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. Ship is one child per source workspace, may coexist with every stage, and refills its workspace slot after completion without bypassing the human Ship gate. sameRepoCardLimits defaults to spec/dev=4, qa=1 and counts active child slots inside each selected non-Ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps child slots backfilled after successful completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; Ship is never handoff-triggered.",
   "$comment_host_capacity": "The launcher registry, not this repo-local file, owns host-wide capacity.maxActiveChildren (default 10, clamp 1..32). It caps initial, refill, and handoff top-level scheduled children across all registered anchors and launcher restarts. Reviewer subagents inside a scheduled child are not counted; parallel settings below only shape demand beneath that ceiling.",
   "parallel": {
     "maxNonShipDispatches": 2,
@@ -43,6 +43,15 @@
       "ship": 1
     }
   },
+  "$comment_learning": "Factory Learning is disabled by default per workspace. When enabled, the single registry-pinned learning runner observes this workspace even if delivery auto-sweeps are paused. Reliability, quality/rework, and throughput/cost lenses use bounded structured evidence; medium/high findings create or update factory:learning-generated cards at the bottom of Spec. Generated cards always require QA -> Signoff and a human move to Ship and never use the auto-ship marker.",
+  "learning": {
+    "enabled": false,
+    "lenses": {
+      "reliability": { "enabled": true },
+      "quality": { "enabled": true },
+      "throughput": { "enabled": true }
+    }
+  },
   "$comment_reviewLenses": "Optional. Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens (design at spec+qa, devex at spec, security at spec+dev+ship, perf at dev/qa, research at spec). Omit the whole block to run only the always-on lenses (eng-review, code-review, /qa). setup-team creates these labels; sweeps auto-apply them to unlabelled cards (generate-if-missing).",
   "reviewLenses": {
     "ui":       { "labels": ["frontend", "design", "ui"] },
@@ -53,7 +62,7 @@
   },
   "$comment_requireShipApproval": "Optional (default false). When true, qa-sweep always preserves Signoff and ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge — a second deliberate act that hardens against an accidental bulk-drag. (The single-runner ship pin lives in the launcher registry: `node scripts/linear-watch.mjs ship-runner on`.)",
   "requireShipApproval": false,
-  "$comment_fastPath": "Enabled by default. Dev-sweep may mark a tiny, high-confidence, low-risk change only after its pushed full origin SHA matches the reviewed final commit. Commit-bound QA-to-Ship automatic routing occurs after full QA only when that SHA is unchanged and requireShipApproval is false. Normal denials, enabled false, and requireShipApproval true preserve Signoff. qa-sweep never merges or deploys, no immediate QA-to-Ship launcher handoff is added, and ship-sweep remains single-runner.",
+  "$comment_fastPath": "Enabled by default. Dev-sweep may mark a tiny, high-confidence, low-risk change only after its pushed full origin SHA matches the reviewed final commit. Commit-bound QA-to-Ship automatic routing occurs after full QA only when that SHA is unchanged and requireShipApproval is false. factory:learning-generated cards never use the auto-ship marker and always preserve Signoff for the human Ship move. Normal denials, enabled false, and requireShipApproval true preserve Signoff. qa-sweep never merges or deploys, no immediate QA-to-Ship launcher handoff is added, and ship-sweep remains single-runner.",
   "fastPath": {
     "enabled": true,
     "maxChangedFiles": 2,

@@ -1,5 +1,11 @@
 # SETUP — bootstrap the board-sweeps workflow into a repo
 
+## Factory Learning Loop
+
+Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and never receives repository write tools or secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
+
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. A `factory:learning-generated` card never auto-ships or uses the auto-ship marker and always requires the human move to Ship. After Done, a fixed evaluation window records the measurable outcome; only no-change/regression with fresh qualifying evidence can recur. Generation three is the cap, after which `blocked:needs-user` routes the Done card to manual review.
+
 **You are an AI coding agent (Claude Code or Codex).** The user pointed you at this kit to install the spec → dev → qa Linear board-sweep workflow into their **target repo**. Follow these steps in order. `KIT` = this repo's path; `TARGET` = the repo you're setting up (usually the current working directory).
 
 Do the work; don't just describe it. Prompt the user only for the inputs in Step 1.
@@ -175,8 +181,8 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. The default scheduled sweeps use Codex so unattended launchd ticks do not depend on a separate Claude login; only switch a scheduled sweep to Claude after confirming that `claude` is installed, logged in, and usable non-interactively. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage.
    Executable preflight then resolves the matching `CODEX_BIN` or `CLAUDE_BIN` override, `PATH`, the ChatGPT.app bundled Codex, the legacy Codex.app bundle, and otherwise must fail before claim. The last two fallbacks apply to Codex; a configured Claude runtime needs its override or `PATH` entry.
-   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across workspace/stage candidates. Distinct Spec, Dev, and QA candidates from one registered workspace may run together; resolved repository overlap is rejected only across different registered workspaces. Ship is highest priority but does not consume this budget or suppress other stages; at most one Ship child runs per registered source workspace. `parallel.sameRepoCardLimits` controls active per-card slots inside each selected non-ship workspace/stage candidate; defaults are spec/dev `4`, QA `1`, and Ship forced to one card per workspace. `parallel.maxSameRepoRefillDispatches` defaults to `8` and is clamped to `0..20`; it caps mid-batch same-repo backfills after successful child completion, and `0` disables refill. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches`, `maxSameRepoRefillDispatches`, or `maxDrainPasses` to `1` for stricter bounded mode on smaller machines.
-   `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick spends at most `parallel.maxNonShipDispatches` handoff dispatch slots, while same-repo refill has its own `parallel.maxSameRepoRefillDispatches` budget. QA can select `Signoff` or `Ship` after testing, but no immediate QA-to-Ship launcher handoff is added; ship is never handoff-triggered.
+   The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across workspace/stage candidates. Distinct Spec, Dev, and QA candidates from one registered workspace may run together; resolved repository overlap is rejected only across different registered workspaces. Ship is highest priority but does not consume this budget or suppress other stages; at most one Ship child runs per registered source workspace. `parallel.sameRepoCardLimits` controls active per-card slots inside each selected non-ship workspace/stage candidate; defaults are spec/dev `4`, QA `1`, and Ship forced to one card per workspace. `parallel.maxSameRepoRefillDispatches` defaults to `8` and is clamped to `0..20`; it caps mid-batch completion backfills, including same-primary-repo Spec/Dev/QA refill and workspace-scoped Ship refill across routed repos, and `0` disables refill. A completed Ship child can therefore admit the next eligible Ship card from its source workspace without waiting for unrelated children, whether that card arrived through human approval or valid commit-bound QA auto-promotion, while the admission queue preserves the one-Ship-per-workspace limit. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches`, `maxSameRepoRefillDispatches`, or `maxDrainPasses` to `1` for stricter bounded mode on smaller machines.
+   `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick spends at most `parallel.maxNonShipDispatches` handoff dispatch slots, while completion refill has its own `parallel.maxSameRepoRefillDispatches` budget. QA can select `Signoff` or `Ship` after testing, but no immediate QA-to-Ship launcher handoff is added; Ship is never handoff-triggered.
    Launcher-registry `capacity.maxActiveChildren` defaults to exactly `10` and clamps to `1..32`. This host-wide ceiling covers initial, refill, and handoff top-level scheduled children across all registered anchors and surviving ledger entries after a launcher restart; the repo-local `parallel.*` values above create demand beneath it. It does not count reviewer subagents spawned inside those children. The installer adds the default to legacy registries while preserving their other fields.
    `fastPath.enabled` defaults true so dev-sweep can bind tiny, high-confidence eligibility to the reviewed full origin SHA. Commit-bound QA-to-Ship automatic routing occurs only after full QA when the final origin SHA is unchanged; all other passing cards follow `QA` → `Signoff` → human approval → `Ship`. `fastPath.enabled: false` or `requireShipApproval: true` always preserves `Signoff`. `qa-sweep` never merges or deploys, and ship-sweep remains the single-runner production path.
 
@@ -191,6 +197,22 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    Source checkout dirtiness is advisory after this point; scheduled dispatch runs from managed clones populated from origin. Unpushed local commits are not visible to unattended sweeps.
 
+   **Optional Factory Learning.** Leave the template's repo-local `learning.enabled: false` for the default disabled behavior. To opt this workspace in, set it to `true` and choose any of the three lens `enabled` flags. Observation does not depend on the project's delivery `auto-sweep` label. Re-run `node "KIT/scripts/linear.mjs" setup-team "<Team>"` after upgrading so `factory:learning-generated` exists.
+
+   On exactly one learning host, edit `~/.config/linear-board-sweeps/registry.json` and merge this machine-local block; use the canonical path of a registered source anchor and never commit this registry:
+
+   ```json
+   "learning": {
+     "enabled": true,
+     "runner": true,
+     "coreSourceAnchor": "/canonical/registered/core-anchor",
+     "maxNewCardsPerRun": 6,
+     "runtime": null
+   }
+   ```
+
+   Keep `runner: false` on every other host. The core anchor receives findings whose ownership spans workspaces; proven local findings stay in their workspace. If the core workspace uses `repoRouting`, its anchor repo must be the target of exactly one `repoRouting.byLabel` label; without routing, the anchor must be the default first `repos` entry. Missing or ambiguous core ownership fails closed. Deterministic code owns confidence, routing, admission, mutation, and outcomes. Optional model synthesis runs in an isolated temporary directory with an allowlisted environment and cannot access Linear credentials or mutate repositories.
+
 4. **Activate the project** (adds the `auto-sweep` label via the API; creates the label if it doesn't exist yet):
    ```bash
    node "KIT/scripts/linear-watch.mjs" activate "ANCHOR"
@@ -202,7 +224,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" doctor
    node "KIT/scripts/linear-watch.mjs" doctor --json
    ```
-   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Optional macOS memory-pressure percentage is shown separately from free bytes. It exits non-zero for unhealthy capacity/runtime/tick or dirty managed state.
+   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Its learning block reports per-lens last success/due/sample/pending/error state, coverage gaps, active/due evaluations, and synthesis availability. A learning error is isolated from ordinary sweep health. Optional macOS memory-pressure percentage is shown separately from free bytes.
 
 6. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
    ```bash
@@ -210,6 +232,15 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
    Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch. With `parallel.sameRepoCardLimits`, dry-run also logs the exact card slots it would claim and dispatch without writing claim labels. `parallel.maxSameRepoRefillDispatches` is visible in live `refill-trigger` / `refill-skip` logs after a child completes; dry-run cannot simulate that mid-batch completion. With `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
+
+   If Factory Learning is enabled, validate it separately:
+
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" learning-status --json
+   node "KIT/scripts/linear-watch.mjs" learning-run --dry-run
+   ```
+
+   Both are read-only; the dry-run prints deterministic proposed creates, updates, and due evaluations with no Linear writes or cursor movement. A live attended `learning-run` requires this host's `learning.runner: true`. Generated cards land at the bottom of Spec without `sweep:manual-only`, must pass real QA and Signoff, and still require a human move to Ship. Disable repo-local `learning.enabled`, or set registry `learning.enabled`/`runner` false, as the kill switch.
 
 7. **Activate the schedule** (10-min timer) and confirm health:
    ```bash
