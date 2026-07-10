@@ -211,7 +211,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    }
    ```
 
-   Keep `runner: false` on every other host. The core anchor receives findings whose ownership spans workspaces; proven local findings stay in their workspace. Deterministic code owns confidence, routing, admission, mutation, and outcomes. Optional model synthesis runs in an isolated temporary directory with an allowlisted environment and cannot access Linear credentials or mutate repositories.
+   Keep `runner: false` on every other host. The core anchor receives findings whose ownership spans workspaces; proven local findings stay in their workspace. If the core workspace uses `repoRouting`, its anchor repo must be the target of exactly one `repoRouting.byLabel` label; without routing, the anchor must be the default first `repos` entry. Missing or ambiguous core ownership fails closed. Deterministic code owns confidence, routing, admission, mutation, and outcomes. Optional model synthesis runs in an isolated temporary directory with an allowlisted environment and cannot access Linear credentials or mutate repositories.
 
 4. **Activate the project** (adds the `auto-sweep` label via the API; creates the label if it doesn't exist yet):
    ```bash
