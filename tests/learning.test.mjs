@@ -828,6 +828,25 @@ test("queue delay requires adjacent windows and review overprocessing requires a
   assert.equal(runLearningDetectors(detectorSnapshot(noBaseline), { ...detectorConfig, enabledDetectors: ["review-overprocessing"] }).length, 0);
 });
 
+test("semantic root fingerprints remain stable as compatible occurrences accumulate", () => {
+  const first = repeat("review-finding", 3, (i) => ({ category: "correctness", fingerprint: `detail-${i}`, rootCauseKey: `detail-${i}` }));
+  const next = [...first, detectorObservation("review-finding", 4, { category: "correctness", fingerprint: "detail-4", rootCauseKey: "detail-4" })];
+  const config = { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] };
+  assert.equal(runLearningDetectors(detectorSnapshot(first), config)[0].rootFingerprint, runLearningDetectors(detectorSnapshot(next), config)[0].rootFingerprint);
+});
+
+test("human questions share an answer key and duration regressions stay stage-specific", () => {
+  const questions = repeat("human-question", 3, (i) => ({ category: "config", answerKey: `answer-${i}` }));
+  const durations = repeat("stage-run", 20, (i) => ({ stage: i < 10 ? "dev" : "qa", riskClass: "medium", metrics: { durationMs: 200, baselineP90Ms: 100 } }));
+  assert.equal(runLearningDetectors(detectorSnapshot(questions), { ...detectorConfig, enabledDetectors: ["recurring-human-question"] }).length, 0);
+  assert.equal(runLearningDetectors(detectorSnapshot(durations), { ...detectorConfig, enabledDetectors: ["stage-duration-regression"] }).length, 0);
+});
+
+test("queue windows recognize ISO-week adjacency across year boundaries", () => {
+  const observations = repeat("queue-run", 20, (i) => ({ window: i < 10 ? "2025-W52" : "2026-W01", metrics: { waitMs: 200, baselineP90Ms: 100 } }));
+  assert.equal(runLearningDetectors(detectorSnapshot(observations), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 1);
+});
+
 test("learning due decisions enforce cadence, sample floors, pending resumes, and evaluation deadlines", () => {
   const state = emptyLearningState();
   state.lenses.reliability.lastSuccessfulCapturedThrough = "2026-07-09T12:00:00.000Z";

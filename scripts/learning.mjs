@@ -228,6 +228,8 @@ function normalizeSnapshotObservation(observation) {
     ["subsystem", sanitizeLearningText(observation.subsystem, 100)],
     ["category", sanitizeLearningText(observation.category, 100)],
     ["relatedKey", sanitizeLearningText(observation.relatedKey, 300)],
+    ["answerKey", sanitizeLearningText(observation.answerKey, 300)],
+    ["policyKey", sanitizeLearningText(observation.policyKey, 300)],
     ["window", sanitizeLearningText(observation.window, 100)],
     ["riskClass", sanitizeLearningText(observation.riskClass, 100)],
     ["recoveryState", sanitizeLearningText(observation.recoveryState, 100)],
@@ -559,13 +561,20 @@ function detectorQualifies(id, observations, config = {}) {
 function consecutiveWindows(left, right) {
   const parse = (value) => {
     const week = String(value).match(/^(\d{4})-W(\d{1,2})$/i);
-    if (week) return Number(week[1]) * 53 + Number(week[2]);
+    if (week) {
+      const year = Number(week[1]);
+      const number = Number(week[2]);
+      const jan4 = new Date(Date.UTC(year, 0, 4));
+      const jan4Day = jan4.getUTCDay() || 7;
+      return jan4.getTime() - (jan4Day - 1) * 86400000 + (number - 1) * 7 * 86400000;
+    }
     const trailing = String(value).match(/(\d+)$/);
     return trailing ? Number(trailing[1]) : null;
   };
   const a = parse(left);
   const b = parse(right);
-  return a !== null && b !== null && b - a === 1;
+  const iso = /^\d{4}-W\d{1,2}$/i.test(String(left)) && /^\d{4}-W\d{1,2}$/i.test(String(right));
+  return a !== null && b !== null && b - a === (iso ? 7 * 86400000 : 1);
 }
 
 function percentile(values, quantile) {
@@ -592,7 +601,7 @@ export const LEARNING_DETECTORS = Object.freeze(detectorDefinitions.map(([id, le
   minimumSample,
   distinctBy,
   qualify: (observations, config) => detectorQualifies(id, observations, config),
-  fingerprintParts: (observations) => [...new Set(observations.map((item) => item.rootCauseKey || item.fingerprint || item.category || item.relatedKey || signal))].sort(),
+  fingerprintParts: (observations) => [detectorSemanticKey(id, observations[0] || {}, signal)],
   metric: Object.freeze({ name: lens === "throughput" ? "p90" : "occurrenceCount", direction: "decrease" }),
   evaluationWindow: Object.freeze({ durationDays: lens === "reliability" ? 7 : 14 }),
 })));
@@ -625,13 +634,19 @@ function detectorWindowDays(detectorId) {
 }
 
 function detectorClusterKey(detector, item) {
-  if (detector.id === "stale-claim-pattern") return [item.stage, item.subsystem].join("|");
-  if (["repeated-review-finding", "spec-quality-failure", "recurring-human-question"].includes(detector.id)) return item.category || "unknown-category";
-  if (detector.id === "red-canary-pattern") return item.relatedKey || item.rootCauseKey || item.fingerprint || "unrelated";
-  if (detector.id === "qa-rework-regression") return [item.sourceWorkspace, item.repoEntry, item.stage].join("|");
-  if (detector.id === "stage-duration-regression" || detector.id === "review-overprocessing") return item.riskClass || "unknown-risk";
-  if (["queue-delay-regression", "nonproductive-run", "capacity-saturation"].includes(detector.id)) return [item.sourceWorkspace, item.stage].join("|");
-  return item.fingerprint || item.rootCauseKey || item.reason || detector.signal;
+  return detectorSemanticKey(detector.id, item, detector.signal);
+}
+
+function detectorSemanticKey(detectorId, item, signal = "unknown") {
+  if (detectorId === "stale-claim-pattern") return [item.stage, item.subsystem].join("|");
+  if (["repeated-review-finding", "spec-quality-failure"].includes(detectorId)) return item.category || "unknown-category";
+  if (detectorId === "recurring-human-question") return [item.category, item.answerKey || item.policyKey || item.relatedKey || item.rootCauseKey || item.fingerprint].join("|");
+  if (detectorId === "red-canary-pattern") return item.relatedKey || item.rootCauseKey || item.fingerprint || "unrelated";
+  if (detectorId === "qa-rework-regression") return [item.sourceWorkspace, item.repoEntry, item.stage].join("|");
+  if (detectorId === "stage-duration-regression") return [item.stage, item.riskClass || "unknown-risk"].join("|");
+  if (detectorId === "review-overprocessing") return item.riskClass || "unknown-risk";
+  if (["queue-delay-regression", "nonproductive-run", "capacity-saturation"].includes(detectorId)) return [item.sourceWorkspace, item.stage].join("|");
+  return item.fingerprint || item.rootCauseKey || item.reason || signal;
 }
 
 function detectorFinding(detector, observations, snapshot, config) {
