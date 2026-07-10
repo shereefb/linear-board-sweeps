@@ -2902,6 +2902,7 @@ function buildLearningEvaluation(issue) {
     detectorId: metadata.acceptanceMetric.detectorId || null,
     signal: metadata.acceptanceMetric.signal || null,
     semanticKey: metadata.acceptanceMetric.semanticKey || null,
+    ownership: metadata.acceptanceMetric.ownership || null,
     baseline,
     expectedDirection,
     minimumChange: Number.isFinite(target) ? Math.abs(target - baseline) : 0,
@@ -3113,13 +3114,23 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
         throw new Error(`learning update ${mutation.mutationId} was not confirmed`);
       }
     } else if (mutation.action === "audit-duplicate") {
-      const live = await fetchIssuesFn();
+      let live = await fetchIssuesFn();
       const duplicate = live.find((candidate) => candidate.id === mutation.issueId);
       if (!duplicate) throw new Error(`learning duplicate target missing: ${mutation.issueId}`);
       const collision = learningIssueProvenanceError(duplicate, mutation);
       if (collision) throw new Error(collision);
       const marker = `[factory-learning duplicate root=${mutation.rootFingerprint} primary=${mutation.primaryIssueId}]`;
-      if (!(duplicate.comments || []).some((comment) => String(comment.body || "").includes(marker))) await addCommentFn(duplicate.id, marker);
+      let writeError = null;
+      if (!(duplicate.comments || []).some((comment) => String(comment.body || "").includes(marker))) {
+        try { await addCommentFn(duplicate.id, marker); }
+        catch (error) { writeError = error; }
+      }
+      live = await fetchIssuesFn();
+      const confirmedDuplicate = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!confirmedDuplicate?.comments?.some((comment) => String(comment.body || "").includes(marker))) {
+        if (writeError) throw writeError;
+        throw new Error(`learning duplicate ${mutation.mutationId} was not confirmed`);
+      }
     } else if (mutation.action === "block-generation-cap") {
       let live = await fetchIssuesFn();
       const issue = live.find((candidate) => candidate.id === mutation.issueId);
@@ -3127,17 +3138,33 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
       const collision = learningIssueProvenanceError(issue, mutation);
       if (collision) throw new Error(collision);
       const fresh = (mutation.occurrenceIds || []).filter((id) => !(issue.occurrenceIds || []).includes(id));
-      if (fresh.length) await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh));
+      const writeErrors = [];
+      if (fresh.length) {
+        try { await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh)); }
+        catch (error) { writeErrors.push(error); }
+      }
       const capMarker = `[factory-learning generation-cap root=${mutation.rootFingerprint} generation=${mutation.generation}]`;
-      if (!(issue.comments || []).some((comment) => String(comment.body || "").includes(capMarker))) await addCommentFn(issue.id, `${capMarker}\nAutomatic recurrence stopped after generation 3; human review is required.`);
+      if (!(issue.comments || []).some((comment) => String(comment.body || "").includes(capMarker))) {
+        try { await addCommentFn(issue.id, `${capMarker}\nAutomatic recurrence stopped after generation 3; human review is required.`); }
+        catch (error) { writeErrors.push(error); }
+      }
       if (!issue.labelNames?.includes("blocked:needs-user")) {
         const blockerId = labels["blocked:needs-user"];
         if (!blockerId) throw new Error("required label blocked:needs-user is missing");
-        await setLabelsFn(issue.id, [...Object.values(issue.labelIds || {}), blockerId]);
+        try { await setLabelsFn(issue.id, [...Object.values(issue.labelIds || {}), blockerId]); }
+        catch (error) { writeErrors.push(error); }
       }
       live = await fetchIssuesFn();
       const confirmedIssue = live.find((candidate) => candidate.id === mutation.issueId);
-      if (!confirmedIssue?.labelNames?.includes("blocked:needs-user")) throw new Error(`learning generation cap ${mutation.mutationId} was not confirmed`);
+      const confirmed = confirmedIssue
+        && !learningIssueProvenanceError(confirmedIssue, mutation)
+        && fresh.every((id) => confirmedIssue.occurrenceIds?.includes(id))
+        && confirmedIssue.comments?.some((comment) => String(comment.body || "").includes(capMarker))
+        && confirmedIssue.labelNames?.includes("blocked:needs-user");
+      if (!confirmed) {
+        if (writeErrors.length) throw writeErrors[0];
+        throw new Error(`learning generation cap ${mutation.mutationId} was not confirmed`);
+      }
     } else {
       throw new Error(`unknown learning mutation action: ${mutation.action}`);
     }
@@ -3374,7 +3401,7 @@ export async function executeLearningCycleWrites({
   }
 
   const prepared = [];
-  const resolvedAccumulatedRoots = new Set();
+  const resolvedAccumulatedRootsByLens = new Map();
   const evaluationSummary = { active: 0, confirmed: 0, restored: 0, errors: [] };
   let remainingCreates = Math.min(6, Math.max(0, Math.floor(Number(registry.learning?.maxNewCardsPerRun ?? 6)) || 0));
   for (const { destination, findings: destinationFindings } of [...destinations.values()].sort((a, b) => a.destination.sourceAnchorPath.localeCompare(b.destination.sourceAnchorPath))) {
@@ -3436,7 +3463,13 @@ export async function executeLearningCycleWrites({
     const mutationRoots = new Set(planned.mutations.map((mutation) => mutation.rootFingerprint));
     for (const finding of destinationFindings) {
       if (!mutationRoots.has(finding.rootFingerprint) && !retryRoots.has(finding.rootFingerprint)
-        && !retryAccumulatedRoots.has(finding.rootFingerprint)) resolvedAccumulatedRoots.add(finding.rootFingerprint);
+        && !retryAccumulatedRoots.has(finding.rootFingerprint)) {
+        for (const lens of finding.lenses || []) {
+          if (!lensAllowed(lens)) continue;
+          if (!resolvedAccumulatedRootsByLens.has(lens)) resolvedAccumulatedRootsByLens.set(lens, new Set());
+          resolvedAccumulatedRootsByLens.get(lens).add(finding.rootFingerprint);
+        }
+      }
     }
     prepared.push({ destination, mutations: planned.mutations, fetchIssuesFn, findingCount: destinationFindings.length });
   }
@@ -3484,8 +3517,8 @@ export async function executeLearningCycleWrites({
   for (const mutation of mutations) {
     for (const lens of mutation.lenses || []) store.updateAccumulated?.(lens, { remove: [mutation.rootFingerprint] });
   }
-  for (const rootFingerprint of resolvedAccumulatedRoots) {
-    for (const lens of Object.keys(store.snapshot?.()?.lenses || {})) store.updateAccumulated?.(lens, { remove: [rootFingerprint] });
+  for (const [lens, rootFingerprints] of resolvedAccumulatedRootsByLens) {
+    store.updateAccumulated?.(lens, { remove: [...rootFingerprints] });
   }
   return {
     resumed: recovery.resumed,
@@ -3893,6 +3926,28 @@ async function fetchFailureTodos(apiKey, teamKey, projectId) {
   return todos;
 }
 
+async function fetchRecoveredFailureTodoFingerprints(apiKey, teamKey, projectId) {
+  const fingerprints = new Set();
+  let cursor = null;
+  do {
+    const d = await gql(
+      `query($c:String,$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } }, state:{ name:{ eq:"Done" } } }){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ description comments(last:100){ nodes{ body } } } } }`,
+      { c: cursor, teamKey, pid: projectId },
+      apiKey,
+    );
+    for (const issue of d.issues.nodes) {
+      const text = [issue.description || "", ...(issue.comments?.nodes || []).map((comment) => comment.body || "")].join("\n");
+      const fingerprint = markerFingerprint(text);
+      if (fingerprint && text.includes(`${FAILURE_RECOVERED_TAG} ${fingerprint} `)) fingerprints.add(fingerprint);
+    }
+    cursor = d.issues.pageInfo.hasNextPage ? d.issues.pageInfo.endCursor : null;
+  } while (cursor);
+  return fingerprints;
+}
+
 async function createFailureTodo(apiKey, meta, projectId, event, fingerprint, envValues) {
   const stateId = meta.stateIds.Todo;
   if (!stateId) throw new Error("Todo state not found on team");
@@ -3925,22 +3980,68 @@ async function commentDuplicateFailureTodo(apiKey, decision) {
   await addComment(apiKey, decision.todo.id, `${FAILURE_DUPLICATE_NOTE} for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
 }
 
-async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, { dryRun = false, recoveredTargets = new Set() } = {}) {
+async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, {
+  dryRun = false,
+  recoveredTargets = new Set(),
+  onLauncherEvidence = null,
+} = {}) {
   const existing = await fetchFailureTodos(apiKey, config.teamKey, config.projectId);
   const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues, recoveredTargets });
   if (dryRun) return decisions;
   if (!decisions.length) return decisions;
   const meta = await teamMeta(apiKey, config.teamKey);
+  const recoveredFingerprints = onLauncherEvidence && decisions.some((decision) => decision.action === "create")
+    ? await fetchRecoveredFailureTodoFingerprints(apiKey, config.teamKey, config.projectId)
+    : new Set();
   for (const d of decisions) {
     if (d.action === "create") {
       const issue = await createFailureTodo(apiKey, meta, config.projectId, d.event, d.fingerprint, envValues);
       logFor(anchorPath, "_", `failure-todo create ${issue.identifier} ${d.fingerprint}`);
+      if (onLauncherEvidence && recoveredFingerprints.has(d.fingerprint)) {
+        const fresh = await fetchClaimCard(apiKey, issue.id);
+        if (fresh.stateName !== "Todo") throw new Error(`${issue.identifier} recurrence Todo was not observable after creation`);
+        const occurredAt = new Date().toISOString();
+        onLauncherEvidence({
+          card: fresh,
+          sweep: "launcher",
+          evidence: {
+            type: "recovery-transition",
+            state: "recurred",
+            occurredAt,
+            key: d.fingerprint,
+            subsystem: "failure-todo",
+            reason: d.event?.kind || "scheduled-failure",
+            summary: `Confirmed failure ${d.fingerprint} recurred after an earlier recovered Todo.`,
+          },
+        });
+      }
     } else if (d.action === "update") {
       await updateFailureTodo(apiKey, d.todo, d.event, d.fingerprint, envValues);
       logFor(anchorPath, "_", `failure-todo update ${d.todo.identifier} ${d.fingerprint}`);
     } else if (d.action === "close") {
       await closeFailureTodo(apiKey, meta, d);
+      const fresh = await fetchClaimCard(apiKey, d.todo.id);
+      const recoveredMarker = `${FAILURE_RECOVERED_TAG} ${d.fingerprint} `;
+      if (fresh.stateName !== "Done" || !(fresh.comments || []).some((comment) => String(comment.body || "").includes(recoveredMarker))) {
+        throw new Error(`${d.todo.identifier} recovery could not be confirmed after moving to Done`);
+      }
       logFor(anchorPath, "_", `failure-todo recovered ${d.todo.identifier} ${d.fingerprint}`);
+      if (onLauncherEvidence) {
+        const occurredAt = new Date().toISOString();
+        onLauncherEvidence({
+          card: fresh,
+          sweep: "launcher",
+          evidence: {
+            type: "recovery-transition",
+            state: "recovered",
+            occurredAt,
+            key: d.fingerprint,
+            subsystem: "failure-todo",
+            reason: "confirmed-done",
+            summary: `Confirmed failure Todo ${fresh.identifier} recovered and moved to Done.`,
+          },
+        });
+      }
     } else if (d.action === "duplicate") {
       await commentDuplicateFailureTodo(apiKey, d);
       logFor(anchorPath, "_", `failure-todo duplicate ${d.todo.identifier} -> ${d.primary.identifier}`);
@@ -3970,6 +4071,35 @@ async function executeReap(apiKey, card, decision, labelMap, sweep) {
     await applyLabelEdit(apiKey, card, { remove: [decision.releaseClaim] });
     await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
   }
+}
+
+export async function recordConfirmedReapEvidence({ apiKey, sourceAnchorPath, config, repoPairs, card, decision, sweep }, {
+  fetchClaimCardFn = fetchClaimCard,
+  appendEvidenceFn = appendLauncherEvidenceRun,
+} = {}) {
+  const fresh = await fetchClaimCardFn(apiKey, card.id);
+  if (hasLabel(fresh, decision.releaseClaim)) throw new Error(`${card.identifier} still carries ${decision.releaseClaim} after reap`);
+  if (decision.action === "escalate-crash" && !hasLabel(fresh, "blocked:needs-user")) {
+    throw new Error(`${card.identifier} lacks blocked:needs-user after crash escalation`);
+  }
+  const occurredAt = new Date().toISOString();
+  return appendEvidenceFn({
+    sourceAnchorPath,
+    config,
+    repoPairs,
+    card: fresh,
+    sweep,
+    occurredAt,
+    evidence: {
+      type: "stale-claim",
+      occurredAt,
+      key: `${sweep}:${decision.releaseClaim}`,
+      stage: sweep,
+      subsystem: "claim-reaper",
+      reason: decision.action,
+      summary: `Confirmed stale ${decision.releaseClaim} claim was removed from ${fresh.identifier}.`,
+    },
+  });
 }
 
 export function dirtyCheckoutEvent(pick, checkout, { gitFn = git, existsFn = fs.existsSync } = {}) {
@@ -4339,6 +4469,34 @@ async function executeOrphanReap(apiKey, card, decision) {
   await addComment(apiKey, card.id, `${ORPHAN_TAG} Auto-released orphaned claim(s) ${list} — stale heartbeat in a state their owning sweep does not run; the prior run likely crashed after advancing the card but before dropping its claim.`);
 }
 
+export async function recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath, config, repoPairs, card, decision, sweep = "launcher" }, {
+  fetchClaimCardFn = fetchClaimCard,
+  appendEvidenceFn = appendLauncherEvidenceRun,
+} = {}) {
+  const fresh = await fetchClaimCardFn(apiKey, card.id);
+  const remaining = (decision.releaseClaims || []).filter((claim) => hasLabel(fresh, claim));
+  if (remaining.length) throw new Error(`${card.identifier} still carries orphaned claim(s): ${remaining.join(", ")}`);
+  const occurredAt = new Date().toISOString();
+  const claims = [...(decision.releaseClaims || [])].sort();
+  return appendEvidenceFn({
+    sourceAnchorPath,
+    config,
+    repoPairs,
+    card: fresh,
+    sweep,
+    occurredAt,
+    evidence: {
+      type: "machine-correctable-poison-card",
+      occurredAt,
+      key: `orphan-claims:${claims.join(",")}`,
+      stage: sweep,
+      subsystem: "orphan-reaper",
+      reason: "orphan-claim-release",
+      summary: `Confirmed orphaned claim cleanup for ${fresh.identifier}: ${claims.join(", ")}.`,
+    },
+  });
+}
+
 async function executeBounce(apiKey, card, labelMap) {
   if (!labelMap["blocked:needs-user"]) return;
   await applyLabelEdit(apiKey, card, { add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
@@ -4352,6 +4510,7 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
   fetchCardFn = fetchCard,
   fetchClaimCardFn = fetchClaimCard,
   onRouteFailure = () => {},
+  onSafetyInvariant = () => {},
 } = {}) {
   const cfg = SWEEP_CFG[sweep];
   const claimId = labelMap[cfg.claim];
@@ -4431,6 +4590,22 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
         const error = new Error(`claim cleanup unverifiable for ${card.identifier}: ${cleanupError.message}`);
         error.code = "CLAIM_CLEANUP_UNVERIFIED";
         error.cause = cleanupError;
+        try {
+          onSafetyInvariant({
+            card,
+            evidence: {
+              type: "proven-safety-invariant",
+              occurredAt: new Date().toISOString(),
+              key: "claim-ownership-cleanup-unverified",
+              stage: sweep,
+              subsystem: "claim-admission",
+              reason: error.code,
+              summary: error.message,
+            },
+          });
+        } catch (evidenceError) {
+          error.evidenceCause = evidenceError;
+        }
         throw error;
       }
     }
@@ -4463,6 +4638,7 @@ export async function expandDispatchBatch(batch, {
   labelMap: providedLabelMap = null,
   fetchRouteCardFn = fetchClaimCard,
   onRouteFailure = () => {},
+  onSafetyInvariant = () => {},
 } = {}) {
   const expanded = [];
   for (const pick of batch) {
@@ -4520,7 +4696,10 @@ export async function expandDispatchBatch(batch, {
         labelMap,
         now,
         repoPairs: active.repoPairs || pick.repoPairs || [],
-      }, { onRouteFailure: (card, failure) => onRouteFailure({ ...pick, issueIdentifier: card.identifier }, failure) });
+      }, {
+        onRouteFailure: (card, failure) => onRouteFailure({ ...pick, issueIdentifier: card.identifier }, failure),
+        onSafetyInvariant: ({ card, evidence }) => onSafetyInvariant({ ...pick, card, evidence }),
+      });
     }
     logFor(pick.anchorPath, pick.sweep, `same-repo slots ${slots.length} selected (per-primary-repo limit ${limit}) under workspace candidate (${pick.count} actionable)`);
     for (const slot of slots) {
@@ -4926,6 +5105,79 @@ function interruptedSignalFor(signal, fallback = null) {
   return typeof reason === "string" ? reason : fallback;
 }
 
+export function buildLauncherEvidenceRunRecord({
+  sourceAnchorPath,
+  config = {},
+  repoPairs = [],
+  card = {},
+  sweep = "launcher",
+  evidence,
+  occurredAt = evidence?.occurredAt || new Date().toISOString(),
+} = {}) {
+  const route = resolveCardRepoRoute({ config, card, repoPairs });
+  if (!route.ok || !card.identifier || !config.projectId || Number.isNaN(Date.parse(occurredAt || ""))) return null;
+  const normalizedEvidence = { ...(evidence || {}), occurredAt };
+  const identity = JSON.stringify([
+    canonicalAnchorIdentity(sourceAnchorPath || "."),
+    config.projectId,
+    route.repoEntry,
+    card.identifier,
+    sweep,
+    normalizedEvidence.type,
+    normalizedEvidence.state || "",
+    normalizedEvidence.key || "",
+    occurredAt,
+  ]);
+  const cardRunId = `launcher:${crypto.createHash("sha256").update(identity).digest("hex").slice(0, 24)}`;
+  return {
+    parentRunId: `launcher:${occurredAt.slice(0, 10)}`,
+    cardRunId,
+    issueIdentifier: card.identifier,
+    sourceWorkspace: canonicalAnchorIdentity(sourceAnchorPath || "."),
+    projectId: config.projectId,
+    repoEntry: route.repoEntry,
+    sweep,
+    runtime: "launcher",
+    launcherEvidence: [normalizedEvidence],
+    outcome: { kind: "launcher-maintenance", success: true },
+    exitCode: 0,
+    startedAt: occurredAt,
+    endedAt: occurredAt,
+  };
+}
+
+export function appendLauncherEvidenceRun(input, {
+  runsDir = LEARNING_RUNS_DIR,
+  appendFileFn = (target, value) => fs.appendFileSync(target, value),
+} = {}) {
+  const occurredAt = input?.occurredAt || input?.evidence?.occurredAt || new Date().toISOString();
+  const record = buildLauncherEvidenceRunRecord(input) || {
+    parentRunId: `launcher-gap:${occurredAt.slice(0, 10)}`,
+    cardRunId: `launcher-gap:${crypto.createHash("sha256").update(JSON.stringify([
+      input?.sourceAnchorPath || "",
+      input?.config?.projectId || "",
+      input?.card?.identifier || "",
+      input?.sweep || "launcher",
+      input?.evidence?.type || "",
+      occurredAt,
+    ])).digest("hex").slice(0, 24)}`,
+    issueIdentifier: input?.card?.identifier || "launcher-route-gap",
+    sourceWorkspace: canonicalAnchorIdentity(input?.sourceAnchorPath || "."),
+    projectId: input?.config?.projectId,
+    sweep: input?.sweep || "launcher",
+    runtime: "launcher",
+    launcherEvidence: [{ ...(input?.evidence || {}), occurredAt }],
+    outcome: { kind: "launcher-evidence-route-gap", success: false },
+    exitCode: 1,
+    startedAt: occurredAt,
+    endedAt: occurredAt,
+  };
+  fs.mkdirSync(runsDir, { recursive: true });
+  const daily = `${record.endedAt.slice(0, 10).replace(/-/g, "")}.jsonl`;
+  appendFileFn(path.join(runsDir, daily), `${JSON.stringify(record)}\n`);
+  return record;
+}
+
 function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
   if (!pick.issueIdentifier || !pick.logDir) return;
   let metrics = {};
@@ -5189,6 +5441,18 @@ async function tick({ dryRun = false } = {}) {
       message: sanitizeFailureMessage(message),
       seenAt: new Date().toISOString(),
     });
+    const launcherEvidenceOptions = (active, options = {}) => ({
+      ...options,
+      onLauncherEvidence: ({ card, sweep, evidence }) => appendLauncherEvidenceRun({
+        sourceAnchorPath: active.sourceAnchorPath,
+        config: active.config,
+        repoPairs: active.repoPairs,
+        card,
+        sweep,
+        evidence,
+        occurredAt: evidence.occurredAt,
+      }),
+    });
     const reconcileDispatchResult = async (result) => {
       const pick = result.pick;
       const active = activeByAnchor.get(pick.anchorPath);
@@ -5252,7 +5516,7 @@ async function tick({ dryRun = false } = {}) {
         }
       }
       try {
-        await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
+        await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
       } catch (e) {
         const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
         logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
@@ -5314,7 +5578,7 @@ async function tick({ dryRun = false } = {}) {
           const event = failureEventFor(pick.anchorPath, pick.config, routingScope, "repo-routing", pick.issueIdentifier, handoffRouting.message);
           active.failures.push(event);
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${pick.issueIdentifier}: ${event.message}`);
-          try { await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set(), active.envValues, { dryRun: false }); } catch (error) { recordLocalFailure(pick.anchorPath, pick.config, routingScope, "failure-todo", pick.issueIdentifier, error.message); }
+          try { await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false })); } catch (error) { recordLocalFailure(pick.anchorPath, pick.config, routingScope, "failure-todo", pick.issueIdentifier, error.message); }
           return;
         }
         issue = handoffRouting.card;
@@ -5392,7 +5656,7 @@ async function tick({ dryRun = false } = {}) {
           active.failures.push(...dirtyFailures);
           for (const failure of dirtyFailures) logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: dirty-checkout ${failure.message}`);
           try {
-            await reconcileFailureTodos(active.apiKey, candidate.config, candidate.anchorPath, dirtyFailures, new Set(), active.envValues, { dryRun: false });
+            await reconcileFailureTodos(active.apiKey, candidate.config, candidate.anchorPath, dirtyFailures, new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
           } catch (e) {
             logFor(candidate.anchorPath, "_", `FATAL failure-todo handoff dirty-checkout reconciliation failed: ${e.message}`);
             recordLocalFailure(candidate.anchorPath, candidate.config, `${candidate.sweep}:dispatch`, "failure-todo", candidate.anchorPath, e.message);
@@ -5474,7 +5738,7 @@ async function tick({ dryRun = false } = {}) {
           writeCurrentTick();
         }
         try {
-          await reconcileFailureTodos(active.apiKey, failure.pick.config, failure.pick.anchorPath, [event], new Set(), active.envValues, { dryRun: false });
+          await reconcileFailureTodos(active.apiKey, failure.pick.config, failure.pick.anchorPath, [event], new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
         } catch (error) {
           logFor(failure.pick.anchorPath, "_", `FATAL failure-todo runtime reconciliation failed: ${error.message}`);
           recordLocalFailure(failure.pick.anchorPath, failure.pick.config, failure.scope, "failure-todo", failure.stableTarget, error.message);
@@ -5485,10 +5749,10 @@ async function tick({ dryRun = false } = {}) {
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) continue;
         try {
-          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set(), active.envValues, {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set(), active.envValues, launcherEvidenceOptions(active, {
             dryRun: false,
             recoveredTargets: new Set([pick.runtimeStableTarget]),
-          });
+          }));
         } catch (error) {
           logFor(pick.anchorPath, "_", `FATAL failure-todo runtime recovery failed: ${error.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, pick.runtimeScope, "failure-todo-recovery", pick.runtimeStableTarget, error.message);
@@ -5553,13 +5817,22 @@ async function tick({ dryRun = false } = {}) {
               failedPick.issueIdentifier,
               failure.message || `${failedPick.issueIdentifier} repository route changed during admission`,
             )),
+            onSafetyInvariant: ({ card, evidence }) => appendLauncherEvidenceRun({
+              sourceAnchorPath: demand.sourceAnchorPath || demand.anchorPath,
+              config: demand.config,
+              repoPairs: activeByAnchor.get(demand.anchorPath)?.repoPairs || demand.repoPairs || [],
+              card,
+              sweep: demand.sweep,
+              evidence,
+              occurredAt: evidence.occurredAt,
+            }),
           });
           if (!pick) {
             const active = activeByAnchor.get(demand.anchorPath);
             if (active && routeFailures.length) {
               active.failures.push(...routeFailures);
               localFailures.push(...routeFailures);
-              await reconcileFailureTodos(active.apiKey, demand.config, demand.anchorPath, routeFailures, new Set(), active.envValues, { dryRun: false });
+              await reconcileFailureTodos(active.apiKey, demand.config, demand.anchorPath, routeFailures, new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
               writeCurrentTick();
             }
             return null;
@@ -5724,7 +5997,12 @@ async function tick({ dryRun = false } = {}) {
             let labelMap;
             try { labelMap = await getLabelMap(); } catch (e) { logFor(anchorPath, sweep, `label map error — deferring reaps: ${e.message}`); recordFailure(sweep, "label-map", config.teamKey, e.message); labelMap = null; }
             if (labelMap) {
-              for (const d of reaps) { try { await executeReap(apiKey, cards.find((c) => c.id === d.id), d, labelMap, sweep); logFor(anchorPath, sweep, `${d.action} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
+              for (const d of reaps) { try {
+                const card = cards.find((c) => c.id === d.id);
+                await executeReap(apiKey, card, d, labelMap, sweep);
+                await recordConfirmedReapEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep });
+                logFor(anchorPath, sweep, `${d.action} ${d.identifier}`);
+              } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
               for (const d of bounces) { try { await executeBounce(apiKey, cards.find((c) => c.id === d.id), labelMap); logFor(anchorPath, sweep, `escalate-bounce ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `bounce error ${d.identifier}: ${e.message}`); recordFailure(sweep, "bounce", d.identifier, e.message); } }
             }
           } else if (dryRun && (reaps.length || bounces.length)) {
@@ -5739,7 +6017,12 @@ async function tick({ dryRun = false } = {}) {
           // (no extra query). Runs on every host (cleanup, not dispatch).
           const foreign = foreignClaimReleases(cards, now, cfg.claim);
           if (!dryRun && foreign.length) {
-            for (const d of foreign) { try { await executeOrphanReap(apiKey, cards.find((c) => c.id === d.id), d); logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
+            for (const d of foreign) { try {
+              const card = cards.find((c) => c.id === d.id);
+              await executeOrphanReap(apiKey, card, d);
+              await recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep });
+              logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`);
+            } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
           } else if (dryRun && foreign.length) {
             logFor(anchorPath, sweep, `[dry-run] would release ${foreign.length} foreign claim(s)`);
           }
@@ -5812,14 +6095,19 @@ async function tick({ dryRun = false } = {}) {
           active.checkedScopes.add("holding");
           const orphans = foreignClaimReleases(held, now);
           if (!dryRun) {
-            for (const d of orphans) { try { await executeOrphanReap(apiKey, held.find((c) => c.id === d.id), d); logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`); } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
+            for (const d of orphans) { try {
+              const card = held.find((c) => c.id === d.id);
+              await executeOrphanReap(apiKey, card, d);
+              await recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep: "holding" });
+              logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`);
+            } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }
           } else if (orphans.length) {
             logFor(anchorPath, "_", `[dry-run] would release ${orphans.length} orphaned claim(s) in holding/legacy states`);
           }
         } catch (e) { logFor(anchorPath, "_", `holding-state reap error: ${e.message}`); recordFailure("holding", "holding-state-fetch", CLAIM_CLEANUP_STATES.join(","), e.message); }
 
         try {
-          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, { dryRun, recoveredTargets: active.recoveredTargets });
+          const decisions = await reconcileFailureTodos(apiKey, config, anchorPath, active.failures, active.checkedScopes, envValues, launcherEvidenceOptions(active, { dryRun, recoveredTargets: active.recoveredTargets }));
           if (dryRun && decisions.length) logFor(anchorPath, "_", `[dry-run] would reconcile ${decisions.length} failure Todo decision(s)`);
         } catch (e) {
           logFor(anchorPath, "_", `FATAL failure-todo reconciliation failed: ${e.message}`);
@@ -5862,7 +6150,7 @@ async function tick({ dryRun = false } = {}) {
         active.failures.push(...failures);
         for (const failure of failures) logFor(pick.anchorPath, pick.sweep, `dispatch blocked: ${failure.message}`);
         try {
-          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set(), active.envValues, { dryRun: false });
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
         } catch (e) {
           logFor(pick.anchorPath, "_", `FATAL failure-todo dirty-checkout reconciliation failed: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, `${pick.sweep}:dispatch`, "failure-todo", pick.anchorPath, e.message);
@@ -5906,7 +6194,7 @@ async function tick({ dryRun = false } = {}) {
                 const failures = refill.blockers.map((b) => failureEventFor(result.pick.anchorPath, result.pick.config, b.scope, b.kind, b.stableTarget, b.message));
                 active.failures.push(...failures);
                 try {
-                  await reconcileFailureTodos(active.apiKey, result.pick.config, result.pick.anchorPath, failures, new Set(), active.envValues, { dryRun: false });
+                  await reconcileFailureTodos(active.apiKey, result.pick.config, result.pick.anchorPath, failures, new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
                 } catch (e) {
                   logFor(result.pick.anchorPath, "_", `FATAL failure-todo refill dirty-checkout reconciliation failed: ${e.message}`);
                   recordLocalFailure(result.pick.anchorPath, result.pick.config, `${result.pick.sweep}:dispatch`, "failure-todo", result.pick.anchorPath, e.message);

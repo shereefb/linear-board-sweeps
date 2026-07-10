@@ -350,10 +350,22 @@ function eventObservation(event, run) {
     result: event.category === "passed" ? "passed" : "needs-changes",
     baselineRate: finiteNumber(event.metrics?.baselineRate),
   };
-  if (event.kind === "question") return { ...base, signal: "human-question", answerKey: event.category };
+  if (event.kind === "question") {
+    const stableKey = stableQuestionKey(event.metrics);
+    return stableKey ? { ...base, signal: "human-question", ...stableKey } : null;
+  }
   if (event.kind === "bounce") return { ...base, signal: "spec-bounce" };
   if (event.kind === "canary" && event.category === "red") return { ...base, signal: "red-canary", relatedKey: "red" };
   if (event.kind === "terminal" && event.category === "failed") return { ...base, signal: "dispatch-failure", fingerprint: "terminal:failed" };
+  return null;
+}
+
+function stableQuestionKey(metrics = {}) {
+  for (const field of ["answerKey", "policyKey"]) {
+    if (typeof metrics?.[field] !== "string") continue;
+    const value = sanitizeLearningText(metrics[field], 201);
+    if (value.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)) return { [field]: value };
+  }
   return null;
 }
 
@@ -658,7 +670,10 @@ export function buildLearningEvidenceSnapshot({
   for (const event of eventById.values()) {
     const run = runById.get(event.identity?.cardRunId);
     const projected = eventObservation(event, run);
-    if (!projected) continue;
+    if (!projected) {
+      if (event.kind === "question") pushGap(`event:${event.eventId}`, "human-question evidence requires a bounded stable answerKey/policyKey");
+      continue;
+    }
     if (!trustedRunRoute(run)) pushGap(`event:${event.eventId}`, "detector event lacks a trusted launcher run route");
     addDerivedObservation(projected, `event:${event.eventId}`);
   }
@@ -967,6 +982,19 @@ function detectorSemanticKey(detectorId, item, signal = "unknown") {
   return item.fingerprint || item.rootCauseKey || item.reason || signal;
 }
 
+function evaluationOwnershipContract(observations, scope) {
+  const contributors = [...new Map(observations.map((item) => {
+    const contributor = {
+      sourceWorkspace: String(item.sourceWorkspace || "").trim(),
+      projectId: String(item.projectId || "").trim(),
+      repoEntry: String(item.repoEntry || "").trim(),
+    };
+    return [JSON.stringify(contributor), contributor];
+  }).filter(([, item]) => item.sourceWorkspace && item.projectId && item.repoEntry)).values()]
+    .sort((a, b) => a.sourceWorkspace.localeCompare(b.sourceWorkspace) || a.projectId.localeCompare(b.projectId) || a.repoEntry.localeCompare(b.repoEntry));
+  return { scope, contributors };
+}
+
 function detectorFinding(detector, observations, snapshot, config) {
   const sourceWorkspaces = [...new Set(observations.map((item) => item.sourceWorkspace).filter(Boolean))].sort();
   const localProjects = [...new Set(observations.map((item) => item.projectId).filter(Boolean))];
@@ -990,6 +1018,8 @@ function detectorFinding(detector, observations, snapshot, config) {
   const baselineValue = metric.aggregation === "p90" ? percentile(metricValues, 0.9)
     : metric.aggregation === "count" ? observations.length
       : metricValues.at(-1);
+  const ownership = evaluationOwnershipContract(observations, scope);
+  const semanticKey = detectorSemanticKey(detector.id, observations[0] || {}, detector.signal);
   return {
     schemaVersion: 1,
     detectorId: detector.id,
@@ -1023,7 +1053,8 @@ function detectorFinding(detector, observations, snapshot, config) {
       aggregation: metric.aggregation,
       detectorId: detector.id,
       signal: detector.signal,
-      semanticKey: detectorSemanticKey(detector.id, observations[0] || {}, detector.signal),
+      semanticKey: JSON.stringify({ version: 1, key: semanticKey, ownership }),
+      ownership,
     },
     evaluationWindow: clone(detector.evaluationWindow),
     exclusions: ["Do not bypass review, QA, Signoff, or the human Ship gate."],
@@ -1312,6 +1343,43 @@ export function planLearningMutations(findings = [], liveIssues = [], config = {
   return { mutations, deferred };
 }
 
+function normalizeEvaluationOwnership(value) {
+  if (!value || !["workspace", "core"].includes(value.scope) || !Array.isArray(value.contributors) || !value.contributors.length || value.contributors.length > 100) return null;
+  const contributors = [];
+  const keys = new Set();
+  for (const item of value.contributors) {
+    const contributor = {
+      sourceWorkspace: String(item?.sourceWorkspace || "").trim(),
+      projectId: String(item?.projectId || "").trim(),
+      repoEntry: String(item?.repoEntry || "").trim(),
+    };
+    if (!contributor.sourceWorkspace || !contributor.projectId || !contributor.repoEntry) return null;
+    const key = JSON.stringify(contributor);
+    if (!keys.has(key)) contributors.push(contributor);
+    keys.add(key);
+  }
+  if (value.scope === "workspace" && contributors.length !== 1) return null;
+  return { scope: value.scope, contributors };
+}
+
+function observationOwnedBy(item, ownership) {
+  return ownership.contributors.some((owner) => owner.sourceWorkspace === item?.sourceWorkspace
+    && owner.projectId === item?.projectId && owner.repoEntry === item?.repoEntry);
+}
+
+function parseEvaluationSemanticContract(value) {
+  if (typeof value !== "string" || !value.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(value);
+    const ownership = normalizeEvaluationOwnership(parsed?.ownership);
+    return parsed?.version === 1 && typeof parsed.key === "string" && parsed.key && ownership
+      ? { key: parsed.key, ownership }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
   const coverageComplete = snapshot?.coverage?.complete !== false;
   const capturedThroughMs = Date.parse(snapshot.capturedThrough || "");
@@ -1321,14 +1389,18 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     const time = Date.parse(item.occurredAt || item.at || "");
     return time > Date.parse(evaluation.completedAt || "") && time <= windowEndsAtMs;
   }).sort((a, b) => Date.parse(a.occurredAt || a.at) - Date.parse(b.occurredAt || b.at));
-  const scoped = evaluation.detectorId && evaluation.signal && evaluation.semanticKey
-    ? observations.filter((item) => item.signal === evaluation.signal
-      && detectorSemanticKey(evaluation.detectorId, item, evaluation.signal) === evaluation.semanticKey)
-    : observations;
+  const embeddedContract = parseEvaluationSemanticContract(evaluation.semanticKey);
+  const semanticKey = embeddedContract?.key || evaluation.semanticKey;
+  const ownership = normalizeEvaluationOwnership(evaluation.ownership || evaluation.acceptanceMetric?.ownership) || embeddedContract?.ownership;
+  const owned = ownership ? observations.filter((item) => observationOwnedBy(item, ownership)) : [];
+  const scoped = evaluation.detectorId && evaluation.signal && semanticKey
+    ? owned.filter((item) => item.signal === evaluation.signal
+      && detectorSemanticKey(evaluation.detectorId, item, evaluation.signal) === semanticKey)
+    : owned;
   const values = scoped.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
   let status = windowReady ? "inconclusive-evidence" : "not-due";
-  const scopedContract = Boolean(evaluation.detectorId && evaluation.signal && evaluation.semanticKey);
-  if (windowReady && coverageComplete && (values.length || scopedContract)) {
+  const scopedContract = Boolean(evaluation.detectorId && evaluation.signal && semanticKey);
+  if (windowReady && coverageComplete && ownership && (values.length || scopedContract)) {
     let value;
     if (evaluation.aggregation === "p90") value = percentile(values, 0.9);
     else if (evaluation.aggregation === "count") value = new Set(scoped.map((item) => item.evidenceId || item.eventId || item.runId || item.cardId).filter(Boolean)).size;

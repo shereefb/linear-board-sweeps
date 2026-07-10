@@ -26,6 +26,7 @@ import {
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
+  buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
@@ -1774,11 +1775,12 @@ test("learning issue discovery restores deterministic evaluation metadata and co
 });
 
 test("learning evaluations persist active windows and confirm exactly one terminal outcome after timeout", async () => {
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app" }] };
   const issue = {
     id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
     rootFingerprint: "root-a", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["e1"], comments: [],
     evaluationMetadata: {
-      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
       baseline: { value: 0.8, unit: "ratio" },
       evaluationWindow: { durationDays: 7 },
     },
@@ -1796,7 +1798,7 @@ test("learning evaluations persist active windows and confirm exactly one termin
   let commentAttempts = 0;
   const dueSnapshot = {
     capturedThrough: "2026-07-09T00:00:00.000Z",
-    observations: [{ at: "2026-07-07T12:00:00.000Z", metrics: { failureRate: 0.1 } }],
+    observations: [{ at: "2026-07-07T12:00:00.000Z", sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.1 } }],
     qualifiedFindings: [], coverage: { complete: true, gaps: [] },
   };
   const due = await executeLearningEvaluations({ issues: [issue], stateStore: firstStore, snapshot: dueSnapshot }, {
@@ -1824,11 +1826,12 @@ test("learning evaluations persist active windows and confirm exactly one termin
 });
 
 test("production learning cycle evaluates generated Done cards even when no detector finding remains", async () => {
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app" }] };
   const issue = {
     id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
     rootFingerprint: "fixed-root", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["old"], comments: [],
     evaluationMetadata: {
-      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
       baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
     },
   };
@@ -1848,7 +1851,7 @@ test("production learning cycle evaluates generated Done cards even when no dete
     capturedThrough: "2026-07-09T00:00:00.000Z",
     snapshot: {
       capturedThrough: "2026-07-09T00:00:00.000Z",
-      observations: [{ at: "2026-07-07T00:00:00.000Z", metrics: { failureRate: 0.1 } }],
+      observations: [{ at: "2026-07-07T00:00:00.000Z", sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.1 } }],
       qualifiedFindings: [], coverage: { complete: true, gaps: [] },
     },
   }, {
@@ -1930,8 +1933,9 @@ test("live learning dry-run plans exact updates, creates, recurrences, caps, and
     sourceAnchorPath: "/source/app", apiKey: "key",
     config: { teamKey: "COD", projectId: "project-1", repoRouting: { byLabel: { "app:main": "app" } } },
   };
+  const ownership = { scope: "workspace", contributors: [{ sourceWorkspace: workspace.sourceAnchorPath, projectId: "project-1", repoEntry: "app" }] };
   const metadata = {
-    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2, ownership },
     baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
   };
   const done = (rootFingerprint, generation, outcomeStatus = null) => ({
@@ -1957,7 +1961,7 @@ test("live learning dry-run plans exact updates, creates, recurrences, caps, and
   });
   const snapshot = {
     capturedThrough: "2026-07-09T00:00:00.000Z",
-    observations: [{ at: "2026-07-07T00:00:00.000Z", metrics: { failureRate: 0.7 } }],
+    observations: [{ at: "2026-07-07T00:00:00.000Z", sourceWorkspace: workspace.sourceAnchorPath, projectId: "project-1", repoEntry: "app", metrics: { failureRate: 0.7 } }],
     coverage: { complete: true, gaps: [] },
   };
   const result = await buildLiveLearningDryRunPlan({
@@ -2161,6 +2165,76 @@ test("deferred and low-confidence learning findings accumulate and are not disca
   assert.equal(result.confirmed, 0);
   assert.deepEqual(Object.keys(accumulated.quality).sort(), ["low-root", "missing-root"]);
   assert.deepEqual(calls.slice(-2), [["stage", "quality", 0], ["commit", "quality"]]);
+});
+
+test("resolved accumulated roots clear only their processed contributing due lens", async () => {
+  const root = "shared-root";
+  const accumulated = {
+    quality: { [root]: learningFindingForWatcher({ rootFingerprint: root, lenses: ["quality"], occurrenceIds: ["known"] }) },
+    reliability: { [root]: learningFindingForWatcher({ rootFingerprint: root, lenses: ["reliability"], occurrenceIds: ["deferred-reliability"] }) },
+    throughput: {},
+  };
+  const stateStore = {
+    snapshot: () => ({ version: 1, lenses: Object.fromEntries(Object.entries(accumulated).map(([lens, values]) => [lens, { accumulated: values, pending: null }])), evaluations: {} }),
+    setEvaluation: () => {},
+    updateAccumulated: (lens, { remove = [] }) => { for (const key of remove) delete accumulated[lens][key]; },
+    stageWindow: () => {}, confirmMutation: () => {}, commitLens: () => true,
+  };
+  await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    dueDecisions: { lenses: { quality: { due: true }, reliability: { due: false } } },
+  }, { fetchIssuesFn: async () => [{
+    id: "generated", stateName: "Dev", rootFingerprint: root, generation: 0,
+    occurrenceIds: ["known"], labelNames: ["factory:learning-generated"], comments: [],
+  }] });
+  assert.equal(accumulated.quality[root], undefined);
+  assert.ok(accumulated.reliability[root], "unprocessed reliability evidence must remain accumulated");
+});
+
+test("comment-only duplicate and generation-cap mutations fail closed when writes are no-ops", async () => {
+  const duplicate = { id: "duplicate", stateName: "Dev", rootFingerprint: "root-a", generation: 0, occurrenceIds: [], comments: [], labelNames: ["factory:learning-generated"] };
+  const duplicateStore = { stageWindow: () => {}, confirmMutation: () => assert.fail("unconfirmed duplicate must not confirm"), commitLens: () => assert.fail("unconfirmed duplicate must not commit") };
+  await assert.rejects(executeLearningMutations({
+    mutations: [{ mutationId: "audit", action: "audit-duplicate", issueId: duplicate.id, primaryIssueId: "primary", rootFingerprint: "root-a", generation: 0 }],
+    stateStore: duplicateStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }), fetchIssuesFn: async () => [duplicate], addCommentFn: async () => {},
+  }), /duplicate.*not confirmed/i);
+
+  const capped = { id: "done", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" } };
+  const capStore = { stageWindow: () => {}, confirmMutation: () => assert.fail("unconfirmed cap must not confirm"), commitLens: () => assert.fail("unconfirmed cap must not commit") };
+  await assert.rejects(executeLearningMutations({
+    mutations: [{ mutationId: "cap", action: "block-generation-cap", issueId: capped.id, rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }) }],
+    stateStore: capStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }),
+    fetchIssuesFn: async () => [capped], addCommentFn: async () => {},
+    setLabelsFn: async () => { capped.labelNames.push("blocked:needs-user"); },
+  }), /generation cap.*not confirmed/i);
+});
+
+test("comment-only duplicate and generation-cap mutations reconcile timeout-after-success", async () => {
+  const duplicateMarker = "[factory-learning duplicate root=root-a primary=primary]";
+  const duplicate = { id: "duplicate", stateName: "Dev", rootFingerprint: "root-a", generation: 0, occurrenceIds: [], comments: [], labelNames: ["factory:learning-generated"] };
+  const duplicateResult = await executeLearningMutations({ mutations: [{ mutationId: "audit", action: "audit-duplicate", issueId: duplicate.id, primaryIssueId: "primary", rootFingerprint: "root-a", generation: 0 }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }), fetchIssuesFn: async () => [duplicate],
+    addCommentFn: async () => { duplicate.comments.push({ body: duplicateMarker }); throw new Error("timeout"); },
+  });
+  assert.equal(duplicateResult.confirmed, 1);
+
+  const capped = { id: "done", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" } };
+  const capResult = await executeLearningMutations({ mutations: [{ mutationId: "cap", action: "block-generation-cap", issueId: capped.id, rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }) }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }), fetchIssuesFn: async () => [capped],
+    addCommentFn: async (_id, body) => {
+      capped.comments.push({ body });
+      for (const id of body.match(/Fresh occurrences:\s*([^\n]+)/)?.[1]?.split(",").map((item) => item.trim()) || []) capped.occurrenceIds.push(id);
+      throw new Error("timeout");
+    },
+    setLabelsFn: async () => { capped.labelNames.push("blocked:needs-user"); throw new Error("timeout"); },
+  });
+  assert.equal(capResult.confirmed, 1);
 });
 
 test("learning writer confirms recurrence links and reconciles timeout-after-success", async () => {
@@ -3201,6 +3275,7 @@ test("claimCardSlots: cleanup read/write failures remain truthful and never remo
   assert.equal(typeof watchModule.claimCardSlots, "function");
   let removalAttempts = 0;
   let owner;
+  const safetyEvidence = [];
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-89", sortOrder: 10, labelNames: [], comments: [] });
   await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
       parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
@@ -3215,8 +3290,11 @@ test("claimCardSlots: cleanup read/write failures remain truthful and never remo
         labelNames: ["dev:in-progress"],
         comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
       }),
+      onSafetyInvariant: (value) => safetyEvidence.push(value),
     }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /cleanup write unavailable/.test(error.message));
   assert.equal(removalAttempts, 1);
+  assert.equal(safetyEvidence.length, 1);
+  assert.equal(safetyEvidence[0].evidence.type, "proven-safety-invariant");
 });
 
 test("claimCardSlots: heartbeat creation failure surfaces an unprovable applied claim", async () => {
@@ -5131,6 +5209,89 @@ test("checkoutDispatchBlockers: legacy source-anchor dispatch still blocks dirty
   assert.equal(blockers[0].kind, "dirty-checkout");
   assert.equal(blockers[0].stableTarget, "anchor:/anchor");
 });
+
+test("launcher evidence records are deterministically routed and durably appended", () => {
+  const input = {
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: [] },
+    sweep: "dev",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    evidence: { type: "stale-claim", key: "dev:dev:in-progress" },
+  };
+  const first = buildLauncherEvidenceRunRecord(input);
+  const second = buildLauncherEvidenceRunRecord(input);
+  assert.equal(first.cardRunId, second.cardRunId);
+  assert.equal(first.sourceWorkspace, "/source/app");
+  assert.equal(first.projectId, "project-1");
+  assert.equal(first.repoEntry, "app");
+  assert.equal(first.issueIdentifier, "COD-1");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-evidence-"));
+  appendLauncherEvidenceRun(input, { runsDir: dir });
+  const [persisted] = fs.readFileSync(path.join(dir, "20260710.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(persisted, first);
+
+  appendLauncherEvidenceRun({
+    ...input,
+    config: { ...input.config, repos: ["app", "worker"], repoRouting: { byLabel: { "app:main": "app", "app:worker": "worker" } } },
+    card: { ...input.card, identifier: "COD-2", labelNames: [] },
+  }, { runsDir: dir });
+  const indexed = readLearningRunIndex(dir, { capturedThrough: "2026-07-11T00:00:00.000Z" });
+  assert.ok(indexed.coverageGaps.some((gap) => /trusted identity and routing fields/.test(gap.reason)));
+});
+
+test("launcher reap evidence is emitted only after the Linear mutation is confirmed", async () => {
+  const base = {
+    apiKey: "key",
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: ["dev:in-progress"] },
+    decision: { action: "reap", releaseClaim: "dev:in-progress" },
+    sweep: "dev",
+  };
+  const emitted = [];
+  await assert.rejects(recordConfirmedReapEvidence(base, {
+    fetchClaimCardFn: async () => base.card,
+    appendEvidenceFn: (value) => emitted.push(value),
+  }), /still carries/);
+  assert.equal(emitted.length, 0);
+
+  await recordConfirmedReapEvidence(base, {
+    fetchClaimCardFn: async () => ({ ...base.card, labelNames: [] }),
+    appendEvidenceFn: (value) => emitted.push(value),
+  });
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.type, "stale-claim");
+});
+
+test("launcher poison-card evidence requires every orphaned claim to be absent", async () => {
+  const base = {
+    apiKey: "key",
+    sourceAnchorPath: "/source/app",
+    config: { projectId: "project-1", repos: ["app"] },
+    repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }],
+    card: { id: "issue-1", identifier: "COD-1", labelNames: ["qa:in-progress"] },
+    decision: { releaseClaims: ["qa:in-progress", "dev:in-progress"] },
+    sweep: "qa",
+  };
+  const emitted = [];
+  await assert.rejects(recordConfirmedOrphanEvidence(base, {
+    fetchClaimCardFn: async () => base.card,
+    appendEvidenceFn: (value) => emitted.push(value),
+  }), /still carries/);
+  assert.equal(emitted.length, 0);
+
+  await recordConfirmedOrphanEvidence(base, {
+    fetchClaimCardFn: async () => ({ ...base.card, labelNames: [] }),
+    appendEvidenceFn: (value) => emitted.push(value),
+  });
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.type, "machine-correctable-poison-card");
+});
+
 test("doctorReport: distinguishes source advisory dirtiness from managed blocking dirtiness", () => {
   const registry = normalizeRegistry({
     kitPath: "/kit",

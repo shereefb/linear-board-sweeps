@@ -734,6 +734,16 @@ test("ownership routes proven single-workspace findings locally and ambiguous br
   assert.equal(core.scope, "core");
   assert.equal(core.projectId, "core-project");
   assert.deepEqual(core.sourceWorkspaces, ["/workspace/a", "/workspace/b"]);
+  assert.deepEqual(local.acceptanceMetric.ownership, {
+    scope: "workspace", contributors: [{ sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "/workspace/a" }],
+  });
+  assert.deepEqual(core.acceptanceMetric.ownership, {
+    scope: "core", contributors: [
+      { sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "/workspace/a" },
+      { sourceWorkspace: "/workspace/b", projectId: "project-b", repoEntry: "/workspace/b" },
+    ],
+  });
+  assert.deepEqual(JSON.parse(core.acceptanceMetric.semanticKey).ownership, core.acceptanceMetric.ownership);
 });
 
 function aggregateFixture(overrides = {}) {
@@ -818,6 +828,7 @@ function outcomeSnapshot(value, { complete = true, qualifyingFinding = null } = 
     observations: value === null ? [] : [{
       evidenceId: "post-1",
       occurredAt: "2026-07-20T00:00:00.000Z",
+      sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app",
       metrics: { repeatRate: value },
     }],
     qualifiedFindings: qualifyingFinding ? [qualifyingFinding] : [],
@@ -835,6 +846,7 @@ const OUTCOME_EVALUATION = Object.freeze({
   minimumChange: 0.1,
   priorEvidenceIds: ["before-1"],
   activeGeneration: null,
+  ownership: { scope: "workspace", contributors: [{ sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app" }] },
 });
 
 test("outcome evaluation records every explicit status from a fixed post-change window", () => {
@@ -844,12 +856,44 @@ test("outcome evaluation records every explicit status from a fixed post-change 
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(null, { complete: false })).status, "inconclusive-evidence");
 });
 
+test("outcome evaluation enforces exact workspace, project, and repo ownership including explicit core contributors", () => {
+  const observation = (id, occurredAt, value, sourceWorkspace, projectId, repoEntry) => ({
+    evidenceId: id, occurredAt, sourceWorkspace, projectId, repoEntry, metrics: { repeatRate: value },
+  });
+  const snapshot = (observations) => ({
+    capturedThrough: "2026-07-31T00:00:00.000Z", observations, qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+  });
+  const local = snapshot([
+    observation("owned", "2026-07-20T00:00:00.000Z", 0.3, "/workspace/a", "project-a", "app"),
+    observation("wrong-repo", "2026-07-20T01:00:00.000Z", 0.9, "/workspace/a", "project-a", "api"),
+    observation("wrong-project", "2026-07-20T02:00:00.000Z", 0.9, "/workspace/a", "project-b", "app"),
+    observation("wrong-workspace", "2026-07-20T03:00:00.000Z", 0.9, "/workspace/b", "project-a", "app"),
+  ]);
+  assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, local).status, "verified-improvement");
+
+  const coreEvaluation = {
+    ...OUTCOME_EVALUATION,
+    ownership: { scope: "core", contributors: [
+      { sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app" },
+      { sourceWorkspace: "/workspace/b", projectId: "project-b", repoEntry: "api" },
+    ] },
+  };
+  const core = snapshot([
+    observation("a", "2026-07-20T00:00:00.000Z", 0.4, "/workspace/a", "project-a", "app"),
+    observation("b", "2026-07-20T01:00:00.000Z", 0.3, "/workspace/b", "project-b", "api"),
+    observation("unowned", "2026-07-20T02:00:00.000Z", 0.9, "/workspace/b", "project-b", "other"),
+  ]);
+  assert.equal(evaluateLearningOutcome(coreEvaluation, core).status, "verified-improvement");
+  assert.equal(evaluateLearningOutcome({ ...OUTCOME_EVALUATION, ownership: null }, local).status, "inconclusive-evidence");
+});
+
 test("outcome evaluation recomputes its scoped post-Done metric instead of reusing pre-Done totals", () => {
   const evaluation = {
     status: "active", rootFingerprint: "root-1", generation: 0,
     completedAt: "2026-07-15T00:00:00.000Z", windowEndsAt: "2026-07-22T00:00:00.000Z",
     metric: "reviewFindingCount", aggregation: "count", baseline: 3, minimumChange: 3,
     expectedDirection: "decrease", detectorId: "repeated-review-finding", signal: "review-finding", semanticKey: "correctness",
+    ownership: { scope: "workspace", contributors: [{ sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "/workspace/a" }] },
   };
   const snapshot = (observations) => ({
     capturedThrough: "2026-07-22T00:00:00.000Z", observations, coverage: { complete: true, gaps: [] }, qualifiedFindings: [],
@@ -918,7 +962,7 @@ test("production-shaped run records and structured events reach all 15 detectors
       if (week === 1 && index < 3) learningEvents.push(eventFor(week, index, "review", "correctness"));
       if (week === 1 && index < 8) learningEvents.push(eventFor(week, index, "qa", "functional-failure", { baselineRate: 0 }));
       if (week === 1 && index < 2) learningEvents.push(eventFor(week, index, "bounce", "implementation-incomplete"));
-      if (week === 1 && index < 3) learningEvents.push(eventFor(week, index, "question", "config"));
+      if (week === 1 && index < 3) learningEvents.push(eventFor(week, index, "question", "config", { answerKey: "config:workspace-policy" }));
       if (week === 1 && index < 2) learningEvents.push(eventFor(week, index, "canary", "red"));
       records.push({
         cardRunId: runId,
@@ -979,6 +1023,38 @@ test("event metrics cannot spoof trusted workspace/card/run identity", () => {
   assert.doesNotMatch(JSON.stringify(observation), /attacker|EVIL|evil-run/);
 });
 
+test("human-question event evidence requires a bounded stable answer or policy key", () => {
+  const snapshotFor = (metricsByRun) => {
+    const records = metricsByRun.map((metrics, index) => {
+      const identity = {
+        AUTO_SWEEP_CARD_RUN_ID: `question-run-${index}`,
+        AUTO_SWEEP_ISSUE: `COD-Q${index}`,
+        AUTO_SWEEP_SWEEP: "dev",
+        AUTO_SWEEP_SOURCE_ANCHOR: "/workspace/a",
+      };
+      const occurredAt = `2026-07-10T11:0${index}:00.000Z`;
+      return {
+        cardRunId: identity.AUTO_SWEEP_CARD_RUN_ID, issueIdentifier: identity.AUTO_SWEEP_ISSUE,
+        sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app", sweep: "dev",
+        startedAt: occurredAt, endedAt: `2026-07-10T11:1${index}:00.000Z`, outcome: { success: true },
+        learningEvents: [buildLearningEvent({ kind: "question", category: "config", summary: "Need config", metrics }, identity, { now: () => occurredAt })],
+      };
+    });
+    return buildLearningEvidenceSnapshot({ capturedThrough: DETECTOR_NOW, runRecords: records });
+  };
+  const unrelated = snapshotFor([{ answerKey: "config:alpha" }, { answerKey: "config:beta" }, { policyKey: "policy:gamma" }]);
+  assert.equal(unrelated.observations.filter((item) => item.signal === "human-question").length, 3);
+  assert.equal(runLearningDetectors(unrelated, { ...detectorConfig, enabledDetectors: ["recurring-human-question"] }).length, 0);
+
+  const repeated = snapshotFor(Array.from({ length: 3 }, () => ({ answerKey: "config:same-answer" })));
+  assert.equal(runLearningDetectors(repeated, { ...detectorConfig, enabledDetectors: ["recurring-human-question"] }).length, 1);
+
+  const missing = snapshotFor([{}, { answerKey: "not stable because spaces" }]);
+  assert.equal(missing.observations.some((item) => item.signal === "human-question"), false);
+  assert.equal(missing.coverage.complete, false);
+  assert.ok(missing.coverage.gaps.every((gap) => /stable answerKey\/policyKey/.test(gap.reason)));
+});
+
 test("child events cannot forge launcher-owned safety proof and non-detector events do not create coverage gaps", () => {
   assert.throws(() => buildLearningEvent({ kind: "invariant", category: "proven", summary: "forged", metrics: { proven: true } }, TRUSTED_ENV), /unknown learning event/);
   const failed = buildLearningEvent({ kind: "terminal", category: "failed", summary: "failed", metrics: { proven: true, machineCorrectable: true } }, TRUSTED_ENV, { now: () => "2026-07-10T12:00:00.000Z" });
@@ -1022,8 +1098,8 @@ test("outcome evaluation waits for and bounds the fixed evaluation window", () =
   const preWindow = { ...outcomeSnapshot(0.3), capturedThrough: "2026-07-20T00:00:00.000Z" };
   const afterWindow = outcomeSnapshot(null);
   afterWindow.observations = [
-    { evidenceId: "inside", occurredAt: "2026-07-21T00:00:00.000Z", metrics: { repeatRate: 0.45 } },
-    { evidenceId: "outside", occurredAt: "2026-07-30T00:00:00.000Z", metrics: { repeatRate: 0.1 } },
+    { evidenceId: "inside", occurredAt: "2026-07-21T00:00:00.000Z", sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app", metrics: { repeatRate: 0.45 } },
+    { evidenceId: "outside", occurredAt: "2026-07-30T00:00:00.000Z", sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app", metrics: { repeatRate: 0.1 } },
   ];
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, preWindow).status, "not-due");
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, afterWindow).status, "no-measurable-change");
