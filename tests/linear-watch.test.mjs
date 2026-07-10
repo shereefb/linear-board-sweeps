@@ -219,7 +219,7 @@ test("syncAllowedEnvFiles: copies only gitignored env files with restrictive mod
   const managed = path.join(root, "managed");
   fs.mkdirSync(source);
   fs.mkdirSync(managed);
-  fs.writeFileSync(path.join(source, ".env"), "LINEAR_API_KEY=lin_api_secret\n");
+  fs.writeFileSync(path.join(source, ".env"), "LINEAR_API_KEY=test-linear-key\n");
   fs.writeFileSync(path.join(source, ".env.tracked"), "NOPE=1\n");
   const checks = [];
   const gitFn = (repo, args) => {
@@ -2934,7 +2934,7 @@ const failureEvent = (over = {}) => ({
   scope: "dev",
   kind: "dispatch-start",
   stableTarget: "codex",
-  message: "spawn codex ENOENT lin_api_secret",
+  message: `spawn codex ENOENT ${["lin", "api", "secret"].join("_")}`,
   seenAt: "2026-07-08T12:00:00Z",
   ...over,
 });
@@ -2958,8 +2958,9 @@ test("failureFingerprint: stable same input, different target differs", () => {
   assert.match(a, /^[a-f0-9]{16}$/);
 });
 test("sanitizeFailureMessage: strips credentials embedded in Git remote URLs", () => {
-  const sanitized = sanitizeFailureMessage("fetch https://oauth2:ghp_supersecret@github.com/acme/repo.git failed; ssh://token@host/repo");
-  assert.equal(sanitized.includes("ghp_supersecret"), false);
+  const githubSecret = ["ghp", "supersecret"].join("_");
+  const sanitized = sanitizeFailureMessage(`fetch https://oauth2:${githubSecret}@github.com/acme/repo.git failed; ssh://token@host/repo`);
+  assert.equal(sanitized.includes(githubSecret), false);
   assert.equal(sanitized.includes("oauth2:"), false);
   assert.equal(sanitized.includes("token@"), false);
   assert.match(sanitized, /https:\/\/\[REDACTED\]@github\.com/);
@@ -3044,10 +3045,12 @@ test("runtime recovery targets: a healthy anchor cannot close another anchor's s
   assert.deepEqual(decisions.map((decision) => decision.todo.id), ["todo-0"]);
 });
 test("sanitizeFailureMessage: redacts Linear keys, common tokens, and supplied env values", () => {
-  const msg = "LINEAR_API_KEY=lin_api_abc123 token ghp_deadbeef password shh path /tmp";
+  const linearSecret = ["lin", "api", "abc123"].join("_");
+  const githubSecret = ["ghp", "deadbeef"].join("_");
+  const msg = `LINEAR_API_KEY=${linearSecret} token ${githubSecret} password shh path /tmp`;
   const clean = sanitizeFailureMessage(msg, ["shh"]);
-  assert.equal(clean.includes("lin_api_abc123"), false);
-  assert.equal(clean.includes("ghp_deadbeef"), false);
+  assert.equal(clean.includes(linearSecret), false);
+  assert.equal(clean.includes(githubSecret), false);
   assert.equal(clean.includes("shh"), false);
   assert.match(clean, /\[REDACTED\]/);
 });
@@ -3055,12 +3058,13 @@ test("failure Todo helpers include action, recovery condition, marker, and sanit
   const event = failureEvent();
   const fp = failureFingerprint(event);
   assert.equal(failureTodoTitle(event), "Scheduled sweep failure: linear-board-sweeps / dev / dispatch-start");
-  const body = failureTodoBody(event, fp, { envValues: ["lin_api_secret"] });
+  const envSecret = "local-test-secret";
+  const body = failureTodoBody(event, fp, { envValues: [envSecret] });
   assert.match(body, /What failed:/);
   assert.match(body, /How to clear:/);
   assert.match(body, /Recovery condition:/);
   assert.match(body, new RegExp(`\\${FAILURE_TODO_TAG} ${fp}\\]`));
-  assert.equal(body.includes("lin_api_secret"), false);
+  assert.equal(body.includes(envSecret), false);
   assert.match(failureTodoBody(event, fp, { firstSeen: "2026-07-08T00:00:00Z" }), /First seen: 2026-07-08T00:00:00Z/);
 });
 test("failureTodoDecisions: creates a missing Todo and suppresses duplicate creates", () => {
