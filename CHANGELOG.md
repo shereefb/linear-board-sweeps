@@ -2,6 +2,22 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.0] - 2026-07-10
+
+### Added
+
+- Route scheduled cards to an explicit primary repository from an exact-one Linear label mapping, while keeping configured sibling repositories available for intentional multi-repo work.
+- Recheck repository ownership before claims, Ship dispatch, handoffs, and each child’s first material work; routing races now fail closed with typed outcomes and self-clearing operator Todos.
+
+### Changed
+
+- Apply same-repository limits independently per routed primary repo, reserve follow-up slots atomically, and keep dry-run selection aligned with live admission so unrelated apps can progress concurrently under the existing ten-child host ceiling.
+- Document multi-repo migration, deploy/canary gates, relation-only `blockedBy` semantics, and delegation-by-default guidance for scheduled and interactive work.
+
+### Fixed
+
+- Stop sibling-app cards from being dispatched into the first configured repository, which previously left valid Guide, Admin, Portal, and Slack work stalled behind the Coach checkout.
+
 ## [1.1.3] - 2026-07-09
 
 ### Fixed
