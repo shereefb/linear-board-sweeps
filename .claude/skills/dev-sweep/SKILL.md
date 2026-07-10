@@ -13,6 +13,10 @@ Build features from "Dev" cards, one worktree per feature, with subagents/parall
 
 ## 0. Preflight (fail fast)
 
+### Direct manual handoff
+
+When `MANUAL_SWEEP_STAGE=dev`, process only `MANUAL_SWEEP_ISSUE` when its state equals `MANUAL_SWEEP_EXPECTED_STATE`; validate route, dependencies, and no foreign claim before claiming it, write/reuse `[manual-sweep-handoff dev <id>]`, heartbeat, and release only that claim. This is the sole exception to the normal `sweep:manual-only` skip and never applies to scheduled runs. For `manual-sweep:fast-track-requested`, preserve every eligibility gate but bypass only size and allowed-label checks; factory-learning, disabled fast path, material risk, failed checks/reviews/lenses deny and remove stale eligibility.
+
 - **Load workspace config.** In scheduled mode, read `$AUTO_SWEEP_ANCHOR/.claude/linear-sweep.json`; otherwise read `.claude/linear-sweep.json` from the current repo root (see spec-sweep §0 for fields). The routed primary repo may be a sibling and is not required to carry a duplicate config. Missing file → exit with a one-line error.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
 - **Coding guardrail.** Before writing, reviewing, debugging, refactoring, or otherwise changing code, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.

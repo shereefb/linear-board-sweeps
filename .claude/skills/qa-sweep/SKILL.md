@@ -5,6 +5,10 @@ description: Smoke-test the configured Linear project's "QA" cards as a real use
 
 # QA Sweep
 
+### Direct manual handoff
+
+When `MANUAL_SWEEP_STAGE=qa`, process only the named expected-state card after route, dependency, and foreign-claim validation. Claim/heartbeat/release only that card and write/reuse `[manual-sweep-handoff qa <id>]`; scheduled selection still skips manual-only cards.
+
 Act as a user: exercise each "QA" feature in a real dev environment, in as much detail as possible, confirm it works well, fix UX/UI bugs you find, then hand it to the human review gate by moving it to **"Signoff"** with screenshots + a written review on the card. A human reviews the "Signoff" column and moves approved cards to "Ship"; ship-sweep does the merge + deploy.
 
 **This sweep NEVER merges and NEVER deploys** (that's ship-sweep, gated behind the human "Ship" move). It is now symmetric with dev-sweep: it lands a green, smoke-tested feature at "Signoff" and stops. Because it no longer touches prod, it is safe to schedule as aggressively as the other sweeps.

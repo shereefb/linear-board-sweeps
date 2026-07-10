@@ -120,7 +120,7 @@ export const SWEEP_ORDER = ["ship", "qa", "dev", "spec"];
 // The kit skill directories the auto-updater propagates to anchors — one per sweep.
 export const SKILL_DIRS = SWEEPS.map((s) => `${s}-sweep`);
 // Human-invoked skills copied to anchors but never included in scheduled dispatch.
-export const MANUAL_SKILL_DIRS = ["unblock-sweep"];
+export const MANUAL_SKILL_DIRS = ["unblock-sweep", "manual-sweep"];
 export const PROPAGATED_SKILL_DIRS = [...SKILL_DIRS, ...MANUAL_SKILL_DIRS];
 // Holding states can carry a stale claim but are fetched by NO sweep (a sweep's
 // own states are reaped in the main loop). qa moves a card to "Signoff" and
