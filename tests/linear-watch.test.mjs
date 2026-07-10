@@ -9,7 +9,7 @@ import { spawn as spawnProcess, spawnSync as spawnProcessSync } from "node:child
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
-import { aggregateLearningFindings } from "../scripts/learning.mjs";
+import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -28,7 +28,7 @@ import {
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
-  buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
+  buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
@@ -5550,6 +5550,50 @@ test("launcher poison-card evidence requires every orphaned claim to be absent",
   });
   assert.equal(emitted.length, 1);
   assert.equal(emitted[0].evidence.type, "machine-correctable-poison-card");
+});
+
+test("route-less failure Todo recovery uses the launcher's trusted anchor repo in routed workspaces", () => {
+  const sourceAnchorPath = "/source/app";
+  const config = {
+    projectId: "project-1",
+    repos: ["app", "worker"],
+    repoRouting: { byLabel: { "app:main": "app", "app:worker": "worker" } },
+  };
+  const repoPairs = [
+    { repoEntry: "app", sourceRepoPath: sourceAnchorPath, managedRepoPath: "/managed/app" },
+    { repoEntry: "worker", sourceRepoPath: "/source/worker", managedRepoPath: "/managed/worker" },
+  ];
+  const repoEntry = trustedLauncherSourceRepoEntry(sourceAnchorPath, config, repoPairs);
+  assert.equal(repoEntry, "app");
+  assert.equal(trustedLauncherSourceRepoEntry("/source/unknown", config, repoPairs), null);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "routed-recovery-evidence-"));
+  appendLauncherEvidenceRun({
+    sourceAnchorPath,
+    config,
+    repoPairs,
+    repoEntry,
+    card: { id: "todo-1", identifier: "COD-50", labelNames: [] },
+    sweep: "launcher",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    evidence: {
+      type: "recovery-transition",
+      state: "open-after-healthy",
+      key: "failure-fingerprint",
+      occurredAt: "2026-07-10T12:00:00.000Z",
+    },
+  }, { runsDir: dir });
+  const indexed = readLearningRunIndex(dir, { capturedThrough: "2026-07-11T00:00:00.000Z" });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-11T00:00:00.000Z",
+    runRecords: indexed.runRecords,
+    coverageGaps: indexed.coverageGaps,
+  });
+  assert.equal(snapshot.coverage.complete, true);
+  assert.equal(snapshot.observations.length, 1);
+  assert.equal(snapshot.observations[0].signal, "failure-recovery");
+  assert.equal(snapshot.observations[0].repoEntry, "app");
+  assert.equal(snapshot.observations[0].recoveryState, "open-after-healthy");
 });
 
 test("doctorReport: distinguishes source advisory dirtiness from managed blocking dirtiness", () => {

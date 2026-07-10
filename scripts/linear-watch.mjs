@@ -5237,11 +5237,18 @@ export function buildLauncherEvidenceRunRecord({
   config = {},
   repoPairs = [],
   card = {},
+  repoEntry = null,
   sweep = "launcher",
   evidence,
   occurredAt = evidence?.occurredAt || new Date().toISOString(),
 } = {}) {
-  const route = resolveCardRepoRoute({ config, card, repoPairs });
+  const configuredEntries = Array.isArray(config.repos) && config.repos.length ? config.repos : repoPairs.map((pair) => pair.repoEntry);
+  const trustedPair = repoEntry && configuredEntries.includes(repoEntry)
+    ? repoPairs.filter((pair) => pair.repoEntry === repoEntry)
+    : [];
+  const route = repoEntry
+    ? (trustedPair.length === 1 ? { ok: true, ...trustedPair[0] } : { ok: false })
+    : resolveCardRepoRoute({ config, card, repoPairs });
   if (!route.ok || !card.identifier || !config.projectId || Number.isNaN(Date.parse(occurredAt || ""))) return null;
   const normalizedEvidence = { ...(evidence || {}), occurredAt };
   const identity = JSON.stringify([
@@ -5271,6 +5278,18 @@ export function buildLauncherEvidenceRunRecord({
     startedAt: occurredAt,
     endedAt: occurredAt,
   };
+}
+
+export function trustedLauncherSourceRepoEntry(sourceAnchorPath, config = {}, repoPairs = [], {
+  canonicalFn = canonicalAnchorIdentity,
+} = {}) {
+  const source = canonicalFn(sourceAnchorPath || ".");
+  const matches = repoPairs.filter((pair) => {
+    try { return canonicalFn(pair.sourceRepoPath) === source; }
+    catch { return false; }
+  });
+  const configuredEntries = Array.isArray(config.repos) && config.repos.length ? config.repos : repoPairs.map((pair) => pair.repoEntry);
+  return matches.length === 1 && configuredEntries.includes(matches[0].repoEntry) ? matches[0].repoEntry : null;
 }
 
 export function appendLauncherEvidenceRun(input, {
@@ -5575,6 +5594,7 @@ async function tick({ dryRun = false } = {}) {
         config: active.config,
         repoPairs: active.repoPairs,
         card,
+        repoEntry: trustedLauncherSourceRepoEntry(active.sourceAnchorPath, active.config, active.repoPairs),
         sweep,
         evidence,
         occurredAt: evidence.occurredAt,
