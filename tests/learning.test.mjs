@@ -58,8 +58,8 @@ test("learning contracts expose stable stage, trigger, lenses, and taxonomy", ()
   assert.equal(LEARNING_TRIGGER, "learning-due");
   assert.deepEqual(LEARNING_LENSES, ["reliability", "quality", "throughput"]);
   assert.deepEqual(LEARNING_EVENT_TAXONOMY, {
-    review: ["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design"],
-    qa: ["environment-start", "functional-failure", "console-error", "network-error", "accessibility", "visual", "build"],
+    review: ["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design", "completed"],
+    qa: ["environment-start", "passed", "functional-failure", "console-error", "network-error", "accessibility", "visual", "build"],
     question: ["config", "credential", "product-decision", "asset", "deploy"],
     bounce: ["missing-acceptance", "missing-design", "missing-repo-scope", "implementation-incomplete"],
     canary: ["red"],
@@ -313,9 +313,9 @@ test("learning evidence snapshots freeze capturedThrough and report partial cove
   });
   assert.deepEqual(snapshot.runRecords.map((record) => record.cardRunId), ["run-before"]);
   assert.deepEqual(snapshot.events.map((event) => event.eventId), [before.eventId]);
-  assert.equal(snapshot.observations.length, 1);
+  assert.equal(snapshot.observations.length, 2);
   assert.equal(snapshot.coverage.complete, false);
-  assert.equal(snapshot.coverage.gaps.length, 1);
+  assert.equal(snapshot.coverage.gaps.length, 2);
   assert.equal(snapshot.capturedThrough, "2026-07-10T12:00:00.000Z");
 });
 
@@ -824,6 +824,109 @@ test("production evidence snapshots retain only the known fields detectors requi
   assert.equal(Object.hasOwn(snapshot.observations[0], "hostDisplayName"), false);
   assert.equal(snapshot.observations[0].signal, "review-finding");
   assert.equal(runLearningDetectors(snapshot, { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] }).length, 1);
+});
+
+test("production-shaped run records and structured events reach all 15 detectors at exact sample thresholds", () => {
+  const weekStarts = ["2026-07-01T12:00:00.000Z", "2026-07-08T12:00:00.000Z", "2026-07-15T12:00:00.000Z"].map(Date.parse);
+  const eventFor = (week, index, kind, category, metrics = {}) => buildLearningEvent({ kind, category, summary: `${kind}/${category}`, metrics }, {
+    AUTO_SWEEP_CARD_RUN_ID: `run-${week}-${index}`,
+    AUTO_SWEEP_ISSUE: `COD-${week}${String(index).padStart(2, "0")}`,
+    AUTO_SWEEP_SWEEP: "dev",
+    AUTO_SWEEP_SOURCE_ANCHOR: "/workspace/a",
+  }, { now: () => new Date(weekStarts[week] + index * 60_000 + 1_000).toISOString() });
+  const records = [];
+  for (let week = 0; week < 3; week++) {
+    for (let index = 0; index < 10; index++) {
+      const runId = `run-${week}-${index}`;
+      const durationMs = [300_000, 600_000, 1_200_000][week];
+      const nonproductive = week === 1 ? index < 2 : week === 2 ? index < 4 : false;
+      const deferred = week === 1 ? index < 3 : week === 2 ? index < 5 : false;
+      const learningEvents = [
+        eventFor(week, index, "terminal", nonproductive ? "blocked" : "advanced"),
+        eventFor(week, index, "review", "completed", { riskClass: "low", findingCount: 0, safetyFloorSatisfied: true, reviewDurationMs: durationMs }),
+      ];
+      const launcherEvidence = [];
+      if (week === 2 && index < 2) {
+        learningEvents.unshift(eventFor(week, index, "terminal", "failed"));
+        launcherEvidence.push({ type: "stale-claim", occurredAt: new Date(weekStarts[week] + index * 60_000 + 2_000).toISOString(), key: "dev-launcher", stage: "dev", subsystem: "launcher" });
+        launcherEvidence.push({ type: "machine-correctable-poison-card", occurredAt: new Date(weekStarts[week] + index * 60_000 + 3_000).toISOString(), key: "auto-reap" });
+      }
+      if (week === 2 && index === 2) launcherEvidence.push({ type: "recovery-transition", state: "recovered", occurredAt: new Date(weekStarts[week] + index * 60_000 + 2_000).toISOString(), key: "runtime-lane" });
+      if (week === 2 && index === 3) launcherEvidence.push({ type: "recovery-transition", state: "recurred", occurredAt: new Date(weekStarts[week] + index * 60_000 + 2_000).toISOString(), key: "runtime-lane" });
+      if (week === 2 && index === 4) launcherEvidence.push({ type: "proven-safety-invariant", occurredAt: new Date(weekStarts[week] + index * 60_000 + 2_000).toISOString(), key: "claim-owner-confirmation" });
+      if (week === 1 && index < 3) learningEvents.push(eventFor(week, index, "review", "correctness"));
+      if (week === 1 && index < 8) learningEvents.push(eventFor(week, index, "qa", "functional-failure", { baselineRate: 0 }));
+      if (week === 1 && index < 2) learningEvents.push(eventFor(week, index, "bounce", "implementation-incomplete"));
+      if (week === 1 && index < 3) learningEvents.push(eventFor(week, index, "question", "config"));
+      if (week === 1 && index < 2) learningEvents.push(eventFor(week, index, "canary", "red"));
+      records.push({
+        cardRunId: runId,
+        issueIdentifier: `COD-${week}${String(index).padStart(2, "0")}`,
+        sourceWorkspace: "/workspace/a",
+        projectId: "project-a",
+        repoEntry: "app",
+        sweep: "dev",
+        queueWaitMs: [60_000, 120_000, 240_000][week],
+        dependencyDeferredCount: deferred ? 1 : 0,
+        outcome: { success: true, kind: "success" },
+        startedAt: new Date(weekStarts[week] + index * 60_000).toISOString(),
+        endedAt: new Date(weekStarts[week] + index * 60_000 + durationMs).toISOString(),
+        learningEvents,
+        launcherEvidence,
+      });
+    }
+  }
+  const snapshot = buildLearningEvidenceSnapshot({ capturedThrough: "2026-07-20T12:00:00.000Z", runRecords: records });
+  assert.equal(snapshot.coverage.complete, true);
+  const exactCounts = {
+    "dispatch-failure": 2, "stale-claim": 2, "failure-recovery": 2, "safety-invariant": 1, "poison-card": 2,
+    "review-finding": 3, "qa-result": 8, "spec-bounce": 2, "human-question": 3, "red-canary": 2,
+    "queue-run": 20, "stage-run": 20, "productive-run": 20, "capacity-run": 20, "review-run": 20,
+  };
+  for (const [signal, count] of Object.entries(exactCounts)) assert.equal(snapshot.observations.filter((item) => item.signal === signal).length, count, signal);
+  for (const detector of LEARNING_DETECTORS) {
+    const findings = runLearningDetectors(snapshot, { ...detectorConfig, enabledDetectors: [detector.id] });
+    assert.equal(findings.length, 1, detector.id);
+    assert.equal(findings[0].projectId, "project-a", detector.id);
+    assert.equal(findings[0].repoEntry, "app", detector.id);
+    assert.ok(snapshot.observations.some((item) => Number.isFinite(item.metrics?.[findings[0].acceptanceMetric.name])), `${detector.id} acceptance metric must exist in projected evidence`);
+  }
+});
+
+test("event metrics cannot spoof trusted workspace/card/run identity", () => {
+  const event = buildLearningEvent({
+    kind: "review", category: "security", summary: "finding",
+    metrics: { sourceWorkspace: "/attacker", projectId: "evil", repoEntry: "evil", cardId: "EVIL-1", runId: "evil-run" },
+  }, TRUSTED_ENV, { now: () => "2026-07-10T12:00:00.000Z" });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-10T12:01:00.000Z",
+    runRecords: [{
+      cardRunId: TRUSTED_ENV.AUTO_SWEEP_CARD_RUN_ID,
+      issueIdentifier: TRUSTED_ENV.AUTO_SWEEP_ISSUE,
+      sourceWorkspace: TRUSTED_ENV.AUTO_SWEEP_SOURCE_ANCHOR,
+      projectId: "project-a", repoEntry: "app", sweep: "dev",
+      startedAt: "2026-07-10T11:00:00.000Z", endedAt: "2026-07-10T12:00:00.000Z",
+      outcome: { success: true }, learningEvents: [event],
+    }],
+  });
+  const observation = snapshot.observations.find((item) => item.signal === "review-finding");
+  assert.equal(observation.sourceWorkspace, TRUSTED_ENV.AUTO_SWEEP_SOURCE_ANCHOR);
+  assert.equal(observation.projectId, "project-a");
+  assert.equal(observation.repoEntry, "app");
+  assert.equal(observation.cardId, TRUSTED_ENV.AUTO_SWEEP_ISSUE);
+  assert.equal(observation.runId, TRUSTED_ENV.AUTO_SWEEP_CARD_RUN_ID);
+  assert.doesNotMatch(JSON.stringify(observation), /attacker|EVIL|evil-run/);
+});
+
+test("child events cannot forge launcher-owned safety proof and non-detector events do not create coverage gaps", () => {
+  assert.throws(() => buildLearningEvent({ kind: "invariant", category: "proven", summary: "forged", metrics: { proven: true } }, TRUSTED_ENV), /unknown learning event/);
+  const failed = buildLearningEvent({ kind: "terminal", category: "failed", summary: "failed", metrics: { proven: true, machineCorrectable: true } }, TRUSTED_ENV, { now: () => "2026-07-10T12:00:00.000Z" });
+  const advanced = buildLearningEvent({ kind: "terminal", category: "advanced", summary: "advanced" }, TRUSTED_ENV, { now: () => "2026-07-10T12:00:00.000Z" });
+  const forged = buildLearningEvidenceSnapshot({ capturedThrough: "2026-07-10T12:01:00.000Z", events: [failed] });
+  assert.equal(forged.observations.some((item) => item.signal === "safety-invariant" || item.proven === true || item.machineCorrectable === true), false);
+  const ignored = buildLearningEvidenceSnapshot({ capturedThrough: "2026-07-10T12:01:00.000Z", events: [advanced] });
+  assert.equal(ignored.observations.length, 0);
+  assert.equal(ignored.coverage.complete, true);
 });
 
 test("semantic detectors cluster compatible evidence and enforce declared time windows", () => {

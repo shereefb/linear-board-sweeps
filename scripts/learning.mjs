@@ -14,10 +14,9 @@ export const MAX_LEARNING_EVENT_METRIC_STRING_CHARS = 500;
 export const MAX_LEARNING_SNAPSHOT_RUNS = 5_000;
 export const MAX_LEARNING_SNAPSHOT_EVENTS = 10_000;
 export const MAX_LEARNING_SNAPSHOT_OBSERVATIONS = 5_000;
-
 export const LEARNING_EVENT_TAXONOMY = Object.freeze({
-  review: Object.freeze(["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design"]),
-  qa: Object.freeze(["environment-start", "functional-failure", "console-error", "network-error", "accessibility", "visual", "build"]),
+  review: Object.freeze(["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design", "completed"]),
+  qa: Object.freeze(["environment-start", "passed", "functional-failure", "console-error", "network-error", "accessibility", "visual", "build"]),
   question: Object.freeze(["config", "credential", "product-decision", "asset", "deploy"]),
   bounce: Object.freeze(["missing-acceptance", "missing-design", "missing-repo-scope", "implementation-incomplete"]),
   canary: Object.freeze(["red"]),
@@ -189,6 +188,7 @@ function normalizeSnapshotRun(record) {
     ["cardRunId", sanitizeLearningText(record.cardRunId, 300)],
     ["issueIdentifier", sanitizeLearningText(record.issueIdentifier, 100)],
     ["sourceWorkspace", sanitizeLearningText(record.sourceWorkspace, 1_000)],
+    ["projectId", sanitizeLearningText(record.projectId, 300)],
     ["repoEntry", sanitizeLearningText(record.repoEntry, 300)],
     ["sweep", sanitizeLearningText(record.sweep, 50)],
     ["runtime", sanitizeLearningText(record.runtime, 100)],
@@ -200,9 +200,41 @@ function normalizeSnapshotRun(record) {
     ["dependencyDeferredCount", finiteNumber(record.dependencyDeferredCount)],
     ["exitCode", finiteNumber(record.exitCode)],
     ["outcome", outcome],
+    ["launcherEvidence", normalizeLauncherEvidence(record.launcherEvidence)],
     ["startedAt", Number.isNaN(Date.parse(record.startedAt || "")) ? undefined : record.startedAt],
     ["endedAt", record.endedAt],
   ]);
+}
+
+const LAUNCHER_EVIDENCE_TYPES = Object.freeze({
+  "stale-claim": Object.freeze({ states: [] }),
+  "recovery-transition": Object.freeze({ states: ["recovered", "recurred", "open-after-healthy"] }),
+  "proven-safety-invariant": Object.freeze({ states: [] }),
+  "machine-correctable-poison-card": Object.freeze({ states: [] }),
+});
+
+function normalizeLauncherEvidence(value) {
+  if (!Array.isArray(value)) return undefined;
+  const evidence = [];
+  for (const item of value.slice(0, 100)) {
+    const type = sanitizeLearningText(item?.type, 100);
+    const contract = LAUNCHER_EVIDENCE_TYPES[type];
+    const occurredAt = item?.occurredAt;
+    const state = sanitizeLearningText(item?.state, 100);
+    if (!contract || Number.isNaN(Date.parse(occurredAt || ""))) continue;
+    if (contract.states.length && !contract.states.includes(state)) continue;
+    evidence.push(compactObject([
+      ["type", type],
+      ["occurredAt", occurredAt],
+      ["state", state],
+      ["key", sanitizeLearningText(item?.key, 300)],
+      ["stage", sanitizeLearningText(item?.stage, 50)],
+      ["subsystem", sanitizeLearningText(item?.subsystem, 100)],
+      ["reason", sanitizeLearningText(item?.reason, 500)],
+      ["summary", sanitizeLearningText(item?.summary, MAX_LEARNING_EVENT_SUMMARY_CHARS)],
+    ]));
+  }
+  return evidence.length ? evidence : undefined;
 }
 
 function normalizeSnapshotObservation(observation) {
@@ -257,6 +289,243 @@ function normalizeSnapshotObservation(observation) {
 function boundedLimit(value, fallback) {
   const parsed = Math.floor(Number(value));
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, fallback) : fallback;
+}
+
+const SIGNAL_METRIC_CONTRACTS = Object.freeze({
+  "dispatch-failure": Object.freeze({ name: "dispatchFailureCount", aggregation: "latest", unit: "occurrences" }),
+  "stale-claim": Object.freeze({ name: "staleClaimCount", aggregation: "latest", unit: "occurrences" }),
+  "failure-recovery": Object.freeze({ name: "failedRecoveryCount", aggregation: "latest", unit: "occurrences" }),
+  "safety-invariant": Object.freeze({ name: "safetyInvariantCount", aggregation: "latest", unit: "occurrences" }),
+  "poison-card": Object.freeze({ name: "poisonCardCount", aggregation: "latest", unit: "occurrences" }),
+  "review-finding": Object.freeze({ name: "reviewFindingCount", aggregation: "latest", unit: "occurrences" }),
+  "qa-result": Object.freeze({ name: "qaNeedsChangesRate", aggregation: "latest", unit: "ratio" }),
+  "spec-bounce": Object.freeze({ name: "specBounceCount", aggregation: "latest", unit: "occurrences" }),
+  "human-question": Object.freeze({ name: "humanQuestionCount", aggregation: "latest", unit: "occurrences" }),
+  "red-canary": Object.freeze({ name: "redCanaryCount", aggregation: "latest", unit: "occurrences" }),
+  "queue-run": Object.freeze({ name: "waitMs", aggregation: "p90", unit: "milliseconds" }),
+  "stage-run": Object.freeze({ name: "durationMs", aggregation: "p90", unit: "milliseconds" }),
+  "productive-run": Object.freeze({ name: "nonproductiveRate", aggregation: "latest", unit: "ratio" }),
+  "capacity-run": Object.freeze({ name: "capacityDeferralRate", aggregation: "latest", unit: "ratio" }),
+  "review-run": Object.freeze({ name: "reviewDurationMs", aggregation: "p90", unit: "milliseconds" }),
+});
+
+function trustedRunRoute(run) {
+  if (!run?.cardRunId || !run?.issueIdentifier || !run?.sourceWorkspace || !run?.projectId || !run?.repoEntry || !run?.sweep) return null;
+  return {
+    sourceWorkspace: run.sourceWorkspace,
+    projectId: run.projectId,
+    repoEntry: run.repoEntry,
+    issueIdentifier: run.issueIdentifier,
+    cardId: run.issueIdentifier,
+    runId: run.cardRunId,
+    sweep: run.sweep,
+    stage: run.sweep,
+  };
+}
+
+function eventObservation(event, run) {
+  const route = trustedRunRoute(run);
+  const identity = event.identity || {};
+  const trusted = route || {
+    sourceWorkspace: identity.sourceAnchor,
+    issueIdentifier: identity.issueIdentifier,
+    cardId: identity.issueIdentifier,
+    runId: identity.cardRunId,
+    sweep: identity.sweep,
+    stage: identity.sweep,
+  };
+  const base = {
+    occurredAt: event.occurredAt,
+    evidenceId: event.eventId,
+    ...trusted,
+    category: event.category,
+    summary: event.summary,
+    references: [`learning-event:${event.eventId}`],
+  };
+  if (event.kind === "review" && event.category !== "completed") return { ...base, signal: "review-finding" };
+  if (event.kind === "qa" && !["environment-start"].includes(event.category)) return {
+    ...base,
+    signal: "qa-result",
+    result: event.category === "passed" ? "passed" : "needs-changes",
+    baselineRate: finiteNumber(event.metrics?.baselineRate),
+  };
+  if (event.kind === "question") return { ...base, signal: "human-question", answerKey: event.category };
+  if (event.kind === "bounce") return { ...base, signal: "spec-bounce" };
+  if (event.kind === "canary" && event.category === "red") return { ...base, signal: "red-canary", relatedKey: "red" };
+  if (event.kind === "terminal" && event.category === "failed") return { ...base, signal: "dispatch-failure", fingerprint: "terminal:failed" };
+  return null;
+}
+
+function launcherEvidenceObservation(evidence, run, index) {
+  const route = trustedRunRoute(run);
+  if (!route) return null;
+  const key = evidence.key || evidence.reason || evidence.type;
+  const base = {
+    occurredAt: evidence.occurredAt,
+    evidenceId: `${run.cardRunId}:launcher:${index}:${stableHash([evidence.type, evidence.occurredAt, key]).slice(0, 16)}`,
+    ...route,
+    fingerprint: key,
+    rootCauseKey: key,
+    reason: evidence.reason,
+    summary: evidence.summary,
+    references: [`launcher-run:${run.cardRunId}`],
+  };
+  if (evidence.type === "stale-claim") return { ...base, signal: "stale-claim", stage: evidence.stage || run.sweep, subsystem: evidence.subsystem || "launcher" };
+  if (evidence.type === "recovery-transition") return { ...base, signal: "failure-recovery", recoveryState: evidence.state };
+  if (evidence.type === "proven-safety-invariant") return { ...base, signal: "safety-invariant", proven: true };
+  if (evidence.type === "machine-correctable-poison-card") return { ...base, signal: "poison-card", machineCorrectable: true };
+  return null;
+}
+
+function isoWeek(timestamp) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const day = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  day.setUTCDate(day.getUTCDate() + 4 - (day.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(day.getUTCFullYear(), 0, 1));
+  const week = Math.ceil((((day - yearStart) / 86400000) + 1) / 7);
+  return `${day.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+function deriveRunObservations(runs, events) {
+  const terminalByRun = new Map();
+  const reviewByRun = new Map();
+  for (const event of events) {
+    const runId = event.identity?.cardRunId;
+    if (!runId) continue;
+    if (event.kind === "terminal") terminalByRun.set(runId, event.category);
+    if (event.kind === "review" && event.category === "completed") reviewByRun.set(runId, {
+      riskClass: sanitizeLearningText(event.metrics?.riskClass, 100),
+      findingCount: finiteNumber(event.metrics?.findingCount),
+      safetyFloorSatisfied: typeof event.metrics?.safetyFloorSatisfied === "boolean" ? event.metrics.safetyFloorSatisfied : undefined,
+      reviewDurationMs: finiteNumber(event.metrics?.reviewDurationMs),
+    });
+  }
+  const eligible = [];
+  for (const run of runs) {
+    const route = trustedRunRoute(run);
+    const window = isoWeek(run.endedAt);
+    if (!route || !window) continue;
+    const durationMs = Date.parse(run.endedAt || "") - Date.parse(run.startedAt || "");
+    const terminal = terminalByRun.get(run.cardRunId);
+    eligible.push({
+      run,
+      route,
+      window,
+      routeKey: [route.sourceWorkspace, route.projectId, route.repoEntry, route.stage].join("\0"),
+      durationMs: Number.isFinite(durationMs) && durationMs >= 0 ? durationMs : undefined,
+      productive: run.outcome?.success === true && terminal ? terminal === "advanced" : undefined,
+      deferred: Number.isFinite(run.dependencyDeferredCount) ? run.dependencyDeferredCount > 0
+        : run.outcome?.kind === "dependency-deferred" ? true : undefined,
+      review: reviewByRun.get(run.cardRunId),
+    });
+  }
+  const byRoute = groupBy(eligible, (item) => item.routeKey);
+  const out = [];
+  for (const routed of byRoute.values()) {
+    const byWindow = groupBy(routed, (item) => item.window);
+    const windows = [...byWindow.keys()].sort();
+    for (let index = 1; index < windows.length; index++) {
+      const previousWindow = windows[index - 1];
+      const window = windows[index];
+      if (!consecutiveWindows(previousWindow, window)) continue;
+      const previous = byWindow.get(previousWindow);
+      const current = byWindow.get(window);
+      const queueBaseline = percentile(previous.map((item) => item.run.queueWaitMs), 0.9);
+      const durationBaseline = percentile(previous.map((item) => item.durationMs), 0.9);
+      const priorProductive = previous.filter((item) => item.productive !== undefined);
+      const productiveBaseline = priorProductive.length ? priorProductive.filter((item) => item.productive === false).length / priorProductive.length : undefined;
+      const priorDeferred = previous.filter((item) => item.deferred !== undefined);
+      const capacityBaseline = priorDeferred.length ? priorDeferred.filter((item) => item.deferred === true).length / priorDeferred.length : undefined;
+      const reviewBaseline = percentile(previous.map((item) => item.review?.reviewDurationMs), 0.9);
+      for (const item of current) {
+        const base = {
+          occurredAt: item.run.endedAt,
+          ...item.route,
+          window,
+          references: [`launcher-run:${item.run.cardRunId}`],
+        };
+        if (Number.isFinite(item.run.queueWaitMs) && Number.isFinite(queueBaseline)) out.push({
+          ...base,
+          evidenceId: `${item.run.cardRunId}:queue-run`,
+          signal: "queue-run",
+          waitMs: item.run.queueWaitMs,
+          queueWaitMs: item.run.queueWaitMs,
+          metrics: { waitMs: item.run.queueWaitMs, baselineP90Ms: queueBaseline },
+        });
+        if (Number.isFinite(item.durationMs) && Number.isFinite(durationBaseline)) out.push({
+          ...base,
+          evidenceId: `${item.run.cardRunId}:stage-run`,
+          signal: "stage-run",
+          riskClass: item.review?.riskClass || "unspecified",
+          durationMs: item.durationMs,
+          metrics: { durationMs: item.durationMs, baselineP90Ms: durationBaseline },
+        });
+        if (item.productive !== undefined && Number.isFinite(productiveBaseline)) out.push({
+          ...base,
+          evidenceId: `${item.run.cardRunId}:productive-run`,
+          signal: "productive-run",
+          success: item.run.outcome.success,
+          productive: item.productive,
+          baselineRate: productiveBaseline,
+        });
+        if (item.deferred !== undefined && Number.isFinite(capacityBaseline)
+          && Number.isFinite(item.run.queueWaitMs) && Number.isFinite(queueBaseline)) out.push({
+          ...base,
+          evidenceId: `${item.run.cardRunId}:capacity-run`,
+          signal: "capacity-run",
+          deferred: item.deferred,
+          baselineRate: capacityBaseline,
+          metrics: { waitMs: item.run.queueWaitMs, baselineP90Ms: queueBaseline },
+        });
+        if (item.review?.riskClass && Number.isFinite(item.review.findingCount)
+          && typeof item.review.safetyFloorSatisfied === "boolean" && Number.isFinite(item.review.reviewDurationMs)
+          && Number.isFinite(reviewBaseline)) out.push({
+          ...base,
+          evidenceId: `${item.run.cardRunId}:review-run`,
+          signal: "review-run",
+          riskClass: item.review.riskClass,
+          findingCount: item.review.findingCount,
+          safetyFloorSatisfied: item.review.safetyFloorSatisfied,
+          metrics: { reviewDurationMs: item.review.reviewDurationMs, baselineReviewDurationMs: reviewBaseline },
+        });
+      }
+    }
+  }
+  return out;
+}
+
+function observationMetricGroupKey(item) {
+  if (["review-finding", "spec-bounce"].includes(item.signal)) return `${item.signal}\0${item.category || "unknown"}`;
+  if (item.signal === "human-question") return `${item.signal}\0${item.category || "unknown"}\0${item.answerKey || "unknown"}`;
+  if (item.signal === "qa-result") return `${item.signal}\0${item.sourceWorkspace || "unknown"}\0${item.repoEntry || "unknown"}\0${item.stage || "unknown"}`;
+  if (["queue-run", "productive-run", "capacity-run"].includes(item.signal)) return `${item.signal}\0${item.sourceWorkspace || "unknown"}\0${item.stage || "unknown"}`;
+  if (item.signal === "stage-run") return `${item.signal}\0${item.stage || "unknown"}\0${item.riskClass || "unknown"}`;
+  if (item.signal === "review-run") return `${item.signal}\0${item.riskClass || "unknown"}`;
+  return `${item.signal}\0${item.fingerprint || item.rootCauseKey || item.reason || item.signal}`;
+}
+
+function addProjectedMetrics(observations) {
+  const groups = groupBy(observations.filter((item) => SIGNAL_METRIC_CONTRACTS[item.signal]), observationMetricGroupKey);
+  for (const group of groups.values()) {
+    const signal = group[0].signal;
+    const contract = SIGNAL_METRIC_CONTRACTS[signal];
+    let value = group.length;
+    if (signal === "qa-result") value = group.filter((item) => item.result === "needs-changes").length / group.length;
+    if (signal === "productive-run") value = group.filter((item) => item.success === true && item.productive === false).length / group.length;
+    if (signal === "capacity-run") value = group.filter((item) => item.deferred === true).length / group.length;
+    if (signal === "queue-run") value = undefined;
+    if (signal === "stage-run") value = undefined;
+    if (signal === "review-run") value = undefined;
+    for (const item of group) {
+      const direct = signal === "queue-run" ? item.waitMs
+        : signal === "stage-run" ? item.durationMs
+          : signal === "review-run" ? item.metrics?.reviewDurationMs
+            : value;
+      item.metrics = { ...(item.metrics || {}), [contract.name]: direct };
+    }
+  }
+  return observations;
 }
 
 export function buildLearningEvidenceSnapshot({
@@ -346,6 +615,7 @@ export function buildLearningEvidenceSnapshot({
     }
   }
   const selectedObservations = [];
+  const observationIds = new Set();
   const observationInspectionLimit = Math.max(4, bounded.observations * 4);
   let inspectedObservations = 0;
   for (const observation of Array.isArray(observations) ? observations : []) {
@@ -359,9 +629,52 @@ export function buildLearningEvidenceSnapshot({
       pushGap("observations", `observations truncated at ${bounded.observations}`);
       continue;
     }
-    try { selectedObservations.push(normalizeSnapshotObservation(observation)); }
+    try {
+      const normalized = normalizeSnapshotObservation(observation);
+      if (normalized.evidenceId && observationIds.has(normalized.evidenceId)) continue;
+      selectedObservations.push(normalized);
+      if (normalized.evidenceId) observationIds.add(normalized.evidenceId);
+    }
     catch { pushGap("observations", "malformed observation omitted"); }
   }
+  const addDerivedObservation = (candidate, source) => {
+    if (!candidate || !inEvidenceWindow(candidate.occurredAt, fromMs, capturedThroughMs)) return;
+    if (candidate.evidenceId && observationIds.has(candidate.evidenceId)) return;
+    if (selectedObservations.length >= bounded.observations) {
+      pushGap("observations", `derived observations truncated at ${bounded.observations}`);
+      return;
+    }
+    try {
+      const normalized = normalizeSnapshotObservation(candidate);
+      selectedObservations.push(normalized);
+      if (normalized.evidenceId) observationIds.add(normalized.evidenceId);
+    } catch {
+      pushGap(source, "structured evidence could not be projected");
+    }
+  };
+  const runById = new Map();
+  for (const run of selectedRuns) if (run.cardRunId && !runById.has(run.cardRunId)) runById.set(run.cardRunId, run);
+  for (const event of eventById.values()) {
+    const run = runById.get(event.identity?.cardRunId);
+    const projected = eventObservation(event, run);
+    if (!projected) continue;
+    if (!trustedRunRoute(run)) pushGap(`event:${event.eventId}`, "detector event lacks a trusted launcher run route");
+    addDerivedObservation(projected, `event:${event.eventId}`);
+  }
+  for (const run of selectedRuns) {
+    const route = trustedRunRoute(run);
+    if (!route && (run.launcherEvidence?.length || Number.isFinite(run.queueWaitMs))) {
+      pushGap(`run:${run.cardRunId || "unknown"}`, "detector run evidence lacks complete trusted identity and routing fields");
+      continue;
+    }
+    for (const [index, evidence] of (run.launcherEvidence || []).entries()) {
+      addDerivedObservation(launcherEvidenceObservation(evidence, run, index), `run:${run.cardRunId}`);
+    }
+  }
+  for (const observation of deriveRunObservations(selectedRuns, [...eventById.values()])) {
+    addDerivedObservation(observation, `run:${observation.runId}`);
+  }
+  addProjectedMetrics(selectedObservations);
   return {
     from,
     capturedThrough,
@@ -671,7 +984,9 @@ function detectorFinding(detector, observations, snapshot, config) {
   const baseConfidence = severe || detector.lens === "reliability" ? "high" : "medium";
   const confidence = complete ? baseConfidence : baseConfidence === "high" ? "medium" : "low";
   const category = observations.find((item) => item.category)?.category || detector.signal;
-  const metricName = detector.lens === "throughput" ? detector.metric.name : `${detector.id}Rate`;
+  const metric = SIGNAL_METRIC_CONTRACTS[detector.signal];
+  const metricValues = observations.map((item) => Number(item.metrics?.[metric.name])).filter(Number.isFinite);
+  const baselineValue = metric.aggregation === "p90" ? percentile(metricValues, 0.9) : metricValues.at(-1);
   return {
     schemaVersion: 1,
     detectorId: detector.id,
@@ -690,7 +1005,7 @@ function detectorFinding(detector, observations, snapshot, config) {
     occurrences: observations.map((item) => ({ id: item.evidenceId || item.eventId || item.runId || item.cardId, occurredAt: item.occurredAt })).filter((item) => item.id && !Number.isNaN(Date.parse(item.occurredAt))).sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(b.id)),
     occurrenceCount: occurrenceIds.length,
     trend: "recurrent",
-    baseline: { value: observations.length, unit: detector.lens === "throughput" ? "runs" : "occurrences" },
+    baseline: { value: baselineValue, unit: metric.unit },
     impact: `Repeated ${category} evidence affects factory ${detector.lens}.`,
     severity: severe ? "critical" : detector.lens === "throughput" ? "medium" : "high",
     confidence,
@@ -698,7 +1013,7 @@ function detectorFinding(detector, observations, snapshot, config) {
     evidenceReferences: [...new Set(observations.flatMap((item) => item.references || []).filter(Boolean))].sort(),
     rootCauseHypothesis: `A shared ${category} factory condition may be causing the observed pattern.`,
     desiredOutcome: `Reduce repeated ${category} evidence without weakening safety gates.`,
-    acceptanceMetric: { name: metricName, direction: "decrease", target: 0 },
+    acceptanceMetric: { name: metric.name, direction: "decrease", target: 0, aggregation: metric.aggregation },
     evaluationWindow: clone(detector.evaluationWindow),
     exclusions: ["Do not bypass review, QA, Signoff, or the human Ship gate."],
     actionable: Boolean(projectId && repoEntry),

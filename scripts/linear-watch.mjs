@@ -1211,6 +1211,10 @@ export async function runDrainLoop({ maxDrainPasses = DEFAULT_MAX_DRAIN_PASSES, 
   return { passes, budgetExhausted: false };
 }
 
+export function shouldStartPostDeliveryLearning(drainResult) {
+  return drainResult?.budgetExhausted !== true;
+}
+
 export function nextSweepForHandoff({ completedSweep, currentStateName, sweepCfg = SWEEP_CFG } = {}) {
   if (completedSweep === "spec" && (sweepCfg.dev?.states || []).includes(currentStateName)) return "dev";
   if (completedSweep === "dev" && (sweepCfg.qa?.states || []).includes(currentStateName)) return "qa";
@@ -1275,7 +1279,7 @@ export function cardWorktreePath(anchorPath, config, issueIdentifier, repoRoute 
   return worktreePath(repo, issueIdentifier);
 }
 
-export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, childIndex = slot.slotIndex || 0) {
+export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, childIndex = slot.slotIndex || 0, options = {}) {
   const issueIdentifier = slot.identifier;
   const logDir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep, issueIdentifier);
   const childRunKey = `${sweep}-${issueIdentifier}-${childIndex}`;
@@ -1295,19 +1299,22 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
     browserProfileDir: path.join(CACHE_DIR, parentRunId, childRunKey, "browser"),
     outcomePath: path.join(CACHE_DIR, parentRunId, childRunKey, "outcome.json"),
     learningEventsPath: path.join(logDir, `learning-events-${eventRunKey}.jsonl`),
-    globalRunsDir: LEARNING_RUNS_DIR,
+    globalRunsDir: Object.hasOwn(options, "globalRunsDir") ? options.globalRunsDir : LEARNING_RUNS_DIR,
   };
 }
 
-export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
+export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options = {}) {
   if (!pick.issueIdentifier) return pick;
   const cardRunId = `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`;
   const sourceWorkspace = canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath);
+  const globalRunsDir = Object.hasOwn(options, "globalRunsDir")
+    ? options.globalRunsDir
+    : Object.hasOwn(pick, "globalRunsDir") ? pick.globalRunsDir : LEARNING_RUNS_DIR;
   const paths = cardRunPaths(pick.anchorPath, pick.config, pick.sweep, {
     identifier: pick.issueIdentifier,
     slotIndex: pick.slotIndex || 0,
     repoRoute: pick.repoRoute,
-  }, parentRunId, childIndex);
+  }, parentRunId, childIndex, { globalRunsDir });
   return {
     ...pick,
     cardRunId,
@@ -2097,6 +2104,84 @@ function capacityStaleError(entry, parentAlive, childAlive) {
   return null;
 }
 
+function sleepSync(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readCapacityLedgerJson(target) {
+  if (!fs.existsSync(target)) return null;
+  return JSON.parse(fs.readFileSync(target, "utf8"));
+}
+
+export function withCapacityLedgerMutationLock(ledgerPath, callback, {
+  timeoutMs = 1_000,
+  retryMs = 10,
+  staleMs = 30_000,
+  parentPid = process.pid,
+  isAlive = isAlivePid,
+  nowMs = () => Date.now(),
+  sleepFn = sleepSync,
+  randomUUID = () => crypto.randomUUID(),
+} = {}) {
+  if (!ledgerPath || typeof callback !== "function") throw new Error("capacity mutation lock requires a ledger path and callback");
+  const lockPath = `${ledgerPath}.lock`;
+  const token = randomUUID();
+  const startedAt = nowMs();
+  const deadline = startedAt + Math.max(0, Number(timeoutMs) || 0);
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  let acquired = false;
+  while (!acquired) {
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: parentPid, token, acquiredAt: new Date(nowMs()).toISOString() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      acquired = true;
+      break;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let owner = null;
+      let mtimeMs = null;
+      try {
+        owner = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+        mtimeMs = fs.statSync(lockPath).mtimeMs;
+      } catch { /* a concurrent owner may still be writing; retry within the bound */ }
+      let reclaimable = false;
+      if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+        try { reclaimable = isAlive(owner.pid) === false; } catch { reclaimable = false; }
+      } else if (Number.isFinite(mtimeMs)) {
+        reclaimable = nowMs() - mtimeMs >= Math.max(1, Number(staleMs) || 1);
+      }
+      if (reclaimable) {
+        try {
+          const current = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+          if (current?.token === owner?.token && current?.pid === owner?.pid) fs.rmSync(lockPath, { force: true });
+        } catch { /* another contender changed or removed the lock */ }
+        continue;
+      }
+      if (nowMs() >= deadline) {
+        const unavailable = new Error(`capacity ledger mutation lock unavailable: ${lockPath}`);
+        unavailable.code = "CAPACITY_LOCK_UNAVAILABLE";
+        throw unavailable;
+      }
+      sleepFn(Math.max(1, Math.min(Number(retryMs) || 1, deadline - nowMs())));
+    }
+  }
+  try {
+    return callback();
+  } finally {
+    if (acquired) {
+      try {
+        const owner = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+        if (owner?.token === token && owner?.pid === parentPid) fs.rmSync(lockPath, { force: true });
+      } catch { /* preserve the callback result; a missing/replaced lock is fail-safe for this owner */ }
+    }
+  }
+}
+
 export function createCapacityLedger({
   ledgerPath = CAPACITY_LEDGER,
   maxActiveChildren = DEFAULT_MAX_ACTIVE_CHILDREN,
@@ -2104,17 +2189,28 @@ export function createCapacityLedger({
   isAlive = isAlivePid,
   now = () => new Date().toISOString(),
   randomUUID = () => crypto.randomUUID(),
-  readJsonFn = (target) => {
-    if (!fs.existsSync(target)) return null;
-    return JSON.parse(fs.readFileSync(target, "utf8"));
-  },
+  readJsonFn = readCapacityLedgerJson,
   writeJsonFn = atomicWriteJson,
+  withMutationLockFn = null,
+  lockTimeoutMs = 1_000,
+  lockRetryMs = 10,
+  lockStaleMs = 30_000,
 } = {}) {
   const configuredMax = maxActiveChildren === null || maxActiveChildren === "" ? Number.NaN : Number(maxActiveChildren);
   const max = Number.isFinite(configuredMax)
     ? Math.min(MAX_ACTIVE_CHILDREN, Math.max(1, Math.floor(configuredMax)))
     : DEFAULT_MAX_ACTIVE_CHILDREN;
   const released = new Set();
+  const usesFilesystemStore = readJsonFn === readCapacityLedgerJson && writeJsonFn === atomicWriteJson;
+  const mutate = typeof withMutationLockFn === "function"
+    ? withMutationLockFn
+    : usesFilesystemStore
+      ? (callback) => withCapacityLedgerMutationLock(ledgerPath, callback, {
+        timeoutMs: lockTimeoutMs,
+        retryMs: lockRetryMs,
+        staleMs: lockStaleMs,
+      })
+      : (callback) => callback();
 
   const read = ({ checkLiveness = false } = {}) => {
     let raw;
@@ -2158,7 +2254,7 @@ export function createCapacityLedger({
   };
 
   const inspect = () => read({ checkLiveness: true });
-  const reconcile = () => {
+  const reconcileUnlocked = () => {
     const state = read();
     if (!state.healthy || state.opaque) return state;
     const kept = [];
@@ -2185,72 +2281,91 @@ export function createCapacityLedger({
     if (kept.length !== state.entries.length) writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: kept });
     return { ...state, entries: kept, active: kept.length, healthy: true, errors: [] };
   };
+  const reconcile = () => {
+    try { return mutate(reconcileUnlocked); }
+    catch (error) {
+      return { version: CAPACITY_LEDGER_VERSION, entries: [], active: max, max, healthy: false, errors: [error.message], opaque: true };
+    }
+  };
 
   const release = (token) => {
     if (!token || released.has(token)) return false;
-    const state = read();
-    if (!state.healthy || state.opaque) return false;
-    const entries = state.entries.filter((entry) => entry.token !== token);
-    if (entries.length === state.entries.length) {
-      released.add(token);
-      return false;
-    }
-    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries });
-    released.add(token);
-    return true;
+    try {
+      return mutate(() => {
+        const state = read();
+        if (!state.healthy || state.opaque) return false;
+        const entries = state.entries.filter((entry) => entry.token !== token);
+        if (entries.length === state.entries.length) {
+          released.add(token);
+          return false;
+        }
+        writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries });
+        released.add(token);
+        return true;
+      });
+    } catch { return false; }
   };
 
   const attachChildPid = (token, childPid) => {
     if (!Number.isInteger(childPid) || childPid <= 0) throw new Error(`invalid child PID ${childPid}`);
-    const state = read();
-    if (!state.healthy || state.opaque) throw new Error(`capacity ledger unhealthy: ${state.errors.join("; ")}`);
-    const entry = state.entries.find((candidate) => candidate.token === token);
-    if (!entry) return false;
-    entry.childPid = childPid;
-    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: state.entries });
-    return true;
+    return mutate(() => {
+      const state = read();
+      if (!state.healthy || state.opaque) throw new Error(`capacity ledger unhealthy: ${state.errors.join("; ")}`);
+      const entry = state.entries.find((candidate) => candidate.token === token);
+      if (!entry) return false;
+      entry.childPid = childPid;
+      writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: state.entries });
+      return true;
+    });
   };
 
   const reserve = (demand = {}) => {
-    const state = reconcile();
-    if (!state.healthy || state.active >= max) return null;
-    const stage = demand.stage || demand.sweep;
-    const trigger = demand.trigger || "initial";
-    const validDeliveryPair = SWEEPS.includes(stage) && ["initial", "refill", "handoff"].includes(trigger);
-    const validLearningPair = stage === LEARNING_STAGE && trigger === LEARNING_TRIGGER;
-    if (!validDeliveryPair && !validLearningPair) throw new Error(`invalid stage/trigger pair: ${stage}/${trigger}`);
-    if (stage === "ship" && state.entries.some((entry) => entry.stage === "ship" && sameCapacityWorkspace(entry, demand))) return null;
-    if (stage === LEARNING_STAGE && state.entries.some((entry) => entry.stage === LEARNING_STAGE)) return null;
-    const existingTokens = new Set(state.entries.map((entry) => entry.token));
-    let token = null;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const candidate = randomUUID();
-      if (typeof candidate === "string" && candidate && !existingTokens.has(candidate)) {
-        token = candidate;
-        break;
-      }
+    try {
+      return mutate(() => {
+        const state = reconcileUnlocked();
+        if (!state.healthy || state.active >= max) return null;
+        const stage = demand.stage || demand.sweep;
+        const trigger = demand.trigger || "initial";
+        const validDeliveryPair = SWEEPS.includes(stage) && ["initial", "refill", "handoff"].includes(trigger);
+        const validLearningPair = stage === LEARNING_STAGE && trigger === LEARNING_TRIGGER;
+        if (!validDeliveryPair && !validLearningPair) throw new Error(`invalid stage/trigger pair: ${stage}/${trigger}`);
+        if (stage === "ship" && state.entries.some((entry) => entry.stage === "ship" && sameCapacityWorkspace(entry, demand))) return null;
+        if (stage === LEARNING_STAGE && state.entries.some((entry) => entry.stage === LEARNING_STAGE)) return null;
+        const existingTokens = new Set(state.entries.map((entry) => entry.token));
+        let token = null;
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const candidate = randomUUID();
+          if (typeof candidate === "string" && candidate && !existingTokens.has(candidate)) {
+            token = candidate;
+            break;
+          }
+        }
+        if (!token) throw new Error("could not allocate a unique capacity token");
+        const entry = {
+          token,
+          parentPid,
+          childPid: null,
+          issueIdentifier: demand.issueIdentifier || demand.topCard?.identifier,
+          workspace: demand.workspace || demand.sourceAnchorPath || demand.anchorPath,
+          ...(demand.managedWorkspace || demand.anchorPath ? { managedWorkspace: demand.managedWorkspace || demand.anchorPath } : {}),
+          stage,
+          trigger,
+          reservedAt: now(),
+        };
+        const error = capacityEntryError(entry);
+        if (error) throw new Error(error);
+        writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: [...state.entries, entry] });
+        return {
+          token,
+          entry,
+          attachChildPid: (pid) => attachChildPid(token, pid),
+          release: () => release(token),
+        };
+      });
+    } catch (error) {
+      if (error?.code === "CAPACITY_LOCK_UNAVAILABLE") return null;
+      throw error;
     }
-    if (!token) throw new Error("could not allocate a unique capacity token");
-    const entry = {
-      token,
-      parentPid,
-      childPid: null,
-      issueIdentifier: demand.issueIdentifier || demand.topCard?.identifier,
-      workspace: demand.workspace || demand.sourceAnchorPath || demand.anchorPath,
-      ...(demand.managedWorkspace || demand.anchorPath ? { managedWorkspace: demand.managedWorkspace || demand.anchorPath } : {}),
-      stage,
-      trigger,
-      reservedAt: now(),
-    };
-    const error = capacityEntryError(entry);
-    if (error) throw new Error(error);
-    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: [...state.entries, entry] });
-    return {
-      token,
-      entry,
-      attachChildPid: (pid) => attachChildPid(token, pid),
-      release: () => release(token),
-    };
   };
 
   return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
@@ -5662,8 +5777,10 @@ async function tick({ dryRun = false } = {}) {
       };
     };
 
-    await runDrainLoop({ maxDrainPasses: drainPassLimit(anchors.map((a) => a.config)), runPass: runSweepPass, log });
-    try {
+    const deliveryDrain = await runDrainLoop({ maxDrainPasses: drainPassLimit(anchors.map((a) => a.config)), runPass: runSweepPass, log });
+    if (!shouldStartPostDeliveryLearning(deliveryDrain)) {
+      log("learning deferred: delivery drain budget exhausted");
+    } else try {
       const learningResolved = resolveRegisteredLearningWorkspaces(reg);
       const learningNow = new Date().toISOString();
       const indexed = readLearningRunIndex(LEARNING_RUNS_DIR, { capturedThrough: learningNow });

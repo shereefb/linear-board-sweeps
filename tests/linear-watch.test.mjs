@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn as spawnProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
@@ -20,6 +21,7 @@ import {
   annotateBoundedDependencyCycles, dependencyCycleFailureEvents,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
   compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, dependencyDeferredIssue, admitDemand,
+  withCapacityLedgerMutationLock, shouldStartPostDeliveryLearning,
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
@@ -826,6 +828,37 @@ test("capacity ledger: UUID collision retries without overwriting an existing re
   assert.equal(createCapacityLedger({ maxActiveChildren: null }).maxActiveChildren, 10);
   assert.equal(reservation.token, "unique");
   assert.deepEqual(stored.entries.map((entry) => entry.token), ["collision", "unique"]);
+});
+test("capacity ledger: cross-process mutation lock defers a concurrent reserve and recovers a dead owner", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-capacity-lock-"));
+  const ledgerPath = path.join(dir, "capacity.json");
+  const readyPath = path.join(dir, "ready");
+  const moduleUrl = new URL("../scripts/linear-watch.mjs", import.meta.url).href;
+  const childCode = `
+    import fs from "node:fs";
+    import { withCapacityLedgerMutationLock } from ${JSON.stringify(moduleUrl)};
+    const [ledgerPath, readyPath] = process.argv.slice(1);
+    withCapacityLedgerMutationLock(ledgerPath, () => {
+      fs.writeFileSync(readyPath, String(process.pid));
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+    }, { timeoutMs: 100 });
+  `;
+  const child = spawnProcess(process.execPath, ["--input-type=module", "-e", childCode, ledgerPath, readyPath], { stdio: ["ignore", "pipe", "pipe"] });
+  const childExit = new Promise((resolve) => child.once("exit", resolve));
+  const deadline = Date.now() + 3_000;
+  while (!fs.existsSync(readyPath) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(fs.existsSync(readyPath), true, "lock-holder child did not become ready");
+
+  const contended = createCapacityLedger({ ledgerPath, maxActiveChildren: 2, lockTimeoutMs: 20 });
+  assert.equal(contended.reserve({ stage: "learning", trigger: "learning-due", workspace: "registry:test", issueIdentifier: "factory-learning:test" }), null);
+
+  child.kill("SIGKILL");
+  await childExit;
+  const restarted = createCapacityLedger({ ledgerPath, maxActiveChildren: 2 });
+  const reservation = restarted.reserve({ stage: "learning", trigger: "learning-due", workspace: "registry:test", issueIdentifier: "factory-learning:test" });
+  assert.ok(reservation, "dead lock owner should be reclaimed after restart");
+  assert.equal(JSON.parse(fs.readFileSync(ledgerPath, "utf8")).entries.length, 1);
+  assert.equal(reservation.release(), true);
 });
 test("queue observations: first capacity wait survives restart and accumulates", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-observations-"));
@@ -2236,6 +2269,11 @@ test("runDrainLoop: stops after a selected pass opts out of continued draining",
   assert.equal(calls, 1);
   assert.equal(result.budgetExhausted, false);
 });
+test("automatic post-delivery learning waits when the delivery drain budget is exhausted", () => {
+  assert.equal(shouldStartPostDeliveryLearning({ budgetExhausted: true }), false);
+  assert.equal(shouldStartPostDeliveryLearning({ budgetExhausted: false }), true);
+  assert.equal(shouldStartPostDeliveryLearning(null), true);
+});
 test("sameRepoCardLimit: defaults, invalid values, and forced ship serial limit", () => {
   assert.deepEqual(DEFAULT_SAME_REPO_CARD_LIMITS, { spec: 4, dev: 4, qa: 1, ship: 1 });
   assert.equal(sameRepoCardLimit({}, "spec"), 4);
@@ -2624,12 +2662,14 @@ test("SafeTaper reviewed fixture releases the exact seven waves without scheduli
 test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(SAME_REPO_PORT_BASE, 47000);
   assert.equal(cardWorktreePath("/ws/repo", { repos: ["repo"] }, "COD-6"), "/ws/repo/.worktrees/COD-6");
-  const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  const globalRunsDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-test-global-runs-"));
+  const paths = cardRunPaths("/ws/repo", { repos: ["repo"] }, "dev", { identifier: "COD-6", slotIndex: 1 }, "run-id", 2, { globalRunsDir });
   assert.equal(paths.worktreePath, "/ws/repo/.worktrees/COD-6");
   assert.match(paths.logDir, /linear-board-sweeps\/repo\/dev\/COD-6$/);
   assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
-  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  assert.equal(paths.globalRunsDir, globalRunsDir);
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2, { globalRunsDir });
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
@@ -2639,7 +2679,8 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
   assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
   assert.match(pick.learningEventsPath, /learning-events-[a-f0-9]{16}\.jsonl$/);
-  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "later-run-id", 2);
+  assert.equal(pick.globalRunsDir, globalRunsDir);
+  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "later-run-id", 2, { globalRunsDir });
   assert.notEqual(laterPick.learningEventsPath, pick.learningEventsPath);
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
@@ -2780,9 +2821,17 @@ test("card dispatch env uses the routed managed sibling for worktrees and export
 });
 test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
+  const globalRunsDir = path.join(anchorPath, "global-runs");
+  const productionRunsDir = path.join(os.homedir(), ".local", "state", "linear-board-sweeps", "runs");
+  const snapshotProductionIndex = () => Object.fromEntries((fs.existsSync(productionRunsDir) ? fs.readdirSync(productionRunsDir) : []).sort().map((name) => {
+    const stat = fs.statSync(path.join(productionRunsDir, name));
+    return [name, { size: stat.size, mtimeMs: stat.mtimeMs }];
+  }));
+  const productionBefore = snapshotProductionIndex();
   const [pick] = await expandDispatchBatch([{
     anchorPath,
     sourceAnchorPath: "/source/repo",
+    globalRunsDir,
     config: { repos: [anchorPath] },
     sweep: "ship",
     count: 1,
@@ -2805,8 +2854,11 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   child.emit("close", 0, null);
   assert.equal((await run).kind, "success");
   assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(pick.globalRunsDir, globalRunsDir);
   const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
+  assert.equal(fs.readdirSync(globalRunsDir).some((name) => name.endsWith(".jsonl")), true);
+  assert.deepEqual(snapshotProductionIndex(), productionBefore);
 });
 test("expandDispatchBatch: Ship route-label races fail before child expansion", async () => {
   const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
