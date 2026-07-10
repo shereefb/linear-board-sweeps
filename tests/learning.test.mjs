@@ -74,7 +74,12 @@ test("workspace learning accepts boolean and object lens enablement without muta
 });
 
 test("canonical anchor identity uses realpath and falls back only for missing paths", () => {
-  assert.equal(canonicalAnchorIdentity("/alias", { realpathFn: () => "/canonical" }), "/canonical");
+  let resolveCalls = 0;
+  assert.equal(canonicalAnchorIdentity("/alias", {
+    realpathFn: () => "/canonical",
+    resolveFn: (p) => { resolveCalls++; return `/resolved${p}`; },
+  }), "/canonical");
+  assert.equal(resolveCalls, 0);
   assert.equal(canonicalAnchorIdentity("relative/repo", {
     realpathFn: () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; },
     resolveFn: (p) => `/resolved/${p}`,
@@ -127,4 +132,59 @@ test("learning state validates lens and mutation identities before writing", () 
   store.stageWindow("throughput", { capturedThrough: "2026-07-10T00:00:00.000Z", mutations: [] });
   assert.throws(() => store.confirmMutation("throughput", "missing"), /unknown learning mutation/);
   assert.equal(writes.length, 1);
+});
+
+test("learning state swaps memory only after stage, confirm, and commit writes succeed", () => {
+  let fail = true;
+  const original = {
+    ...memoryLearningStore().store.snapshot(),
+  };
+  const store = createLearningStateStore({
+    statePath: "/state/learning-state.json",
+    readJsonFn: () => structuredClone(original),
+    writeJsonFn: () => { if (fail) throw new Error("disk full"); },
+    now: () => "2026-07-10T12:00:00.000Z",
+  });
+  assert.throws(() => store.stageWindow("quality", {
+    capturedThrough: "2026-07-10T00:00:00.000Z",
+    mutations: [{ mutationId: "m1", action: "create" }],
+  }), /disk full/);
+  assert.equal(store.snapshot().lenses.quality.pending, null);
+
+  fail = false;
+  store.stageWindow("quality", {
+    capturedThrough: "2026-07-10T00:00:00.000Z",
+    mutations: [{ mutationId: "m1", action: "create" }],
+  });
+  fail = true;
+  assert.throws(() => store.confirmMutation("quality", "m1"), /disk full/);
+  assert.equal(store.snapshot().lenses.quality.pending.mutations.m1.status, "pending");
+
+  fail = false;
+  store.confirmMutation("quality", "m1");
+  fail = true;
+  assert.throws(() => store.commitLens("quality"), /disk full/);
+  assert.equal(store.snapshot().lenses.quality.lastSuccessfulCapturedThrough, null);
+  assert.equal(store.snapshot().lenses.quality.pending.mutations.m1.status, "confirmed");
+});
+
+test("learning state resumes the same recovered window and rejects overwriting it", () => {
+  const first = memoryLearningStore();
+  const pending = first.store.stageWindow("reliability", {
+    from: "2026-07-01T00:00:00.000Z",
+    capturedThrough: "2026-07-02T00:00:00.000Z",
+    mutations: [{ mutationId: "m1", action: "create" }],
+  });
+  const second = memoryLearningStore(first.stored());
+  assert.deepEqual(second.store.stageWindow("reliability", {
+    from: "2026-07-01T00:00:00.000Z",
+    capturedThrough: "2026-07-02T00:00:00.000Z",
+    mutations: [{ mutationId: "m1", action: "create" }],
+  }), pending);
+  assert.throws(() => second.store.stageWindow("reliability", {
+    from: "2026-07-02T00:00:00.000Z",
+    capturedThrough: "2026-07-03T00:00:00.000Z",
+    mutations: [{ mutationId: "m2", action: "create" }],
+  }), /pending learning window/);
+  assert.equal(second.store.snapshot().lenses.reliability.pending.capturedThrough, "2026-07-02T00:00:00.000Z");
 });

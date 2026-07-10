@@ -30,11 +30,10 @@ export function canonicalAnchorIdentity(anchorPath, {
   realpathFn = fs.realpathSync.native,
   resolveFn = path.resolve,
 } = {}) {
-  const resolved = resolveFn(anchorPath || ".");
   try {
-    return resolveFn(realpathFn(resolved));
+    return realpathFn(anchorPath || ".");
   } catch (error) {
-    if (error?.code === "ENOENT") return resolved;
+    if (error?.code === "ENOENT") return resolveFn(anchorPath || ".");
     throw error;
   }
 }
@@ -134,7 +133,10 @@ export function createLearningStateStore({
   if (typeof writeJsonFn !== "function") throw new Error("learning state writeJsonFn is required");
   let state = normalizeLearningState(readJsonFn(statePath));
 
-  const persist = () => writeJsonFn(statePath, clone(state));
+  const persistCandidate = (candidate) => {
+    writeJsonFn(statePath, clone(candidate));
+    state = candidate;
+  };
 
   return {
     snapshot() {
@@ -153,14 +155,28 @@ export function createLearningStateStore({
         if (mutationMap[mutationId]) throw new Error(`duplicate learning mutation: ${mutationId}`);
         mutationMap[mutationId] = { ...clone(mutation), mutationId, status: "pending" };
       }
-      state.lenses[lens].pending = {
+      const existing = state.lenses[lens].pending;
+      if (existing) {
+        const existingMutations = Object.fromEntries(Object.entries(existing.mutations || {}).map(([id, mutation]) => [id, {
+          ...clone(mutation),
+          status: "pending",
+          confirmedAt: undefined,
+        }]));
+        const sameWindow = existing.from === from
+          && existing.capturedThrough === capturedThrough
+          && JSON.stringify(existingMutations) === JSON.stringify(mutationMap);
+        if (sameWindow) return clone(existing);
+        throw new Error(`pending learning window already exists for ${lens}`);
+      }
+      const candidate = clone(state);
+      candidate.lenses[lens].pending = {
         from,
         capturedThrough,
         stagedAt: now(),
         mutations: mutationMap,
       };
-      persist();
-      return clone(state.lenses[lens].pending);
+      persistCandidate(candidate);
+      return clone(candidate.lenses[lens].pending);
     },
 
     confirmMutation(lens, mutationId) {
@@ -168,10 +184,12 @@ export function createLearningStateStore({
       const pending = state.lenses[lens].pending;
       const mutation = pending?.mutations?.[mutationId];
       if (!mutation) throw new Error(`unknown learning mutation: ${mutationId}`);
-      mutation.status = "confirmed";
-      mutation.confirmedAt = now();
-      persist();
-      return clone(mutation);
+      const candidate = clone(state);
+      const candidateMutation = candidate.lenses[lens].pending.mutations[mutationId];
+      candidateMutation.status = "confirmed";
+      candidateMutation.confirmedAt = now();
+      persistCandidate(candidate);
+      return clone(candidateMutation);
     },
 
     commitLens(lens) {
@@ -179,9 +197,10 @@ export function createLearningStateStore({
       const pending = state.lenses[lens].pending;
       if (!pending) return false;
       if (Object.values(pending.mutations || {}).some((mutation) => mutation.status !== "confirmed")) return false;
-      state.lenses[lens].lastSuccessfulCapturedThrough = pending.capturedThrough;
-      state.lenses[lens].pending = null;
-      persist();
+      const candidate = clone(state);
+      candidate.lenses[lens].lastSuccessfulCapturedThrough = pending.capturedThrough;
+      candidate.lenses[lens].pending = null;
+      persistCandidate(candidate);
       return true;
     },
   };
