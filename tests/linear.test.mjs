@@ -145,6 +145,10 @@ test("guarded terminal move allows only a current source card with its owned cla
 });
 
 for (const [override, reason] of [
+  [{ destinationState: "Done" }, "invalid-destination"],
+  [{ destinationState: "Dev" }, "invalid-destination"],
+  [{ destinationState: "Unexpected" }, "invalid-destination"],
+  [{ expectedState: "Dev", stateName: "Dev", ownedClaim: "dev:in-progress", destinationState: "QA" }, "invalid-destination"],
   [{ stateName: "Signoff" }, "source-state-changed"],
   [{ labelNames: ["qa:passed"] }, "owned-claim-missing"],
   [{ labelNames: ["qa:passed", "qa:in-progress", "blocked:needs-user"] }, "blocking-label"],

@@ -218,6 +218,10 @@ export function guardedTerminalMoveDecision(input = {}) {
   const facts = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
   const deny = (reason) => ({ eligible: false, reason });
+  if (facts.expectedState !== WORKFLOW_STATES.qa
+    || ![WORKFLOW_STATES.signoff, WORKFLOW_STATES.ship].includes(facts.destinationState)) {
+    return deny("invalid-destination");
+  }
   if (TERMINAL_MOVE_CLAIM_BY_STATE[facts.expectedState] !== facts.ownedClaim) return deny("invalid-owned-claim");
   if (facts.stateName !== facts.expectedState) return deny("source-state-changed");
   if (!labels.has(facts.ownedClaim)) return deny("owned-claim-missing");
