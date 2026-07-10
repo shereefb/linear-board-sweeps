@@ -11,6 +11,9 @@ export const LEARNING_EVENT_VERSION = 1;
 export const MAX_LEARNING_EVENT_SUMMARY_CHARS = 1_000;
 export const MAX_LEARNING_EVENT_METRICS = 32;
 export const MAX_LEARNING_EVENT_METRIC_STRING_CHARS = 500;
+export const MAX_LEARNING_SNAPSHOT_RUNS = 5_000;
+export const MAX_LEARNING_SNAPSHOT_EVENTS = 10_000;
+export const MAX_LEARNING_SNAPSHOT_OBSERVATIONS = 5_000;
 
 export const LEARNING_EVENT_TAXONOMY = Object.freeze({
   review: Object.freeze(["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design"]),
@@ -71,6 +74,12 @@ function requireEventPair(kind, category) {
   }
 }
 
+function learningEventId({ occurredAt, kind, category, summary, metrics, identity }) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify({ occurredAt, kind, category, summary, metrics, identity }))
+    .digest("hex");
+}
+
 export function buildLearningEvent(input = {}, trustedEnv = {}, { now = () => new Date().toISOString() } = {}) {
   const kind = String(input.kind || "").trim();
   const category = String(input.category || "").trim();
@@ -81,9 +90,7 @@ export function buildLearningEvent(input = {}, trustedEnv = {}, { now = () => ne
   if (Number.isNaN(Date.parse(occurredAt))) throw new Error("learning event timestamp must be ISO formatted");
   const identity = trustedLearningIdentity(trustedEnv);
   const metrics = sanitizeMetrics(input.metrics);
-  const eventId = crypto.createHash("sha256")
-    .update(JSON.stringify({ occurredAt, kind, category, summary, metrics, identity }))
-    .digest("hex");
+  const eventId = learningEventId({ occurredAt, kind, category, summary, metrics, identity });
   return { version: LEARNING_EVENT_VERSION, eventId, occurredAt, kind, category, summary, metrics, identity };
 }
 
@@ -105,9 +112,8 @@ function sanitizeStoredEvent(event) {
     sanitizeLearningText(event.identity[key], key === "sourceAnchor" ? 1_000 : 300),
   ]));
   if (Object.values(identity).some((value) => !value)) throw new Error("invalid event identity");
-  return {
+  const sanitized = {
     version: LEARNING_EVENT_VERSION,
-    eventId: sanitizeLearningText(event.eventId, 128),
     occurredAt: event.occurredAt,
     kind: event.kind,
     category: event.category,
@@ -115,6 +121,7 @@ function sanitizeStoredEvent(event) {
     metrics: sanitizeMetrics(event.metrics),
     identity,
   };
+  return { ...sanitized, eventId: learningEventId(sanitized) };
 }
 
 export function readLearningEvents(eventPath, { maxBytes = 1024 * 1024, maxEvents = 1_000, expectedIdentity = null } = {}) {
@@ -161,6 +168,69 @@ function inEvidenceWindow(timestamp, fromMs, capturedThroughMs) {
   return !Number.isNaN(time) && (fromMs === null || time > fromMs) && time <= capturedThroughMs;
 }
 
+function finiteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function compactObject(entries) {
+  return Object.fromEntries(entries.filter(([, value]) => value !== undefined));
+}
+
+function normalizeSnapshotRun(record) {
+  if (!record || typeof record !== "object" || Number.isNaN(Date.parse(record.endedAt || ""))) throw new Error("invalid run record");
+  const outcome = record.outcome && typeof record.outcome === "object" ? compactObject([
+    ["kind", sanitizeLearningText(record.outcome.kind, 100)],
+    ["exitCode", finiteNumber(record.outcome.exitCode)],
+    ["signal", sanitizeLearningText(record.outcome.signal, 50)],
+    ["success", typeof record.outcome.success === "boolean" ? record.outcome.success : undefined],
+  ]) : undefined;
+  return compactObject([
+    ["parentRunId", sanitizeLearningText(record.parentRunId, 300)],
+    ["cardRunId", sanitizeLearningText(record.cardRunId, 300)],
+    ["issueIdentifier", sanitizeLearningText(record.issueIdentifier, 100)],
+    ["sourceWorkspace", sanitizeLearningText(record.sourceWorkspace, 1_000)],
+    ["repoEntry", sanitizeLearningText(record.repoEntry, 300)],
+    ["sweep", sanitizeLearningText(record.sweep, 50)],
+    ["runtime", sanitizeLearningText(record.runtime, 100)],
+    ["model", sanitizeLearningText(record.model, 200)],
+    ["effort", sanitizeLearningText(record.effort, 50)],
+    ["trigger", sanitizeLearningText(record.trigger, 100)],
+    ["queueWaitMs", finiteNumber(record.queueWaitMs)],
+    ["capacityHighWater", finiteNumber(record.capacityHighWater)],
+    ["dependencyDeferredCount", finiteNumber(record.dependencyDeferredCount)],
+    ["exitCode", finiteNumber(record.exitCode)],
+    ["outcome", outcome],
+    ["startedAt", Number.isNaN(Date.parse(record.startedAt || "")) ? undefined : record.startedAt],
+    ["endedAt", record.endedAt],
+  ]);
+}
+
+function normalizeSnapshotObservation(observation) {
+  if (!observation || typeof observation !== "object") throw new Error("invalid observation");
+  const at = observation.at || observation.observedAt;
+  if (Number.isNaN(Date.parse(at || ""))) throw new Error("invalid observation timestamp");
+  return compactObject([
+    ["at", at],
+    ["kind", sanitizeLearningText(observation.kind, 100)],
+    ["sourceWorkspace", sanitizeLearningText(observation.sourceWorkspace, 1_000)],
+    ["issueIdentifier", sanitizeLearningText(observation.issueIdentifier, 100)],
+    ["stage", sanitizeLearningText(observation.stage, 50)],
+    ["sweep", sanitizeLearningText(observation.sweep, 50)],
+    ["reason", sanitizeLearningText(observation.reason, 500)],
+    ["summary", sanitizeLearningText(observation.summary, MAX_LEARNING_EVENT_SUMMARY_CHARS)],
+    ["waitMs", finiteNumber(observation.waitMs)],
+    ["queueWaitMs", finiteNumber(observation.queueWaitMs)],
+    ["durationMs", finiteNumber(observation.durationMs)],
+    ["count", finiteNumber(observation.count)],
+    ["metrics", observation.metrics === undefined ? undefined : sanitizeMetrics(observation.metrics)],
+  ]);
+}
+
+function boundedLimit(value, fallback) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, fallback) : fallback;
+}
+
 export function buildLearningEvidenceSnapshot({
   from = null,
   capturedThrough,
@@ -168,19 +238,67 @@ export function buildLearningEvidenceSnapshot({
   events = [],
   observations = [],
   coverageGaps = [],
+  limits = {},
 } = {}) {
   const capturedThroughMs = Date.parse(capturedThrough || "");
   const fromMs = from === null ? null : Date.parse(from);
   if (Number.isNaN(capturedThroughMs) || (fromMs !== null && Number.isNaN(fromMs))) {
     throw new Error("learning evidence window requires valid ISO timestamps");
   }
-  const selectedRuns = runRecords.filter((record) => inEvidenceWindow(record?.endedAt, fromMs, capturedThroughMs));
-  const eventById = new Map();
-  for (const event of [...events, ...selectedRuns.flatMap((record) => record.learningEvents || [])]) {
-    if (event?.eventId && inEvidenceWindow(event.occurredAt, fromMs, capturedThroughMs)) eventById.set(event.eventId, event);
+  const bounded = {
+    runRecords: boundedLimit(limits.runRecords, MAX_LEARNING_SNAPSHOT_RUNS),
+    events: boundedLimit(limits.events, MAX_LEARNING_SNAPSHOT_EVENTS),
+    observations: boundedLimit(limits.observations, MAX_LEARNING_SNAPSHOT_OBSERVATIONS),
+  };
+  const gaps = coverageGaps.slice(0, 100).map((gap) => ({
+    source: sanitizeLearningText(gap?.source || "unknown", 500),
+    reason: sanitizeLearningText(gap?.reason || "unspecified coverage gap", 500),
+  }));
+  if (coverageGaps.length > 100) gaps.push({ source: "snapshot", reason: "coverage gaps truncated at 100" });
+  const selectedRuns = [];
+  const selectedRawRuns = [];
+  for (const record of Array.isArray(runRecords) ? runRecords : []) {
+    if (!inEvidenceWindow(record?.endedAt, fromMs, capturedThroughMs)) continue;
+    if (selectedRuns.length >= bounded.runRecords) {
+      if (!gaps.some((gap) => gap.reason.includes("run records truncated"))) gaps.push({ source: "runRecords", reason: `run records truncated at ${bounded.runRecords}` });
+      continue;
+    }
+    try {
+      selectedRuns.push(normalizeSnapshotRun(record));
+      selectedRawRuns.push(record);
+    } catch {
+      gaps.push({ source: "runRecords", reason: "malformed run record omitted" });
+    }
   }
-  const selectedObservations = observations.filter((observation) => inEvidenceWindow(observation?.at || observation?.observedAt, fromMs, capturedThroughMs));
-  const gaps = coverageGaps.map((gap) => clone(gap));
+  const eventById = new Map();
+  const addEvent = (candidate) => {
+    if (!inEvidenceWindow(candidate?.occurredAt, fromMs, capturedThroughMs)) return;
+    try {
+      const event = sanitizeStoredEvent(candidate);
+      if (eventById.has(event.eventId)) return;
+      if (eventById.size >= bounded.events) {
+        if (!gaps.some((gap) => gap.reason.includes("events truncated"))) gaps.push({ source: "events", reason: `events truncated at ${bounded.events}` });
+        return;
+      }
+      eventById.set(event.eventId, event);
+    } catch {
+      gaps.push({ source: "events", reason: "malformed learning event omitted" });
+    }
+  };
+  for (const event of Array.isArray(events) ? events : []) addEvent(event);
+  for (const record of selectedRawRuns) {
+    for (const event of Array.isArray(record.learningEvents) ? record.learningEvents : []) addEvent(event);
+  }
+  const selectedObservations = [];
+  for (const observation of Array.isArray(observations) ? observations : []) {
+    if (!inEvidenceWindow(observation?.at || observation?.observedAt, fromMs, capturedThroughMs)) continue;
+    if (selectedObservations.length >= bounded.observations) {
+      if (!gaps.some((gap) => gap.reason.includes("observations truncated"))) gaps.push({ source: "observations", reason: `observations truncated at ${bounded.observations}` });
+      continue;
+    }
+    try { selectedObservations.push(normalizeSnapshotObservation(observation)); }
+    catch { gaps.push({ source: "observations", reason: "malformed observation omitted" }); }
+  }
   return {
     from,
     capturedThrough,

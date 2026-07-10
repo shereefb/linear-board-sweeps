@@ -83,6 +83,13 @@ test("canonical Claude and Codex sweep copies match byte-for-byte", () => {
   }
 });
 
+test("canonical sweep skill headings contain no patch artifacts", () => {
+  for (const sweep of ["spec", "dev", "qa", "ship"]) {
+    const text = fs.readFileSync(new URL(`../skills/${sweep}-sweep/SKILL.md`, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /^\+## /m, sweep);
+  }
+});
+
 test("shared AGENTS rules distinguish relation blockers from human-only labels", () => {
   for (const file of ["../AGENTS.md", "../templates/AGENTS.snippet.md"]) {
     const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");

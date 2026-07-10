@@ -94,7 +94,7 @@ Emit:
 - each red production canary as `canary red`;
 - exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
 
-+## Machine-independence & handoff (auto-sweep)
+## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
 

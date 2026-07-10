@@ -32,6 +32,7 @@ import {
 import {
   appendLearningEvent,
   buildLearningEvent,
+  canonicalAnchorIdentity,
   normalizeLearningRegistry,
   readLearningEvents,
 } from "./learning.mjs";
@@ -1011,6 +1012,10 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
   const issueIdentifier = slot.identifier;
   const logDir = path.join(STATE_DIR, anchorSlug(anchorPath), sweep, issueIdentifier);
   const childRunKey = `${sweep}-${issueIdentifier}-${childIndex}`;
+  const eventRunKey = crypto.createHash("sha256")
+    .update(`${parentRunId}:${childRunKey}:${slot.slotIndex || 0}`)
+    .digest("hex")
+    .slice(0, 16);
   const tmpDir = path.join(CACHE_DIR, parentRunId, childRunKey, "tmp");
   const portBase = SAME_REPO_PORT_BASE + childIndex * 10;
   return {
@@ -1022,7 +1027,7 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
     screenshotDir: path.join(logDir, "screenshots"),
     browserProfileDir: path.join(CACHE_DIR, parentRunId, childRunKey, "browser"),
     outcomePath: path.join(CACHE_DIR, parentRunId, childRunKey, "outcome.json"),
-    learningEventsPath: path.join(logDir, "learning-events.jsonl"),
+    learningEventsPath: path.join(logDir, `learning-events-${eventRunKey}.jsonl`),
     globalRunsDir: LEARNING_RUNS_DIR,
   };
 }
@@ -1030,6 +1035,7 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
 export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
   if (!pick.issueIdentifier) return pick;
   const cardRunId = `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`;
+  const sourceWorkspace = canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath);
   const paths = cardRunPaths(pick.anchorPath, pick.config, pick.sweep, {
     identifier: pick.issueIdentifier,
     slotIndex: pick.slotIndex || 0,
@@ -1046,7 +1052,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
       AUTO_SWEEP_SWEEP: pick.sweep,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
       AUTO_SWEEP_ANCHOR: pick.anchorPath,
-      AUTO_SWEEP_SOURCE_ANCHOR: pick.sourceAnchorPath || pick.anchorPath,
+      AUTO_SWEEP_SOURCE_ANCHOR: sourceWorkspace,
       ...(pick.repoRoute?.managedRepoPath ? { AUTO_SWEEP_REPO: pick.repoRoute.managedRepoPath } : {}),
       ...(pick.repoRoute?.sourceRepoPath ? { AUTO_SWEEP_SOURCE_REPO: pick.repoRoute.sourceRepoPath } : {}),
       ...(pick.repoRoute?.label ? { AUTO_SWEEP_REPO_LABEL: pick.repoRoute.label } : {}),
@@ -3652,13 +3658,16 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
       cardRunId: pick.cardRunId,
       issueIdentifier: pick.issueIdentifier,
       sweep: pick.sweep,
-      sourceAnchor: pick.sourceAnchorPath || pick.anchorPath,
+      sourceAnchor: pick.childEnv?.AUTO_SWEEP_SOURCE_ANCHOR
+        || canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath || "."),
     } : null,
   });
   const record = {
     parentRunId: pick.parentRunId,
     cardRunId: pick.cardRunId,
     issueIdentifier: pick.issueIdentifier,
+    sourceWorkspace: pick.childEnv?.AUTO_SWEEP_SOURCE_ANCHOR
+      || canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath || "."),
     sweep: pick.sweep,
     slotIndex: pick.slotIndex || 0,
     sameRepoLimit: pick.sameRepoLimit,

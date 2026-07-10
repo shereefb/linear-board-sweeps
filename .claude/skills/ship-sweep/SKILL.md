@@ -116,7 +116,7 @@ Emit:
 - each red production canary as `canary red`;
 - exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
 
-+## Machine-independence & handoff (auto-sweep)
+## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the launcher, and any other machine coordinate ONLY through origin. ship-sweep is single-runner, but a crash still has to hand off cleanly.
 

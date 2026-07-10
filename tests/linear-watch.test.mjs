@@ -1973,7 +1973,9 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
   assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
   assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
-  assert.match(pick.learningEventsPath, /learning-events\.jsonl$/);
+  assert.match(pick.learningEventsPath, /learning-events-[a-f0-9]{16}\.jsonl$/);
+  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "later-run-id", 2);
+  assert.notEqual(laterPick.learningEventsPath, pick.learningEventsPath);
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
@@ -1994,7 +1996,7 @@ test("run records embed structured events and mirror the exact record into the g
     category: "correctness",
     summary: "Null case",
     metrics: {},
-    identity: { cardRunId: "run-1", issueIdentifier: "COD-143", sweep: "dev", sourceAnchor: anchorPath },
+    identity: { cardRunId: "run-1", issueIdentifier: "COD-143", sweep: "dev", sourceAnchor: fs.realpathSync.native(anchorPath) },
   })}\nmalformed\n`);
   const child = new EventEmitter();
   child.pid = 456;
@@ -2050,6 +2052,21 @@ test("card dispatch env prefers the original source anchor for managed workspace
   }, "run-id");
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_ANCHOR, "/managed/repo");
+});
+test("card dispatch env canonicalizes the trusted source workspace identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-anchor-"));
+  const real = path.join(root, "real");
+  const alias = path.join(root, "alias");
+  fs.mkdirSync(real);
+  fs.symlinkSync(real, alias);
+  const pick = withCardDispatchEnv({
+    anchorPath: alias,
+    sourceAnchorPath: alias,
+    config: { repos: [alias] },
+    sweep: "dev",
+    issueIdentifier: "COD-143",
+  }, "run-id");
+  assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, fs.realpathSync.native(real));
 });
 test("card dispatch env uses the routed managed sibling for worktrees and exports both repo paths", () => {
   const repoRoute = {

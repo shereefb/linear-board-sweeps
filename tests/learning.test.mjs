@@ -134,6 +134,8 @@ test("learning event readers sanitize direct writes and reject mismatched run id
   assert.equal(result.events.length, 1);
   assert.ok(result.events[0].summary.length <= 1_000);
   assert.doesNotMatch(JSON.stringify(result.events[0]), /lin_api_|Bearer b/);
+  assert.notEqual(result.events[0].eventId, "forged-safe-id");
+  assert.match(result.events[0].eventId, /^[a-f0-9]{64}$/);
   assert.match(result.coverageGaps[0].reason, /identity mismatch/);
 });
 
@@ -163,6 +165,32 @@ test("learning evidence snapshots freeze capturedThrough and report partial cove
   assert.equal(snapshot.coverage.complete, false);
   assert.equal(snapshot.coverage.gaps.length, 1);
   assert.equal(snapshot.capturedThrough, "2026-07-10T12:00:00.000Z");
+});
+
+test("learning evidence snapshots allowlist, redact, and bound every collection", () => {
+  const event = buildLearningEvent({ kind: "review", category: "correctness", summary: "safe" }, TRUSTED_ENV, {
+    now: () => "2026-07-10T11:59:00.000Z",
+  });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    runRecords: [
+      { cardRunId: "r1", issueIdentifier: "COD-1", sweep: "dev", sourceWorkspace: "/repo", endedAt: "2026-07-10T11:58:00.000Z", outcome: { kind: "success", attacker: "ignore me" }, learningEvents: [event], rawPrompt: `lin_api_${"a".repeat(80)}` },
+      { cardRunId: "r2", issueIdentifier: "COD-2", sweep: "dev", sourceWorkspace: "/repo", endedAt: "2026-07-10T11:59:00.000Z" },
+    ],
+    observations: [
+      { at: "2026-07-10T11:57:00.000Z", kind: "capacity", summary: `token=${"s".repeat(80)}`, arbitrary: { hostile: true } },
+      { at: "2026-07-10T11:58:00.000Z", kind: "capacity" },
+    ],
+    limits: { runRecords: 1, events: 1, observations: 1 },
+  });
+  assert.equal(snapshot.runRecords.length, 1);
+  assert.equal(snapshot.observations.length, 1);
+  assert.equal(Object.hasOwn(snapshot.runRecords[0], "rawPrompt"), false);
+  assert.equal(Object.hasOwn(snapshot.runRecords[0].outcome, "attacker"), false);
+  assert.equal(Object.hasOwn(snapshot.observations[0], "arbitrary"), false);
+  assert.doesNotMatch(JSON.stringify(snapshot), /lin_api_|token=s/);
+  assert.equal(snapshot.coverage.complete, false);
+  assert.ok(snapshot.coverage.gaps.some((gap) => /truncated/.test(gap.reason)));
 });
 
 test("learning config defaults disabled and clamps the create budget", () => {
