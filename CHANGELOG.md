@@ -2,6 +2,12 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.1.1] - 2026-07-09
+
+### Fixed
+
+- Add the standard per-user Bun installation directory to the launchd wrapper PATH so scheduled QA and Ship children can start gstack browser canaries from a minimal launchd environment.
+
 ## [1.1.0] - 2026-07-09
 
 ### Added

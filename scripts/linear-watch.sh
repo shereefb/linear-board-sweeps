@@ -10,6 +10,6 @@ HERE="${0:A:h}"
 
 # Adjust these to the machine if node/codex/claude live elsewhere. Homebrew + a
 # common nvm path + the ChatGPT/Codex app bundles cover the usual cases.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/Applications/ChatGPT.app/Contents/Resources:/Applications/Codex.app/Contents/Resources:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.bun/bin:$HOME/.local/bin:/Applications/ChatGPT.app/Contents/Resources:/Applications/Codex.app/Contents/Resources:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 exec node "$HERE/linear-watch.mjs" tick "$@"

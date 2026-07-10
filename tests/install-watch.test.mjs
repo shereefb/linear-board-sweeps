@@ -7,12 +7,13 @@ import { spawnSync } from "node:child_process";
 
 const repoRoot = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 
-test("launchd wrapper exposes ChatGPT and legacy Codex app bundles", () => {
+test("launchd wrapper exposes user Bun plus ChatGPT and legacy Codex app bundles", () => {
   const wrapper = fs.readFileSync(path.join(repoRoot, "scripts", "linear-watch.sh"), "utf8");
   const pathExport = wrapper.match(/^export PATH="([^"]+)"$/m)?.[1].split(":") ?? [];
 
   assert.ok(pathExport.includes("/Applications/ChatGPT.app/Contents/Resources"));
   assert.ok(pathExport.includes("/Applications/Codex.app/Contents/Resources"));
+  assert.ok(pathExport.includes("$HOME/.bun/bin"));
 });
 
 test("install-watch uses a managed clean kit clone for launchd runtime", () => {
