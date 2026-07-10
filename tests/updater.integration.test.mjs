@@ -55,6 +55,69 @@ test("refreshAnchorSkills: commits to main even when a feature branch is checked
   }
 });
 
+test("refreshAnchorSkills: reuses a clean existing main worktree owned elsewhere", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-existing-main-"));
+  try {
+    const origin = path.join(root, "origin.git");
+    const anchor = path.join(root, "anchor");
+    const mainOwner = path.join(root, "main owner");
+    g(root, "init", "--bare", "-b", "main", origin);
+    g(root, "clone", origin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "0.0.1\n");
+    g(anchor, "add", "-A");
+    g(anchor, "commit", "-m", "seed");
+    g(anchor, "push", "origin", "main");
+    g(anchor, "checkout", "-b", "COD-135-feature");
+    g(anchor, "worktree", "add", mainOwner, "main");
+
+    const result = refreshAnchorSkills(anchor, KIT, "9.9.6");
+
+    assert.equal(result.ok, true, result.reason);
+    assert.match(result.reason, /existing main worktree/);
+    assert.equal(g(mainOwner, "show", "HEAD:.claude/skills/.sweep-version"), "9.9.6");
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "9.9.6");
+    assert.equal(g(anchor, "show", "COD-135-feature:.claude/skills/.sweep-version"), "0.0.1");
+    assert.equal(g(anchor, "symbolic-ref", "--short", "HEAD"), "COD-135-feature");
+    assert.ok(fs.existsSync(mainOwner));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("refreshAnchorSkills: refuses a dirty existing main worktree without removing it", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-dirty-main-"));
+  try {
+    const origin = path.join(root, "origin.git");
+    const anchor = path.join(root, "anchor");
+    const mainOwner = path.join(root, "main-owner");
+    g(root, "init", "--bare", "-b", "main", origin);
+    g(root, "clone", origin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "0.0.1\n");
+    g(anchor, "add", "-A");
+    g(anchor, "commit", "-m", "seed");
+    g(anchor, "push", "origin", "main");
+    g(anchor, "checkout", "-b", "COD-135-feature");
+    g(anchor, "worktree", "add", mainOwner, "main");
+    fs.writeFileSync(path.join(mainOwner, "local-note.txt"), "preserve me\n");
+
+    const result = refreshAnchorSkills(anchor, KIT, "9.9.5");
+
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /existing main worktree dirty/);
+    assert.equal(g(mainOwner, "show", "HEAD:.claude/skills/.sweep-version"), "0.0.1");
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "0.0.1");
+    assert.equal(fs.readFileSync(path.join(mainOwner, "local-note.txt"), "utf8"), "preserve me\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const primaryBranch of ["main", "COD-2-feature"]) {
   test(`refreshAnchorSkills: commit-hook failure is reported on ${primaryBranch} without a false push success`, () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-hook-fail-"));
