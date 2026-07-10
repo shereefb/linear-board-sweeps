@@ -3,6 +3,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   positionAfter, reviewLensLabels, bottomSortOrder, issueUpdateToStateBottomInput,
@@ -99,13 +102,13 @@ test("fetchIssueDependencies rejects query failures instead of returning an empt
 });
 
 const linearCli = fileURLToPath(new URL("../scripts/linear.mjs", import.meta.url));
-function runDependencyStatusCli(inverseRelations) {
+function runDependencyStatusCli(inverseRelations, env = {}) {
   const response = { data: { issue: { identifier: "COD-9", inverseRelations } } };
   const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
   return spawnSync(process.execPath, ["--import", preload, linearCli, "dependency-status", "COD-9"], {
     encoding: "utf8",
-    env: { ...process.env, LINEAR_API_KEY: "key" },
+    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
   });
 }
 
@@ -129,6 +132,30 @@ test("dependency-status CLI emits blocker JSON and maps readiness to exit status
   const incomplete = runDependencyStatusCli({ pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] });
   assert.equal(incomplete.status, 2, incomplete.stderr);
   assert.equal(JSON.parse(incomplete.stdout).reason, "incomplete-relations");
+});
+
+test("dependency-status CLI writes a machine-readable parent outcome for blocked and unreadable dependencies", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dependency-cli-outcome-"));
+  const blockedPath = path.join(dir, "blocked.json");
+  const blocked = runDependencyStatusCli({
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: "r1", type: "blocks", issue: { id: "b1", identifier: "COD-1", state: { id: "s1", name: "Dev", type: "unstarted" } } }],
+  }, { AUTO_SWEEP_OUTCOME_PATH: blockedPath });
+  assert.equal(blocked.status, 3, blocked.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(blockedPath, "utf8")), {
+    version: 1,
+    kind: "dependency-deferred",
+    issueIdentifier: "COD-9",
+    dependencyExitCode: 3,
+    dependency: { reason: "blocked", blockers: [{ identifier: "COD-1", stateName: "Dev" }] },
+  });
+
+  const unreadablePath = path.join(dir, "unreadable.json");
+  const unreadable = runDependencyStatusCli({ pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] }, {
+    AUTO_SWEEP_OUTCOME_PATH: unreadablePath,
+  });
+  assert.equal(unreadable.status, 2, unreadable.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(unreadablePath, "utf8")).dependencyExitCode, 2);
 });
 
 // ── board position ───────────────────────────────────────────────────────────

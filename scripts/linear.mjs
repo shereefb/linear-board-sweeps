@@ -482,9 +482,35 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
           blockers: eligibility.unresolved.map(({ identifier, stateName }) => ({ identifier, stateName })),
         }));
         process.exitCode = eligibility.eligible ? 0 : eligibility.reason === "blocked" ? 3 : 2;
+        if (process.exitCode === 0 && process.env.AUTO_SWEEP_OUTCOME_PATH) {
+          fs.rmSync(process.env.AUTO_SWEEP_OUTCOME_PATH, { force: true });
+        }
+        if (process.exitCode !== 0 && process.env.AUTO_SWEEP_OUTCOME_PATH) {
+          fs.mkdirSync(path.dirname(process.env.AUTO_SWEEP_OUTCOME_PATH), { recursive: true });
+          fs.writeFileSync(process.env.AUTO_SWEEP_OUTCOME_PATH, JSON.stringify({
+            version: 1,
+            kind: "dependency-deferred",
+            issueIdentifier: result.issue,
+            dependencyExitCode: process.exitCode,
+            dependency: {
+              reason: eligibility.reason,
+              blockers: eligibility.unresolved.map(({ identifier, stateName }) => ({ identifier, stateName })),
+            },
+          }));
+        }
       } catch (error) {
         console.error(String(error.message || error));
         process.exitCode = 2;
+        if (process.env.AUTO_SWEEP_OUTCOME_PATH) {
+          fs.mkdirSync(path.dirname(process.env.AUTO_SWEEP_OUTCOME_PATH), { recursive: true });
+          fs.writeFileSync(process.env.AUTO_SWEEP_OUTCOME_PATH, JSON.stringify({
+            version: 1,
+            kind: "dependency-deferred",
+            issueIdentifier: args[0],
+            dependencyExitCode: 2,
+            dependency: { reason: "unreadable", blockers: [] },
+          }));
+        }
       }
     },
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),

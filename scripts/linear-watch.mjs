@@ -323,26 +323,45 @@ function whichRuntime(runtime, env) {
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
-export function resolveRuntimeExecutable(runtime, env = process.env, {
-  existsFn = fs.existsSync,
-  whichFn = whichRuntime,
-} = {}) {
+export function resolveRuntimeExecutable(runtime, env = process.env, options = {}) {
+  const {
+    existsFn = fs.existsSync,
+    statFn = fs.statSync,
+    accessFn = fs.accessSync,
+    whichFn = whichRuntime,
+  } = options;
+  const customLegacyExistsOnly = Object.hasOwn(options, "existsFn")
+    && !Object.hasOwn(options, "statFn")
+    && !Object.hasOwn(options, "accessFn");
+  const executableFile = (candidate) => {
+    try {
+      if (customLegacyExistsOnly) return Boolean(existsFn(candidate));
+      if (!statFn(candidate).isFile()) return false;
+      accessFn(candidate, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const name = runtime || "codex";
   const override = env?.[`${name.toUpperCase()}_BIN`];
   if (override) {
     const candidate = path.resolve(override);
-    if (existsFn(candidate)) return { ok: true, runtime: name, path: candidate, source: "override" };
+    if (executableFile(candidate)) return { ok: true, runtime: name, path: candidate, source: "override" };
   }
 
   const fromPath = whichFn(name, env || {});
-  if (fromPath) return { ok: true, runtime: name, path: path.resolve(fromPath), source: "path" };
+  if (fromPath) {
+    const candidate = path.resolve(fromPath);
+    if (executableFile(candidate)) return { ok: true, runtime: name, path: candidate, source: "path" };
+  }
 
   if (name === "codex") {
     for (const candidate of [
       "/Applications/ChatGPT.app/Contents/Resources/codex",
       "/Applications/Codex.app/Contents/Resources/codex",
     ]) {
-      if (existsFn(candidate)) return { ok: true, runtime: name, path: candidate, source: "application" };
+      if (executableFile(candidate)) return { ok: true, runtime: name, path: candidate, source: "application" };
     }
   }
 
@@ -897,6 +916,7 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
     appPort: portBase,
     screenshotDir: path.join(logDir, "screenshots"),
     browserProfileDir: path.join(CACHE_DIR, parentRunId, childRunKey, "browser"),
+    outcomePath: path.join(CACHE_DIR, parentRunId, childRunKey, "outcome.json"),
   };
 }
 
@@ -923,6 +943,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
       AUTO_SWEEP_APP_PORT: String(paths.appPort),
       AUTO_SWEEP_SCREENSHOT_DIR: paths.screenshotDir,
       AUTO_SWEEP_BROWSER_PROFILE_DIR: paths.browserProfileDir,
+      AUTO_SWEEP_OUTCOME_PATH: paths.outcomePath,
     },
   };
 }
@@ -1083,6 +1104,11 @@ export function rotateNonShipCandidates(candidates, seed = 0) {
   const rotatedAnchors = [...anchors.slice(offset), ...anchors.slice(0, offset)];
   const anchorRank = new Map(rotatedAnchors.map((anchor, index) => [anchor, index]));
   return [...ranked].sort((a, b) => {
+    const stageOrder = SWEEP_ORDER.indexOf(a.sweep) - SWEEP_ORDER.indexOf(b.sweep);
+    if (stageOrder !== 0) return stageOrder;
+    const boardOrder = boardOrderValue(b.topCard || { sortOrder: b.topSortOrder })
+      - boardOrderValue(a.topCard || { sortOrder: a.topSortOrder });
+    if (boardOrder !== 0) return boardOrder;
     const ao = anchorRank.get(a.anchorPath) ?? Number.MAX_SAFE_INTEGER;
     const bo = anchorRank.get(b.anchorPath) ?? Number.MAX_SAFE_INTEGER;
     if (ao !== bo) return ao - bo;
@@ -1222,6 +1248,7 @@ function escapeRegExp(s) {
 
 export function sanitizeFailureMessage(message, envValues = []) {
   let out = String(message || "");
+  out = out.replace(/\b((?:https?|ssh):\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, "$1[REDACTED]@");
   out = out.replace(/lin_api_[A-Za-z0-9_-]+/g, "[REDACTED]");
   out = out.replace(/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/g, "[REDACTED]");
   out = out.replace(/\b(?:xox[baprs]-|sk-[A-Za-z0-9_-]{12,})[A-Za-z0-9_-]*/g, "[REDACTED]");
@@ -1766,7 +1793,7 @@ export function createCapacityLedger({
   return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
 }
 
-export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null, onUnconfirmedDemand = null } = {}) {
+export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null, onCapacityFailure = null, onUnconfirmedDemand = null } = {}) {
   if (!ledger || typeof ledger.reserve !== "function") throw new Error("capacity ledger is required");
   if (typeof executeDemand !== "function") throw new Error("executeDemand is required");
   const pending = [];
@@ -1778,10 +1805,11 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
   const idleWaiters = [];
 
   const demandKey = (demand) => [demand.workspace || demand.anchorPath || "", demand.stage || demand.sweep || "", demand.issueIdentifier || demand.topCard?.identifier || ""].join("\0");
-  const scheduleDrain = () => {
+  const scheduleDrain = (coalesce = true) => {
     if (drainScheduled) return;
     drainScheduled = true;
-    queueMicrotask(() => {
+    const schedule = coalesce ? setImmediate : queueMicrotask;
+    schedule(() => {
       drainScheduled = false;
       drainAdmissionQueue();
     });
@@ -1819,7 +1847,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
       localActive -= 1;
       if (localActive === 0) sampler?.stop?.();
       byKey.delete(item.key);
-      scheduleDrain();
+      scheduleDrain(false);
       notifyIdle();
     });
   };
@@ -1830,7 +1858,18 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
       pending.sort((a, b) => compareAdmissionDemand(a.demand, b.demand));
       while (pending.length) {
         const state = ledger.reconcile();
-        if (!state.healthy) break;
+        if (!state.healthy) {
+          const failed = pending.splice(0);
+          const error = new Error(`capacity unavailable: ${(state.errors || ["ledger unhealthy"]).join("; ")}`);
+          error.code = "CAPACITY_UNAVAILABLE";
+          error.capacityState = state;
+          for (const item of failed) {
+            byKey.delete(item.key);
+            item.reject(error);
+          }
+          onCapacityFailure?.(error, failed.map((item) => item.demand), state);
+          break;
+        }
         if (state.active >= state.max) {
           for (const item of pending) onCapacityDeferred?.(item.demand, state);
           if (localActive === 0) {
@@ -2111,16 +2150,36 @@ async function normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesF
   const connection = node?.inverseRelations;
   const pageInfo = connection?.pageInfo;
   if (typeof pageInfo?.hasNextPage !== "boolean") {
-    throw new Error(`inverseRelations pageInfo missing for ${node?.identifier || node?.id || "unknown issue"}`);
+    const error = new Error(`inverseRelations pageInfo missing for ${node?.identifier || node?.id || "unknown issue"}`);
+    error.code = "DEPENDENCY_READ_UNAVAILABLE";
+    error.issueIdentifier = node?.identifier || node?.id || "unknown";
+    error.relationId = "inverseRelations";
+    throw error;
   }
 
   let blockers = normalizeBlockingRelations(connection);
   let blockersComplete = !pageInfo.hasNextPage;
   if (!blockersComplete) {
-    const resolved = await fetchIssueDependenciesFn(apiKey, node.id, { gqlFn });
+    let resolved;
+    try {
+      resolved = await fetchIssueDependenciesFn(apiKey, node.id, { gqlFn });
+    } catch (cause) {
+      const error = new Error(`dependency read failed for ${node.identifier || node.id}: ${cause.message}`);
+      error.code = "DEPENDENCY_READ_UNAVAILABLE";
+      error.issueIdentifier = node.identifier || node.id;
+      error.relationId = "inverseRelations";
+      error.cause = cause;
+      throw error;
+    }
     blockers = resolved?.blockers || [];
     blockersComplete = resolved?.complete === true;
-    if (!blockersComplete) throw new Error(`incomplete relation pagination for ${node.identifier || node.id}`);
+    if (!blockersComplete) {
+      const error = new Error(`incomplete relation pagination for ${node.identifier || node.id}`);
+      error.code = "DEPENDENCY_READ_UNAVAILABLE";
+      error.issueIdentifier = node.identifier || node.id;
+      error.relationId = "inverseRelations";
+      throw error;
+    }
   }
 
   return {
@@ -2129,6 +2188,22 @@ async function normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesF
     blockersComplete,
     dependency: dependencyEligibility(blockers, blockersComplete),
   };
+}
+
+export function dependencyReadFailureEvents(error, { anchorPath, projectId, seenAt = new Date().toISOString() } = {}) {
+  if (error?.code !== "DEPENDENCY_READ_UNAVAILABLE") return [];
+  const issueIdentifier = error.issueIdentifier || "unknown";
+  const relationId = error.relationId || "inverseRelations";
+  return [{
+    anchorPath,
+    anchorSlug: anchorSlug(anchorPath),
+    projectId: projectId || "unknown",
+    scope: `dependency:${issueIdentifier}`,
+    kind: "dependency-read",
+    stableTarget: `${issueIdentifier}:${relationId}`,
+    message: sanitizeFailureMessage(error.message),
+    seenAt,
+  }];
 }
 
 export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, states, {
@@ -2795,7 +2870,13 @@ async function executeBounce(apiKey, card, labelMap) {
   await addComment(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
 }
 
-async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now }) {
+export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now }, {
+  applyLabelEditFn = applyLabelEdit,
+  addCommentFn = addComment,
+  sleepFn = sleep,
+  fetchCardFn = fetchCard,
+  fetchClaimCardFn = fetchClaimCard,
+} = {}) {
   const cfg = SWEEP_CFG[sweep];
   const claimId = labelMap[cfg.claim];
   if (!claimId) throw new Error(`missing team label ${cfg.claim}`);
@@ -2805,14 +2886,16 @@ async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parent
     if (claimed.length >= limit) break;
     const slotIndex = claimed.length;
     const owner = ownerToken({ parentRunId, issueIdentifier: card.identifier, slotIndex });
+    let claimApplied = false;
     try {
-      await applyLabelEdit(apiKey, card, { add: { [cfg.claim]: claimId } });
-      await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Claimed for same-repo parallel ${sweep} slot ${slotIndex + 1}/${limit}.`);
-      await sleep(CLAIM_CONFIRM_DELAY_MS);
-      const fresh = await fetchCard(apiKey, card.id);
+      await applyLabelEditFn(apiKey, card, { add: { [cfg.claim]: claimId } });
+      claimApplied = true;
+      await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Claimed for same-repo parallel ${sweep} slot ${slotIndex + 1}/${limit}.`);
+      await sleepFn(CLAIM_CONFIRM_DELAY_MS);
+      const fresh = await fetchCardFn(apiKey, card.id);
       if (!claimConfirmed(fresh, cfg, owner, cfg.states)) {
         if (hasLabel(fresh, cfg.claim) && latestHeartbeatOwner(fresh, cfg.claim) === owner) {
-          await applyLabelEdit(apiKey, fresh, { remove: [cfg.claim] });
+          await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
         }
         logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
         continue;
@@ -2829,19 +2912,36 @@ async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parent
       });
     } catch (e) {
       logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${e.message}`);
+      if (!claimApplied) continue;
+      try {
+        const latest = await fetchClaimCardFn(apiKey, card.id);
+        if (hasLabel(latest, cfg.claim) && latestHeartbeatOwner(latest, cfg.claim) === owner) {
+          await applyLabelEditFn(apiKey, latest, { remove: [cfg.claim] });
+        }
+      } catch (cleanupError) {
+        logFor(anchorPath, sweep, `claim-cleanup-unverified ${card.identifier}: ${cleanupError.message}`);
+        const error = new Error(`claim cleanup unverifiable for ${card.identifier}: ${cleanupError.message}`);
+        error.code = "CLAIM_CLEANUP_UNVERIFIED";
+        error.cause = cleanupError;
+        throw error;
+      }
     }
   }
   return claimed;
 }
 
-async function releaseOwnedDispatchClaim(apiKey, pick, reason) {
+export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
+  fetchClaimCardFn = fetchClaimCard,
+  applyLabelEditFn = applyLabelEdit,
+  addCommentFn = addComment,
+} = {}) {
   const cfg = SWEEP_CFG[pick.sweep];
   if (!cfg || !pick.issueId || !pick.ownerToken) return false;
-  const fresh = await fetchClaimCard(apiKey, pick.issueId);
+  const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
   if (!hasLabel(fresh, cfg.claim)) return false;
   if (latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
-  await applyLabelEdit(apiKey, fresh, { remove: [cfg.claim] });
-  await addComment(apiKey, fresh.id, `${ORPHAN_TAG} Released launch pre-claim \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Will retry on a later tick.`);
+  await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
+  await addCommentFn(apiKey, fresh.id, `${ORPHAN_TAG} Released launch pre-claim \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Will retry on a later tick.`);
   return true;
 }
 
@@ -2857,7 +2957,7 @@ export async function expandDispatchBatch(batch, {
   const expanded = [];
   for (const pick of batch) {
     if (pick.sweep === "ship") {
-      expanded.push(pick);
+      expanded.push(withCardDispatchEnv(pick, parentRunId, childIndexAllocator.next()));
       continue;
     }
     const rawSlotLimit = pick.slotLimit;
@@ -3102,8 +3202,9 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
     const url = git(kit, ["remote", "get-url", "origin"], { allowFail: true }).out;
     if (url !== reg.kitRemote) {
       const msg = `kit remote ${url} != expected ${reg.kitRemote} — skipping self-update`;
-      updateLog(`update: ${msg}`);
-      onFailure(null, "update", "kit-remote", kit, msg);
+      const safeMessage = sanitizeFailureMessage(msg);
+      updateLog(`update: ${safeMessage}`);
+      onFailure(null, "update", "kit-remote", kit, safeMessage);
       return;
     }
   }
@@ -3111,15 +3212,17 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
   const fetchResult = git(kit, ["fetch", "origin", reg.kitRef], { allowFail: true });
   if (fetchResult.status !== 0) {
     const msg = `kit fetch failed for origin/${reg.kitRef}: ${fetchResult.err}`;
-    updateLog(`update: ${msg}`);
-    onFailure(null, "update", "kit-fetch", kit, msg);
+    const safeMessage = sanitizeFailureMessage(msg);
+    updateLog(`update: ${safeMessage}`);
+    onFailure(null, "update", "kit-fetch", kit, safeMessage);
     return;
   }
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
   if (merge.status !== 0) {
     const msg = `kit clone not fast-forwardable (diverged/dirty) — left alone: ${merge.err}`;
-    updateLog(`update: ${msg}`);
-    onFailure(null, "update", "kit-fast-forward", kit, msg);
+    const safeMessage = sanitizeFailureMessage(msg);
+    updateLog(`update: ${safeMessage}`);
+    onFailure(null, "update", "kit-fast-forward", kit, safeMessage);
     return;
   }
   const after = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
@@ -3138,8 +3241,9 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
       updateLog(`update: ${anchorSlug(anchor)} skills → ${marker} (${res.reason})`);
       if (!res.ok) onFailure(anchor, "update", "skills-refresh", marker, res.reason);
     } catch (e) {
-      updateLog(`update: ${anchorSlug(anchor)} failed: ${e.message}`);
-      onFailure(anchor, "update", "skills-refresh", marker, e.message);
+      const safeMessage = sanitizeFailureMessage(e.message);
+      updateLog(`update: ${anchorSlug(anchor)} failed: ${safeMessage}`);
+      onFailure(anchor, "update", "skills-refresh", marker, safeMessage);
     }
   }
 }
@@ -3166,6 +3270,29 @@ export function classifyDispatchOutcome(event = {}) {
   if (base.signal) return { kind: "signal", ...base };
   if (base.exitCode === 0) return { kind: "success", ...base };
   return { kind: "exit", ...base };
+}
+
+function dependencyOutcomeForPick(pick = {}) {
+  if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
+  try {
+    const value = JSON.parse(fs.readFileSync(pick.outcomePath, "utf8"));
+    if (value?.version !== 1 || value?.kind !== "dependency-deferred") return null;
+    if (value.issueIdentifier && value.issueIdentifier !== pick.issueIdentifier) return null;
+    const dependencyExitCode = Number(value.dependencyExitCode);
+    if (![2, 3].includes(dependencyExitCode)) return null;
+    return {
+      kind: "dependency-deferred",
+      code: dependencyExitCode === 3 ? "DEPENDENCY_BLOCKED" : "DEPENDENCY_UNREADABLE",
+      exitCode: 0,
+      signal: null,
+      path: pick.runtimeExecutable || null,
+      cwd: pick.anchorPath || null,
+      dependencyExitCode,
+      dependency: value.dependency || null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function runtimeDisabledByOutcome(outcome) {
@@ -3343,10 +3470,35 @@ export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = 
         ? { type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }
         : { type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
     });
-    child.on("close", (exitCode, childSignal) => finish(classifyDispatchOutcome(signal?.aborted
-      ? { type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd }
-      : { type: "close", exitCode, signal: childSignal, path: executable, cwd })));
+    child.on("close", (exitCode, childSignal) => finish(signal?.aborted
+      ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
+      : (dependencyOutcomeForPick(pick) || classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }))));
   });
+}
+
+export function attachUpdateFailuresToAnchors(anchors, updateFailures, {
+  eventFor,
+  onUnmapped = () => {},
+  markRecovered = false,
+} = {}) {
+  const bySource = new Map((anchors || []).map((active) => [active.sourceAnchorPath, active]));
+  const failedSources = new Set();
+  let globalFailure = false;
+  for (const failure of updateFailures || []) {
+    const active = failure.anchorPath ? bySource.get(failure.anchorPath) : null;
+    if (!active) {
+      if (!failure.anchorPath) globalFailure = true;
+      onUnmapped(failure);
+      continue;
+    }
+    failedSources.add(active.sourceAnchorPath);
+    active.failures.push(eventFor(active, failure));
+  }
+  if (markRecovered) {
+    for (const active of anchors || []) {
+      if (!globalFailure && !failedSources.has(active.sourceAnchorPath)) active.checkedScopes.add("update");
+    }
+  }
 }
 
 export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResult, signal = null, dispatchOptions = {} } = {}) {
@@ -3411,7 +3563,7 @@ async function tick({ dryRun = false } = {}) {
       scope,
       kind,
       stableTarget,
-      message: String(message || ""),
+      message: sanitizeFailureMessage(message),
       seenAt: new Date().toISOString(),
     });
     const reconcileDispatchResult = async (result) => {
@@ -3428,9 +3580,10 @@ async function tick({ dryRun = false } = {}) {
         logDir: pick.logDir,
       }) : runtime;
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
-      const releaseClaim = startFailure || result.kind === "interrupted";
+      const dependencyDeferred = result.kind === "dependency-deferred";
+      const releaseClaim = startFailure || result.kind === "interrupted" || dependencyDeferred;
       const detail = result.signal || result.code || result.exitCode;
-      const failures = result.kind === "success" ? [] : [
+      const failures = (result.kind === "success" || dependencyDeferred) ? [] : [
         failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
       ];
       if (runtimeDisabledByOutcome(result)) {
@@ -3452,8 +3605,9 @@ async function tick({ dryRun = false } = {}) {
       }
       if (releaseClaim && pick.issueIdentifier) {
         try {
-          const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
-          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
+          const releaseReason = dependencyDeferred ? "dependency preflight deferred material work" : `dispatcher via ${runtime} could not start`;
+          const released = await releaseOwnedDispatchClaim(active.apiKey, pick, releaseReason);
+          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after ${dependencyDeferred ? "dependency deferral" : "dispatch-start failure"} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
@@ -3468,7 +3622,20 @@ async function tick({ dryRun = false } = {}) {
         recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
         writeCurrentTick();
       }
-      observationStore.clear(pick);
+      if (dependencyDeferred) {
+        const key = observationKey(pick);
+        const dependency = result.dependency || { reason: result.code === "DEPENDENCY_BLOCKED" ? "blocked" : "incomplete-relations", blockers: [] };
+        dependencyDeferredKeys.add(key);
+        dependencyDeferredIssues.set(key, {
+          sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+          sweep: pick.sweep,
+          issueIdentifier: pick.issueIdentifier,
+          reason: dependency.reason,
+          blockers: dependency.blockers || [],
+        });
+      } else {
+        observationStore.clear(pick);
+      }
       capacityDeferredKeys.delete(observationKey(pick));
       return active;
     };
@@ -3699,6 +3866,11 @@ async function tick({ dryRun = false } = {}) {
         }
         writeCurrentTick();
       },
+      onCapacityFailure: (error) => {
+        const event = failureEventFor("_", null, "capacity", "capacity-ledger", CAPACITY_LEDGER, error.message);
+        if (!localFailures.some((failure) => failureFingerprint(failure) === failureFingerprint(event))) localFailures.push(event);
+        writeCurrentTick();
+      },
       onUnconfirmedDemand: (demand) => {
         observationStore.clear(demand);
         capacityDeferredKeys.delete(observationKey(demand));
@@ -3794,14 +3966,11 @@ async function tick({ dryRun = false } = {}) {
       anchors.push(active);
       activeByAnchor.set(managedAnchorPath, active);
     }
-    for (const f of updateFailures) {
-      const active = f.anchorPath ? activeByAnchor.get(f.anchorPath) : null;
-      if (active) active.failures.push(failureEventFor(f.anchorPath, active.config, f.scope, f.kind, f.stableTarget, f.message));
-      else recordLocalFailure(f.anchorPath || "_", null, f.scope, f.kind, f.stableTarget, f.message);
-    }
-    if (!dryRun && reg.autoUpdate && !updateFailures.some((f) => !f.anchorPath)) {
-      for (const active of anchors) active.checkedScopes.add("update");
-    }
+    attachUpdateFailuresToAnchors(anchors, updateFailures, {
+      eventFor: (active, failure) => failureEventFor(active.anchorPath, active.config, failure.scope, failure.kind, failure.stableTarget, failure.message),
+      onUnmapped: (failure) => recordLocalFailure(failure.anchorPath || "_", null, failure.scope, failure.kind, failure.stableTarget, failure.message),
+      markRecovered: !dryRun && Boolean(reg.autoUpdate),
+    });
     refillBudget.remaining = maxSameRepoRefillDispatches(anchors.map((a) => a.config));
     refillBudget.disabled = refillBudget.remaining === 0;
 
@@ -3836,9 +4005,26 @@ async function tick({ dryRun = false } = {}) {
             }
           }
         } else {
-          for (const sweep of SWEEPS) {
-            logFor(anchorPath, sweep, `fetch error: ${scheduledPass.admissionError.message}`);
-            recordFailure(sweep, "fetch", scheduledStates.join(","), scheduledPass.admissionError.message);
+          const dependencyFailures = dependencyReadFailureEvents(scheduledPass.admissionError, {
+            anchorPath,
+            projectId: config.projectId,
+          });
+          if (dependencyFailures.length) {
+            for (const failure of dependencyFailures) {
+              active.failures.push(failure);
+              logFor(anchorPath, "_", `dependency read unavailable ${failure.stableTarget}: ${failure.message}`);
+              const fingerprint = failureFingerprint(failure);
+              if (!reportedDependencyCycleFailures.has(fingerprint)) {
+                reportedDependencyCycleFailures.add(fingerprint);
+                localFailures.push(failure);
+                writeCurrentTick();
+              }
+            }
+          } else {
+            for (const sweep of SWEEPS) {
+              logFor(anchorPath, sweep, `fetch error: ${sanitizeFailureMessage(scheduledPass.admissionError.message)}`);
+              recordFailure(sweep, "fetch", scheduledStates.join(","), scheduledPass.admissionError.message);
+            }
           }
         }
         if (scheduledPass.cleanupError) {

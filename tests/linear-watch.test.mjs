@@ -8,6 +8,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
+import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
@@ -250,7 +251,7 @@ test("resolveRuntimeExecutable: explicit override wins and is validated", () => 
 });
 test("resolveRuntimeExecutable: PATH lookup returns an absolute executable", () => {
   const resolved = resolveRuntimeExecutable("claude", { PATH: "/opt/bin:/usr/bin" }, {
-    existsFn: () => false,
+    existsFn: (candidate) => candidate === "/opt/bin/claude",
     whichFn: (runtime, env) => {
       assert.equal(runtime, "claude");
       assert.equal(env.PATH, "/opt/bin:/usr/bin");
@@ -290,6 +291,30 @@ test("resolveRuntimeExecutable: missing runtime is a typed preflight failure", (
     path: null,
     source: null,
   });
+});
+test("resolveRuntimeExecutable: rejects non-regular and non-executable candidates from overrides and app bundles", () => {
+  const accessCalls = [];
+  const statFn = (candidate) => ({ isFile: () => candidate !== "/custom/codex" });
+  const accessFn = (candidate, mode) => {
+    accessCalls.push([candidate, mode]);
+    if (candidate.includes("ChatGPT.app")) throw Object.assign(new Error("not executable"), { code: "EACCES" });
+  };
+  const resolved = resolveRuntimeExecutable("codex", { CODEX_BIN: "/custom/codex", PATH: "/missing" }, {
+    whichFn: () => null,
+    statFn,
+    accessFn,
+  });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.path, "/Applications/Codex.app/Contents/Resources/codex");
+  assert.ok(accessCalls.every(([, mode]) => mode === fs.constants.X_OK));
+
+  const none = resolveRuntimeExecutable("codex", { CODEX_BIN: "/custom/codex" }, {
+    whichFn: () => null,
+    statFn: () => ({ isFile: () => true }),
+    accessFn: () => { throw Object.assign(new Error("not executable"), { code: "EACCES" }); },
+  });
+  assert.equal(none.ok, false);
+  assert.equal(none.code, "ENOENT");
 });
 test("preflightRuntimeCandidates: scopes a missing runtime by anchor/runtime/host and keeps other lanes ready", () => {
   const calls = [];
@@ -528,6 +553,48 @@ test("capacity ledger: malformed or unverifiable entries fail closed and consume
   });
   assert.equal(unverifiable.reconcile().healthy, false);
   assert.equal(unverifiable.reserve({ stage: "qa", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-2" }), null);
+});
+test("admission queue: malformed capacity settles demands and idle waiters with a typed failure", async () => {
+  const failures = [];
+  const queue = createAdmissionQueue({
+    ledger: {
+      reconcile: () => ({ healthy: false, active: 1, max: 10, entries: [{ token: "broken" }], errors: ["malformed entry broken"] }),
+      reserve: () => assert.fail("unhealthy capacity must never reserve"),
+    },
+    executeDemand: () => assert.fail("unhealthy capacity must never claim or execute"),
+    onCapacityFailure: (failure, demands) => failures.push({ failure, demands }),
+  });
+  const demand = { stage: "qa", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-41" };
+  await assert.rejects(queue.admitDemand(demand), (error) => error.code === "CAPACITY_UNAVAILABLE" && /malformed entry/.test(error.message));
+  await queue.whenIdle();
+  assert.equal(queue.pendingCount, 0);
+  assert.equal(queue.activeCount, 0);
+  assert.equal(failures.length, 1);
+  assert.deepEqual(failures[0].demands.map((item) => item.issueIdentifier), ["COD-41"]);
+});
+
+test("admission queue: simultaneous completion discoveries coalesce before global priority", async () => {
+  let stored = null;
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `token-${++n}`; })(),
+  });
+  const order = [];
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (demand) => { order.push(demand.stage); return demand.stage; },
+  });
+  const dev = queue.admitDemand({ stage: "dev", trigger: "refill", workspace: "/dev", issueIdentifier: "COD-1", boardOrder: 10 });
+  let qa;
+  queueMicrotask(() => {
+    qa = queue.admitDemand({ stage: "qa", trigger: "handoff", workspace: "/qa", issueIdentifier: "COD-2", boardOrder: 1 });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await Promise.all([dev, qa]);
+  assert.deepEqual(order, ["qa", "dev"]);
 });
 test("capacity ledger: read-only inspect reports confirmed stale entries and preserves a live child", () => {
   const entries = [
@@ -1767,6 +1834,104 @@ test("card dispatch env prefers the original source anchor for managed workspace
   }, "run-id");
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
 });
+test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
+  const [pick] = await expandDispatchBatch([{
+    anchorPath,
+    sourceAnchorPath: "/source/repo",
+    config: { repos: [anchorPath] },
+    sweep: "ship",
+    count: 1,
+    topCard: dependencyReadyCard({ id: "ship-id", identifier: "COD-77", sortOrder: 10 }),
+    issueId: "ship-id",
+    issueIdentifier: "COD-77",
+    ownerToken: "ship-owner",
+  }], { dryRun: false, parentRunId: "ship-run", activeByAnchor: new Map(), now: NOW });
+  assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
+  assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(pick.issueId, "ship-id");
+  assert.match(pick.logDir, /ship\/COD-77$/);
+
+  const child = new EventEmitter();
+  child.pid = 501;
+  let spawnedEnv;
+  const run = dispatchAsync(anchorPath, "ship", {}, { ...pick, runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: (_executable, _args, options) => { spawnedEnv = options.env; return child; },
+  });
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
+  assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
+});
+
+test("claimCardSlots: confirmation exceptions clean up only the claim owned by this attempt", async () => {
+  assert.equal(typeof watchModule.claimCardSlots, "function");
+  const edits = [];
+  let reads = 0;
+  let owner;
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-88", sortOrder: 10, labelNames: [], comments: [] });
+  const result = await watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+  }, {
+    applyLabelEditFn: async (_key, fresh, edit) => edits.push({ fresh, edit }),
+    addCommentFn: async (_key, _id, body) => { owner = body.match(/owner=([^ ]+)/)?.[1]; },
+    sleepFn: async () => {},
+    fetchCardFn: async () => { reads += 1; throw new Error("confirmation unavailable"); },
+    fetchClaimCardFn: async () => { reads += 1; return {
+      ...card,
+      labelNames: ["dev:in-progress"],
+      comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    }; },
+  });
+  assert.deepEqual(result, []);
+  assert.equal(reads, 2);
+  assert.deepEqual(edits.at(-1).edit, { remove: ["dev:in-progress"] });
+});
+
+test("claimCardSlots: cleanup read/write failures remain truthful and never remove an unverified claim", async () => {
+  assert.equal(typeof watchModule.claimCardSlots, "function");
+  let removalAttempts = 0;
+  let owner;
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-89", sortOrder: 10, labelNames: [], comments: [] });
+  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+      parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+    }, {
+      applyLabelEditFn: async (_key, _fresh, edit) => {
+        if (edit.remove) { removalAttempts += 1; throw new Error("cleanup write unavailable"); }
+      },
+      addCommentFn: async (_key, _id, body) => { owner = body.match(/owner=([^ ]+)/)?.[1]; }, sleepFn: async () => {},
+      fetchCardFn: async () => { throw new Error("confirmation unavailable"); },
+      fetchClaimCardFn: async () => ({
+        ...card,
+        labelNames: ["dev:in-progress"],
+        comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+      }),
+    }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /cleanup write unavailable/.test(error.message));
+  assert.equal(removalAttempts, 1);
+});
+
+test("releaseOwnedDispatchClaim: dependency deferral removes only the matching owned claim", async () => {
+  assert.equal(typeof watchModule.releaseOwnedDispatchClaim, "function");
+  const edits = [];
+  const fresh = {
+    id: "issue-91", identifier: "COD-91", labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-91 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  const released = await watchModule.releaseOwnedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "owner-91",
+  }, "dependency preflight deferred material work", {
+    fetchClaimCardFn: async () => fresh,
+    applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
+    addCommentFn: async () => {},
+  });
+  assert.equal(released, true);
+  assert.deepEqual(edits, [{ remove: ["dev:in-progress"] }]);
+
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "other-owner",
+  }, "dependency deferred", { fetchClaimCardFn: async () => fresh }), false);
+});
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
   const base = {
@@ -2111,14 +2276,21 @@ test("selectDispatchBatch: dispatches disjoint anchors up to the configured non-
 });
 test("selectDispatchBatch: rotates non-ship anchors so later workspaces are not always leftovers", () => {
   const candidates = [
-    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "qa", count: 1, topCard: { sortOrder: 30 } },
-    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "dev", count: 1, topCard: { sortOrder: 20 } },
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, topCard: { sortOrder: 10 } },
+    { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "dev", count: 1, topCard: { sortOrder: 10 } },
     { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "dev", count: 1, topCard: { sortOrder: 10 } },
   ];
   const first = selectDispatchBatch(candidates, { maxNonShipDispatches: 2, rotationSeed: 0 });
   const rotated = selectDispatchBatch(candidates, { maxNonShipDispatches: 2, rotationSeed: 2 });
   assert.deepEqual(first.map((c) => c.anchorPath), ["/ws/a", "/ws/b"]);
   assert.deepEqual(rotated.map((c) => c.anchorPath), ["/ws/c", "/ws/a"]);
+});
+test("selectDispatchBatch: stage priority outranks workspace rotation", () => {
+  const selected = selectDispatchBatch([
+    { anchorPath: "/ws/spec", config: { repos: ["spec"] }, sweep: "spec", count: 1, topCard: { identifier: "COD-1", sortOrder: 100 } },
+    { anchorPath: "/ws/qa", config: { repos: ["qa"] }, sweep: "qa", count: 1, topCard: { identifier: "COD-2", sortOrder: 1 } },
+  ], { maxNonShipDispatches: 1, rotationSeed: 1 });
+  assert.deepEqual(selected.map((candidate) => candidate.sweep), ["qa"]);
 });
 test("rotateNonShipCandidates: preserves each anchor's internal sweep/card priority", () => {
   const rotated = rotateNonShipCandidates([
@@ -2271,6 +2443,26 @@ test("classifyDispatchOutcome: exit 127, signal, interruption, and success remai
   assert.deepEqual(classifyDispatchOutcome({ ...base, type: "close", exitCode: 0 }), {
     kind: "success", code: null, exitCode: 0, signal: null, ...base,
   });
+});
+test("dispatchAsync: child dependency outcome channel overrides a superficially successful runtime exit", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dependency-outcome-"));
+  const logDir = path.join(anchorPath, "logs");
+  const outcomePath = path.join(anchorPath, "dependency-outcome.json");
+  const child = new EventEmitter();
+  child.pid = 502;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-90", issueId: "issue-90", ownerToken: "owner-90",
+    logDir, outcomePath, runtimeExecutable: "/resolved/codex",
+    childEnv: { AUTO_SWEEP_OUTCOME_PATH: outcomePath },
+  }, { spawnFn: () => child });
+  fs.writeFileSync(outcomePath, JSON.stringify({ version: 1, kind: "dependency-deferred", issueIdentifier: "COD-90", dependencyExitCode: 3 }));
+  child.emit("close", 0, null);
+  const outcome = await run;
+  assert.equal(outcome.kind, "dependency-deferred");
+  assert.equal(outcome.code, "DEPENDENCY_BLOCKED");
+  assert.equal(outcome.dependencyExitCode, 3);
+  const recordName = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(logDir, recordName), "utf8")).outcome.kind, "dependency-deferred");
 });
 test("runtimeDisabledByOutcome: only executable disappearance disables a runtime lane", () => {
   const base = { path: "/resolved/codex", cwd: "/workspace" };
@@ -2710,6 +2902,59 @@ test("failureFingerprint: stable same input, different target differs", () => {
   assert.equal(a, b);
   assert.notEqual(a, c);
   assert.match(a, /^[a-f0-9]{16}$/);
+});
+test("sanitizeFailureMessage: strips credentials embedded in Git remote URLs", () => {
+  const sanitized = sanitizeFailureMessage("fetch https://oauth2:ghp_supersecret@github.com/acme/repo.git failed; ssh://token@host/repo");
+  assert.equal(sanitized.includes("ghp_supersecret"), false);
+  assert.equal(sanitized.includes("oauth2:"), false);
+  assert.equal(sanitized.includes("token@"), false);
+  assert.match(sanitized, /https:\/\/\[REDACTED\]@github\.com/);
+});
+
+test("update failures attach by source anchor and only healthy anchors recover update scope", () => {
+  assert.equal(typeof watchModule.attachUpdateFailuresToAnchors, "function");
+  const a = { anchorPath: "/managed/a", sourceAnchorPath: "/source/a", config: { projectId: "p" }, failures: [], checkedScopes: new Set() };
+  const b = { anchorPath: "/managed/b", sourceAnchorPath: "/source/b", config: { projectId: "p" }, failures: [], checkedScopes: new Set() };
+  const local = [];
+  watchModule.attachUpdateFailuresToAnchors([a, b], [{ anchorPath: "/source/a", scope: "update", kind: "skills-refresh", stableTarget: "v2", message: "push failed" }], {
+    eventFor: (active, failure) => ({ ...failure, anchorPath: active.anchorPath, projectId: active.config.projectId }),
+    onUnmapped: (failure) => local.push(failure),
+    markRecovered: true,
+  });
+  assert.equal(a.failures.length, 1);
+  assert.equal(a.failures[0].anchorPath, "/managed/a");
+  assert.equal(a.checkedScopes.has("update"), false);
+  assert.equal(b.checkedScopes.has("update"), true);
+  assert.deepEqual(local, []);
+});
+test("a global updater failure prevents every anchor from claiming update recovery", () => {
+  const anchors = ["a", "b"].map((name) => ({
+    anchorPath: `/managed/${name}`, sourceAnchorPath: `/source/${name}`, config: {}, failures: [], checkedScopes: new Set(),
+  }));
+  const unmapped = [];
+  watchModule.attachUpdateFailuresToAnchors(anchors, [{ anchorPath: null, scope: "update", kind: "kit-fetch", stableTarget: "/kit", message: "fetch failed" }], {
+    eventFor: () => assert.fail("global update failure has no single anchor"),
+    onUnmapped: (failure) => unmapped.push(failure),
+    markRecovered: true,
+  });
+  assert.equal(anchors.some((active) => active.checkedScopes.has("update")), false);
+  assert.equal(unmapped.length, 1);
+});
+
+test("dependency read anomalies become one dependent-scoped diagnostic instead of four sweep failures", () => {
+  assert.equal(typeof watchModule.dependencyReadFailureEvents, "function");
+  const error = Object.assign(new Error("inverseRelations pageInfo missing for COD-42"), {
+    code: "DEPENDENCY_READ_UNAVAILABLE",
+    issueIdentifier: "COD-42",
+    relationId: "inverseRelations",
+  });
+  const events = watchModule.dependencyReadFailureEvents(error, {
+    anchorPath: "/managed/app", projectId: "p", seenAt: "2026-07-09T00:00:00.000Z",
+  });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].scope, "dependency:COD-42");
+  assert.equal(events[0].stableTarget, "COD-42:inverseRelations");
+  assert.equal(events[0].kind, "dependency-read");
 });
 test("runtime recovery targets: a healthy anchor cannot close another anchor's shared-project Todo", () => {
   const ready = preflightRuntimeCandidates([
