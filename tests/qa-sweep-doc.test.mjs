@@ -30,8 +30,9 @@ test("sweep distributions document the commit-bound QA handoff", () => {
   assert.match(qa, /\[auto-sweep-auto-ship <KEY> head=<full-git-sha>\]/);
   assert.match(qa, /`fast-path:eligible`/);
   assert.match(qa, /`qa:passed`/);
-  assert.match(qa, /`config\.fastPath\.enabled !== false`/);
-  assert.match(qa, /`config\.requireShipApproval === false`/);
+  assert.match(qa, /`fastPathEnabled: config\.fastPath\.enabled !== false`/);
+  assert.match(qa, /`requireShipApproval: config\.requireShipApproval`/);
+  assert.doesNotMatch(qa, /`requireShipApproval: config\.requireShipApproval === false`/);
   assert.match(qa, /final origin[^\n]*SHA[^\n]*reviewed SHA/i);
   assert.match(qa, /remove `fast-path:eligible`[^\n]*stale/i);
   assert.match(qa, /policy denial[^\n]*not a QA failure/i);
