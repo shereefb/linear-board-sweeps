@@ -544,10 +544,31 @@ test("capacity ledger: read-only inspect reports confirmed stale entries and pre
   assert.equal(state.healthy, false);
   assert.equal(state.active, 3);
   assert.deepEqual(state.errors, [
-    "stale entry dead-child: child PID 20 is dead",
+    "stale entry dead-child: parent PID 10 and child PID 20 are dead",
     "stale entry dead-reservation: parent PID 11 is dead before child spawn",
   ]);
   assert.deepEqual(state.entries.map((entry) => entry.token), entries.map((entry) => entry.token));
+});
+test("capacity ledger: parent-alive child-dead settling interval remains healthy and active", () => {
+  let stored = { version: 1, entries: [
+    { token: "settling-child", parentPid: 50, childPid: 51, issueIdentifier: "COD-50", workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z" },
+  ] };
+  let writes = 0;
+  const ledger = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_target, value) => { writes += 1; stored = structuredClone(value); },
+    isAlive: (pid) => pid === 50,
+  });
+
+  const inspected = ledger.inspect();
+  assert.equal(inspected.healthy, true);
+  assert.equal(inspected.active, 1);
+  assert.deepEqual(inspected.errors, []);
+  const reconciled = ledger.reconcile();
+  assert.equal(reconciled.healthy, true);
+  assert.equal(reconciled.active, 1);
+  assert.deepEqual(reconciled.entries.map((entry) => entry.token), ["settling-child"]);
+  assert.equal(writes, 0);
 });
 test("capacity ledger: duplicate tokens are malformed and release never removes corrupt entries", () => {
   const entry = (issueIdentifier) => ({
@@ -2857,8 +2878,8 @@ test("capacity doctor: real ledger inspection surfaces stale entries without mut
 
   assert.equal(report.ok, false);
   assert.equal(report.capacity.active, 2);
-  assert.deepEqual(report.capacity.errors, ["stale entry stale-child: child PID 31 is dead"]);
-  assert.match(formatDoctorReport(report), /capacity error: stale entry stale-child: child PID 31 is dead/);
+  assert.deepEqual(report.capacity.errors, ["stale entry stale-child: parent PID 30 and child PID 31 are dead"]);
+  assert.match(formatDoctorReport(report), /capacity error: stale entry stale-child: parent PID 30 and child PID 31 are dead/);
   assert.equal(fs.readFileSync(ledgerPath, "utf8"), before);
 });
 test("doctor telemetry: JSON and human summaries expose scheduler health and tuning evidence", () => {

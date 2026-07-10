@@ -1483,8 +1483,8 @@ function capacityStaleError(entry, parentAlive, childAlive) {
   if (entry.childPid === null && parentAlive === false) {
     return `stale entry ${entry.token}: parent PID ${entry.parentPid} is dead before child spawn`;
   }
-  if (entry.childPid !== null && childAlive === false) {
-    return `stale entry ${entry.token}: child PID ${entry.childPid} is dead`;
+  if (entry.childPid !== null && parentAlive === false && childAlive === false) {
+    return `stale entry ${entry.token}: parent PID ${entry.parentPid} and child PID ${entry.childPid} are dead`;
   }
   return null;
 }
@@ -1570,7 +1570,7 @@ export function createCapacityLedger({
         kept.push(entry);
         continue;
       }
-      const stale = entry.childPid === null ? !parentAlive : !childAlive;
+      const stale = entry.childPid === null ? !parentAlive : !parentAlive && !childAlive;
       if (!stale) kept.push(entry);
     }
     if (errors.length) return { ...state, entries: kept, active: kept.length, healthy: false, errors };
