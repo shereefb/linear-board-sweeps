@@ -3350,6 +3350,55 @@ test("releaseOwnedDispatchClaim: dependency deferral removes only the matching o
     sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "other-owner",
   }, "dependency deferred", { fetchClaimCardFn: async () => fresh }), false);
 });
+test("releaseOwnedDispatchClaim: successful completion only releases a claim while the card remains in the completed sweep", async () => {
+  const edits = [];
+  const base = {
+    id: "issue-141",
+    identifier: "COD-141",
+    labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-141 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  const pick = { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" };
+
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child stopped in Dev", {
+    expectedStates: ["Dev"],
+    fetchClaimCardFn: async () => ({ ...base, stateName: "Dev" }),
+    applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
+    addCommentFn: async () => {},
+  }), true);
+  assert.deepEqual(edits, [{ remove: ["dev:in-progress"] }]);
+
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child advanced", {
+    expectedStates: ["Dev"],
+    fetchClaimCardFn: async () => ({ ...base, stateName: "QA" }),
+    applyLabelEditFn: async () => { throw new Error("advanced claims must be left to the child/holding-state cleanup"); },
+    addCommentFn: async () => {},
+  }), false);
+});
+test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
+  assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
+  const calls = [];
+  const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "success",
+    pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
+  }, "codex / gpt-5.6", {
+    releaseOwnedDispatchClaimFn: async (...args) => { calls.push(args); return true; },
+  });
+
+  assert.deepEqual(result, { attempted: true, released: true, reasonKind: "successful same-state completion" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "key");
+  assert.deepEqual(calls[0][1], { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" });
+  assert.match(calls[0][2], /successful child via codex \/ gpt-5\.6 exited/);
+  assert.deepEqual(calls[0][3], { expectedStates: ["Dev"] });
+
+  assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "exit",
+    pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
+  }, "codex", {
+    releaseOwnedDispatchClaimFn: async () => { throw new Error("ordinary child failures keep their claim for stale-run handling"); },
+  }), { attempted: false, released: false, reasonKind: null });
+});
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
   const base = {
@@ -3548,7 +3597,7 @@ test("buildSameRepoRefillDispatches: refill stays on the completed card's primar
   assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-3"]);
   assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
 });
-test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship suppress refill", async () => {
+test("buildSameRepoRefillDispatches: budget, capacity, and failed child suppress refill", async () => {
   const base = {
     result: {
       success: true,
@@ -3581,12 +3630,6 @@ test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship su
     refillBudget: { remaining: 1 },
     result: { ...base.result, success: false },
   })).reason, "ineligible");
-  assert.equal((await buildSameRepoRefillDispatches({
-    ...base,
-    refillBudget: { remaining: 1 },
-    result: { ...base.result, pick: { ...base.result.pick, sweep: "ship" } },
-  })).reason, "ship");
-
   const full = createSameRepoActiveCounts();
   full.increment({ anchorPath: "/ws/repo", sweep: "dev", issueIdentifier: "COD-1" });
   assert.equal((await buildSameRepoRefillDispatches({
@@ -3600,6 +3643,59 @@ test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship su
       checkoutDispatchBlockers: () => [],
     },
   })).reason, "no-capacity");
+});
+test("buildSameRepoRefillDispatches: completed Ship immediately offers the next eligible card in its workspace", async () => {
+  const refillBudget = { remaining: 3 };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const config = {
+    teamKey: "SAF",
+    projectId: "project-safe",
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+  };
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "SAF-200",
+      pick: {
+        anchorPath: "/managed/safe",
+        sourceAnchorPath: "/source/safe",
+        sweep: "ship",
+        issueId: "issue-200",
+        issueIdentifier: "SAF-200",
+        config,
+        repoPairs,
+        repoRoute: repoPairs[0],
+      },
+    },
+    activeByAnchor: new Map([["/managed/safe", { apiKey: "lin", repoPairs }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget,
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    deferClaim: true,
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-safe"]),
+      checkoutDispatchBlockers: () => [],
+      fetchCards: async () => [
+        dependencyReadyCard({ id: "issue-200", identifier: "SAF-200", sortOrder: 100, updatedAt: minsAgo(1), labelNames: ["app:coach", "blocked:needs-user"], comments: [] }),
+        dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", sortOrder: 50, updatedAt: minsAgo(1), labelNames: ["app:guide"], comments: [] }),
+      ],
+      logFor: () => {},
+    },
+  });
+
+  assert.equal(result.reason, "triggered");
+  assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-207"]);
+  assert.equal(result.dispatches[0].workspace, "/source/safe");
+  assert.equal(result.dispatches[0].stage, "ship");
+  assert.equal(result.dispatches[0].trigger, "refill");
+  assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
+  assert.equal(refillBudget.remaining, 2);
 });
 test("buildSameRepoRefillDispatches: live board claims count against refill capacity", async () => {
   const activeSameRepo = createSameRepoActiveCounts();
