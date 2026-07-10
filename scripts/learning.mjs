@@ -207,17 +207,43 @@ function normalizeSnapshotRun(record) {
 
 function normalizeSnapshotObservation(observation) {
   if (!observation || typeof observation !== "object") throw new Error("invalid observation");
-  const at = observation.at || observation.observedAt;
+  const at = observation.occurredAt || observation.at || observation.observedAt;
   if (Number.isNaN(Date.parse(at || ""))) throw new Error("invalid observation timestamp");
   return compactObject([
     ["at", at],
+    ["occurredAt", at],
+    ["evidenceId", sanitizeLearningText(observation.evidenceId, 300)],
+    ["signal", sanitizeLearningText(observation.signal, 100)],
     ["kind", sanitizeLearningText(observation.kind, 100)],
     ["sourceWorkspace", sanitizeLearningText(observation.sourceWorkspace, 1_000)],
+    ["projectId", sanitizeLearningText(observation.projectId, 300)],
+    ["repoEntry", sanitizeLearningText(observation.repoEntry, 500)],
     ["issueIdentifier", sanitizeLearningText(observation.issueIdentifier, 100)],
+    ["cardId", sanitizeLearningText(observation.cardId, 100)],
+    ["runId", sanitizeLearningText(observation.runId, 300)],
+    ["fingerprint", sanitizeLearningText(observation.fingerprint, 300)],
+    ["rootCauseKey", sanitizeLearningText(observation.rootCauseKey, 300)],
     ["stage", sanitizeLearningText(observation.stage, 50)],
     ["sweep", sanitizeLearningText(observation.sweep, 50)],
+    ["subsystem", sanitizeLearningText(observation.subsystem, 100)],
+    ["category", sanitizeLearningText(observation.category, 100)],
+    ["relatedKey", sanitizeLearningText(observation.relatedKey, 300)],
+    ["window", sanitizeLearningText(observation.window, 100)],
+    ["riskClass", sanitizeLearningText(observation.riskClass, 100)],
+    ["recoveryState", sanitizeLearningText(observation.recoveryState, 100)],
+    ["result", sanitizeLearningText(observation.result, 100)],
     ["reason", sanitizeLearningText(observation.reason, 500)],
     ["summary", sanitizeLearningText(observation.summary, MAX_LEARNING_EVENT_SUMMARY_CHARS)],
+    ["references", Array.isArray(observation.references) ? observation.references.slice(0, 50).map((value) => sanitizeLearningText(value, 500)) : undefined],
+    ["proven", typeof observation.proven === "boolean" ? observation.proven : undefined],
+    ["machineCorrectable", typeof observation.machineCorrectable === "boolean" ? observation.machineCorrectable : undefined],
+    ["seriousMissingGate", typeof observation.seriousMissingGate === "boolean" ? observation.seriousMissingGate : undefined],
+    ["success", typeof observation.success === "boolean" ? observation.success : undefined],
+    ["productive", typeof observation.productive === "boolean" ? observation.productive : undefined],
+    ["deferred", typeof observation.deferred === "boolean" ? observation.deferred : undefined],
+    ["safetyFloorSatisfied", typeof observation.safetyFloorSatisfied === "boolean" ? observation.safetyFloorSatisfied : undefined],
+    ["baselineRate", finiteNumber(observation.baselineRate)],
+    ["findingCount", finiteNumber(observation.findingCount)],
     ["waitMs", finiteNumber(observation.waitMs)],
     ["queueWaitMs", finiteNumber(observation.queueWaitMs)],
     ["durationMs", finiteNumber(observation.durationMs)],
@@ -326,7 +352,7 @@ export function buildLearningEvidenceSnapshot({
       break;
     }
     inspectedObservations += 1;
-    if (!inEvidenceWindow(observation?.at || observation?.observedAt, fromMs, capturedThroughMs)) continue;
+    if (!inEvidenceWindow(observation?.occurredAt || observation?.at || observation?.observedAt, fromMs, capturedThroughMs)) continue;
     if (selectedObservations.length >= bounded.observations) {
       pushGap("observations", `observations truncated at ${bounded.observations}`);
       continue;
@@ -368,7 +394,20 @@ const detectorDefinitions = [
 
 function detectorQualifies(id, observations, config = {}) {
   const thresholds = config.thresholds || {};
-  if (id === "failed-recovery") return observations.some((item) => item.recoveryState === "recovered") && observations.some((item) => item.recoveryState === "recurred");
+  if (id === "repeated-dispatch-failure") {
+    const cutoff24h = Date.parse(observations.at(-1)?.occurredAt || "") - 24 * 3600000;
+    return observations.filter((item) => Date.parse(item.occurredAt) >= cutoff24h).length >= 2 || observations.length >= 3;
+  }
+  if (id === "failed-recovery") {
+    const ordered = [...observations].sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt));
+    let recoveredAt = null;
+    for (const item of ordered) {
+      if (item.recoveryState === "recovered") recoveredAt = Date.parse(item.occurredAt);
+      if (item.recoveryState === "recurred" && recoveredAt !== null && Date.parse(item.occurredAt) > recoveredAt) return true;
+      if (item.recoveryState === "open-after-healthy") return true;
+    }
+    return false;
+  }
   if (id === "safety-invariant-violation") return observations.some((item) => item.proven === true);
   if (id === "poison-card-cluster") return observations.filter((item) => item.machineCorrectable === true).length >= 2;
   if (id === "qa-rework-regression") {
@@ -379,27 +418,62 @@ function detectorQualifies(id, observations, config = {}) {
   }
   if (id === "red-canary-pattern") return observations.some((item) => item.seriousMissingGate === true) || observations.length >= 2;
   if (id === "queue-delay-regression") {
-    const windows = new Set(observations.map((item) => item.window).filter(Boolean));
-    return observations.length >= 20 && windows.size >= 2 && observations.every((item) => {
-      const value = Number(item.metrics?.waitMs);
-      const baseline = Number(item.metrics?.baselineP90Ms);
+    const byWindow = groupBy(observations.filter((item) => item.window), (item) => item.window);
+    const windows = [...byWindow.keys()].sort().slice(-2);
+    return observations.length >= 20 && windows.length === 2 && windows.every((window) => {
+      const group = byWindow.get(window);
+      const value = percentile(group.map((item) => Number(item.metrics?.waitMs)), 0.9);
+      const baseline = percentile(group.map((item) => Number(item.metrics?.baselineP90Ms)), 0.9);
       return value >= Number(thresholds.queueDelayFloorMs ?? 60_000) && baseline > 0 && value / baseline >= Number(thresholds.relativeRegression ?? 1.25);
     });
   }
-  if (id === "stage-duration-regression") return observations.length >= 20 && observations.every((item) => {
-    const value = Number(item.metrics?.durationMs);
-    const baseline = Number(item.metrics?.baselineP90Ms);
+  if (id === "stage-duration-regression") return observations.length >= 20 && (() => {
+    const value = percentile(observations.map((item) => Number(item.metrics?.durationMs)), 0.9);
+    const baseline = percentile(observations.map((item) => Number(item.metrics?.baselineP90Ms)), 0.9);
     return value >= Number(thresholds.stageDurationFloorMs ?? 300_000) && baseline > 0 && value / baseline >= Number(thresholds.relativeRegression ?? 1.25);
-  });
-  if (id === "nonproductive-run") return observations.length >= 20 && observations.filter((item) => item.success === true && item.productive === false).length >= 3;
-  if (id === "capacity-saturation") return observations.length >= 20
-    && observations.filter((item) => item.deferred === true).length / observations.length >= Number(thresholds.capacityDeferralRate ?? 0.2)
-    && observations.some((item) => Number(item.metrics?.waitMs) >= Number(thresholds.queueDelayFloorMs ?? 60_000));
-  if (id === "review-overprocessing") return observations.length >= 20 && observations.every((item) => item.riskClass === "low"
-    && item.findingCount === 0
-    && item.safetyFloorSatisfied === true
-    && Number(item.metrics?.reviewDurationMs) >= Number(thresholds.reviewCostFloorMs ?? 300_000));
+  })();
+  if (id === "nonproductive-run") {
+    const current = observations.filter((item) => item.success === true && item.productive === false).length / observations.length;
+    const baseline = Number(observations.find((item) => Number.isFinite(item.baselineRate))?.baselineRate || 0);
+    return observations.length >= 20 && current >= Number(thresholds.nonproductiveRateFloor ?? 0.1) && (baseline === 0 ? current > 0 : current / baseline >= Number(thresholds.relativeRegression ?? 1.25));
+  }
+  if (id === "capacity-saturation") {
+    const current = observations.filter((item) => item.deferred === true).length / observations.length;
+    const baselineRate = Number(observations.find((item) => Number.isFinite(item.baselineRate))?.baselineRate || 0);
+    const delay = percentile(observations.map((item) => Number(item.metrics?.waitMs)), 0.9);
+    const delayBaseline = percentile(observations.map((item) => Number(item.metrics?.baselineP90Ms)), 0.9);
+    return observations.length >= 20
+      && current >= Number(thresholds.capacityDeferralRate ?? 0.2)
+      && (baselineRate === 0 ? current > 0 : current / baselineRate >= Number(thresholds.relativeRegression ?? 1.25))
+      && delay >= Number(thresholds.queueDelayFloorMs ?? 60_000)
+      && delayBaseline > 0
+      && delay / delayBaseline >= Number(thresholds.relativeRegression ?? 1.25);
+  }
+  if (id === "review-overprocessing") {
+    const relevant = observations.filter((item) => item.riskClass === "low" && item.safetyFloorSatisfied === true);
+    const costly = relevant.filter((item) => item.findingCount === 0);
+    const duration = percentile(costly.map((item) => Number(item.metrics?.reviewDurationMs)), 0.9);
+    const baseline = percentile(costly.map((item) => Number(item.metrics?.baselineReviewDurationMs ?? Number(thresholds.reviewCostFloorMs ?? 300_000) / 2)), 0.9);
+    return observations.length >= 20 && costly.length / observations.length >= Number(thresholds.reviewOverprocessingRateFloor ?? 0.5)
+      && duration >= Number(thresholds.reviewCostFloorMs ?? 300_000) && baseline > 0 && duration / baseline >= Number(thresholds.relativeRegression ?? 1.25);
+  }
   return true;
+}
+
+function percentile(values, quantile) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return Number.NaN;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * quantile) - 1))];
+}
+
+function groupBy(values, keyFn) {
+  const groups = new Map();
+  for (const value of values) {
+    const key = keyFn(value);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(value);
+  }
+  return groups;
 }
 
 export const LEARNING_DETECTORS = Object.freeze(detectorDefinitions.map(([id, lens, signal, minimumSample, distinctBy]) => Object.freeze({
@@ -429,11 +503,26 @@ function detectorEvidence(snapshot, detector) {
 function distinctEvidence(observations, key) {
   const seen = new Set();
   return observations.filter((item) => {
-    const identity = item?.[key] || item?.evidenceId || item?.eventId;
+    const identity = item?.[key];
     if (!identity || seen.has(identity)) return false;
     seen.add(identity);
     return true;
   });
+}
+
+function detectorWindowDays(detectorId) {
+  if (detectorId === "repeated-dispatch-failure") return 7;
+  if (["repeated-review-finding", "qa-rework-regression", "spec-quality-failure", "recurring-human-question", "red-canary-pattern"].includes(detectorId)) return 14;
+  return detectorId.startsWith("queue-") || detectorId.includes("duration") || detectorId.includes("run") || detectorId.includes("capacity") || detectorId.includes("overprocessing") ? 14 : 7;
+}
+
+function detectorClusterKey(detector, item) {
+  if (detector.id === "stale-claim-pattern") return [item.stage, item.subsystem, item.fingerprint || item.rootCauseKey].join("|");
+  if (["repeated-review-finding", "spec-quality-failure", "recurring-human-question"].includes(detector.id)) return [item.category, item.rootCauseKey || item.fingerprint].join("|");
+  if (detector.id === "red-canary-pattern") return item.relatedKey || item.rootCauseKey || item.fingerprint || "unrelated";
+  if (detector.id === "qa-rework-regression") return [item.sourceWorkspace, item.repoEntry, item.stage].join("|");
+  if (detector.id === "stage-duration-regression" || detector.id === "review-overprocessing") return item.riskClass || "unknown-risk";
+  return item.fingerprint || item.rootCauseKey || item.reason || detector.signal;
 }
 
 function detectorFinding(detector, observations, snapshot, config) {
@@ -470,6 +559,7 @@ function detectorFinding(detector, observations, snapshot, config) {
     firstSeenAt: timestamps[0] || snapshot.from || snapshot.capturedThrough,
     lastSeenAt: timestamps.at(-1) || snapshot.capturedThrough,
     occurrenceIds,
+    occurrences: observations.map((item) => ({ id: item.evidenceId || item.eventId || item.runId || item.cardId, occurredAt: item.occurredAt })).filter((item) => item.id && !Number.isNaN(Date.parse(item.occurredAt))).sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.id.localeCompare(b.id)),
     occurrenceCount: occurrenceIds.length,
     trend: "recurrent",
     baseline: { value: observations.length, unit: detector.lens === "throughput" ? "runs" : "occurrences" },
@@ -492,13 +582,22 @@ export function runLearningDetectors(snapshot = {}, config = {}) {
   const findings = [];
   for (const detector of LEARNING_DETECTORS) {
     if (enabled && !enabled.has(detector.id)) continue;
-    let observations = distinctEvidence(detectorEvidence(snapshot, detector), detector.distinctBy);
-    if (observations.length < detector.minimumSample) {
-      if (!(detector.id === "red-canary-pattern" && observations.some((item) => item.seriousMissingGate === true))) continue;
+    const capturedThroughMs = Date.parse(snapshot.capturedThrough || new Date().toISOString());
+    const cutoff = capturedThroughMs - detectorWindowDays(detector.id) * 86400000;
+    const windowed = detectorEvidence(snapshot, detector).filter((item) => {
+      const time = Date.parse(item.occurredAt || item.at || "");
+      return !Number.isNaN(time) && time > cutoff && time <= capturedThroughMs;
+    });
+    const clusters = groupBy(windowed, (item) => detectorClusterKey(detector, item));
+    for (const cluster of clusters.values()) {
+      let observations = distinctEvidence(cluster, detector.distinctBy);
+      if (observations.length < detector.minimumSample) {
+        if (!(detector.id === "red-canary-pattern" && observations.some((item) => item.seriousMissingGate === true))) continue;
+      }
+      observations = observations.sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt) || String(a.evidenceId || "").localeCompare(String(b.evidenceId || "")));
+      if (!detector.qualify(observations, config)) continue;
+      findings.push(detectorFinding(detector, observations, snapshot, config));
     }
-    observations = observations.sort((a, b) => String(a.evidenceId || "").localeCompare(String(b.evidenceId || "")));
-    if (!detector.qualify(observations, config)) continue;
-    findings.push(detectorFinding(detector, observations, snapshot, config));
   }
   return findings.sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.detectorId.localeCompare(b.detectorId));
 }
@@ -516,12 +615,24 @@ export function aggregateLearningFindings(findings = []) {
     base.lenses = [...new Set(sorted.flatMap((item) => item.lenses || []))].sort();
     base.occurrenceIds = [...new Set(sorted.flatMap((item) => item.occurrenceIds || []))].sort();
     base.occurrenceCount = base.occurrenceIds.length;
+    base.occurrences = [...new Map(sorted.flatMap((item) => item.occurrences || []).map((item) => [item.id, clone(item)])).values()]
+      .sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)) || String(a.id).localeCompare(String(b.id)));
     base.evidenceReferences = [...new Set(sorted.flatMap((item) => item.evidenceReferences || []))].sort();
+    base.sourceWorkspaces = [...new Set(sorted.flatMap((item) => item.sourceWorkspaces || []))].sort();
     base.detectorProvenance = [...new Set(sorted.map((item) => `${item.detectorId}/${item.detectorVersion}`))].sort();
     base.firstSeenAt = sorted.map((item) => item.firstSeenAt).sort()[0];
     base.lastSeenAt = sorted.map((item) => item.lastSeenAt).sort().at(-1);
     base.severity = sorted.map((item) => item.severity).sort((a, b) => (severityOrder[b] || 0) - (severityOrder[a] || 0))[0];
     base.confidence = sorted.map((item) => item.confidence).sort((a, b) => (confidenceOrder[b] || 0) - (confidenceOrder[a] || 0))[0];
+    const coverageGaps = [...new Map(sorted.flatMap((item) => item.coverage?.gaps || []).map((gap) => [`${gap.source}\0${gap.reason}`, clone(gap)])).values()];
+    base.coverage = { complete: sorted.every((item) => item.coverage?.complete !== false), gaps: coverageGaps };
+    base.measurementContracts = sorted.map((item) => ({
+      detector: `${item.detectorId}/${item.detectorVersion}`,
+      baseline: clone(item.baseline),
+      acceptanceMetric: clone(item.acceptanceMetric),
+      evaluationWindow: clone(item.evaluationWindow),
+      coverage: clone(item.coverage),
+    }));
     base.contributingFindings = sorted.map((item) => ({ detectorId: item.detectorId, detectorVersion: item.detectorVersion, fingerprint: item.fingerprint }));
     return base;
   }).sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.scope.localeCompare(b.scope));
@@ -540,7 +651,7 @@ export function rankQualifiedFindings(findings = [], maxNewCards = MAX_NEW_LEARN
   const qualified = [...findings].filter((item) => item.actionable !== false && ["medium", "high"].includes(item.confidence)).sort(rankFinding);
   const updates = qualified.filter((item) => item.existingCardId);
   const creates = qualified.filter((item) => !item.existingCardId);
-  const createLimit = Math.max(0, Math.floor(Number(maxNewCards)) || 0);
+  const createLimit = Math.min(MAX_NEW_LEARNING_CARDS_PER_RUN, Math.max(0, Math.floor(Number(maxNewCards)) || 0));
   const admittedCreates = creates.slice(0, createLimit);
   const admittedSet = new Set([...updates, ...admittedCreates]);
   return { admitted: [...updates, ...admittedCreates], deferred: findings.filter((item) => !admittedSet.has(item)) };
@@ -553,39 +664,54 @@ function stableJson(value) {
 }
 
 export function renderFindingCard(finding) {
-  const marker = `[factory-learning root=${finding.rootFingerprint} generation=${finding.generation || 0}]`;
-  return [
-    `# Factory improvement: ${finding.impact}`,
+  const safe = (value, max = 1_000) => sanitizeLearningText(value, max);
+  const marker = `[factory-learning root=${safe(finding.rootFingerprint, 128)} generation=${Math.max(0, Math.floor(Number(finding.generation)) || 0)}]`;
+  const impact = safe(finding.impact);
+  const references = (finding.evidenceReferences || []).slice(0, 100).map((value) => safe(value, 500));
+  const body = [
+    `# Factory improvement: ${impact}`,
     "",
-    `## Observed pattern\n${finding.impact}`,
-    `## Occurrences\n${finding.occurrenceCount}: ${(finding.occurrenceIds || []).join(", ")}`,
-    `## Evidence\n${(finding.evidenceReferences || []).join("\n") || "Structured evidence IDs are recorded above."}`,
-    `## Coverage\n${finding.coverage?.complete ? "complete" : `partial: ${(finding.coverage?.gaps || []).map((gap) => `${gap.source}: ${gap.reason}`).join("; ")}`}`,
-    `## Root-cause hypothesis\n${finding.rootCauseHypothesis}`,
-    `## Desired outcome\n${finding.desiredOutcome}`,
-    `## Acceptance metric\n${stableJson(finding.acceptanceMetric)}`,
-    `## Baseline\n${stableJson(finding.baseline)}`,
-    `## Evaluation window\n${stableJson(finding.evaluationWindow)}`,
-    `## Exclusions\n${(finding.exclusions || []).join("\n")}`,
-    `## Detector provenance\n${(finding.detectorProvenance || [`${finding.detectorId}/${finding.detectorVersion}`]).join(", ")}`,
+    `## Observed pattern\n${impact}`,
+    `## Evidence window\n${safe(finding.firstSeenAt, 100)} through ${safe(finding.lastSeenAt, 100)}`,
+    `## Affected workspaces\n${(finding.sourceWorkspaces || []).slice(0, 50).map((value) => safe(value, 500)).join("\n")}`,
+    `## Occurrences\n${Math.max(0, Math.floor(Number(finding.occurrenceCount)) || 0)}: ${(finding.occurrenceIds || []).slice(0, 200).map((value) => safe(value, 300)).join(", ")}`,
+    `## Evidence\n${references.join("\n")}`,
+    `## Confidence\n${safe(finding.confidence, 20)}`,
+    `## Severity\n${safe(finding.severity, 20)}`,
+    `## Contributing lenses\n${(finding.lenses || []).slice(0, 10).map((value) => safe(value, 50)).join(", ")}`,
+    `## Coverage\n${finding.coverage?.complete ? "complete" : `partial: ${(finding.coverage?.gaps || []).slice(0, 100).map((gap) => `${safe(gap.source, 300)}: ${safe(gap.reason, 500)}`).join("; ")}`}`,
+    `## Root-cause hypothesis\n${safe(finding.rootCauseHypothesis, 2_000)}`,
+    `## Desired outcome\n${safe(finding.desiredOutcome, 2_000)}`,
+    `## Acceptance metric\n${safe(stableJson(finding.acceptanceMetric), 2_000)}`,
+    `## Baseline\n${safe(stableJson(finding.baseline), 2_000)}`,
+    `## Evaluation window\n${safe(stableJson(finding.evaluationWindow), 2_000)}`,
+    `## Exclusions\n${(finding.exclusions || []).slice(0, 50).map((value) => safe(value, 500)).join("\n")}`,
+    `## Detector provenance\n${(finding.detectorProvenance || [`${finding.detectorId}/${finding.detectorVersion}`]).slice(0, 50).map((value) => safe(value, 200)).join(", ")}`,
     "",
     marker,
   ].join("\n\n");
+  return sanitizeLearningText(body, 20_000);
 }
 
 export function renderEvidenceDelta(finding, occurrenceIds = []) {
   const known = new Set(finding?.occurrenceIds || []);
   const fresh = [...new Set(occurrenceIds)].filter((id) => !known.has(id)).sort();
-  return `[factory-learning evidence-delta root=${finding.rootFingerprint}]\nFresh occurrences: ${fresh.join(", ") || "none"}`;
+  return sanitizeLearningText(`[factory-learning evidence-delta root=${finding.rootFingerprint}]\nFresh occurrences: ${fresh.join(", ") || "none"}`, 5_000);
 }
 
 export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
   const coverageComplete = snapshot?.coverage?.complete !== false;
-  const observations = (snapshot.observations || []).filter((item) => Date.parse(item.occurredAt || item.at || "") > Date.parse(evaluation.completedAt || ""));
+  const capturedThroughMs = Date.parse(snapshot.capturedThrough || "");
+  const windowEndsAtMs = Date.parse(evaluation.windowEndsAt || "");
+  const windowReady = !Number.isNaN(capturedThroughMs) && !Number.isNaN(windowEndsAtMs) && capturedThroughMs >= windowEndsAtMs;
+  const observations = (snapshot.observations || []).filter((item) => {
+    const time = Date.parse(item.occurredAt || item.at || "");
+    return time > Date.parse(evaluation.completedAt || "") && time <= windowEndsAtMs;
+  }).sort((a, b) => Date.parse(a.occurredAt || a.at) - Date.parse(b.occurredAt || b.at));
   const values = observations.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
   let status = "inconclusive-evidence";
-  if (coverageComplete && values.length) {
-    const value = values.at(-1);
+  if (windowReady && coverageComplete && values.length) {
+    const value = evaluation.aggregation === "p90" ? percentile(values, 0.9) : values.at(-1);
     const baseline = Number(evaluation.baseline);
     const change = Number(evaluation.minimumChange || 0);
     const improved = evaluation.expectedDirection === "increase" ? value - baseline >= change : baseline - value >= change;
@@ -593,11 +719,12 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     status = improved ? "verified-improvement" : regressed ? "regression" : "no-measurable-change";
   }
   const recurrence = { action: "none", generation: evaluation.generation || 0, rootFingerprint: evaluation.rootFingerprint };
-  if (["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration === null) {
+  if (["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration == null) {
     const prior = new Set(evaluation.priorEvidenceIds || []);
     const fresh = (snapshot.qualifiedFindings || []).find((finding) => finding.rootFingerprint === evaluation.rootFingerprint
-      && Date.parse(finding.lastSeenAt || "") > Date.parse(evaluation.completedAt || "")
-      && (finding.occurrenceIds || []).some((id) => !prior.has(id)));
+      && (finding.occurrences || []).some((occurrence) => !prior.has(occurrence.id)
+        && Date.parse(occurrence.occurredAt || "") > Date.parse(evaluation.completedAt || "")
+        && Date.parse(occurrence.occurredAt || "") <= capturedThroughMs));
     if (fresh) {
       if ((evaluation.generation || 0) >= 3) Object.assign(recurrence, { action: "block-needs-user", generation: 3 });
       else Object.assign(recurrence, { action: "create", generation: (evaluation.generation || 0) + 1 });

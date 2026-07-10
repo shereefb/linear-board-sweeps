@@ -434,7 +434,7 @@ function repeat(signal, count, overrides = {}) {
 const DETECTOR_MATRIX = [
   ["repeated-dispatch-failure", 2, (n) => repeat("dispatch-failure", n)],
   ["stale-claim-pattern", 2, (n) => repeat("stale-claim", n)],
-  ["failed-recovery", 2, (n) => repeat("failure-recovery", n, (i) => ({ recoveryState: i === 0 ? "recovered" : "recurred" }))],
+  ["failed-recovery", 2, (n) => repeat("failure-recovery", n, (i) => ({ recoveryState: i === 0 ? "recurred" : "recovered" }))],
   ["safety-invariant-violation", 1, (n) => repeat("safety-invariant", n, { proven: true, severity: "critical" })],
   ["poison-card-cluster", 2, (n) => repeat("poison-card", n, { machineCorrectable: true })],
   ["repeated-review-finding", 3, (n) => repeat("review-finding", n, { category: "correctness" })],
@@ -552,6 +552,10 @@ function aggregateFixture(overrides = {}) {
     firstSeenAt: "2026-07-01T00:00:00.000Z",
     lastSeenAt: "2026-07-03T00:00:00.000Z",
     occurrenceIds: ["o1", "o2"],
+    occurrences: [
+      { id: "o1", occurredAt: "2026-07-02T00:00:00.000Z" },
+      { id: "o2", occurredAt: "2026-07-03T00:00:00.000Z" },
+    ],
     occurrenceCount: 2,
     trend: "recurrent",
     baseline: { value: 1, unit: "findings" },
@@ -611,7 +615,7 @@ function outcomeSnapshot(value, { complete = true, qualifyingFinding = null } = 
     coverage: { complete, gaps: complete ? [] : [{ source: "runs", reason: "missing" }] },
     observations: value === null ? [] : [{
       evidenceId: "post-1",
-      occurredAt: "2026-07-25T00:00:00.000Z",
+      occurredAt: "2026-07-20T00:00:00.000Z",
       metrics: { repeatRate: value },
     }],
     qualifiedFindings: qualifyingFinding ? [qualifyingFinding] : [],
@@ -639,8 +643,8 @@ test("outcome evaluation records every explicit status from a fixed post-change 
 });
 
 test("recurrence requires fresh independent qualified evidence, permits one active generation, and caps at three", () => {
-  const fresh = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["post-1"], lastSeenAt: "2026-07-25T00:00:00.000Z" });
-  const stale = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["before-1"], lastSeenAt: "2026-07-14T00:00:00.000Z" });
+  const fresh = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["post-1"], occurrences: [{ id: "post-1", occurredAt: "2026-07-25T00:00:00.000Z" }], lastSeenAt: "2026-07-25T00:00:00.000Z" });
+  const stale = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["before-1"], occurrences: [{ id: "before-1", occurredAt: "2026-07-14T00:00:00.000Z" }], lastSeenAt: "2026-07-14T00:00:00.000Z" });
   const create = evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(0.5, { qualifyingFinding: fresh }));
   const staleDecision = evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(0.5, { qualifyingFinding: stale }));
   const active = evaluateLearningOutcome({ ...OUTCOME_EVALUATION, activeGeneration: 1 }, outcomeSnapshot(0.5, { qualifyingFinding: fresh }));
@@ -649,4 +653,93 @@ test("recurrence requires fresh independent qualified evidence, permits one acti
   assert.equal(staleDecision.recurrence.action, "none");
   assert.equal(active.recurrence.action, "none");
   assert.deepEqual(capped.recurrence, { action: "block-needs-user", generation: 3, rootFingerprint: "root-1" });
+});
+
+test("production evidence snapshots retain only the known fields detectors require", () => {
+  const raw = repeat("review-finding", 3, { category: "correctness" });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: DETECTOR_NOW,
+    observations: raw,
+  });
+  assert.equal(Object.hasOwn(snapshot.observations[0], "hostDisplayName"), false);
+  assert.equal(snapshot.observations[0].signal, "review-finding");
+  assert.equal(runLearningDetectors(snapshot, { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] }).length, 1);
+});
+
+test("semantic detectors cluster compatible evidence and enforce declared time windows", () => {
+  const unrelatedFailures = [
+    detectorObservation("dispatch-failure", 0, { fingerprint: "a" }),
+    detectorObservation("dispatch-failure", 1, { fingerprint: "b" }),
+  ];
+  const oldFailure = detectorObservation("dispatch-failure", 2, { fingerprint: "a", occurredAt: "2026-06-01T00:00:00.000Z" });
+  const mixedReview = repeat("review-finding", 3, (i) => ({ category: i === 2 ? "security" : "correctness" }));
+  const mixedQuestion = repeat("human-question", 3, (i) => ({ category: i === 2 ? "credential" : "config" }));
+  assert.equal(runLearningDetectors(detectorSnapshot([...unrelatedFailures, oldFailure]), { ...detectorConfig, enabledDetectors: ["repeated-dispatch-failure"] }).length, 0);
+  assert.equal(runLearningDetectors(detectorSnapshot(mixedReview), { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] }).length, 0);
+  assert.equal(runLearningDetectors(detectorSnapshot(mixedQuestion), { ...detectorConfig, enabledDetectors: ["recurring-human-question"] }).length, 0);
+});
+
+test("distinct-card and run detectors fail closed when the required identity is absent", () => {
+  const noRuns = repeat("dispatch-failure", 2).map(({ runId: _runId, ...item }) => item);
+  const noCards = repeat("review-finding", 3, { category: "correctness" }).map(({ cardId: _cardId, ...item }) => item);
+  assert.equal(runLearningDetectors(detectorSnapshot(noRuns), { ...detectorConfig, enabledDetectors: ["repeated-dispatch-failure"] }).length, 0);
+  assert.equal(runLearningDetectors(detectorSnapshot(noCards), { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] }).length, 0);
+});
+
+test("throughput regressions use window p90s rather than requiring every raw run to regress", () => {
+  const observations = repeat("queue-run", 20, (i) => ({
+    window: i < 10 ? "2026-W27" : "2026-W28",
+    metrics: { waitMs: i === 0 || i === 10 ? 50 : 200, baselineP90Ms: 100 },
+  }));
+  assert.equal(runLearningDetectors(detectorSnapshot(observations), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 1);
+});
+
+test("outcome evaluation waits for and bounds the fixed evaluation window", () => {
+  const preWindow = { ...outcomeSnapshot(0.3), capturedThrough: "2026-07-20T00:00:00.000Z" };
+  const afterWindow = outcomeSnapshot(null);
+  afterWindow.observations = [
+    { evidenceId: "inside", occurredAt: "2026-07-21T00:00:00.000Z", metrics: { repeatRate: 0.45 } },
+    { evidenceId: "outside", occurredAt: "2026-07-30T00:00:00.000Z", metrics: { repeatRate: 0.1 } },
+  ];
+  assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, preWindow).status, "inconclusive-evidence");
+  assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, afterWindow).status, "no-measurable-change");
+});
+
+test("recurrence proves freshness on the unknown occurrence itself", () => {
+  const mixed = aggregateFixture({
+    rootFingerprint: "root-1",
+    occurrenceIds: ["before-1", "old-unknown"],
+    occurrences: [
+      { id: "before-1", occurredAt: "2026-07-25T00:00:00.000Z" },
+      { id: "old-unknown", occurredAt: "2026-07-01T00:00:00.000Z" },
+    ],
+    lastSeenAt: "2026-07-25T00:00:00.000Z",
+  });
+  const decision = evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(0.5, { qualifyingFinding: mixed }));
+  assert.equal(decision.recurrence.action, "none");
+});
+
+test("new-card admission clamps caller budgets to the global six-create safety cap", () => {
+  const creates = Array.from({ length: 8 }, (_, i) => aggregateFixture({ rootFingerprint: `unsafe-${i}` }));
+  assert.equal(rankQualifiedFindings(creates, 100).admitted.length, 6);
+});
+
+test("aggregation preserves every measurement and coverage contract and rendering is bounded", () => {
+  const quality = aggregateFixture({ coverage: { complete: true, gaps: [] } });
+  const reliability = aggregateFixture({
+    detectorId: "poison-card-cluster",
+    lenses: ["reliability"],
+    baseline: { value: 7, unit: "parks" },
+    acceptanceMetric: { name: "parkRate", direction: "decrease", target: 0 },
+    evaluationWindow: { durationDays: 7 },
+    coverage: { complete: false, gaps: [{ source: "runs", reason: "partial" }] },
+  });
+  const merged = aggregateLearningFindings([quality, reliability])[0];
+  assert.equal(merged.measurementContracts.length, 2);
+  assert.equal(merged.coverage.complete, false);
+  assert.deepEqual(merged.sourceWorkspaces, ["/workspace/a"]);
+  const body = renderFindingCard({ ...merged, impact: `token=lin_api_${"x".repeat(100)} ${"z".repeat(30_000)}` });
+  assert.ok(body.length <= 20_000);
+  assert.doesNotMatch(body, /lin_api_|Structured evidence IDs are recorded above/);
+  for (const phrase of ["Evidence window", "Affected workspaces", "Confidence", "Severity", "Contributing lenses"]) assert.match(body, new RegExp(phrase));
 });
