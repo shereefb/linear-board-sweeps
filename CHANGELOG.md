@@ -2,6 +2,13 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.4] - 2026-07-10
+
+### Fixed
+
+- Refill a registered workspace's Ship slot as soon as its current Ship child completes, including when the next human-approved card routes to a different primary repo, without waiting for unrelated children in the original batch.
+- Release a successful child's launcher-owned in-progress claim when the card remains in the same workflow state, so partial work can resume immediately instead of appearing active until the stale-heartbeat timeout.
+
 ## [1.2.0.3] - 2026-07-10
 
 ### Changed
