@@ -93,7 +93,9 @@ export function qaHandoffDecision(input = {}) {
   const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
   const deny = (reason) => ({ destination: WORKFLOW_STATES.signoff, eligible: false, reason });
 
+  if (facts.fastPathEnabled !== undefined && typeof facts.fastPathEnabled !== "boolean") return deny("invalid-fast-path-enabled");
   if (facts.fastPathEnabled === false) return deny("fast-path-disabled");
+  if (facts.requireShipApproval !== undefined && typeof facts.requireShipApproval !== "boolean") return deny("invalid-ship-approval");
   if (facts.requireShipApproval === true) return deny("ship-approval-required");
   if (facts.stateName !== WORKFLOW_STATES.qa) return deny("not-in-qa");
   if (!labels.has("fast-path:eligible")) return deny("missing-fast-path-label");

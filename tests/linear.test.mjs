@@ -62,9 +62,37 @@ for (const [override, reason] of QA_HANDOFF_DENIALS) {
   });
 }
 
+const QA_HANDOFF_INVALID_CONFIG = [
+  [{ fastPathEnabled: "false" }, "invalid-fast-path-enabled"],
+  [{ fastPathEnabled: null }, "invalid-fast-path-enabled"],
+  [{ fastPathEnabled: 0 }, "invalid-fast-path-enabled"],
+  [{ requireShipApproval: "true" }, "invalid-ship-approval"],
+  [{ requireShipApproval: null }, "invalid-ship-approval"],
+  [{ requireShipApproval: 0 }, "invalid-ship-approval"],
+];
+
+for (const [override, reason] of QA_HANDOFF_INVALID_CONFIG) {
+  test(`QA handoff fails closed with ${reason} for ${JSON.stringify(override)}`, () => {
+    assert.deepEqual(qaHandoffDecision({ ...QA_HANDOFF_BASE, ...override }), {
+      destination: "Signoff",
+      eligible: false,
+      reason,
+    });
+  });
+}
+
 test("QA handoff defaults fast path on and ship approval off", () => {
   const { fastPathEnabled: _fastPathEnabled, requireShipApproval: _requireShipApproval, ...input } = QA_HANDOFF_BASE;
   assert.deepEqual(qaHandoffDecision(input), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+  assert.deepEqual(qaHandoffDecision({
+    ...input,
+    fastPathEnabled: undefined,
+    requireShipApproval: undefined,
+  }), {
     destination: "Ship",
     eligible: true,
     reason: "eligible",
