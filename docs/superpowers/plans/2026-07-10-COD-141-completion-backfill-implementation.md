@@ -46,5 +46,5 @@
 
 - [x] Document completion-driven refill and live-process claim semantics.
 - [x] Bump the repository's four-part patch version in `VERSION`.
-- [ ] Run the full suite, syntax checks, independent review, and deployment verification.
+- [x] Run the full suite, syntax checks, and independent review.
 - [ ] Push, merge, install the new kit, refresh all registered managed workspaces, restart the watcher, and verify source/managed/install version parity.
