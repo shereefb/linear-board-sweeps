@@ -133,6 +133,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 - **Workspace** = one Linear project ↔ one **anchor repo** (the repo holding `.claude/linear-sweep.json`, i.e. `TARGET`) plus any sibling repos it lists in `config.repos`. One anchor per project.
 - **Activation** = a Linear **project label `auto-sweep`**. The launcher only sweeps a registered anchor whose project carries that label. `activate`/`deactivate` toggle it via the API.
 - **Manual-only issue label** = `sweep:manual-only`. Use it on cards created or moved by direct user conversations and non-sweep skills unless the card is meant to enter the unattended queue immediately. The scheduled launcher skips these cards in every sweep; `unblock-sweep` can clear the label after a human chooses to resume automation.
+- **Dependency gate** = a `blockedBy` relation releases only when every blocker is in exact canonical `Done`; other completed-type states do not release it. The launcher checks before and during claim, and every scheduled child runs `node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"` before material work. Use a relation alone for a separate prerequisite: never add `blocked:needs-user` merely because a `blockedBy` relation exists.
 - **`ANCHOR`** below = the absolute path to `TARGET` (the source anchor repo). Registration creates managed workspace metadata under `~/.local/share/linear-board-sweeps/workspaces/<anchor>/`. Repeat this step's register/activate for each anchor if the user runs several projects on this machine.
 
 1. **Ensure runtime selection exists** in `ANCHOR/.claude/linear-sweep.json`. If it was copied from the template (Step 7) it already has this. If not, add:
@@ -173,8 +174,10 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    }
    ```
    The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. The default scheduled sweeps use Codex so unattended launchd ticks do not depend on a separate Claude login; only switch a scheduled sweep to Claude after confirming that `claude` is installed, logged in, and usable non-interactively. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage.
+   Executable preflight then resolves the matching `CODEX_BIN` or `CLAUDE_BIN` override, `PATH`, the ChatGPT.app bundled Codex, the legacy Codex.app bundle, and otherwise must fail before claim. The last two fallbacks apply to Codex; a configured Claude runtime needs its override or `PATH` entry.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across disjoint anchors. `parallel.sameRepoCardLimits` controls active per-card slots inside each selected non-ship workspace/sweep candidate; defaults are spec/dev `4`, QA `1`, and ship forced to `1`. `parallel.maxSameRepoRefillDispatches` defaults to `8` and is clamped to `0..20`; it caps mid-batch same-repo backfills after successful child completion, and `0` disables refill. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches`, `maxSameRepoRefillDispatches`, or `maxDrainPasses` to `1` for stricter bounded mode on smaller machines. ship-sweep is always serial.
    `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick spends at most `parallel.maxNonShipDispatches` handoff dispatch slots, while same-repo refill has its own `parallel.maxSameRepoRefillDispatches` budget. QA still stops at the human signoff queue; ship is never handoff-triggered.
+   Launcher-registry `capacity.maxActiveChildren` defaults to exactly `10` and clamps to `1..32`. This host-wide ceiling covers initial, refill, and handoff top-level scheduled children across all registered anchors and surviving ledger entries after a launcher restart; the repo-local `parallel.*` values above create demand beneath it. It does not count reviewer subagents spawned inside those children. The installer adds the default to legacy registries while preserving their other fields.
    `fastPath.enabled` defaults true so dev-sweep can mark tiny, high-confidence changes as eligible for a human to skip `Signoff`. Set it to false to require normal QA for every card. The human-only `Ship` move remains required.
 
 2. **Install the launcher** (creates/updates a managed clean kit clone under `~/.local/share/linear-board-sweeps/kit`, symlinks the wrapper, materializes the launchd plist, and points `registry.json` at that managed clone — does NOT activate the schedule):
@@ -199,7 +202,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" doctor
    node "KIT/scripts/linear-watch.mjs" doctor --json
    ```
-   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, and dirty managed dispatch blockers. It exits non-zero when scheduled dispatch is blocked by dirty managed state.
+   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Optional macOS memory-pressure percentage is shown separately from free bytes. It exits non-zero for unhealthy capacity/runtime/tick or dirty managed state.
 
 6. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
    ```bash
@@ -211,9 +214,27 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
 7. **Activate the schedule** (10-min timer) and confirm health:
    ```bash
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist
-   node "KIT/scripts/linear-watch.mjs" health      # "last tick …" or "tick in progress"
+   node "KIT/scripts/linear-watch.mjs" health      # reads current-tick.json or the last completed tick
    ```
    Stop later with `launchctl bootout gui/$(id -u)/com.linear-board-sweeps.watch`. Pause one project without stopping the launcher: `node "KIT/scripts/linear-watch.mjs" deactivate "ANCHOR"`.
+
+### Upgrade existing registered anchors
+
+Run this attended on the always-on host. Stop the timer, update the kit, and use `node "KIT/scripts/linear-watch.mjs" list` to enumerate every registered `ANCHOR`. For each listed anchor, set `ANCHOR` to its absolute source path and run:
+
+```bash
+for SWEEP in spec dev qa ship unblock; do
+  mkdir -p "$ANCHOR/.claude/skills/$SWEEP-sweep"
+  cp "$KIT/skills/$SWEEP-sweep/SKILL.md" "$ANCHOR/.claude/skills/$SWEEP-sweep/SKILL.md"
+  cmp "$KIT/skills/$SWEEP-sweep/SKILL.md" "$ANCHOR/.claude/skills/$SWEEP-sweep/SKILL.md"
+done
+```
+
+Verify the anchor's existing `AGENTS.md` contains the exact-`Done` dependency preflight and relation-only label rule; edit only that managed Board sweeps section and preserve unrelated user instructions. Review, commit, and push those exact skill/AGENTS changes in each anchor before resuming its schedule. Re-run `KIT/scripts/install-watch.sh` once on the host to migrate the registry to `capacity.maxActiveChildren: 10` without dropping existing settings.
+
+Before restarting launchd, run `doctor`, `doctor --json`, and `tick --dry-run` from the updated kit. `health` uses `current-tick.json`, so a live process with systemic current tick failures remains red. The resource and queue metrics are evidence only: the launcher does not auto-throttle. Keep the ten-minute interval and default capacity for a 24-hour observation before tuning the ceiling or repo-local slots.
+
+Perform a one-time dry-run audit for each project returned by `list`: in Linear, filter for `blocked:needs-user`, then report only cards that also have a current visible `blockedBy` relation. Require attended confirmation and direct provenance in issue history/comments that the label merely mirrored that still-current relation and that no later human request reused the label before removing it. Preserve ambiguous labels. This audit is limited to current visible relations: bounded cycle detection and cross-team token visibility mean it is not an organization-wide guarantee. Do not infer an invisible relation, reconstruct a removed relation, or bulk-delete labels.
 
 **Managed workspace notes.** Scheduled sweeps clone/fetch/ff-only every configured repo in `config.repos` into one managed workspace root. `.env` is copied only when it exists in the source repo and is gitignored there, then written in the managed clone with mode `0600`. Screenshots, logs, browser profiles, and temporary files should use the launcher-provided `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` paths under state/cache directories, not repo roots.
 

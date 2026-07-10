@@ -4,6 +4,7 @@ import fs from "node:fs";
 
 const scheduledSweeps = ["spec", "dev", "qa", "ship"];
 const allSweeps = [...scheduledSweeps, "unblock"];
+const operatorDocs = ["../README.md", "../SETUP.md", "../docs/linear-rules.md"];
 
 test("Codex AGENTS instructions include the Karpathy coding guardrail", () => {
   const files = [
@@ -84,5 +85,60 @@ test("shared AGENTS rules distinguish relation blockers from human-only labels",
     assert.match(text, /exact(?: canonical)? `Done`/, file);
     assert.match(text, /never add `blocked:needs-user` merely because a `blockedBy` relation exists/, file);
     assert.match(text, /direct human answer[^\n]*existing human-block label/, file);
+  }
+});
+
+test("operator docs define exact-Done relation-only dependency behavior", () => {
+  for (const file of operatorDocs) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.match(text, /exact(?: canonical)? `Done`/, file);
+    assert.match(text, /`blockedBy` relation/, file);
+    assert.match(text, /never add `blocked:needs-user` merely because a `blockedBy` relation exists/, file);
+    assert.match(text, /dependency-status/, file);
+  }
+});
+
+test("operator docs and template explain the host ceiling and runtime preflight", () => {
+  const files = ["../README.md", "../SETUP.md"];
+  for (const file of files) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.match(text, /`capacity\.maxActiveChildren`[^\n]*defaults to (?:exactly )?`10`/, file);
+    assert.match(text, /clamp(?:ed|s)?[^\n]*`1\.\.32`/, file);
+    assert.match(text, /top-level scheduled children/, file);
+    assert.match(text, /reviewer subagents[^\n]*not counted|does not count reviewer subagents/, file);
+    assert.match(text, /`[A-Z]+_BIN`[^\n]*`PATH`[^\n]*ChatGPT\.app[^\n]*legacy Codex\.app[^\n]*fail before claim/, file);
+  }
+
+  const template = fs.readFileSync(new URL("../templates/linear-sweep.json", import.meta.url), "utf8");
+  assert.match(template, /host-wide[^\n]*`?capacity\.maxActiveChildren`?[^\n]*10/, "templates/linear-sweep.json");
+  assert.match(template, /top-level scheduled children/, "templates/linear-sweep.json");
+  assert.match(template, /reviewer subagents[^\n]*not counted/i, "templates/linear-sweep.json");
+});
+
+test("operator docs require health evidence and an observation window before tuning", () => {
+  for (const file of ["../README.md", "../SETUP.md"]) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.match(text, /current-tick\.json/, file);
+    assert.match(text, /`health`[^\n]*current tick|`health`[^\n]*current-tick/, file);
+    assert.match(text, /`doctor`[^\n]*capacity[^\n]*high-water/, file);
+    assert.match(text, /persistent[^\n]*current-backlog[^\n]*queue[^\n]*p50\/p90/, file);
+    assert.match(text, /optional[^\n]*memory-pressure/i, file);
+    assert.match(text, /does not auto-throttle/, file);
+    assert.match(text, /24-hour observation/, file);
+  }
+});
+
+test("migration docs limit the legacy relation-plus-label audit to visible proven cases", () => {
+  for (const file of ["../SETUP.md", "../docs/linear-rules.md"]) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.match(text, /one-time dry-run audit/, file);
+    assert.match(text, /current visible `blockedBy` relation/, file);
+    assert.match(text, /`blocked:needs-user`/, file);
+    assert.match(text, /attended confirmation/, file);
+    assert.match(text, /direct provenance/, file);
+    assert.match(text, /preserve ambiguous labels/i, file);
+    assert.match(text, /bounded cycle detection/, file);
+    assert.match(text, /cross-team[^\n]*token visibility/, file);
+    assert.match(text, /not (?:an )?organization-wide guarantee|does not provide (?:an )?organization-wide guarantee/, file);
   }
 });

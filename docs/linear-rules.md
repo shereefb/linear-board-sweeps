@@ -39,6 +39,14 @@ Each human hand-off `Todo` card should state, in plain language: *what* to do, *
 
 Scheduled launcher failure `Todo` cards are deduplicated by fingerprint. Repeated ticks update the existing card at most daily unless the normalized error changes. When a later tick checks the same scope without seeing the failure, the launcher comments `[auto-sweep-tick-recovered <fingerprint> <ISO>]` and moves the Todo to `Done`. If config or credentials are too broken to write Linear, no impossible Todo is attempted; the failure stays visible in local logs and `linear-watch.mjs health` exits non-zero.
 
+## Dependency relations
+
+A dependent card may run only when every current visible `blockedBy` relation points to a blocker in exact canonical `Done`. Canceled, Duplicate, Archived, and other terminal-looking states remain unresolved; state type alone is insufficient. The launcher checks during queue scan and fresh claim confirmation. A scheduled child checks again, before its first material mutation, with `node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"` and fails closed if relation data is unreadable or incomplete.
+
+For an independently completable prerequisite, create or reuse its issue, create the relation, and leave the dependent unclaimed. Use the relation alone: never add `blocked:needs-user` merely because a `blockedBy` relation exists. Keep `blocked:needs-user` for a direct human answer without a separate issue and for the existing crash/bounce protections. When the final blocker reaches exact `Done`, the dependent becomes eligible on the next fresh read without a dependency-label edit.
+
+Bounded cycle detection is an operational limitation, not a full graph crawl: diagnosis is only as complete as the active registered queue and relations returned to the service account. Multi-hop cycles through other workflow states, projects, teams, or invisible relations may not be diagnosed, and cross-team token visibility can omit data the launcher cannot know exists. This is not an organization-wide guarantee; operators must inspect persistent waits and access boundaries rather than assuming no reported cycle means no cycle.
+
 ## Workflow labels
 
 Claim/release + blocked signals. The sweeps create these if missing.
@@ -76,6 +84,8 @@ The launcher also writes/reads a few **audit-marker comments** on cards (you don
 ## Manual unblock workflow
 
 `unblock-sweep` is a human-invoked skill for reviewing cards that carry `blocked:open-questions`, `blocked:needs-user`, or `qa:needs-changes` across all registered anchors, including paused projects. It shows one blocked card at a time, records the user's resolution in a Linear audit comment, and removes only the selected blocking label(s). It is copied to anchors for Claude/Codex discovery but is not part of scheduled `SWEEPS`.
+
+After upgrading a legacy installation, perform a one-time dry-run audit across every registered project: find cards with `blocked:needs-user` and report only those that also have a current visible `blockedBy` relation. Label removal requires attended confirmation and direct provenance that the label merely mirrored the still-current relation and no later human request reused it; preserve ambiguous labels. The audit shares the scheduler's bounded cycle detection and cross-team token visibility limits, so it does not provide an organization-wide guarantee and must never bulk-remove labels or infer invisible/removed relations.
 
 ## Tracking rules (going forward)
 
