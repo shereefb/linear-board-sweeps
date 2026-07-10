@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import {
@@ -15,12 +16,12 @@ import {
   worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
-  boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, rotateNonShipCandidates,
+  boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
@@ -32,7 +33,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
-  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, finalizeTickState,
+  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -292,7 +293,7 @@ test("preflightRuntimeCandidates: scopes a missing runtime by anchor/runtime/hos
   assert.deepEqual(result.ready.map((pick) => [pick.sweep, pick.runtimeExecutable]), [["qa", "/opt/bin/claude"]]);
   assert.equal(result.failures.length, 1);
   assert.equal(result.failures[0].scope, "runtime:codex:builder-1");
-  assert.equal(result.failures[0].stableTarget, JSON.stringify({ anchorPath: "/managed/app", runtime: "codex", host: "builder-1" }));
+  assert.equal(result.failures[0].stableTarget, JSON.stringify({ sourceAnchorPath: "/managed/app", runtime: "codex", host: "builder-1" }));
   assert.deepEqual(calls, ["codex", "claude"]);
 
   preflightRuntimeCandidates(candidates, {
@@ -301,6 +302,25 @@ test("preflightRuntimeCandidates: scopes a missing runtime by anchor/runtime/hos
     envForCandidate: () => ({}),
     resolveFn: () => { throw new Error("cached lane should not resolve again"); },
   });
+});
+test("preflightAndSelectDispatchBatch: missing higher-priority runtime does not starve a healthy lane on the same anchor", async () => {
+  const candidates = [
+    { anchorPath: "/managed/app", sweep: "qa", count: 1, topSortOrder: 10, config: { runtimes: { qa: { runtime: "claude" } } } },
+    { anchorPath: "/managed/app", sweep: "dev", count: 1, topSortOrder: 9, config: { runtimes: { dev: { runtime: "codex" } } } },
+  ];
+  const result = await preflightAndSelectDispatchBatch(candidates, {
+    preflightFn: async (all) => preflightRuntimeCandidates(all, {
+      host: "builder-1",
+      envForCandidate: () => ({}),
+      resolveFn: (runtime) => runtime === "codex"
+        ? { ok: true, runtime, path: "/opt/bin/codex", source: "path" }
+        : { ok: false, runtime, code: "ENOENT", path: null, source: null },
+    }),
+    selectOptions: { maxNonShipDispatches: 2, rotationSeed: 0 },
+  });
+
+  assert.deepEqual(result.selected.map((candidate) => candidate.sweep), ["dev"]);
+  assert.deepEqual(result.failures.map((failure) => failure.runtime), ["claude"]);
 });
 
 test("runtimeConfigForSweep: per-sweep runtimes override legacy runtime/models", () => {
@@ -1450,6 +1470,7 @@ test("classifyDispatchOutcome: executable ENOENT and cwd ENOENT are distinct", (
     path: "/resolved/codex",
     cwd: "/workspace",
     cwdExists: true,
+    executableExists: false,
   });
   const cwd = classifyDispatchOutcome({
     type: "error",
@@ -1485,7 +1506,7 @@ test("classifyDispatchOutcome: exit 127, signal, interruption, and success remai
 test("runtimeDisabledByOutcome: only executable disappearance disables a runtime lane", () => {
   const base = { path: "/resolved/codex", cwd: "/workspace" };
   const outcomes = [
-    classifyDispatchOutcome({ ...base, type: "error", error: { code: "ENOENT" }, cwdExists: true }),
+    classifyDispatchOutcome({ ...base, type: "error", error: { code: "ENOENT" }, cwdExists: true, executableExists: false }),
     classifyDispatchOutcome({ ...base, type: "error", error: { code: "ENOENT" }, cwdExists: false }),
     classifyDispatchOutcome({ ...base, type: "close", exitCode: 127 }),
     classifyDispatchOutcome({ ...base, type: "close", exitCode: null, signal: "SIGTERM" }),
@@ -1494,8 +1515,78 @@ test("runtimeDisabledByOutcome: only executable disappearance disables a runtime
   ];
   assert.deepEqual(outcomes.map(runtimeDisabledByOutcome), [true, false, false, false, false, false]);
 });
+test("classifyDispatchOutcome: ENOENT with existing executable is a spawn error, not runtime disappearance", () => {
+  const outcome = classifyDispatchOutcome({
+    type: "error",
+    error: { code: "ENOENT" },
+    path: "/resolved/script-with-missing-shebang-interpreter",
+    cwd: "/workspace",
+    cwdExists: true,
+    executableExists: true,
+  });
+  assert.deepEqual(outcome, {
+    kind: "spawn-error",
+    code: "ENOENT",
+    exitCode: null,
+    signal: null,
+    path: "/resolved/script-with-missing-shebang-interpreter",
+    cwd: "/workspace",
+  });
+  assert.equal(runtimeDisabledByOutcome(outcome), false);
+});
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────
+test("dispatch abort context: SIGTERM interrupts active child once and records the typed outcome", async () => {
+  const processLike = new EventEmitter();
+  const context = createDispatchAbortContext({ processLike });
+  assert.equal(processLike.listenerCount("SIGINT"), 1);
+  assert.equal(processLike.listenerCount("SIGTERM"), 1);
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-abort-"));
+  const logDir = path.join(anchorPath, "logs");
+  const spawnFn = (executable, args, options) => {
+    assert.equal(executable, "/resolved/codex");
+    assert.equal(options.signal, context.signal);
+    const child = new EventEmitter();
+    options.signal.addEventListener("abort", () => {
+      setImmediate(() => {
+        const error = new Error("The operation was aborted");
+        error.code = "ABORT_ERR";
+        child.emit("error", error);
+        child.emit("close", null, "SIGTERM");
+      });
+    }, { once: true });
+    return child;
+  };
+  const run = dispatchBatch([{
+    anchorPath,
+    sweep: "dev",
+    config: {},
+    issueIdentifier: "COD-9",
+    logDir,
+    runtimeExecutable: "/resolved/codex",
+  }], {
+    dispatchFn: dispatchAsync,
+    signal: context.signal,
+    dispatchOptions: { spawnFn },
+  });
+
+  processLike.emit("SIGTERM");
+  const [result] = await run;
+  assert.equal(result.kind, "interrupted");
+  assert.equal(result.signal, "SIGTERM");
+  assert.equal(result.success, false);
+  const recordFile = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  const recordLines = fs.readFileSync(path.join(logDir, recordFile), "utf8").trim().split("\n");
+  assert.equal(recordLines.length, 1);
+  const record = JSON.parse(recordLines[0]);
+  assert.equal(record.outcome.kind, "interrupted");
+  assert.equal(record.outcome.signal, "SIGTERM");
+
+  context.dispose();
+  assert.equal(processLike.listenerCount("SIGINT"), 0);
+  assert.equal(processLike.listenerCount("SIGTERM"), 0);
+});
+
 test("SWEEP_CFG.ship exists and the derived lists include it", () => {
   assert.deepEqual(SWEEP_CFG.ship.states, ["Ship"]);
   assert.equal(SWEEP_CFG.ship.claim, "ship:in-progress");
@@ -1718,6 +1809,39 @@ test("failureFingerprint: stable same input, different target differs", () => {
   assert.notEqual(a, c);
   assert.match(a, /^[a-f0-9]{16}$/);
 });
+test("runtime recovery targets: a healthy anchor cannot close another anchor's shared-project Todo", () => {
+  const ready = preflightRuntimeCandidates([
+    { sourceAnchorPath: "/src/a/app", anchorPath: "/managed/a/app", sweep: "dev", config: { projectId: "shared" } },
+    { sourceAnchorPath: "/src/b/app", anchorPath: "/managed/b/app", sweep: "dev", config: { projectId: "shared" } },
+  ], {
+    host: "builder-1",
+    envForCandidate: () => ({}),
+    resolveFn: (runtime) => ({ ok: true, runtime, path: "/opt/bin/codex", source: "path" }),
+  }).ready;
+  assert.equal(ready[0].runtimeStableTarget, JSON.stringify({ sourceAnchorPath: "/src/a/app", runtime: "codex", host: "builder-1" }));
+  assert.equal(ready[1].runtimeStableTarget, JSON.stringify({ sourceAnchorPath: "/src/b/app", runtime: "codex", host: "builder-1" }));
+
+  const todos = ready.map((pick, index) => {
+    const event = failureEvent({
+      anchorPath: pick.anchorPath,
+      anchorSlug: "app",
+      projectId: "shared",
+      scope: pick.runtimeScope,
+      kind: "runtime-missing",
+      stableTarget: pick.runtimeStableTarget,
+    });
+    const fingerprint = failureFingerprint(event);
+    return existingFailureTodo(fingerprint, {
+      id: `todo-${index}`,
+      scope: pick.runtimeScope,
+      description: failureTodoBody(event, fingerprint),
+    });
+  });
+  const decisions = failureTodoDecisions([], todos, new Set(), NOW, {
+    recoveredTargets: new Set([ready[0].runtimeStableTarget]),
+  });
+  assert.deepEqual(decisions.map((decision) => decision.todo.id), ["todo-0"]);
+});
 test("sanitizeFailureMessage: redacts Linear keys, common tokens, and supplied env values", () => {
   const msg = "LINEAR_API_KEY=lin_api_abc123 token ghp_deadbeef password shh path /tmp";
   const clean = sanitizeFailureMessage(msg, ["shh"]);
@@ -1860,11 +1984,14 @@ test("healthStatus: live current tick remains unhealthy after a systemic failure
   });
   assert.deepEqual(healthy, { ok: true, reason: "tick in progress (pid 42)" });
 });
-test("finalizeTickState: atomically writes the completed current tick and copies it to last-tick", () => {
+test("finalizeTickState: writes versioned last-tick before removing current-tick", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-"));
   const currentPath = path.join(dir, "current-tick.json");
   const lastTickPath = path.join(dir, "last-tick");
+  const order = [];
+  atomicWriteJson(currentPath, { version: 1, status: "running", pid: 42, failures: [] });
   const completed = finalizeTickState({
+    version: 1,
     status: "running",
     pid: 42,
     startedAt: "2026-07-09T12:00:00.000Z",
@@ -1874,13 +2001,41 @@ test("finalizeTickState: atomically writes the completed current tick and copies
     currentPath,
     lastTickPath,
     now: () => "2026-07-09T12:03:00.000Z",
+    writeJsonFn: (target, value) => { order.push(`write:${path.basename(target)}`); atomicWriteJson(target, value); },
+    removeFn: (target) => { order.push(`remove:${path.basename(target)}`); fs.rmSync(target, { force: true }); },
   });
 
+  assert.equal(completed.version, 1);
   assert.equal(completed.status, "complete");
   assert.equal(completed.endedAt, "2026-07-09T12:03:00.000Z");
-  assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, "utf8")), completed);
+  assert.equal(fs.existsSync(currentPath), false);
   assert.deepEqual(JSON.parse(fs.readFileSync(lastTickPath, "utf8")), completed);
-  assert.deepEqual(fs.readdirSync(dir).sort(), ["current-tick.json", "last-tick"]);
+  assert.deepEqual(fs.readdirSync(dir), ["last-tick"]);
+  assert.deepEqual(order, ["write:last-tick", "remove:current-tick.json"]);
+});
+test("finalizeTickState: failed last-tick write preserves a red current-tick", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-failure-"));
+  const currentPath = path.join(dir, "current-tick.json");
+  const lastTickPath = path.join(dir, "last-tick");
+  const state = { version: 1, status: "running", pid: 42, at: "2026-07-09T12:00:00.000Z", failures: [] };
+  atomicWriteJson(currentPath, state);
+
+  assert.throws(() => finalizeTickState(state, {
+    currentPath,
+    lastTickPath,
+    now: () => "2026-07-09T12:03:00.000Z",
+    writeJsonFn: (target, value) => {
+      if (target === lastTickPath) throw new Error("disk full");
+      atomicWriteJson(target, value);
+    },
+  }), /disk full/);
+
+  const preserved = JSON.parse(fs.readFileSync(currentPath, "utf8"));
+  assert.equal(preserved.version, 1);
+  assert.equal(preserved.status, "running");
+  assert.equal(preserved.failures.at(-1).kind, "last-tick-write");
+  assert.match(preserved.failures.at(-1).message, /disk full/);
+  assert.equal(fs.existsSync(lastTickPath), false);
 });
 test("doctorReport: a running current tick owned by a dead PID is stale", () => {
   const report = doctorReport({

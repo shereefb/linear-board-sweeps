@@ -43,6 +43,7 @@ const CACHE_DIR = path.join(HOME, ".cache", "linear-board-sweeps");
 const TICK_LOCK = path.join(STATE_DIR, "tick.lock");
 const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
+export const TICK_STATE_VERSION = 1;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
@@ -346,15 +347,22 @@ export function preflightRuntimeCandidates(candidates, {
   const failures = [];
   for (const pick of candidates || []) {
     const runtime = runtimeConfigForSweep(pick.config || {}, pick.sweep).runtime || "codex";
-    const key = runtimeLaneKey(pick.anchorPath, runtime, host);
+    const sourceAnchorPath = pick.sourceAnchorPath || pick.anchorPath;
+    const key = runtimeLaneKey(sourceAnchorPath, runtime, host);
     let resolution = cache.get(key);
     if (!resolution) {
       resolution = resolveFn(runtime, envForCandidate(pick));
       cache.set(key, resolution);
     }
     const scope = `runtime:${runtime}:${host}`;
-    const stableTarget = JSON.stringify({ anchorPath: pick.anchorPath, runtime, host });
-    if (resolution.ok) ready.push({ ...pick, runtimeExecutable: resolution.path, runtimeLaneKey: key });
+    const stableTarget = JSON.stringify({ sourceAnchorPath, runtime, host });
+    if (resolution.ok) ready.push({
+      ...pick,
+      runtimeExecutable: resolution.path,
+      runtimeLaneKey: key,
+      runtimeScope: scope,
+      runtimeStableTarget: stableTarget,
+    });
     else failures.push({ pick, runtime, host, key, scope, stableTarget, resolution });
   }
   return { ready, failures, cache };
@@ -837,6 +845,14 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT
   return picked;
 }
 
+export async function preflightAndSelectDispatchBatch(candidates, {
+  preflightFn,
+  selectOptions = {},
+} = {}) {
+  const checked = await preflightFn(candidates);
+  return { ...checked, selected: selectDispatchBatch(checked.ready, selectOptions) };
+}
+
 export function rotateNonShipCandidates(candidates, seed = 0) {
   const ranked = candidates.filter((candidate) => candidate.sweep !== "ship");
   const anchors = [];
@@ -1150,12 +1166,31 @@ export function finalizeTickState(state, {
   currentPath = CURRENT_TICK,
   lastTickPath = LAST_TICK,
   now = () => new Date().toISOString(),
+  writeJsonFn = atomicWriteJson,
+  removeFn = (target) => fs.rmSync(target, { force: true }),
 } = {}) {
   const endedAt = now();
-  const completed = { ...state, status: "complete", at: endedAt, endedAt };
-  atomicWriteJson(currentPath, completed);
-  atomicWriteJson(lastTickPath, completed);
-  return completed;
+  const completed = { ...state, version: TICK_STATE_VERSION, status: "complete", at: endedAt, endedAt };
+  try {
+    writeJsonFn(lastTickPath, completed);
+    removeFn(currentPath);
+    return completed;
+  } catch (error) {
+    const failure = {
+      kind: "last-tick-write",
+      message: String(error?.message || error),
+      seenAt: endedAt,
+    };
+    const preserved = {
+      ...state,
+      version: TICK_STATE_VERSION,
+      status: "running",
+      at: endedAt,
+      failures: [...(state?.failures || []), failure],
+    };
+    try { writeJsonFn(currentPath, preserved); } catch { /* preserve original finalization error */ }
+    throw error;
+  }
 }
 
 // ── IO: filesystem / registry ────────────────────────────────────────────────
@@ -2033,6 +2068,8 @@ export async function expandDispatchBatch(batch, {
         triggeredBy: pick.triggeredBy,
         runtimeExecutable: pick.runtimeExecutable,
         runtimeLaneKey: pick.runtimeLaneKey,
+        runtimeScope: pick.runtimeScope,
+        runtimeStableTarget: pick.runtimeStableTarget,
       }, parentRunId, childIndexAllocator.next()));
     }
   }
@@ -2138,6 +2175,8 @@ export async function buildSameRepoRefillDispatches({
     triggeredBy: { issue: result.issueIdentifier, sweep, kind: "same-repo-refill" },
     runtimeExecutable: pick.runtimeExecutable,
     runtimeLaneKey: pick.runtimeLaneKey,
+    runtimeScope: pick.runtimeScope,
+    runtimeStableTarget: pick.runtimeStableTarget,
   }];
   const dispatches = await expandDispatchBatch(batch, {
     dryRun: false,
@@ -2268,7 +2307,10 @@ export function classifyDispatchOutcome(event = {}) {
   if (event.type === "interruption") return { kind: "interrupted", ...base, code: "INTERRUPTED" };
   if (event.type === "error") {
     const code = event.error?.code || event.code || "SPAWN_ERROR";
-    if (code === "ENOENT") return { kind: event.cwdExists === false ? "cwd-enoent" : "executable-enoent", ...base, code };
+    if (code === "ENOENT") {
+      if (event.cwdExists === false) return { kind: "cwd-enoent", ...base, code };
+      if (event.executableExists === false) return { kind: "executable-enoent", ...base, code };
+    }
     return { kind: "spawn-error", ...base, code };
   }
   if (base.signal) return { kind: "signal", ...base };
@@ -2278,6 +2320,31 @@ export function classifyDispatchOutcome(event = {}) {
 
 export function runtimeDisabledByOutcome(outcome) {
   return outcome?.kind === "executable-enoent";
+}
+
+export function createDispatchAbortContext({ processLike = process } = {}) {
+  const controller = new AbortController();
+  let interruptedSignal = null;
+  const handlers = new Map(["SIGINT", "SIGTERM"].map((signal) => [signal, () => {
+    if (controller.signal.aborted) return;
+    interruptedSignal = signal;
+    controller.abort({ signal });
+  }]));
+  for (const [signal, handler] of handlers) processLike.on(signal, handler);
+  return {
+    controller,
+    signal: controller.signal,
+    get interruptedSignal() { return interruptedSignal; },
+    dispose() {
+      for (const [signal, handler] of handlers) processLike.off(signal, handler);
+    },
+  };
+}
+
+function interruptedSignalFor(signal, fallback = null) {
+  const reason = signal?.reason;
+  if (reason && typeof reason === "object" && reason.signal) return reason.signal;
+  return typeof reason === "string" ? reason : fallback;
 }
 
 function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
@@ -2332,7 +2399,7 @@ function dispatch(anchorPath, sweep, config, pick = {}) {
   const r = spawnSync(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
   fs.closeSync(fd);
   const outcome = r.error
-    ? classifyDispatchOutcome({ type: "error", error: r.error, path: executable, cwd, cwdExists: fs.existsSync(cwd) })
+    ? classifyDispatchOutcome({ type: "error", error: r.error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) })
     : classifyDispatchOutcome({ type: "close", exitCode: r.status, signal: r.signal, path: executable, cwd });
   if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${r.error.message}`);
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
@@ -2340,7 +2407,7 @@ function dispatch(anchorPath, sweep, config, pick = {}) {
   return outcome;
 }
 
-function dispatchAsync(anchorPath, sweep, config, pick = {}) {
+export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null } = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
   const executable = pick.runtimeExecutable || cmd;
@@ -2355,7 +2422,7 @@ function dispatchAsync(anchorPath, sweep, config, pick = {}) {
   const startedAt = new Date().toISOString();
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
   return new Promise((resolve) => {
-    const child = spawn(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
+    const child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
     let settled = false;
     const finish = (outcome) => {
       if (settled) return;
@@ -2367,16 +2434,21 @@ function dispatchAsync(anchorPath, sweep, config, pick = {}) {
     };
     child.on("error", (e) => {
       logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
-      finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd) }));
+      const interrupted = e.code === "ABORT_ERR" || signal?.aborted;
+      finish(classifyDispatchOutcome(interrupted
+        ? { type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }
+        : { type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
     });
-    child.on("close", (exitCode, signal) => finish(classifyDispatchOutcome({ type: "close", exitCode, signal, path: executable, cwd })));
+    child.on("close", (exitCode, childSignal) => finish(classifyDispatchOutcome(signal?.aborted
+      ? { type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd }
+      : { type: "close", exitCode, signal: childSignal, path: executable, cwd })));
   });
 }
 
-export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResult } = {}) {
+export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResult, signal = null, dispatchOptions = {} } = {}) {
   return Promise.all(batch.map(async (c) => {
     const startedAt = new Date().toISOString();
-    const outcome = await dispatchFn(c.anchorPath, c.sweep, c.config, c);
+    const outcome = await dispatchFn(c.anchorPath, c.sweep, c.config, c, { ...dispatchOptions, signal });
     const completedAt = new Date().toISOString();
     const result = {
       anchorPath: c.anchorPath,
@@ -2402,13 +2474,17 @@ async function tick({ dryRun = false } = {}) {
   const parentRunId = `${os.hostname()}-${process.pid}-${Date.now().toString(36)}`;
   const localFailures = [];
   let tickState = null;
+  let dispatchAbortContext = null;
   if (!dryRun) {
     if (!acquireTickLock()) { log("another tick holds the lock — exit"); return; }
     const startedAt = new Date().toISOString();
-    tickState = { status: "running", pid: process.pid, parentRunId, startedAt, at: startedAt, kit: null, failures: [] };
+    tickState = { version: TICK_STATE_VERSION, status: "running", pid: process.pid, parentRunId, startedAt, at: startedAt, kit: null, failures: [] };
   }
   try {
-    if (!dryRun) atomicWriteJson(CURRENT_TICK, tickState);
+    if (!dryRun) {
+      atomicWriteJson(CURRENT_TICK, tickState);
+      dispatchAbortContext = createDispatchAbortContext();
+    }
     const updateFailures = [];
     const activeByAnchor = new Map();
     const runtimeCache = new Map();
@@ -2440,6 +2516,7 @@ async function tick({ dryRun = false } = {}) {
         logDir: pick.logDir,
       }) : runtime;
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
+      const releaseClaim = startFailure || result.kind === "interrupted";
       const detail = result.signal || result.code || result.exitCode;
       const failures = result.kind === "success" ? [] : [
         failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
@@ -2453,15 +2530,15 @@ async function tick({ dryRun = false } = {}) {
           localFailures.push(failureEventFor(
             pick.anchorPath,
             pick.config,
-            `runtime:${runtimeName}:${os.hostname()}`,
+            pick.runtimeScope || `runtime:${runtimeName}:${os.hostname()}`,
             "runtime-disappeared",
-            JSON.stringify({ anchorPath: pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
+            pick.runtimeStableTarget || JSON.stringify({ sourceAnchorPath: pick.sourceAnchorPath || pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
             `${runtimeName} executable disappeared after preflight on ${os.hostname()}`,
           ));
           writeCurrentTick();
         }
       }
-      if (startFailure && pick.issueIdentifier) {
+      if (releaseClaim && pick.issueIdentifier) {
         try {
           const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
           if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
@@ -2591,7 +2668,7 @@ async function tick({ dryRun = false } = {}) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
           return;
         }
-        const [runtimeReadyCandidate] = await preflightCandidatesForTick(batch);
+        const [runtimeReadyCandidate] = (await preflightCandidatesForTick(batch)).ready;
         if (!runtimeReadyCandidate) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: runtime-preflight`);
           return;
@@ -2672,17 +2749,18 @@ async function tick({ dryRun = false } = {}) {
       for (const pick of checked.ready) {
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) continue;
-        const runtime = runtimeConfigForSweep(pick.config, pick.sweep).runtime || "codex";
-        const scope = `runtime:${runtime}:${os.hostname()}`;
         try {
-          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([scope]), active.envValues, { dryRun: false });
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set(), active.envValues, {
+            dryRun: false,
+            recoveredTargets: new Set([pick.runtimeStableTarget]),
+          });
         } catch (error) {
           logFor(pick.anchorPath, "_", `FATAL failure-todo runtime recovery failed: ${error.message}`);
-          recordLocalFailure(pick.anchorPath, pick.config, scope, "failure-todo-recovery", pick.runtimeExecutable, error.message);
+          recordLocalFailure(pick.anchorPath, pick.config, pick.runtimeScope, "failure-todo-recovery", pick.runtimeStableTarget, error.message);
           writeCurrentTick();
         }
       }
-      return checked.ready;
+      return checked;
     };
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
@@ -2869,7 +2947,10 @@ async function tick({ dryRun = false } = {}) {
 
       const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
       const rotationSeed = Math.floor(Date.now() / 600000);
-      const batch = selectDispatchBatch(candidates, { maxNonShipDispatches, rotationSeed });
+      const selectOptions = { maxNonShipDispatches, rotationSeed };
+      const batch = dryRun
+        ? selectDispatchBatch(candidates, selectOptions)
+        : (await preflightAndSelectDispatchBatch(candidates, { preflightFn: preflightCandidatesForTick, selectOptions })).selected;
       if (!batch.length) {
         log(pass === 1 ? "no actionable work — cheap tick" : `drain pass ${pass}: no actionable work — stop`);
         return { candidates, selectedBatch: [], dispatched: false };
@@ -2877,6 +2958,10 @@ async function tick({ dryRun = false } = {}) {
       if (dryRun) {
         for (const m of dryRunDispatchMessages(batch)) logFor(m.anchorPath, m.sweep, m.body);
         return { candidates, selectedBatch: batch, dispatched: false };
+      }
+      if (dispatchAbortContext?.signal.aborted) {
+        log(`tick interrupted by ${dispatchAbortContext.interruptedSignal} before dispatch`);
+        return { candidates, selectedBatch: [], dispatched: false };
       }
 
       const cleanBatch = [];
@@ -2902,12 +2987,7 @@ async function tick({ dryRun = false } = {}) {
         log("dispatch blocked by dirty checkout(s)");
         return { candidates, selectedBatch: [], dispatched: false };
       }
-      const runtimeReadyBatch = await preflightCandidatesForTick(cleanBatch);
-      if (!runtimeReadyBatch.length) {
-        log("dispatch blocked by runtime preflight");
-        return { candidates, selectedBatch: [], dispatched: false };
-      }
-      const dispatches = await expandDispatchBatch(runtimeReadyBatch, { dryRun: false, parentRunId, activeByAnchor, now, childIndexAllocator });
+      const dispatches = await expandDispatchBatch(cleanBatch, { dryRun: false, parentRunId, activeByAnchor, now, childIndexAllocator });
       if (!dispatches.length) {
         log("no confirmed card slots — cheap tick");
         return { candidates, selectedBatch: [], dispatched: false };
@@ -2957,7 +3037,7 @@ async function tick({ dryRun = false } = {}) {
         if (!alreadyReserved) {
           for (const child of children) activeSameRepo.increment(child);
         }
-        return dispatchBatch(children, { onResult: handleDispatchResult });
+        return dispatchBatch(children, { onResult: handleDispatchResult, signal: dispatchAbortContext?.signal });
       };
       const results = await dispatchChildren(dispatches);
       return {
@@ -2988,6 +3068,10 @@ async function tick({ dryRun = false } = {}) {
   } finally {
     if (!dryRun) {
       try {
+        dispatchAbortContext?.dispose();
+        if (dispatchAbortContext?.interruptedSignal) {
+          process.exitCode = dispatchAbortContext.interruptedSignal === "SIGINT" ? 130 : 143;
+        }
         finalizeTickState({ ...tickState, failures: [...localFailures] });
       } finally {
         releaseTickLock();
