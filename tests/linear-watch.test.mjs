@@ -2959,7 +2959,9 @@ test("failureFingerprint: stable same input, different target differs", () => {
 });
 test("sanitizeFailureMessage: strips credentials embedded in Git remote URLs", () => {
   const githubSecret = ["ghp", "supersecret"].join("_");
-  const sanitized = sanitizeFailureMessage(`fetch https://oauth2:${githubSecret}@github.com/acme/repo.git failed; ssh://token@host/repo`);
+  const credentialedHttpUrl = "https://oauth2" + ":" + githubSecret + "@" + "github.com/acme/repo.git";
+  const credentialedSshUrl = "ssh://token" + "@" + "host/repo";
+  const sanitized = sanitizeFailureMessage(`fetch ${credentialedHttpUrl} failed; ${credentialedSshUrl}`);
   assert.equal(sanitized.includes(githubSecret), false);
   assert.equal(sanitized.includes("oauth2:"), false);
   assert.equal(sanitized.includes("token@"), false);
