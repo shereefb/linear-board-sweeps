@@ -322,6 +322,28 @@ test("preflightAndSelectDispatchBatch: missing higher-priority runtime does not 
   assert.deepEqual(result.selected.map((candidate) => candidate.sweep), ["dev"]);
   assert.deepEqual(result.failures.map((failure) => failure.runtime), ["claude"]);
 });
+test("preflightAndSelectDispatchBatch: unavailable Ship preserves the human gate and blocks healthy non-Ship work", async () => {
+  const candidates = [
+    { anchorPath: "/managed/ship", sweep: "ship", count: 1, config: { runtimes: { ship: { runtime: "claude" } } } },
+    { anchorPath: "/managed/dev", sweep: "dev", count: 3, config: { runtimes: { dev: { runtime: "codex" } } } },
+  ];
+  let claimCalls = 0;
+  const result = await preflightAndSelectDispatchBatch(candidates, {
+    preflightFn: async (all) => preflightRuntimeCandidates(all, {
+      host: "builder-1",
+      envForCandidate: () => ({}),
+      resolveFn: (runtime) => runtime === "codex"
+        ? { ok: true, runtime, path: "/opt/bin/codex", source: "path" }
+        : { ok: false, runtime, code: "ENOENT", path: null, source: null },
+    }),
+    selectOptions: { maxNonShipDispatches: 2 },
+  });
+  if (result.selected.length) claimCalls += 1;
+
+  assert.deepEqual(result.failures.map((failure) => failure.pick.sweep), ["ship"]);
+  assert.deepEqual(result.selected, []);
+  assert.equal(claimCalls, 0);
+});
 
 test("runtimeConfigForSweep: per-sweep runtimes override legacy runtime/models", () => {
   const resolved = runtimeConfigForSweep({

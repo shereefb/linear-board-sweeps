@@ -849,7 +849,8 @@ export async function preflightAndSelectDispatchBatch(candidates, {
   preflightFn,
   selectOptions = {},
 } = {}) {
-  const checked = await preflightFn(candidates);
+  const shipCandidates = candidates.filter((candidate) => candidate.sweep === "ship");
+  const checked = await preflightFn(shipCandidates.length ? shipCandidates : candidates);
   return { ...checked, selected: selectDispatchBatch(checked.ready, selectOptions) };
 }
 
