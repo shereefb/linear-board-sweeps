@@ -47,6 +47,7 @@ import {
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
   buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
+  filterLearningFindingsForRun,
   resolveRegisteredLearningWorkspaces, readLearningRunIndex, runPostDeliveryLearning,
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
@@ -1946,7 +1947,14 @@ test("live learning dry-run plans exact updates, creates, recurrences, caps, and
     done("verified-root", 0, "verified-improvement"),
     done("cap-root", 3, "regression"),
   ];
-  const finding = (rootFingerprint, occurrenceIds) => learningFindingForWatcher({ rootFingerprint, occurrenceIds, sourceWorkspaces: [workspace.sourceAnchorPath] });
+  const finding = (rootFingerprint, occurrenceIds) => learningFindingForWatcher({
+    rootFingerprint,
+    occurrenceIds,
+    occurrences: occurrenceIds.map((id) => ({ id, occurredAt: "2026-07-08T00:00:00.000Z" })),
+    firstSeenAt: "2026-07-08T00:00:00.000Z",
+    lastSeenAt: "2026-07-08T00:00:00.000Z",
+    sourceWorkspaces: [workspace.sourceAnchorPath],
+  });
   const snapshot = {
     capturedThrough: "2026-07-09T00:00:00.000Z",
     observations: [{ at: "2026-07-07T00:00:00.000Z", metrics: { failureRate: 0.7 } }],
@@ -2050,7 +2058,7 @@ test("learning writer treats timeout-after-success as confirmed and updates by c
   });
   assert.equal(createResult.confirmed, 1);
 
-  const before = { id: "active", identifier: "COD-11", title: "Human title", description: "Human body", stateName: "Ship", labelNames: ["human"], rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] };
+  const before = { id: "active", identifier: "COD-11", title: "Human title", description: "Human body", stateName: "Ship", labelNames: ["factory:learning-generated", "human"], rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] };
   let current = [structuredClone(before)];
   const calls = [];
   await executeLearningMutations({ mutations: [{ mutationId: "m-update", action: "append-evidence", issueId: "active", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e2"], finding }] }, {
@@ -2059,12 +2067,100 @@ test("learning writer treats timeout-after-success as confirmed and updates by c
     addCommentFn: async (issueId, body) => {
       calls.push({ issueId, body });
       current[0].occurrenceIds.push("e2");
+      throw new Error("comment timeout after success");
     },
   });
   assert.equal(calls.length, 1);
   assert.deepEqual({ title: current[0].title, description: current[0].description, stateName: current[0].stateName, labelNames: current[0].labelNames }, {
     title: before.title, description: before.description, stateName: before.stateName, labelNames: before.labelNames,
   });
+});
+
+test("learning writer rejects unproven marker collisions and accepts a human-advanced generated create", async () => {
+  const finding = learningFindingForWatcher({ repoEntry: "app" });
+  const mutation = { mutationId: "create-root", action: "create", rootFingerprint: finding.rootFingerprint, generation: 0, routeLabel: "app:main", finding };
+  const labels = { "factory:learning-generated": "prov", "app:main": "route" };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => labels,
+    fetchIssuesFn: async () => [{ id: "human", stateName: "Ship", rootFingerprint: finding.rootFingerprint, generation: 0, labelNames: ["app:main"] }],
+  }), /provenance collision/i);
+  const result = await executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => labels,
+    fetchIssuesFn: async () => [{ id: "advanced", stateName: "Dev", rootFingerprint: finding.rootFingerprint, generation: 0, labelNames: ["factory:learning-generated", "app:main"] }],
+  });
+  assert.equal(result.confirmed, 1);
+});
+
+test("automatic learning admits only due contributing lenses while attended learning forces all", () => {
+  const findings = [
+    learningFindingForWatcher({ rootFingerprint: "quality", lenses: ["quality"] }),
+    learningFindingForWatcher({ rootFingerprint: "cross", lenses: ["quality", "reliability"] }),
+  ];
+  const due = { lenses: { quality: { due: false }, reliability: { due: true }, throughput: { due: false } } };
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: true }).map((finding) => [finding.rootFingerprint, finding.lenses]), [["cross", ["reliability"]]]);
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: false }).map((finding) => finding.rootFingerprint), ["quality", "cross"]);
+});
+
+test("production learning replays persisted pending WAL before staging a new evidence window", async () => {
+  const finding = learningFindingForWatcher({ rootFingerprint: "resume-root", lenses: ["quality"] });
+  const mutation = {
+    mutationId: "resume-create", action: "create", rootFingerprint: "resume-root", generation: 0, finding,
+    destination: { sourceAnchorPath: "/source/app", projectId: "project-1", teamKey: "COD" }, lenses: ["quality"], status: "pending",
+  };
+  const state = { version: 1, lenses: {
+    reliability: { accumulated: {}, pending: null },
+    quality: { accumulated: {}, pending: { capturedThrough: "2026-07-09T00:00:00.000Z", mutations: { [mutation.mutationId]: mutation } } },
+    throughput: { accumulated: {}, pending: null },
+  }, evaluations: {} };
+  const calls = [];
+  const live = [];
+  const stateStore = {
+    snapshot: () => structuredClone(state),
+    setEvaluation: () => {},
+    stageWindow: () => assert.fail("recovery must replay before staging a new window"),
+    confirmMutation: (lens, id) => { calls.push(["confirm", lens, id]); state.lenses[lens].pending.mutations[id].status = "confirmed"; },
+    commitLens: (lens) => { calls.push(["commit", lens]); state.lenses[lens].pending = null; return true; },
+    updateAccumulated: () => {},
+  };
+  const result = await executeLearningCycleWrites({
+    findings: [], workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore, capturedThrough: "2026-07-10T00:00:00.000Z",
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }), fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      const created = { id: "created", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: "resume-root", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      live.push(created); return created;
+    },
+  });
+  assert.equal(result.resumed, 1);
+  assert.deepEqual(calls, [["confirm", "quality", "resume-create"], ["commit", "quality"]]);
+});
+
+test("deferred and low-confidence learning findings accumulate and are not discarded by watermark commits", async () => {
+  const accumulated = { reliability: {}, quality: {}, throughput: {} };
+  const calls = [];
+  const stateStore = {
+    snapshot: () => ({ version: 1, lenses: Object.fromEntries(Object.entries(accumulated).map(([lens, values]) => [lens, { accumulated: values, pending: null }])), evaluations: {} }),
+    setEvaluation: () => {},
+    updateAccumulated: (lens, { upsert = [], remove = [] }) => {
+      for (const finding of upsert) accumulated[lens][finding.rootFingerprint] = structuredClone(finding);
+      for (const root of remove) delete accumulated[lens][root];
+      calls.push(["accumulate", lens, upsert.map((item) => item.rootFingerprint), remove]);
+    },
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.length]),
+    confirmMutation: () => {}, commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  const low = learningFindingForWatcher({ rootFingerprint: "low-root", lenses: ["quality"], confidence: "low" });
+  const missing = learningFindingForWatcher({ rootFingerprint: "missing-root", lenses: ["quality"], projectId: "missing-project" });
+  const result = await executeLearningCycleWrites({
+    findings: [low, missing], workspaces: [], registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T00:00:00.000Z", dueDecisions: { lenses: { quality: { due: true } } },
+  });
+  assert.equal(result.confirmed, 0);
+  assert.deepEqual(Object.keys(accumulated.quality).sort(), ["low-root", "missing-root"]);
+  assert.deepEqual(calls.slice(-2), [["stage", "quality", 0], ["commit", "quality"]]);
 });
 
 test("learning writer confirms recurrence links and reconciles timeout-after-success", async () => {
@@ -2187,6 +2283,8 @@ test("generation cap appends fresh evidence and one blocker audit while preservi
 function learningFindingForWatcher(overrides = {}) {
   return {
     rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], occurrenceCount: 1,
+    occurrences: [{ id: "e1", occurredAt: "2026-07-08T00:00:00.000Z" }],
+    firstSeenAt: "2026-07-08T00:00:00.000Z", lastSeenAt: "2026-07-08T00:00:00.000Z",
     confidence: "high", severity: "high", impact: "Repeated failures", actionable: true,
     projectId: "project-1", repoEntry: "app", lenses: ["reliability"], coverage: { complete: true, gaps: [] },
     rootCauseHypothesis: "A factory condition may recur.", desiredOutcome: "Reduce failures.",
@@ -2701,7 +2799,7 @@ test("run records embed structured events and mirror the exact record into the g
     kind: "review",
     category: "correctness",
     summary: "Null case",
-    metrics: {},
+    metrics: { projectId: "spoofed", repoEntry: "spoofed" },
     identity: { cardRunId: "run-1", issueIdentifier: "COD-143", sweep: "dev", sourceAnchor: fs.realpathSync.native(anchorPath) },
   })}\nmalformed\n`);
   const child = new EventEmitter();
@@ -2711,6 +2809,8 @@ test("run records embed structured events and mirror the exact record into the g
     cardRunId: "run-1",
     sweep: "dev",
     sourceAnchorPath: anchorPath,
+    config: { projectId: "project-1", repos: ["app"] },
+    repoRoute: { repoEntry: "app" },
     logDir,
     learningEventsPath,
     globalRunsDir,
@@ -2726,6 +2826,8 @@ test("run records embed structured events and mirror the exact record into the g
   assert.deepEqual(globalRecord, localRecord);
   assert.equal(localRecord.learningEvents.length, 1);
   assert.equal(localRecord.learningEventCoverageGaps.length, 1);
+  assert.equal(localRecord.projectId, "project-1");
+  assert.equal(localRecord.repoEntry, "app");
 });
 
 test("global learning run indexes use the log retention window", () => {

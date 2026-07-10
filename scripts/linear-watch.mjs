@@ -1021,6 +1021,14 @@ function readLearningStateSafe(statePath = LEARNING_STATE_PATH) {
 
 export function buildLearningCyclePreview({ registry, workspaces, state, snapshot, now = new Date().toISOString() } = {}) {
   const calculatedDue = learningDueDecisions({ state, snapshot, workspaces, now });
+  for (const [lens, decision] of Object.entries(calculatedDue.lenses || {})) {
+    const accumulated = Object.values(state?.lenses?.[lens]?.accumulated || {});
+    if (!decision.due && accumulated.some((finding) => finding?.actionable !== false && ["medium", "high"].includes(finding?.confidence))) {
+      calculatedDue.lenses[lens] = { ...decision, due: true, reason: "accumulated-retry", sampleCount: accumulated.length };
+    }
+  }
+  calculatedDue.due = calculatedDue.anyDue = Object.values(calculatedDue.lenses || {}).some((decision) => decision.due)
+    || (calculatedDue.evaluations?.due || []).length > 0;
   const due = registry?.learning?.enabled === true ? calculatedDue : {
     ...calculatedDue,
     lenses: Object.fromEntries(Object.entries(calculatedDue.lenses || {}).map(([lens, decision]) => [lens, { ...decision, due: false, reason: "registry-disabled" }])),
@@ -2891,6 +2899,9 @@ function buildLearningEvaluation(issue) {
     windowEndsAt: new Date(Date.parse(completedAt) + durationDays * 86400000).toISOString(),
     metric,
     aggregation: metadata.acceptanceMetric.aggregation || "latest",
+    detectorId: metadata.acceptanceMetric.detectorId || null,
+    signal: metadata.acceptanceMetric.signal || null,
+    semanticKey: metadata.acceptanceMetric.semanticKey || null,
     baseline,
     expectedDirection,
     minimumChange: Number.isFinite(target) ? Math.abs(target - baseline) : 0,
@@ -2982,6 +2993,12 @@ function learningIssueMatches(issue, mutation) {
   return issue?.rootFingerprint === mutation.rootFingerprint && Number(issue.generation || 0) === Number(mutation.generation || 0);
 }
 
+function learningIssueProvenanceError(issue, mutation = {}) {
+  const required = [LEARNING_PROVENANCE_LABEL, mutation.routeLabel || mutation.requiredRouteLabel].filter(Boolean);
+  const missing = required.filter((label) => !issue?.labelNames?.includes(label));
+  return missing.length ? `learning provenance collision for ${mutation.rootFingerprint || issue?.rootFingerprint}: missing ${missing.join(", ")}` : null;
+}
+
 export async function executeLearningMutations(plan = {}, deps = {}) {
   const mutations = Array.isArray(plan.mutations) ? plan.mutations : [];
   const {
@@ -3028,6 +3045,10 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
       if (mutation.routeLabel && !routeId) throw new Error(`required route label ${mutation.routeLabel} is missing`);
       let live = await fetchIssuesFn();
       let existing = live.find((issue) => learningIssueMatches(issue, mutation));
+      if (existing) {
+        const collision = learningIssueProvenanceError(existing, mutation);
+        if (collision) throw new Error(collision);
+      }
       let created = existing;
       if (!existing) {
         const meta = await loadTeamFn();
@@ -3055,8 +3076,8 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
         existing = live.find((issue) => learningIssueMatches(issue, mutation));
         if (!existing) throw new Error(`learning create ${mutation.mutationId} was not visible after write`);
         const expectedLabels = [LEARNING_PROVENANCE_LABEL, ...(mutation.routeLabel ? [mutation.routeLabel] : [])];
-        if (existing.stateName !== "Spec" || expectedLabels.some((label) => !existing.labelNames?.includes(label))
-          || (Number.isFinite(input.sortOrder) && existing.sortOrder > input.sortOrder)) {
+        if (expectedLabels.some((label) => !existing.labelNames?.includes(label))
+          || (existing.stateName === "Spec" && Number.isFinite(input.sortOrder) && existing.sortOrder > input.sortOrder)) {
           throw new Error(`learning create ${mutation.mutationId} failed Spec/rank/label confirmation`);
         }
       }
@@ -3076,22 +3097,35 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
       let live = await fetchIssuesFn();
       const issue = live.find((candidate) => candidate.id === mutation.issueId);
       if (!issue) throw new Error(`learning update target missing: ${mutation.issueId}`);
+      const collision = learningIssueProvenanceError(issue, mutation);
+      if (collision) throw new Error(collision);
       const known = new Set(issue.occurrenceIds || []);
       const fresh = (mutation.occurrenceIds || []).filter((id) => !known.has(id));
-      if (fresh.length) await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh));
+      let writeError = null;
+      if (fresh.length) {
+        try { await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh)); }
+        catch (error) { writeError = error; }
+      }
       live = await fetchIssuesFn();
       const confirmedIssue = live.find((candidate) => candidate.id === mutation.issueId);
-      if (!confirmedIssue || fresh.some((id) => !confirmedIssue.occurrenceIds?.includes(id))) throw new Error(`learning update ${mutation.mutationId} was not confirmed`);
+      if (!confirmedIssue || fresh.some((id) => !confirmedIssue.occurrenceIds?.includes(id))) {
+        if (writeError) throw writeError;
+        throw new Error(`learning update ${mutation.mutationId} was not confirmed`);
+      }
     } else if (mutation.action === "audit-duplicate") {
       const live = await fetchIssuesFn();
       const duplicate = live.find((candidate) => candidate.id === mutation.issueId);
       if (!duplicate) throw new Error(`learning duplicate target missing: ${mutation.issueId}`);
+      const collision = learningIssueProvenanceError(duplicate, mutation);
+      if (collision) throw new Error(collision);
       const marker = `[factory-learning duplicate root=${mutation.rootFingerprint} primary=${mutation.primaryIssueId}]`;
       if (!(duplicate.comments || []).some((comment) => String(comment.body || "").includes(marker))) await addCommentFn(duplicate.id, marker);
     } else if (mutation.action === "block-generation-cap") {
       let live = await fetchIssuesFn();
       const issue = live.find((candidate) => candidate.id === mutation.issueId);
       if (!issue) throw new Error(`learning generation-cap target missing: ${mutation.issueId}`);
+      const collision = learningIssueProvenanceError(issue, mutation);
+      if (collision) throw new Error(collision);
       const fresh = (mutation.occurrenceIds || []).filter((id) => !(issue.occurrenceIds || []).includes(id));
       if (fresh.length) await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh));
       const capMarker = `[factory-learning generation-cap root=${mutation.rootFingerprint} generation=${mutation.generation}]`;
@@ -3128,6 +3162,15 @@ export function learningRunExecutionDecision({ dryRun = false, automatic = false
   return "run";
 }
 
+export function filterLearningFindingsForRun(findings = [], dueDecisions = {}, { automatic = false } = {}) {
+  if (!automatic) return findings.map((finding) => structuredClone(finding));
+  const dueLenses = new Set(Object.entries(dueDecisions?.lenses || {}).filter(([, decision]) => decision?.due).map(([lens]) => lens));
+  return findings.flatMap((finding) => {
+    const lenses = [...new Set(finding?.lenses || [])].filter((lens) => dueLenses.has(lens));
+    return lenses.length ? [{ ...structuredClone(finding), lenses }] : [];
+  });
+}
+
 export async function buildLiveLearningDryRunPlan({
   findings = [],
   workspaces = [],
@@ -3154,6 +3197,10 @@ export async function buildLiveLearningDryRunPlan({
   }
   const deferred = [];
   for (const finding of findings) {
+    if (!['medium', 'high'].includes(finding?.confidence) || finding?.actionable === false) {
+      deferred.push({ finding, reason: finding?.confidence === "low" ? "low-confidence-accumulated" : "not-actionable-accumulated" });
+      continue;
+    }
     const candidates = workspaces.filter((workspace) => workspace.config?.projectId === finding.projectId && workspace.apiKey);
     const sourceScoped = candidates.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
     const workspace = (sourceScoped.length ? sourceScoped : candidates).sort((a, b) => a.sourceAnchorPath.localeCompare(b.sourceAnchorPath))[0];
@@ -3225,6 +3272,55 @@ export async function buildLiveLearningDryRunPlan({
   };
 }
 
+function learningDestinationForMutation(mutation, workspaces = []) {
+  const metadata = mutation?.destination || {};
+  const candidates = workspaces.filter((workspace) => workspace?.apiKey
+    && (!metadata.projectId || workspace.config?.projectId === metadata.projectId)
+    && (!metadata.sourceAnchorPath || workspace.sourceAnchorPath === metadata.sourceAnchorPath));
+  if (candidates.length === 1) return candidates[0];
+  const finding = mutation?.finding || {};
+  const byProject = workspaces.filter((workspace) => workspace?.apiKey && workspace.config?.projectId === finding.projectId);
+  const bySource = byProject.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
+  return (bySource.length ? bySource : byProject).sort((a, b) => a.sourceAnchorPath.localeCompare(b.sourceAnchorPath))[0] || null;
+}
+
+async function resumePendingLearningWrites(store, workspaces, deps = {}) {
+  const state = store?.snapshot?.();
+  const pendingLenses = Object.entries(state?.lenses || {}).filter(([, lensState]) => lensState?.pending);
+  if (!pendingLenses.length) return { resumed: 0 };
+  const mutations = new Map();
+  for (const [lens, lensState] of pendingLenses) {
+    for (const mutation of Object.values(lensState.pending.mutations || {})) {
+      if (!mutations.has(mutation.mutationId)) mutations.set(mutation.mutationId, { mutation, lenses: [] });
+      mutations.get(mutation.mutationId).lenses.push({ lens, status: mutation.status });
+    }
+  }
+  let resumed = 0;
+  for (const { mutation, lenses } of mutations.values()) {
+    const unconfirmed = lenses.filter((item) => item.status !== "confirmed");
+    if (unconfirmed.length) {
+      const destination = learningDestinationForMutation(mutation, workspaces);
+      if (!destination) throw new Error(`pending learning mutation ${mutation.mutationId} destination is unavailable`);
+      const fetchIssuesFn = deps.fetchIssuesFn
+        ? () => deps.fetchIssuesFn(destination)
+        : () => fetchLearningIssues(destination.apiKey, { teamKey: destination.config.teamKey, projectId: destination.config.projectId });
+      await executeLearningMutations({
+        mutations: [{ ...mutation, status: undefined, confirmedAt: undefined }],
+        walManagedExternally: true,
+        apiKey: destination.apiKey,
+        teamKey: destination.config.teamKey,
+        projectId: destination.config.projectId,
+      }, { ...deps, fetchIssuesFn });
+      for (const item of unconfirmed) store.confirmMutation(item.lens, mutation.mutationId);
+      resumed += 1;
+    }
+  }
+  for (const [lens] of pendingLenses) {
+    if (!store.commitLens(lens)) throw new Error(`pending learning WAL for ${lens} did not fully confirm`);
+  }
+  return { resumed };
+}
+
 export async function executeLearningCycleWrites({
   findings = [],
   workspaces = [],
@@ -3233,8 +3329,22 @@ export async function executeLearningCycleWrites({
   capturedThrough = new Date().toISOString(),
   snapshot = { capturedThrough, observations: [], coverage: { complete: true, gaps: [] } },
   dueDecisions = null,
+  forceAllLenses = false,
   from = null,
 } = {}, deps = {}) {
+  const store = stateStore || openLearningStateStore();
+  const recovery = await resumePendingLearningWrites(store, workspaces, deps);
+  const dueLensNames = new Set(Object.entries(dueDecisions?.lenses || {}).filter(([, decision]) => decision?.due).map(([lens]) => lens));
+  const lensAllowed = (lens) => forceAllLenses || !dueDecisions?.lenses || dueLensNames.has(lens);
+  const carried = Object.entries(store.snapshot?.()?.lenses || {}).flatMap(([lens, lensState]) =>
+    lensAllowed(lens) ? Object.values(lensState?.accumulated || {}) : []);
+  const cycleFindings = aggregateLearningFindings([...carried, ...findings]);
+  const retryAccumulatedRoots = new Set();
+  const accumulate = (finding) => {
+    for (const lens of finding?.lenses || ["reliability"]) {
+      if (lensAllowed(lens)) store.updateAccumulated?.(lens, { upsert: [finding] });
+    }
+  };
   const destinations = new Map();
   const deferred = [];
   for (const workspace of workspaces) {
@@ -3242,13 +3352,20 @@ export async function executeLearningCycleWrites({
     const key = `${workspace.sourceAnchorPath}\0${workspace.config.projectId}`;
     destinations.set(key, { destination: workspace, findings: [] });
   }
-  for (const finding of findings) {
+  for (const finding of cycleFindings) {
+    if (!['medium', 'high'].includes(finding.confidence) || finding.actionable === false) {
+      accumulate(finding);
+      deferred.push({ finding, reason: finding.confidence === "low" ? "low-confidence-accumulated" : "not-actionable-accumulated" });
+      continue;
+    }
     const candidates = workspaces.filter((workspace) => workspace.config?.projectId === finding.projectId);
     const sourceScoped = candidates.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
     const destination = (sourceScoped.length ? sourceScoped : candidates)
       .sort((a, b) => a.sourceAnchorPath.localeCompare(b.sourceAnchorPath))[0];
     if (!destination?.apiKey) {
       deferred.push({ finding, reason: destination ? "destination-credential-missing" : "destination-workspace-missing" });
+      accumulate(finding);
+      retryAccumulatedRoots.add(finding.rootFingerprint);
       continue;
     }
     const key = `${destination.sourceAnchorPath}\0${finding.projectId}`;
@@ -3256,8 +3373,8 @@ export async function executeLearningCycleWrites({
     destinations.get(key).findings.push(finding);
   }
 
-  const store = stateStore || openLearningStateStore();
   const prepared = [];
+  const resolvedAccumulatedRoots = new Set();
   const evaluationSummary = { active: 0, confirmed: 0, restored: 0, errors: [] };
   let remainingCreates = Math.min(6, Math.max(0, Math.floor(Number(registry.learning?.maxNewCardsPerRun ?? 6)) || 0));
   for (const { destination, findings: destinationFindings } of [...destinations.values()].sort((a, b) => a.destination.sourceAnchorPath.localeCompare(b.destination.sourceAnchorPath))) {
@@ -3279,12 +3396,48 @@ export async function executeLearningCycleWrites({
     evaluationSummary.restored += evaluationResult.restored;
     evaluationSummary.errors.push(...evaluationResult.errors);
     if (evaluationResult.confirmed) liveIssues = await fetchIssuesFn();
-    const planned = planLearningMutations(destinationFindings, liveIssues, {
+    const safeFindings = [];
+    for (const finding of destinationFindings) {
+      const routeLabels = destination.config?.repoRouting?.byLabel && typeof destination.config.repoRouting.byLabel === "object"
+        ? Object.entries(destination.config.repoRouting.byLabel).filter(([, repoEntry]) => repoEntry === finding.repoEntry).map(([label]) => label)
+        : [];
+      const requiredRouteLabel = routeLabels.length === 1 ? routeLabels[0] : null;
+      const collision = liveIssues.find((issue) => issue.rootFingerprint === finding.rootFingerprint
+        && learningIssueProvenanceError(issue, { rootFingerprint: finding.rootFingerprint, requiredRouteLabel }));
+      if (collision) {
+        deferred.push({ finding, reason: "marker-provenance-collision", issueId: collision.id });
+        accumulate(finding);
+        retryAccumulatedRoots.add(finding.rootFingerprint);
+      } else safeFindings.push(finding);
+    }
+    const planned = planLearningMutations(safeFindings, liveIssues, {
       ...destination.config,
       maxNewCardsPerRun: remainingCreates,
     });
+    const destinationMetadata = { sourceAnchorPath: destination.sourceAnchorPath, projectId: destination.config.projectId, teamKey: destination.config.teamKey };
+    for (const mutation of planned.mutations) {
+      mutation.destination = destinationMetadata;
+      const routeLabels = destination.config?.repoRouting?.byLabel && typeof destination.config.repoRouting.byLabel === "object"
+        ? Object.entries(destination.config.repoRouting.byLabel).filter(([, repoEntry]) => repoEntry === mutation.finding?.repoEntry).map(([label]) => label)
+        : [];
+      mutation.requiredRouteLabel = mutation.routeLabel || (routeLabels.length === 1 ? routeLabels[0] : null);
+    }
     remainingCreates -= planned.mutations.filter((mutation) => mutation.action === "create").length;
     deferred.push(...planned.deferred);
+    const retryReasons = new Set(["new-card-budget", "ambiguous-or-missing-route-label", "recurrence-evidence-time-unproven"]);
+    const retryRoots = new Set();
+    for (const item of planned.deferred) {
+      if (retryReasons.has(item.reason)) {
+        accumulate(item.finding);
+        retryRoots.add(item.finding?.rootFingerprint);
+        retryAccumulatedRoots.add(item.finding?.rootFingerprint);
+      }
+    }
+    const mutationRoots = new Set(planned.mutations.map((mutation) => mutation.rootFingerprint));
+    for (const finding of destinationFindings) {
+      if (!mutationRoots.has(finding.rootFingerprint) && !retryRoots.has(finding.rootFingerprint)
+        && !retryAccumulatedRoots.has(finding.rootFingerprint)) resolvedAccumulatedRoots.add(finding.rootFingerprint);
+    }
     prepared.push({ destination, mutations: planned.mutations, fetchIssuesFn, findingCount: destinationFindings.length });
   }
   const mutations = prepared.flatMap((entry) => entry.mutations);
@@ -3328,7 +3481,14 @@ export async function executeLearningCycleWrites({
   for (const lens of byLens.keys()) {
     if (!store.commitLens(lens)) throw new Error(`learning WAL for ${lens} did not fully confirm`);
   }
+  for (const mutation of mutations) {
+    for (const lens of mutation.lenses || []) store.updateAccumulated?.(lens, { remove: [mutation.rootFingerprint] });
+  }
+  for (const rootFingerprint of resolvedAccumulatedRoots) {
+    for (const lens of Object.keys(store.snapshot?.()?.lenses || {})) store.updateAccumulated?.(lens, { remove: [rootFingerprint] });
+  }
   return {
+    resumed: recovery.resumed,
     mutations: mutations.length,
     confirmed,
     deferred,
@@ -4791,6 +4951,8 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     issueIdentifier: pick.issueIdentifier,
     sourceWorkspace: pick.childEnv?.AUTO_SWEEP_SOURCE_ANCHOR
       || canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath || "."),
+    projectId: pick.config?.projectId,
+    repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0] || ".",
     sweep: pick.sweep,
     slotIndex: pick.slotIndex || 0,
     sameRepoLimit: pick.sameRepoLimit,
@@ -5793,13 +5955,14 @@ async function tick({ dryRun = false } = {}) {
         coverageGaps: [...indexed.coverageGaps, ...learningResolved.coverageGaps, ...stateResult.coverageGaps],
       });
       const preview = buildLearningCyclePreview({ registry: reg, workspaces: learningResolved.workspaces, state: stateResult.state, snapshot, now: learningNow });
+      const automaticFindings = filterLearningFindingsForRun(preview.findings, preview.due, { automatic: true });
       if (dryRun) {
         log(`[dry-run] learning due=${preview.due.due} admitted=${preview.admitted.length} deferred=${preview.deferred.length}`);
       } else {
         const learningResult = await runPostDeliveryLearning({
           registry: reg,
           dueDecisions: preview.due,
-          findings: preview.qualified,
+          findings: automaticFindings,
           ledger: capacityLedger,
           dispatchFn: reg.learning?.runtime
             ? (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: reg.learning.runtime }, { onSpawn })
@@ -6049,10 +6212,11 @@ async function cmdLearningRun(args = []) {
   const stateResult = readLearningStateSafe();
   const snapshot = buildLearningEvidenceSnapshot({ capturedThrough: now, runRecords: indexed.runRecords, events: indexed.events, observations: indexed.observations, coverageGaps: [...indexed.coverageGaps, ...resolved.coverageGaps, ...stateResult.coverageGaps] });
   const preview = buildLearningCyclePreview({ registry, workspaces: resolved.workspaces, state: stateResult.state, snapshot, now });
+  const runFindings = filterLearningFindingsForRun(preview.findings, preview.due, { automatic });
   const execution = learningRunExecutionDecision({ dryRun, automatic, due: preview.due.due });
   if (execution === "dry-run") {
     const livePlan = await buildLiveLearningDryRunPlan({
-      findings: preview.qualified,
+      findings: runFindings,
       workspaces: resolved.workspaces,
       registry,
       snapshot,
@@ -6068,7 +6232,7 @@ async function cmdLearningRun(args = []) {
   const result = await runPostDeliveryLearning({
     registry,
     dueDecisions: automatic ? preview.due : { ...preview.due, due: true, anyDue: true, forced: true },
-    findings: preview.qualified,
+    findings: runFindings,
     ledger,
     dispatchFn: registry.learning?.runtime
       ? (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: registry.learning.runtime }, { onSpawn })
@@ -6080,6 +6244,7 @@ async function cmdLearningRun(args = []) {
       capturedThrough: now,
       snapshot,
       dueDecisions: preview.due,
+      forceAllLenses: !automatic,
     }),
   });
   console.log(JSON.stringify({ ...result, due: preview.due }, null, 2));

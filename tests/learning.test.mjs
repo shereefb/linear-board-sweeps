@@ -69,6 +69,11 @@ test("learning contracts expose stable stage, trigger, lenses, and taxonomy", ()
 
 const learningFinding = (overrides = {}) => ({
   rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1", "e2"],
+  occurrences: [
+    { id: "e1", occurredAt: "2026-07-02T00:00:00.000Z" },
+    { id: "e2", occurredAt: "2026-07-06T00:00:00.000Z" },
+  ],
+  firstSeenAt: "2026-07-01T00:00:00.000Z", lastSeenAt: "2026-07-10T00:00:00.000Z",
   confidence: "high", severity: "high", actionable: true, projectId: "project-1",
   repoEntry: "app", impact: "Repeated failures", ...overrides,
 });
@@ -93,13 +98,13 @@ test("learning mutation planner creates, updates active cards, and preserves Sig
 });
 
 test("learning mutation planner handles Done recurrence, duplicates, cap, and six-create budget", () => {
-  const done = [{ id: "done-0", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], outcomeStatus: "no-measurable-change" }];
+  const done = [{ id: "done-0", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], completedAt: "2026-07-05T00:00:00.000Z", outcomeStatus: "no-measurable-change" }];
   const recurrence = planLearningMutations([learningFinding()], done, {});
   assert.equal(recurrence.mutations.find((item) => item.action === "create")?.generation, 1);
   assert.equal(recurrence.mutations.find((item) => item.action === "create")?.relatedIssueId, "done-0");
 
   const capped = planLearningMutations([learningFinding({ generation: 3 })], [{
-    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], outcomeStatus: "regression",
+    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], completedAt: "2026-07-05T00:00:00.000Z", outcomeStatus: "regression",
   }], {});
   assert.equal(capped.mutations.some((item) => item.action === "create"), false);
   assert.equal(capped.mutations.find((item) => item.action === "block-generation-cap")?.issueId, "done-3");
@@ -125,11 +130,48 @@ test("learning mutation planner gates recurrence on a confirmed terminal outcome
   ]) {
     const result = planLearningMutations([learningFinding()], [{
       id: "done", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0,
-      occurrenceIds: ["e1"], outcomeStatus,
+      occurrenceIds: ["e1"], completedAt: "2026-07-05T00:00:00.000Z", outcomeStatus,
     }], {});
     assert.equal(result.mutations.some((mutation) => mutation.action === "create"), creates, String(outcomeStatus));
     if (!creates) assert.ok(result.deferred.some((item) => item.reason === "evaluation-not-recurrence-eligible"), String(outcomeStatus));
   }
+});
+
+test("Done recurrence and generation caps require timestamp-proven post-completion evidence", () => {
+  const done = (overrides = {}) => ({
+    id: "done", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0,
+    occurrenceIds: ["known"], completedAt: "2026-07-05T00:00:00.000Z", outcomeStatus: "regression", ...overrides,
+  });
+  const finding = (occurrences, overrides = {}) => learningFinding({
+    occurrenceIds: occurrences.map((item) => item.id), occurrences,
+    firstSeenAt: "2026-07-01T00:00:00.000Z", lastSeenAt: "2026-07-10T00:00:00.000Z", ...overrides,
+  });
+
+  const preDone = planLearningMutations([finding([{ id: "unknown-pre", occurredAt: "2026-07-04T00:00:00.000Z" }])], [done()], {});
+  assert.equal(preDone.mutations.length, 0);
+  assert.equal(preDone.deferred[0].reason, "no-post-completion-evidence");
+
+  const mixed = planLearningMutations([finding([
+    { id: "unknown-pre", occurredAt: "2026-07-04T00:00:00.000Z" },
+    { id: "unknown-post", occurredAt: "2026-07-06T00:00:00.000Z" },
+  ])], [done()], {});
+  const recurrence = mixed.mutations.find((item) => item.action === "create");
+  assert.deepEqual(recurrence.finding.occurrenceIds, ["unknown-post"]);
+  assert.deepEqual(recurrence.finding.occurrences, [{ id: "unknown-post", occurredAt: "2026-07-06T00:00:00.000Z" }]);
+
+  for (const [label, issue, evidence] of [
+    ["missing completedAt", done({ completedAt: null }), [{ id: "post", occurredAt: "2026-07-06T00:00:00.000Z" }]],
+    ["missing timestamp", done(), [{ id: "post" }]],
+    ["invalid timestamp", done(), [{ id: "post", occurredAt: "invalid" }]],
+    ["outside finding window", done(), [{ id: "post", occurredAt: "2026-07-11T00:00:00.000Z" }]],
+  ]) {
+    const planned = planLearningMutations([finding(evidence)], [issue], {});
+    assert.equal(planned.mutations.length, 0, label);
+    assert.equal(planned.deferred[0].reason, "recurrence-evidence-time-unproven", label);
+  }
+
+  const capped = planLearningMutations([finding([{ id: "post", occurredAt: "2026-07-06T00:00:00.000Z" }])], [done({ generation: 3 })], {});
+  assert.deepEqual(capped.mutations.find((item) => item.action === "block-generation-cap")?.occurrenceIds, ["post"]);
 });
 
 test("learning mutation planner never budgets updates and emits no duplicate occurrence", () => {
@@ -800,6 +842,25 @@ test("outcome evaluation records every explicit status from a fixed post-change 
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(0.45)).status, "no-measurable-change");
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(0.7)).status, "regression");
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, outcomeSnapshot(null, { complete: false })).status, "inconclusive-evidence");
+});
+
+test("outcome evaluation recomputes its scoped post-Done metric instead of reusing pre-Done totals", () => {
+  const evaluation = {
+    status: "active", rootFingerprint: "root-1", generation: 0,
+    completedAt: "2026-07-15T00:00:00.000Z", windowEndsAt: "2026-07-22T00:00:00.000Z",
+    metric: "reviewFindingCount", aggregation: "count", baseline: 3, minimumChange: 3,
+    expectedDirection: "decrease", detectorId: "repeated-review-finding", signal: "review-finding", semanticKey: "correctness",
+  };
+  const snapshot = (observations) => ({
+    capturedThrough: "2026-07-22T00:00:00.000Z", observations, coverage: { complete: true, gaps: [] }, qualifiedFindings: [],
+  });
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([])).status, "verified-improvement");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([detectorObservation("review-finding", 0, {
+    occurredAt: "2026-07-18T00:00:00.000Z", category: "correctness", metrics: { reviewFindingCount: 99 },
+  })])).status, "no-measurable-change");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot(Array.from({ length: 4 }, (_, index) => detectorObservation("review-finding", index, {
+    occurredAt: `2026-07-${18 + index}T00:00:00.000Z`, category: "correctness", metrics: { reviewFindingCount: 99 },
+  })))).status, "regression");
 });
 
 test("recurrence requires fresh independent qualified evidence, permits one active generation, and caps at three", () => {

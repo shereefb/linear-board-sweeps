@@ -84,7 +84,9 @@ For scheduled card runs, emit bounded machine-readable evidence at the decision 
 
 ```bash
 node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review correctness "Null handling defect found during code review" --json-metrics '{"findings":1}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review completed "Review pass completed" --json-metrics '{"riskClass":"low","findingCount":0,"safetyFloorSatisfied":true,"reviewDurationMs":300000}' >/dev/null 2>&1 || true
 node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa functional-failure "Primary checkout flow failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa passed "QA passed" >/dev/null 2>&1 || true
 node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event bounce implementation-incomplete "Returned to Dev because the implementation is incomplete" >/dev/null 2>&1 || true
 node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event question product-decision "Human product decision required before continuing" >/dev/null 2>&1 || true
 node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event canary red "Production canary failed" >/dev/null 2>&1 || true
@@ -94,7 +96,9 @@ node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event terminal adv
 Emit:
 
 - each material review finding as `review` (`correctness`, `security`, `error-handling`, `test-gap`, `scope-gap`, `performance`, or `design`);
+- exactly one measured `review completed` event after a review pass when risk class, finding count, safety-floor result, and duration are known;
 - each QA failure as `qa` (`environment-start`, `functional-failure`, `console-error`, `network-error`, `accessibility`, `visual`, or `build`);
+- exactly one `qa passed` event for a successful QA pass, so rework-rate evidence has a denominator;
 - each backward workflow return as `bounce` (`missing-acceptance`, `missing-design`, `missing-repo-scope`, or `implementation-incomplete`);
 - each direct human dependency as `question` (`config`, `credential`, `product-decision`, `asset`, or `deploy`);
 - each red production canary as `canary red`;

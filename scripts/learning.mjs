@@ -14,6 +14,7 @@ export const MAX_LEARNING_EVENT_METRIC_STRING_CHARS = 500;
 export const MAX_LEARNING_SNAPSHOT_RUNS = 5_000;
 export const MAX_LEARNING_SNAPSHOT_EVENTS = 10_000;
 export const MAX_LEARNING_SNAPSHOT_OBSERVATIONS = 5_000;
+export const MAX_ACCUMULATED_LEARNING_FINDINGS_PER_LENS = 200;
 export const LEARNING_EVENT_TAXONOMY = Object.freeze({
   review: Object.freeze(["correctness", "security", "error-handling", "test-gap", "scope-gap", "performance", "design", "completed"]),
   qa: Object.freeze(["environment-start", "passed", "functional-failure", "console-error", "network-error", "accessibility", "visual", "build"]),
@@ -292,20 +293,20 @@ function boundedLimit(value, fallback) {
 }
 
 const SIGNAL_METRIC_CONTRACTS = Object.freeze({
-  "dispatch-failure": Object.freeze({ name: "dispatchFailureCount", aggregation: "latest", unit: "occurrences" }),
-  "stale-claim": Object.freeze({ name: "staleClaimCount", aggregation: "latest", unit: "occurrences" }),
-  "failure-recovery": Object.freeze({ name: "failedRecoveryCount", aggregation: "latest", unit: "occurrences" }),
-  "safety-invariant": Object.freeze({ name: "safetyInvariantCount", aggregation: "latest", unit: "occurrences" }),
-  "poison-card": Object.freeze({ name: "poisonCardCount", aggregation: "latest", unit: "occurrences" }),
-  "review-finding": Object.freeze({ name: "reviewFindingCount", aggregation: "latest", unit: "occurrences" }),
-  "qa-result": Object.freeze({ name: "qaNeedsChangesRate", aggregation: "latest", unit: "ratio" }),
-  "spec-bounce": Object.freeze({ name: "specBounceCount", aggregation: "latest", unit: "occurrences" }),
-  "human-question": Object.freeze({ name: "humanQuestionCount", aggregation: "latest", unit: "occurrences" }),
-  "red-canary": Object.freeze({ name: "redCanaryCount", aggregation: "latest", unit: "occurrences" }),
+  "dispatch-failure": Object.freeze({ name: "dispatchFailureCount", aggregation: "count", unit: "occurrences" }),
+  "stale-claim": Object.freeze({ name: "staleClaimCount", aggregation: "count", unit: "occurrences" }),
+  "failure-recovery": Object.freeze({ name: "failedRecoveryCount", aggregation: "count", unit: "occurrences" }),
+  "safety-invariant": Object.freeze({ name: "safetyInvariantCount", aggregation: "count", unit: "occurrences" }),
+  "poison-card": Object.freeze({ name: "poisonCardCount", aggregation: "count", unit: "occurrences" }),
+  "review-finding": Object.freeze({ name: "reviewFindingCount", aggregation: "count", unit: "occurrences" }),
+  "qa-result": Object.freeze({ name: "qaNeedsChangesRate", aggregation: "rate", unit: "ratio" }),
+  "spec-bounce": Object.freeze({ name: "specBounceCount", aggregation: "count", unit: "occurrences" }),
+  "human-question": Object.freeze({ name: "humanQuestionCount", aggregation: "count", unit: "occurrences" }),
+  "red-canary": Object.freeze({ name: "redCanaryCount", aggregation: "count", unit: "occurrences" }),
   "queue-run": Object.freeze({ name: "waitMs", aggregation: "p90", unit: "milliseconds" }),
   "stage-run": Object.freeze({ name: "durationMs", aggregation: "p90", unit: "milliseconds" }),
-  "productive-run": Object.freeze({ name: "nonproductiveRate", aggregation: "latest", unit: "ratio" }),
-  "capacity-run": Object.freeze({ name: "capacityDeferralRate", aggregation: "latest", unit: "ratio" }),
+  "productive-run": Object.freeze({ name: "nonproductiveRate", aggregation: "rate", unit: "ratio" }),
+  "capacity-run": Object.freeze({ name: "capacityDeferralRate", aggregation: "rate", unit: "ratio" }),
   "review-run": Object.freeze({ name: "reviewDurationMs", aggregation: "p90", unit: "milliseconds" }),
 });
 
@@ -986,7 +987,9 @@ function detectorFinding(detector, observations, snapshot, config) {
   const category = observations.find((item) => item.category)?.category || detector.signal;
   const metric = SIGNAL_METRIC_CONTRACTS[detector.signal];
   const metricValues = observations.map((item) => Number(item.metrics?.[metric.name])).filter(Number.isFinite);
-  const baselineValue = metric.aggregation === "p90" ? percentile(metricValues, 0.9) : metricValues.at(-1);
+  const baselineValue = metric.aggregation === "p90" ? percentile(metricValues, 0.9)
+    : metric.aggregation === "count" ? observations.length
+      : metricValues.at(-1);
   return {
     schemaVersion: 1,
     detectorId: detector.id,
@@ -1013,7 +1016,15 @@ function detectorFinding(detector, observations, snapshot, config) {
     evidenceReferences: [...new Set(observations.flatMap((item) => item.references || []).filter(Boolean))].sort(),
     rootCauseHypothesis: `A shared ${category} factory condition may be causing the observed pattern.`,
     desiredOutcome: `Reduce repeated ${category} evidence without weakening safety gates.`,
-    acceptanceMetric: { name: metric.name, direction: "decrease", target: 0, aggregation: metric.aggregation },
+    acceptanceMetric: {
+      name: metric.name,
+      direction: "decrease",
+      target: 0,
+      aggregation: metric.aggregation,
+      detectorId: detector.id,
+      signal: detector.signal,
+      semanticKey: detectorSemanticKey(detector.id, observations[0] || {}, detector.signal),
+    },
     evaluationWindow: clone(detector.evaluationWindow),
     exclusions: ["Do not bypass review, QA, Signoff, or the human Ship gate."],
     actionable: Boolean(projectId && repoEntry),
@@ -1173,6 +1184,29 @@ function learningIssueOrder(a, b) {
     || String(a.identifier || a.id).localeCompare(String(b.identifier || b.id));
 }
 
+function postCompletionOccurrences(finding, issue, freshIds) {
+  const completedAt = Date.parse(issue?.completedAt || "");
+  const windowStart = Date.parse(finding?.firstSeenAt || "");
+  const windowEnd = Date.parse(finding?.lastSeenAt || "");
+  if ([completedAt, windowStart, windowEnd].some(Number.isNaN) || windowStart > windowEnd) {
+    return { ok: false, reason: "recurrence-evidence-time-unproven" };
+  }
+  const byId = groupBy((finding.occurrences || []).filter((item) => item?.id), (item) => item.id);
+  const proven = [];
+  for (const id of freshIds) {
+    const matches = byId.get(id) || [];
+    if (matches.length !== 1) return { ok: false, reason: "recurrence-evidence-time-unproven" };
+    const occurredAt = Date.parse(matches[0].occurredAt || "");
+    if (Number.isNaN(occurredAt) || occurredAt < windowStart || occurredAt > windowEnd) {
+      return { ok: false, reason: "recurrence-evidence-time-unproven" };
+    }
+    if (occurredAt > completedAt) proven.push(clone(matches[0]));
+  }
+  if (!proven.length) return { ok: false, reason: "no-post-completion-evidence" };
+  proven.sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)) || String(a.id).localeCompare(String(b.id)));
+  return { ok: true, occurrences: proven, occurrenceIds: proven.map((item) => item.id) };
+}
+
 // Pure, retry-stable planning. Linear remains authoritative: callers must build
 // liveIssues from complete marker/comment pagination immediately before using it.
 export function planLearningMutations(findings = [], liveIssues = [], config = {}) {
@@ -1225,11 +1259,19 @@ export function planLearningMutations(findings = [], liveIssues = [], config = {
         deferred.push({ finding, reason: "evaluation-not-recurrence-eligible", generation, outcomeStatus: primary.outcomeStatus || null });
         continue;
       }
+      let recurrenceEvidence = null;
+      if (primary.stateName === "Done") {
+        recurrenceEvidence = postCompletionOccurrences(finding, primary, fresh);
+        if (!recurrenceEvidence.ok) {
+          deferred.push({ finding, reason: recurrenceEvidence.reason, generation });
+          continue;
+        }
+      }
       if (primary.stateName === "Done" && generation >= 3) {
         mutations.push({
-          mutationId: learningMutationId("block-generation-cap", rootFingerprint, generation, fresh.join(",")),
+          mutationId: learningMutationId("block-generation-cap", rootFingerprint, generation, recurrenceEvidence.occurrenceIds.join(",")),
           action: "block-generation-cap", rootFingerprint, generation, issueId: primary.id,
-          occurrenceIds: fresh, finding,
+          occurrenceIds: recurrenceEvidence.occurrenceIds, finding,
         });
         continue;
       }
@@ -1238,7 +1280,15 @@ export function planLearningMutations(findings = [], liveIssues = [], config = {
           deferred.push({ finding, reason: "new-card-budget", generation: generation + 1 });
           continue;
         }
-        const recurrenceFinding = { ...clone(finding), generation: generation + 1 };
+        const recurrenceFinding = {
+          ...clone(finding),
+          generation: generation + 1,
+          occurrenceIds: recurrenceEvidence.occurrenceIds,
+          occurrences: recurrenceEvidence.occurrences,
+          occurrenceCount: recurrenceEvidence.occurrenceIds.length,
+          firstSeenAt: recurrenceEvidence.occurrences[0].occurredAt,
+          lastSeenAt: recurrenceEvidence.occurrences.at(-1).occurredAt,
+        };
         mutations.push({
           mutationId: learningMutationId("create", rootFingerprint, generation + 1),
           action: "create", rootFingerprint, generation: generation + 1,
@@ -1271,15 +1321,28 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     const time = Date.parse(item.occurredAt || item.at || "");
     return time > Date.parse(evaluation.completedAt || "") && time <= windowEndsAtMs;
   }).sort((a, b) => Date.parse(a.occurredAt || a.at) - Date.parse(b.occurredAt || b.at));
-  const values = observations.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
+  const scoped = evaluation.detectorId && evaluation.signal && evaluation.semanticKey
+    ? observations.filter((item) => item.signal === evaluation.signal
+      && detectorSemanticKey(evaluation.detectorId, item, evaluation.signal) === evaluation.semanticKey)
+    : observations;
+  const values = scoped.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
   let status = windowReady ? "inconclusive-evidence" : "not-due";
-  if (windowReady && coverageComplete && values.length) {
-    const value = evaluation.aggregation === "p90" ? percentile(values, 0.9) : values.at(-1);
+  const scopedContract = Boolean(evaluation.detectorId && evaluation.signal && evaluation.semanticKey);
+  if (windowReady && coverageComplete && (values.length || scopedContract)) {
+    let value;
+    if (evaluation.aggregation === "p90") value = percentile(values, 0.9);
+    else if (evaluation.aggregation === "count") value = new Set(scoped.map((item) => item.evidenceId || item.eventId || item.runId || item.cardId).filter(Boolean)).size;
+    else if (evaluation.aggregation === "rate" && evaluation.signal === "qa-result") value = scoped.length ? scoped.filter((item) => item.result === "needs-changes").length / scoped.length : 0;
+    else if (evaluation.aggregation === "rate" && evaluation.signal === "productive-run") value = scoped.length ? scoped.filter((item) => item.success === true && item.productive === false).length / scoped.length : 0;
+    else if (evaluation.aggregation === "rate" && evaluation.signal === "capacity-run") value = scoped.length ? scoped.filter((item) => item.deferred === true).length / scoped.length : 0;
+    else value = values.at(-1);
     const baseline = Number(evaluation.baseline);
     const change = Number(evaluation.minimumChange || 0);
-    const improved = evaluation.expectedDirection === "increase" ? value - baseline >= change : baseline - value >= change;
-    const regressed = evaluation.expectedDirection === "increase" ? value < baseline : value > baseline;
-    status = improved ? "verified-improvement" : regressed ? "regression" : "no-measurable-change";
+    if (Number.isFinite(value)) {
+      const improved = evaluation.expectedDirection === "increase" ? value - baseline >= change : baseline - value >= change;
+      const regressed = evaluation.expectedDirection === "increase" ? value < baseline : value > baseline;
+      status = improved ? "verified-improvement" : regressed ? "regression" : "no-measurable-change";
+    }
   }
   const recurrence = { action: "none", generation: evaluation.generation || 0, rootFingerprint: evaluation.rootFingerprint };
   if (["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration == null) {
@@ -1431,6 +1494,29 @@ export function createLearningStateStore({
       candidate.evaluations[id] = clone(evaluation);
       persistCandidate(candidate);
       return clone(candidate.evaluations[id]);
+    },
+
+    updateAccumulated(lens, { upsert = [], remove = [] } = {}) {
+      requireLens(lens);
+      const candidate = clone(state);
+      const accumulated = { ...(candidate.lenses[lens].accumulated || {}) };
+      for (const rootFingerprint of remove) delete accumulated[String(rootFingerprint || "")];
+      for (const finding of upsert) {
+        const rootFingerprint = String(finding?.rootFingerprint || "").trim();
+        if (!rootFingerprint) throw new Error("accumulated learning finding requires rootFingerprint");
+        accumulated[rootFingerprint] = clone(finding);
+      }
+      const confidence = { high: 3, medium: 2, low: 1 };
+      const severity = { critical: 4, high: 3, medium: 2, low: 1 };
+      const bounded = Object.fromEntries(Object.entries(accumulated).sort(([, a], [, b]) =>
+        (confidence[b?.confidence] || 0) - (confidence[a?.confidence] || 0)
+        || (severity[b?.severity] || 0) - (severity[a?.severity] || 0)
+        || String(b?.lastSeenAt || "").localeCompare(String(a?.lastSeenAt || ""))
+        || String(a?.rootFingerprint || "").localeCompare(String(b?.rootFingerprint || "")))
+        .slice(0, MAX_ACCUMULATED_LEARNING_FINDINGS_PER_LENS));
+      candidate.lenses[lens].accumulated = bounded;
+      persistCandidate(candidate);
+      return clone(bounded);
     },
 
     stageWindow(lens, { from = null, capturedThrough, mutations = [] } = {}) {
