@@ -17,13 +17,17 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
+  compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, admitDemand,
+  runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  admissionDemandsForCandidates,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
+  DEFAULT_MAX_ACTIVE_CHILDREN,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -83,6 +87,18 @@ test("normalizeRegistry: managed workspace roots include a path hash to avoid sa
   const roots = normalized.repos.map((repo) => normalized.managedAnchors[repo].managedWorkspaceRoot);
   assert.equal(new Set(roots).size, 2);
   assert.ok(roots.every((root) => /workspaces\/app-[a-f0-9]{8}$/.test(root)), roots.join(", "));
+});
+test("capacity registry: legacy registries default to exactly ten and configured values clamp to positive integers", () => {
+  assert.deepEqual(normalizeRegistry({}).capacity, { maxActiveChildren: 10 });
+  assert.equal(DEFAULT_MAX_ACTIVE_CHILDREN, 10);
+  assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 3.9 } }).capacity.maxActiveChildren, 3);
+  assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 0 } }).capacity.maxActiveChildren, 1);
+  assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: "invalid" } }).capacity.maxActiveChildren, 10);
+});
+test("capacity installation: persists ten without deleting existing registry settings", () => {
+  const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/install-watch.sh"), "utf8");
+  assert.match(source, /capacity:\s*\{\s*maxActiveChildren:\s*10\s*\}/);
+  assert.match(source, /registry\s*=\s*\{\s*\.\.\.registry,\s*capacity:/);
 });
 test("resolveWorkspaceRepos: managed mode maps relative and absolute repos under the managed workspace", () => {
   const record = workspaceRecordForSourceAnchor("/src/app", {
@@ -432,6 +448,172 @@ test("lockIsReclaimable: a legitimately long-running (alive) tick is never recla
   // The bug the PID lock fixes: age alone must NOT free a live lock.
   assert.equal(lockIsReclaimable({ pid: 999, at: "2000-01-01T00:00:00Z" }, { isAlive: () => true }), false);
 });
+test("capacity ledger: reserves before work, attaches child PID, and releases idempotently", async () => {
+  let stored = null;
+  const writes = [];
+  const ledger = createCapacityLedger({
+    ledgerPath: "/state/capacity.json",
+    maxActiveChildren: 10,
+    parentPid: 123,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => {
+      stored = structuredClone(value);
+      writes.push(structuredClone(value));
+    },
+    isAlive: () => true,
+    randomUUID: () => "token-1",
+    now: () => "2026-07-09T12:00:00.000Z",
+  });
+  const events = [];
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (_demand, reservation) => {
+      events.push(["execute", structuredClone(stored)]);
+      reservation.attachChildPid(456);
+      events.push(["attached", structuredClone(stored)]);
+      return "done";
+    },
+  });
+
+  const result = await admitDemand({
+    stage: "dev", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-1",
+  }, { queue });
+
+  assert.equal(result, "done");
+  assert.equal(events[0][1].entries[0].childPid, null);
+  assert.equal(events[1][1].entries[0].childPid, 456);
+  assert.deepEqual(stored, { version: 1, entries: [] });
+  assert.equal(ledger.release("token-1"), false);
+  assert.equal(writes.length, 3);
+});
+test("capacity ledger: live children survive dead parents while dead child/dead parent entries prune", () => {
+  let stored = {
+    version: 1,
+    entries: [
+      { token: "live-child", parentPid: 10, childPid: 20, issueIdentifier: "COD-1", workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z" },
+      { token: "dead-child", parentPid: 11, childPid: 21, issueIdentifier: "COD-2", workspace: "/managed", stage: "qa", trigger: "handoff", reservedAt: "2026-07-09T00:00:00.000Z" },
+      { token: "dead-reservation", parentPid: 12, childPid: null, issueIdentifier: "COD-3", workspace: "/managed", stage: "spec", trigger: "refill", reservedAt: "2026-07-09T00:00:00.000Z" },
+    ],
+  };
+  const ledger = createCapacityLedger({
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: (pid) => pid === 20,
+  });
+
+  const snapshot = ledger.reconcile();
+  assert.deepEqual(snapshot.entries.map((entry) => entry.token), ["live-child"]);
+  assert.equal(snapshot.active, 1);
+});
+test("capacity ledger: malformed or unverifiable entries fail closed and consume capacity", () => {
+  const malformed = createCapacityLedger({
+    maxActiveChildren: 10,
+    readJsonFn: () => ({ version: 1, entries: [{ token: "broken" }] }),
+    writeJsonFn: () => assert.fail("malformed ledger must not be rewritten automatically"),
+  }).inspect();
+  assert.equal(malformed.healthy, false);
+  assert.equal(malformed.active, 1);
+
+  const unverifiable = createCapacityLedger({
+    maxActiveChildren: 1,
+    readJsonFn: () => ({ version: 1, entries: [
+      { token: "unknown", parentPid: 10, childPid: 20, issueIdentifier: "COD-1", workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z" },
+    ] }),
+    writeJsonFn: () => assert.fail("unverifiable ledger must not be rewritten automatically"),
+    isAlive: () => { throw new Error("permission denied"); },
+  });
+  assert.equal(unverifiable.reconcile().healthy, false);
+  assert.equal(unverifiable.reserve({ stage: "qa", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-2" }), null);
+});
+test("capacity admission: eleven simultaneous demands never run more than ten", async () => {
+  let stored = null;
+  let active = 0;
+  let peak = 0;
+  const releases = [];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 10,
+    parentPid: 100,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `token-${++n}`; })(),
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => releases.push(resolve));
+      active -= 1;
+    },
+  });
+  const runs = Array.from({ length: 11 }, (_, index) => admitDemand({
+    stage: "dev", trigger: "initial", boardOrder: 11 - index, rotationRank: 0,
+    issueIdentifier: `COD-${index + 1}`, workspace: "/managed",
+  }, { queue }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(active, 10);
+  assert.equal(peak, 10);
+  assert.equal(stored.entries.length, 10);
+
+  releases.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(active, 10);
+  assert.equal(peak, 10);
+  for (const release of releases.splice(0)) release();
+  await Promise.all(runs);
+  assert.equal(stored.entries.length, 0);
+});
+test("capacity admission: queued Ship is exclusive and waits for active non-Ship work", async () => {
+  let stored = null;
+  const started = [];
+  const releases = [];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 3,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `token-${++n}`; })(),
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (demand) => {
+      started.push(demand.issueIdentifier);
+      await new Promise((resolve) => releases.push(resolve));
+    },
+  });
+  const dev = admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: "COD-DEV", workspace: "/managed" }, { queue });
+  await new Promise((resolve) => setImmediate(resolve));
+  const spec = admitDemand({ stage: "spec", trigger: "initial", issueIdentifier: "COD-SPEC", workspace: "/managed" }, { queue });
+  const ship = admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP", workspace: "/managed" }, { queue });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["COD-DEV"]);
+  releases.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["COD-DEV", "COD-SHIP"]);
+  releases.shift()();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(started, ["COD-DEV", "COD-SHIP", "COD-SPEC"]);
+  releases.shift()();
+  await Promise.all([dev, spec, ship]);
+});
+test("capacity admission: each completed child is handled before later siblings finish", async () => {
+  const resolvers = new Map();
+  const handled = [];
+  const queue = {
+    admitDemand: (demand) => new Promise((resolve) => resolvers.set(demand.issueIdentifier, resolve)),
+  };
+  const run = runAdmissionDemands([
+    { issueIdentifier: "COD-1" },
+    { issueIdentifier: "COD-2" },
+  ], { queue, onResult: async (result) => handled.push(result.issueIdentifier) });
+
+  resolvers.get("COD-1")({ issueIdentifier: "COD-1" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(handled, ["COD-1"]);
+  resolvers.get("COD-2")({ issueIdentifier: "COD-2" });
+  assert.deepEqual((await run).map((result) => result.issueIdentifier), ["COD-1", "COD-2"]);
+});
 
 // ── version compare ──────────────────────────────────────────────────────────
 test("isNewerVersion: different non-empty marker is newer; same or empty is not", () => {
@@ -638,6 +820,32 @@ test("selectDispatch: within a sweep, top board card first; zero-count ignored; 
   ]);
   assert.equal(pick.topCard.identifier, "COD-2");
   assert.equal(selectDispatch([{ sweep: "dev", count: 0, topCard: { sortOrder: 1 } }]), null);
+});
+test("admission priority: Ship, stage, same-stage handoff, board, rotation, and identifier form a total order", () => {
+  const demands = [
+    { stage: "spec", trigger: "handoff", boardOrder: 99, rotationRank: 0, issueIdentifier: "COD-9" },
+    { stage: "dev", trigger: "handoff", boardOrder: 1, rotationRank: 0, issueIdentifier: "COD-8" },
+    { stage: "qa", trigger: "refill", boardOrder: 90, rotationRank: 0, issueIdentifier: "COD-7" },
+    { stage: "qa", trigger: "initial", boardOrder: 100, rotationRank: 1, issueIdentifier: "COD-6" },
+    { stage: "qa", trigger: "handoff", boardOrder: 1, rotationRank: 9, issueIdentifier: "COD-5" },
+    { stage: "ship", trigger: "initial", boardOrder: 0, rotationRank: 9, issueIdentifier: "COD-4" },
+  ];
+  assert.deepEqual(demands.sort(compareAdmissionDemand).map((d) => d.issueIdentifier), [
+    "COD-4", "COD-5", "COD-6", "COD-7", "COD-8", "COD-9",
+  ]);
+
+  const ties = [
+    { stage: "dev", trigger: "refill", boardOrder: 5, rotationRank: 1, issueIdentifier: "COD-2" },
+    { stage: "dev", trigger: "initial", boardOrder: 5, rotationRank: 0, issueIdentifier: "COD-9" },
+    { stage: "dev", trigger: "initial", boardOrder: 5, rotationRank: 0, issueIdentifier: "COD-1" },
+  ];
+  assert.deepEqual(ties.sort(compareAdmissionDemand).map((d) => d.issueIdentifier), ["COD-1", "COD-9", "COD-2"]);
+});
+test("admission priority: a lower-stage handoff never leapfrogs a higher stage", () => {
+  assert.ok(compareAdmissionDemand(
+    { stage: "dev", trigger: "handoff", issueIdentifier: "COD-1" },
+    { stage: "qa", trigger: "refill", issueIdentifier: "COD-2" },
+  ) > 0);
 });
 test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
   assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);
@@ -1314,6 +1522,58 @@ test("buildSameRepoRefillDispatches: live board claims count against refill capa
   assert.equal(result.reason, "no-capacity");
   assert.deepEqual(claimCalls, []);
 });
+test("capacity refill admission: deferred mode returns unclaimed demands", async () => {
+  const claimCalls = [];
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "COD-4",
+      pick: {
+        anchorPath: "/ws/repo",
+        sweep: "dev",
+        issueIdentifier: "COD-4",
+        config: { teamKey: "COD", projectId: "project-1", repos: ["repo"], parallel: { sameRepoCardLimits: { dev: 2 } } },
+      },
+    },
+    activeByAnchor: new Map([["/ws/repo", { apiKey: "lin" }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget: { remaining: 2 },
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    now: NOW,
+    deferClaim: true,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-1"]),
+      fetchCards: async () => [
+        dependencyReadyCard({ id: "next-1", identifier: "COD-5", sortOrder: 20, updatedAt: minsAgo(1), labelNames: [], comments: [] }),
+        dependencyReadyCard({ id: "next-2", identifier: "COD-6", sortOrder: 10, updatedAt: minsAgo(1), labelNames: [], comments: [] }),
+      ],
+      claimCardSlots: async () => { claimCalls.push("claim"); return []; },
+      checkoutDispatchBlockers: () => [],
+      logFor: () => {},
+    },
+  });
+
+  assert.deepEqual(claimCalls, []);
+  assert.deepEqual(result.dispatches.map((d) => [d.issueIdentifier, d.trigger]), [["COD-5", "refill"], ["COD-6", "refill"]]);
+  assert.ok(result.dispatches.every((d) => d.cards.length === 1 && d.slotLimit === 1));
+});
+test("capacity initial admission: candidate expansion produces stable unclaimed demand records", () => {
+  const demands = admissionDemandsForCandidates([{
+    anchorPath: "/managed/repo",
+    sweep: "qa",
+    config: { parallel: { sameRepoCardLimits: { qa: 2 } } },
+    cards: [
+      dependencyReadyCard({ id: "one", identifier: "COD-1", sortOrder: 20, labelNames: [], comments: [] }),
+      dependencyReadyCard({ id: "two", identifier: "COD-2", sortOrder: 10, labelNames: [], comments: [] }),
+    ],
+  }], { trigger: "initial", now: NOW, rotationRanks: new Map([["/managed/repo", 3]]) });
+
+  assert.deepEqual(demands.map((d) => ({ stage: d.stage, trigger: d.trigger, id: d.issueIdentifier, board: d.boardOrder, rotation: d.rotationRank })), [
+    { stage: "qa", trigger: "initial", id: "COD-1", board: 20, rotation: 3 },
+    { stage: "qa", trigger: "initial", id: "COD-2", board: 10, rotation: 3 },
+  ]);
+});
 test("buildSameRepoRefillDispatches: dirty checks include managed sibling paths from the completed child", async () => {
   const seen = [];
   const result = await buildSameRepoRefillDispatches({
@@ -1607,6 +1867,23 @@ test("dispatch abort context: SIGTERM interrupts active child once and records t
   context.dispose();
   assert.equal(processLike.listenerCount("SIGINT"), 0);
   assert.equal(processLike.listenerCount("SIGTERM"), 0);
+});
+test("capacity ledger: dispatch attaches the live child PID immediately after spawn", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-pid-"));
+  const attached = [];
+  const child = new EventEmitter();
+  child.pid = 456;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-10",
+    logDir: path.join(anchorPath, "logs"),
+    runtimeExecutable: "/resolved/codex",
+  }, {
+    spawnFn: () => child,
+    onSpawn: (pid) => attached.push(pid),
+  });
+  assert.deepEqual(attached, [456]);
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
 });
 
 test("SWEEP_CFG.ship exists and the derived lists include it", () => {
@@ -2071,6 +2348,16 @@ test("doctorReport: a running current tick owned by a dead PID is stale", () => 
   assert.equal(report.tick.ok, false);
   assert.match(report.tick.reason, /STALE.*dead pid 404/i);
   assert.match(formatDoctorReport(report), /tick: +STALE.*dead pid 404/i);
+});
+test("capacity doctor: malformed ledger is unhealthy and reports active/max", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, capacity: { maxActiveChildren: 10 } },
+    capacityState: { healthy: false, active: 1, max: 10, errors: ["entry broken"] },
+  });
+  assert.equal(report.ok, false);
+  assert.deepEqual(report.capacity, { healthy: false, active: 1, max: 10, errors: ["entry broken"] });
+  assert.match(formatDoctorReport(report), /capacity: 1\/10 BLOCKED/);
+  assert.match(formatDoctorReport(report), /entry broken/);
 });
 
 test("pushWithRetry: succeeds on first attempt", () => {

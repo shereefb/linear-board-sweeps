@@ -43,7 +43,9 @@ const CACHE_DIR = path.join(HOME, ".cache", "linear-board-sweeps");
 const TICK_LOCK = path.join(STATE_DIR, "tick.lock");
 const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
+const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
 export const TICK_STATE_VERSION = 1;
+export const CAPACITY_LEDGER_VERSION = 1;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
@@ -62,6 +64,7 @@ export const HEARTBEAT_MIN = 5;
 export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
+export const DEFAULT_MAX_ACTIVE_CHILDREN = 10;
 export const DEFAULT_MAX_DRAIN_PASSES = 5;
 export const MAX_DRAIN_PASSES = 5;
 export const DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES = 8;
@@ -124,7 +127,7 @@ export function managedWorkspaceRootFor(sourceAnchorPath, { homeDir = HOME } = {
 }
 
 function defaultRegistry() {
-  return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, repos: [], managedAnchors: {} };
+  return { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: null, shipRunner: false, capacity: { maxActiveChildren: DEFAULT_MAX_ACTIVE_CHILDREN }, repos: [], managedAnchors: {} };
 }
 
 export function normalizeRegistry(reg = {}, { now = () => new Date().toISOString(), homeDir = HOME } = {}) {
@@ -132,6 +135,14 @@ export function normalizeRegistry(reg = {}, { now = () => new Date().toISOString
   out.repos = Array.isArray(out.repos) ? [...out.repos] : [];
   out.kitRef = out.kitRef || "main";
   out.shipRunner = out.shipRunner === true;
+  const rawCapacity = out.capacity?.maxActiveChildren;
+  const configuredCapacity = rawCapacity === null || rawCapacity === "" ? Number.NaN : Number(rawCapacity);
+  out.capacity = {
+    ...(out.capacity && typeof out.capacity === "object" ? out.capacity : {}),
+    maxActiveChildren: Number.isFinite(configuredCapacity)
+      ? Math.max(1, Math.floor(configuredCapacity))
+      : DEFAULT_MAX_ACTIVE_CHILDREN,
+  };
   out.managedAnchors = { ...(out.managedAnchors || {}) };
   for (const sourceAnchorPath of out.repos) {
     const existing = out.managedAnchors[sourceAnchorPath] || {};
@@ -550,6 +561,30 @@ export function sortByBoardPosition(cards) {
   });
 }
 
+const ADMISSION_STAGE_ORDER = new Map(SWEEP_ORDER.map((stage, index) => [stage, index]));
+
+export function compareAdmissionDemand(a = {}, b = {}) {
+  const aStage = a.stage || a.sweep || "";
+  const bStage = b.stage || b.sweep || "";
+  const stageOrder = (ADMISSION_STAGE_ORDER.get(aStage) ?? SWEEP_ORDER.length)
+    - (ADMISSION_STAGE_ORDER.get(bStage) ?? SWEEP_ORDER.length);
+  if (stageOrder !== 0) return stageOrder;
+
+  const handoffOrder = Number((b.trigger || "initial") === "handoff")
+    - Number((a.trigger || "initial") === "handoff");
+  if (handoffOrder !== 0) return handoffOrder;
+
+  const boardOrder = boardOrderValue({ sortOrder: b.boardOrder ?? b.topSortOrder ?? b.topCard?.sortOrder })
+    - boardOrderValue({ sortOrder: a.boardOrder ?? a.topSortOrder ?? a.topCard?.sortOrder });
+  if (boardOrder !== 0) return boardOrder;
+
+  const rotationOrder = (Number.isFinite(Number(a.rotationRank)) ? Number(a.rotationRank) : Number.MAX_SAFE_INTEGER)
+    - (Number.isFinite(Number(b.rotationRank)) ? Number(b.rotationRank) : Number.MAX_SAFE_INTEGER);
+  if (rotationOrder !== 0) return rotationOrder;
+  return String(a.issueIdentifier || a.topCard?.identifier || "")
+    .localeCompare(String(b.issueIdentifier || b.topCard?.identifier || ""));
+}
+
 // Reflect this tick's reap/bounce decisions on the in-memory cards so the
 // actionable count is correct: a reaped card loses its claim (actionable again);
 // an escalated card (crash or bounce) gains blocked:needs-user (not actionable).
@@ -801,6 +836,44 @@ export function sameRepoAvailableSlots({ cards = [], cfg, anchorPath, sweep, act
   )).length : 0;
   const parentActive = activeSameRepo?.get(anchorPath, sweep) || 0;
   return Math.max(0, Math.floor(Number(limit)) - Math.max(parentActive, boardActiveClaims));
+}
+
+export function admissionDemandsForCandidates(candidates, {
+  trigger = "initial",
+  now = Date.now(),
+  rotationRanks = new Map(),
+} = {}) {
+  const demands = [];
+  for (const candidate of candidates || []) {
+    const stage = candidate.sweep;
+    const rotationRank = rotationRanks.get(candidate.anchorPath) ?? candidate.rotationRank ?? 0;
+    const cards = stage === "ship"
+      ? [candidate.topCard || candidate.cards?.[0]].filter(Boolean)
+      : selectCardSlots(
+        candidate.cards || [],
+        SWEEP_CFG[stage],
+        stage,
+        candidate.slotLimit ?? sameRepoCardLimit(candidate.config || {}, stage),
+        now,
+      ).map((slot) => slot.card);
+    for (const card of cards) {
+      demands.push({
+        ...candidate,
+        stage,
+        trigger,
+        workspace: candidate.anchorPath,
+        issueIdentifier: card.identifier,
+        boardOrder: boardOrderValue(card),
+        rotationRank,
+        topCard: card,
+        topSortOrder: card.sortOrder,
+        cards: [card],
+        count: 1,
+        slotLimit: 1,
+      });
+    }
+  }
+  return demands;
 }
 
 function repoSet(candidate) {
@@ -1161,6 +1234,266 @@ export function atomicWriteJson(filePath, value) {
     try { fs.rmSync(tempPath, { force: true }); } catch { /* ignore cleanup failure */ }
     throw error;
   }
+}
+
+function capacityEntryError(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "entry is not an object";
+  if (typeof entry.token !== "string" || !entry.token) return "token is missing";
+  if (!Number.isInteger(entry.parentPid) || entry.parentPid <= 0) return `entry ${entry.token} has invalid parentPid`;
+  if (entry.childPid !== null && (!Number.isInteger(entry.childPid) || entry.childPid <= 0)) return `entry ${entry.token} has invalid childPid`;
+  if (typeof entry.issueIdentifier !== "string" || !entry.issueIdentifier) return `entry ${entry.token} has invalid issueIdentifier`;
+  if (typeof entry.workspace !== "string" || !entry.workspace) return `entry ${entry.token} has invalid workspace`;
+  if (!SWEEPS.includes(entry.stage)) return `entry ${entry.token} has invalid stage`;
+  if (!["initial", "refill", "handoff"].includes(entry.trigger)) return `entry ${entry.token} has invalid trigger`;
+  if (typeof entry.reservedAt !== "string" || Number.isNaN(Date.parse(entry.reservedAt))) return `entry ${entry.token} has invalid reservedAt`;
+  return null;
+}
+
+export function createCapacityLedger({
+  ledgerPath = CAPACITY_LEDGER,
+  maxActiveChildren = DEFAULT_MAX_ACTIVE_CHILDREN,
+  parentPid = process.pid,
+  isAlive = isAlivePid,
+  now = () => new Date().toISOString(),
+  randomUUID = () => crypto.randomUUID(),
+  readJsonFn = (target) => {
+    if (!fs.existsSync(target)) return null;
+    return JSON.parse(fs.readFileSync(target, "utf8"));
+  },
+  writeJsonFn = atomicWriteJson,
+} = {}) {
+  const max = Number.isFinite(Number(maxActiveChildren))
+    ? Math.max(1, Math.floor(Number(maxActiveChildren)))
+    : DEFAULT_MAX_ACTIVE_CHILDREN;
+  const released = new Set();
+
+  const read = ({ checkLiveness = false } = {}) => {
+    let raw;
+    try {
+      raw = readJsonFn(ledgerPath);
+    } catch (error) {
+      return { version: CAPACITY_LEDGER_VERSION, entries: [], active: max, max, healthy: false, errors: [`ledger unreadable: ${error.message}`], opaque: true };
+    }
+    if (raw === null || raw === undefined) return { version: CAPACITY_LEDGER_VERSION, entries: [], active: 0, max, healthy: true, errors: [], opaque: false };
+    if (!raw || raw.version !== CAPACITY_LEDGER_VERSION || !Array.isArray(raw.entries)) {
+      return { version: CAPACITY_LEDGER_VERSION, entries: [], active: max, max, healthy: false, errors: ["ledger schema is malformed"], opaque: true };
+    }
+    const entries = raw.entries.map((entry) => ({ ...entry }));
+    const errors = entries.map(capacityEntryError).filter(Boolean);
+    if (checkLiveness && !errors.length) {
+      for (const entry of entries) {
+        for (const [kind, pid] of [["parent", entry.parentPid], ["child", entry.childPid]]) {
+          if (kind === "child" && pid === null) continue;
+          try {
+            const live = isAlive(pid);
+            if (typeof live !== "boolean") errors.push(`entry ${entry.token} ${kind} PID ${pid} is unverifiable`);
+          } catch (error) {
+            errors.push(`entry ${entry.token} ${kind} PID ${pid} is unverifiable: ${error.message}`);
+          }
+        }
+      }
+    }
+    return { version: CAPACITY_LEDGER_VERSION, entries, active: entries.length, max, healthy: errors.length === 0, errors, opaque: false };
+  };
+
+  const inspect = () => read({ checkLiveness: true });
+  const reconcile = () => {
+    const state = read();
+    if (!state.healthy || state.opaque) return state;
+    const kept = [];
+    const errors = [];
+    for (const entry of state.entries) {
+      let parentAlive;
+      let childAlive = null;
+      try {
+        parentAlive = isAlive(entry.parentPid);
+        if (typeof parentAlive !== "boolean") throw new Error("non-boolean liveness result");
+        if (entry.childPid !== null) {
+          childAlive = isAlive(entry.childPid);
+          if (typeof childAlive !== "boolean") throw new Error("non-boolean liveness result");
+        }
+      } catch (error) {
+        errors.push(`entry ${entry.token} PID is unverifiable: ${error.message}`);
+        kept.push(entry);
+        continue;
+      }
+      const stale = entry.childPid === null ? !parentAlive : !parentAlive && !childAlive;
+      if (!stale) kept.push(entry);
+    }
+    if (errors.length) return { ...state, entries: kept, active: kept.length, healthy: false, errors };
+    if (kept.length !== state.entries.length) writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: kept });
+    return { ...state, entries: kept, active: kept.length, healthy: true, errors: [] };
+  };
+
+  const release = (token) => {
+    if (!token || released.has(token)) return false;
+    const state = read();
+    if (!state.healthy || state.opaque) return false;
+    const entries = state.entries.filter((entry) => entry.token !== token);
+    if (entries.length === state.entries.length) {
+      released.add(token);
+      return false;
+    }
+    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries });
+    released.add(token);
+    return true;
+  };
+
+  const attachChildPid = (token, childPid) => {
+    if (!Number.isInteger(childPid) || childPid <= 0) throw new Error(`invalid child PID ${childPid}`);
+    const state = read();
+    if (!state.healthy || state.opaque) throw new Error(`capacity ledger unhealthy: ${state.errors.join("; ")}`);
+    const entry = state.entries.find((candidate) => candidate.token === token);
+    if (!entry) return false;
+    entry.childPid = childPid;
+    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: state.entries });
+    return true;
+  };
+
+  const reserve = (demand = {}) => {
+    const state = reconcile();
+    if (!state.healthy || state.active >= max) return null;
+    const stage = demand.stage || demand.sweep;
+    if (stage === "ship" ? state.active > 0 : state.entries.some((entry) => entry.stage === "ship")) return null;
+    const token = randomUUID();
+    const entry = {
+      token,
+      parentPid,
+      childPid: null,
+      issueIdentifier: demand.issueIdentifier || demand.topCard?.identifier,
+      workspace: demand.workspace || demand.anchorPath,
+      stage,
+      trigger: demand.trigger || "initial",
+      reservedAt: now(),
+    };
+    const error = capacityEntryError(entry);
+    if (error) throw new Error(error);
+    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: [...state.entries, entry] });
+    return {
+      token,
+      entry,
+      attachChildPid: (pid) => attachChildPid(token, pid),
+      release: () => release(token),
+    };
+  };
+
+  return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
+}
+
+export function createAdmissionQueue({ ledger, executeDemand } = {}) {
+  if (!ledger || typeof ledger.reserve !== "function") throw new Error("capacity ledger is required");
+  if (typeof executeDemand !== "function") throw new Error("executeDemand is required");
+  const pending = [];
+  const byKey = new Map();
+  let localActive = 0;
+  let drainScheduled = false;
+  let draining = false;
+
+  const demandKey = (demand) => [demand.workspace || demand.anchorPath || "", demand.stage || demand.sweep || "", demand.issueIdentifier || demand.topCard?.identifier || ""].join("\0");
+  const scheduleDrain = () => {
+    if (drainScheduled) return;
+    drainScheduled = true;
+    queueMicrotask(() => {
+      drainScheduled = false;
+      drainAdmissionQueue();
+    });
+  };
+  const settleRun = (item, reservation) => {
+    localActive += 1;
+    (async () => {
+      try {
+        return await executeDemand(item.demand, reservation);
+      } finally {
+        reservation.release();
+      }
+    })().then(item.resolve, item.reject).finally(() => {
+      localActive -= 1;
+      byKey.delete(item.key);
+      scheduleDrain();
+    });
+  };
+  const drainAdmissionQueue = () => {
+    if (draining) return;
+    draining = true;
+    try {
+      pending.sort((a, b) => compareAdmissionDemand(a.demand, b.demand));
+      while (pending.length) {
+        const state = ledger.reconcile();
+        if (!state.healthy) break;
+        if (state.active >= state.max) {
+          if (localActive === 0) {
+            for (const item of pending.splice(0)) {
+              byKey.delete(item.key);
+              item.resolve(null);
+            }
+          }
+          break;
+        }
+        const shipIndex = pending.findIndex((item) => (item.demand.stage || item.demand.sweep) === "ship");
+        if (shipIndex >= 0 && state.active > 0) {
+          if (localActive === 0) {
+            for (const item of pending.splice(0)) {
+              byKey.delete(item.key);
+              item.resolve(null);
+            }
+          }
+          break;
+        }
+        if (shipIndex < 0 && state.entries.some((entry) => entry.stage === "ship")) {
+          if (localActive === 0) {
+            for (const item of pending.splice(0)) {
+              byKey.delete(item.key);
+              item.resolve(null);
+            }
+          }
+          break;
+        }
+        const item = pending.splice(shipIndex >= 0 ? shipIndex : 0, 1)[0];
+        const reservation = ledger.reserve(item.demand);
+        if (!reservation) {
+          pending.unshift(item);
+          break;
+        }
+        settleRun(item, reservation);
+        if ((item.demand.stage || item.demand.sweep) === "ship") break;
+      }
+    } finally {
+      draining = false;
+    }
+  };
+  const enqueue = (demand) => {
+    const key = demandKey(demand);
+    const existing = byKey.get(key);
+    if (existing) return existing.promise;
+    let resolve;
+    let reject;
+    const promise = new Promise((onResolve, onReject) => { resolve = onResolve; reject = onReject; });
+    const item = { demand, key, promise, resolve, reject };
+    byKey.set(key, item);
+    pending.push(item);
+    scheduleDrain();
+    return promise;
+  };
+  return {
+    admitDemand: enqueue,
+    drainAdmissionQueue,
+    get pendingCount() { return pending.length; },
+    get activeCount() { return localActive; },
+  };
+}
+
+export function admitDemand(demand, { queue } = {}) {
+  if (!queue || typeof queue.admitDemand !== "function") throw new Error("admission queue is required");
+  return queue.admitDemand(demand);
+}
+
+export async function runAdmissionDemands(demands, { queue, onResult } = {}) {
+  const results = await Promise.all((demands || []).map(async (demand) => {
+    const result = await admitDemand(demand, { queue });
+    if (result && onResult) await onResult(result);
+    return result;
+  }));
+  return results.filter(Boolean);
 }
 
 export function finalizeTickState(state, {
@@ -1859,6 +2192,8 @@ export function doctorReport({
   registryPath = REGISTRY_PATH,
   currentTick = null,
   lastTick = null,
+  capacityState = null,
+  capacityLedgerPath = CAPACITY_LEDGER,
   isAlive = isAlivePid,
   now = Date.now(),
 } = {}) {
@@ -1881,6 +2216,12 @@ export function doctorReport({
     },
     anchors: [],
   };
+  report.capacity = capacityState || createCapacityLedger({
+    ledgerPath: capacityLedgerPath,
+    maxActiveChildren: reg.capacity.maxActiveChildren,
+    isAlive,
+  }).inspect();
+  if (!report.capacity.healthy) report.ok = false;
   if (currentTick || lastTick) {
     report.tick = healthStatus({ currentTick, lastTick, isAlive, now });
     if (!report.tick.ok) report.ok = false;
@@ -1923,7 +2264,11 @@ export function formatDoctorReport(report) {
     `host: ${report.host} user: ${report.user}`,
     `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
     `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
+    `capacity: ${report.capacity.active}/${report.capacity.max}${report.capacity.healthy ? "" : " BLOCKED"}`,
   ];
+  if (!report.capacity.healthy) {
+    for (const error of report.capacity.errors || []) lines.push(`  capacity error: ${error}`);
+  }
   if (report.tick) lines.push(`tick: ${report.tick.reason}`);
   if (report.kit.dirty) lines.push(`  kit dirty: ${report.kit.dirty.message.replace(/\n/g, "\n  ")}`);
   for (const anchor of report.anchors) {
@@ -2067,6 +2412,9 @@ export async function expandDispatchBatch(batch, {
         ownerToken: slot.ownerToken,
         parentRunId,
         triggeredBy: pick.triggeredBy,
+        trigger: pick.trigger,
+        rotationRank: pick.rotationRank,
+        handoffHops: pick.handoffHops,
         runtimeExecutable: pick.runtimeExecutable,
         runtimeLaneKey: pick.runtimeLaneKey,
         runtimeScope: pick.runtimeScope,
@@ -2086,6 +2434,7 @@ export async function buildSameRepoRefillDispatches({
   childIndexAllocator,
   reg = {},
   now = Date.now(),
+  deferClaim = false,
   deps = {},
 } = {}) {
   const pick = result?.pick || {};
@@ -2154,14 +2503,6 @@ export async function buildSameRepoRefillDispatches({
     return empty("no-actionable");
   }
 
-  let labelMap;
-  try {
-    labelMap = await (deps.teamLabelMap || teamLabelMap)(active.apiKey, pick.config.teamKey);
-  } catch (e) {
-    logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: label-map`);
-    return empty("label-map");
-  }
-
   const batch = [{
     anchorPath: pick.anchorPath,
     sourceAnchorPath: pick.sourceAnchorPath,
@@ -2179,15 +2520,27 @@ export async function buildSameRepoRefillDispatches({
     runtimeScope: pick.runtimeScope,
     runtimeStableTarget: pick.runtimeStableTarget,
   }];
-  const dispatches = await expandDispatchBatch(batch, {
-    dryRun: false,
-    parentRunId,
-    activeByAnchor,
-    now,
-    childIndexAllocator,
-    claimCardSlotsFn: deps.claimCardSlots,
-    labelMap,
-  });
+  let dispatches;
+  if (deferClaim) {
+    dispatches = admissionDemandsForCandidates(batch, { trigger: "refill", now });
+  } else {
+    let labelMap;
+    try {
+      labelMap = await (deps.teamLabelMap || teamLabelMap)(active.apiKey, pick.config.teamKey);
+    } catch (e) {
+      logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: label-map`);
+      return empty("label-map");
+    }
+    dispatches = await expandDispatchBatch(batch, {
+      dryRun: false,
+      parentRunId,
+      activeByAnchor,
+      now,
+      childIndexAllocator,
+      claimCardSlotsFn: deps.claimCardSlots,
+      labelMap,
+    });
+  }
   if (!dispatches.length) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: no-actionable`);
     return empty("no-actionable");
@@ -2408,7 +2761,7 @@ function dispatch(anchorPath, sweep, config, pick = {}) {
   return outcome;
 }
 
-export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null } = {}) {
+export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null, onSpawn = null } = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
   const executable = pick.runtimeExecutable || cmd;
@@ -2423,7 +2776,6 @@ export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = 
   const startedAt = new Date().toISOString();
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
   return new Promise((resolve) => {
-    const child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
     let settled = false;
     const finish = (outcome) => {
       if (settled) return;
@@ -2433,6 +2785,14 @@ export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = 
       writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
       resolve(outcome);
     };
+    let child;
+    try {
+      child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
+      if (onSpawn && Number.isInteger(child?.pid) && child.pid > 0) onSpawn(child.pid, child);
+    } catch (e) {
+      finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+      return;
+    }
     child.on("error", (e) => {
       logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
       const interrupted = e.code === "ABORT_ERR" || signal?.aborted;
@@ -2492,6 +2852,7 @@ async function tick({ dryRun = false } = {}) {
     const reportedRuntimeFailures = new Set();
     const activeSameRepo = createSameRepoActiveCounts();
     const childIndexAllocator = createChildIndexAllocator();
+    const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
     const refillBudget = { remaining: 0 };
     const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
       anchorPath,
@@ -2676,23 +3037,17 @@ async function tick({ dryRun = false } = {}) {
         }
         handoffBudget.remaining -= 1;
         firedHandoffs.add(key);
-        const reservation = { anchorPath: pick.anchorPath, sweep: nextSweep, issueIdentifier: issue.identifier };
-        activeSameRepo.increment(reservation);
         logFor(pick.anchorPath, nextSweep, `handoff-trigger ${issue.identifier}: ${pick.sweep}->${nextSweep}`);
-        const downstream = (await expandDispatchBatch([runtimeReadyCandidate], {
-          dryRun: false,
-          parentRunId,
-          activeByAnchor,
+        const downstream = admissionDemandsForCandidates([runtimeReadyCandidate], {
+          trigger: "handoff",
           now: Date.now(),
-          childIndexAllocator,
-        })).map((d) => ({ ...d, triggeredBy: { issue: issue.identifier, sweep: pick.sweep } }));
+        }).map((d) => ({ ...d, triggeredBy: { issue: issue.identifier, sweep: pick.sweep } }));
         if (!downstream.length) {
-          activeSameRepo.decrement(reservation);
           handoffBudget.remaining += 1;
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
           return;
         }
-        const results = await dispatchChildren(downstream, { alreadyReserved: true });
+        const results = await dispatchChildren(downstream);
         current = results.find((r) => r.issueIdentifier === issue.identifier) || results[0];
         remaining -= 1;
       }
@@ -2763,6 +3118,35 @@ async function tick({ dryRun = false } = {}) {
       }
       return checked;
     };
+    const initialCapacity = capacityLedger.reconcile();
+    if (!initialCapacity.healthy) {
+      localFailures.push(failureEventFor("_", null, "capacity", "capacity-ledger", CAPACITY_LEDGER, initialCapacity.errors.join("; ")));
+      writeCurrentTick();
+    }
+    const admissionQueue = createAdmissionQueue({
+      ledger: capacityLedger,
+      executeDemand: async (demand, reservation) => {
+        activeSameRepo.increment(demand);
+        try {
+          const [pick] = await expandDispatchBatch([demand], {
+            dryRun: false,
+            parentRunId,
+            activeByAnchor,
+            now: Date.now(),
+            childIndexAllocator,
+          });
+          if (!pick) return null;
+          const [result] = await dispatchBatch([pick], {
+            signal: dispatchAbortContext?.signal,
+            dispatchOptions: { onSpawn: (pid) => reservation.attachChildPid(pid) },
+          });
+          await reconcileDispatchResult(result);
+          return result;
+        } finally {
+          activeSameRepo.decrement(demand);
+        }
+      },
+    });
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
     };
@@ -2988,7 +3372,8 @@ async function tick({ dryRun = false } = {}) {
         log("dispatch blocked by dirty checkout(s)");
         return { candidates, selectedBatch: [], dispatched: false };
       }
-      const dispatches = await expandDispatchBatch(cleanBatch, { dryRun: false, parentRunId, activeByAnchor, now, childIndexAllocator });
+      const rotationRanks = new Map(cleanBatch.map((pick, index) => [pick.anchorPath, index]));
+      const dispatches = admissionDemandsForCandidates(cleanBatch, { trigger: "initial", now, rotationRanks });
       if (!dispatches.length) {
         log("no confirmed card slots — cheap tick");
         return { candidates, selectedBatch: [], dispatched: false };
@@ -2997,8 +3382,6 @@ async function tick({ dryRun = false } = {}) {
       const handoffBudget = { remaining: maxNonShipDispatches };
       let dispatchChildren;
       const handleDispatchResult = async (result) => {
-        activeSameRepo.decrement(result.pick);
-        await reconcileDispatchResult(result);
         await Promise.all([
           runHandoffTriggers(result, firedHandoffs, handoffBudget, dispatchChildren),
           (async () => {
@@ -3015,6 +3398,7 @@ async function tick({ dryRun = false } = {}) {
               childIndexAllocator,
               reg,
               now: Date.now(),
+              deferClaim: true,
             });
             if (refill.blockers?.length) {
               const active = activeByAnchor.get(result.pick.anchorPath);
@@ -3034,11 +3418,8 @@ async function tick({ dryRun = false } = {}) {
           })(),
         ]);
       };
-      dispatchChildren = async (children, { alreadyReserved = false } = {}) => {
-        if (!alreadyReserved) {
-          for (const child of children) activeSameRepo.increment(child);
-        }
-        return dispatchBatch(children, { onResult: handleDispatchResult, signal: dispatchAbortContext?.signal });
+      dispatchChildren = async (children) => {
+        return runAdmissionDemands(children, { queue: admissionQueue, onResult: handleDispatchResult });
       };
       const results = await dispatchChildren(dispatches);
       return {
