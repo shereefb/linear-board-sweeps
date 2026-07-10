@@ -2,6 +2,12 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.1] - 2026-07-10
+
+### Fixed
+
+- Read scheduled sweep configuration from the managed workspace anchor even after a routed child changes into its primary sibling repo, so Guide, Admin, Portal, and Slack preflights no longer fail because those repos correctly omit a duplicate `.claude/linear-sweep.json`.
+
 ## [1.2.0.0] - 2026-07-10
 
 ### Added

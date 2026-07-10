@@ -70,6 +70,6 @@
     "schema": null
   },
   "deploy": "<how this project reaches production for every repo in config.repos — e.g. 'web: Vercel auto-deploys on push to main; api: run ...; manual DB migration Todo required before deploy'>",
-  "$comment_artifacts": "Scheduled sweeps receive AUTO_SWEEP_REPO and AUTO_SWEEP_SOURCE_REPO for the label-routed primary repo, AUTO_SWEEP_REPO_LABEL and AUTO_SWEEP_REPO_ENTRY for the mandatory live child preflight, AUTO_SWEEP_WORKTREE beneath its managed clone, plus AUTO_SWEEP_LOG_DIR, AUTO_SWEEP_TMPDIR, AUTO_SWEEP_SCREENSHOT_DIR, and AUTO_SWEEP_BROWSER_PROFILE_DIR under state/cache paths. Evidence and scratch artifacts should use those paths rather than repo roots.",
+  "$comment_artifacts": "Scheduled sweeps receive AUTO_SWEEP_ANCHOR for the managed config owner, AUTO_SWEEP_REPO and AUTO_SWEEP_SOURCE_REPO for the label-routed primary repo, AUTO_SWEEP_REPO_LABEL and AUTO_SWEEP_REPO_ENTRY for the mandatory live child preflight, AUTO_SWEEP_WORKTREE beneath its managed clone, plus AUTO_SWEEP_LOG_DIR, AUTO_SWEEP_TMPDIR, AUTO_SWEEP_SCREENSHOT_DIR, and AUTO_SWEEP_BROWSER_PROFILE_DIR under state/cache paths. Evidence and scratch artifacts should use those paths rather than repo roots.",
   "credentialsNote": "<where app + tooling secrets live — e.g. '.env.local for app secrets; Linear key in gitignored .env copied to managed clones with mode 0600'>"
 }

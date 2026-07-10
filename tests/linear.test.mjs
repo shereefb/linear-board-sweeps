@@ -138,8 +138,8 @@ function runDependencyStatusCli(inverseRelations, env = {}) {
   });
 }
 
-function runRepoStatusCli(labelNames, env = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-status-"));
+function runRepoStatusCli(labelNames, env = {}, { configDir, cwd } = {}) {
+  const dir = configDir || fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-status-"));
   fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
   fs.writeFileSync(path.join(dir, ".claude", "linear-sweep.json"), JSON.stringify({
     repos: ["coach", "guide"],
@@ -149,7 +149,7 @@ function runRepoStatusCli(labelNames, env = {}) {
   const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
   return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", "SAF-207", "app:guide", "guide"], {
-    cwd: dir,
+    cwd: cwd || dir,
     encoding: "utf8",
     env: { ...process.env, LINEAR_API_KEY: "key", ...env },
   });
@@ -172,6 +172,17 @@ test("repo-status CLI fails closed on a live label race and writes a parent outc
     routeExitCode: 3,
     routing: { reason: "route-changed", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [{ label: "app:coach", repoEntry: "coach" }] },
   });
+});
+test("repo-status CLI reads routing config from the scheduled workspace anchor", () => {
+  const anchor = fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-anchor-"));
+  const routedRepo = fs.mkdtempSync(path.join(os.tmpdir(), "linear-routed-repo-"));
+  const result = runRepoStatusCli(
+    ["app:guide"],
+    { AUTO_SWEEP_ANCHOR: anchor },
+    { configDir: anchor, cwd: routedRepo },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).eligible, true);
 });
 test("child preflights preserve the first deferred outcome if a later check mistakenly continues", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-first-outcome-"));

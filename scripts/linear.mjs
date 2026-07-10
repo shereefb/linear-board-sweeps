@@ -317,12 +317,13 @@ async function setupTeam(nameOrKey) {
   console.log(`\nTeam "${team.name}" (${team.key}) ready. teamId=${team.id}`);
 }
 
-// Best-effort read of the repo-local sweep config (for reviewLenses labels).
-// setup-team runs from a target repo's root; a kit-level run without a config
-// just creates the base taxonomy.
+// Best-effort read of the workspace-anchor sweep config (for reviewLenses labels).
+// Scheduled children receive the managed anchor explicitly; direct setup-team
+// runs fall back to the target repo root, and kit-level runs without a config
+// just create the base taxonomy.
 function readLocalSweepConfig() {
   try {
-    const p = path.join(process.cwd(), ".claude", "linear-sweep.json");
+    const p = path.join(process.env.AUTO_SWEEP_ANCHOR || process.cwd(), ".claude", "linear-sweep.json");
     return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : null;
   } catch { return null; }
 }
@@ -521,7 +522,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "repo-status": async () => {
       const [issueId, expectedLabel, expectedRepoEntry] = args;
       try {
-        const configPath = path.join(process.cwd(), ".claude", "linear-sweep.json");
+        const configPath = path.join(process.env.AUTO_SWEEP_ANCHOR || process.cwd(), ".claude", "linear-sweep.json");
         const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
         const result = await fetchIssueLabels(KEY, issueId);
         const eligibility = repoRouteEligibility(result.labelNames, config.repoRouting?.byLabel, expectedLabel, expectedRepoEntry);

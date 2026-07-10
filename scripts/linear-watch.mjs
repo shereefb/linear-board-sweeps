@@ -1033,6 +1033,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
+      AUTO_SWEEP_ANCHOR: pick.anchorPath,
       AUTO_SWEEP_SOURCE_ANCHOR: pick.sourceAnchorPath || pick.anchorPath,
       ...(pick.repoRoute?.managedRepoPath ? { AUTO_SWEEP_REPO: pick.repoRoute.managedRepoPath } : {}),
       ...(pick.repoRoute?.sourceRepoPath ? { AUTO_SWEEP_SOURCE_REPO: pick.repoRoute.sourceRepoPath } : {}),
