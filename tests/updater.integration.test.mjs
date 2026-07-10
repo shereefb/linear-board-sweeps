@@ -90,6 +90,43 @@ for (const primaryBranch of ["main", "COD-2-feature"]) {
   });
 }
 
+test("refreshAnchorSkills: a no-change retry pushes a marker commit left local by an earlier push failure", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-retry-push-"));
+  const origin = path.join(root, "origin.git");
+  const offlineOrigin = path.join(root, "origin.offline.git");
+  try {
+    const anchor = path.join(root, "anchor");
+    g(root, "init", "--bare", "-b", "main", origin);
+    g(root, "clone", origin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "0.0.1\n");
+    g(anchor, "add", "-A");
+    g(anchor, "commit", "-m", "seed");
+    g(anchor, "push", "origin", "main");
+    const remoteBefore = g(anchor, "rev-parse", "origin/main");
+
+    fs.renameSync(origin, offlineOrigin);
+    const first = refreshAnchorSkills(anchor, KIT, "9.9.7");
+    assert.equal(first.ok, false);
+    assert.match(first.reason, /push failed/);
+    assert.equal(g(anchor, "show", "HEAD:.claude/skills/.sweep-version"), "9.9.7");
+    assert.notEqual(g(anchor, "rev-parse", "HEAD"), remoteBefore);
+
+    fs.renameSync(offlineOrigin, origin);
+    const second = refreshAnchorSkills(anchor, KIT, "9.9.7");
+    assert.equal(second.ok, true, second.reason);
+    assert.match(second.reason, /already current|committed on main/);
+    g(anchor, "fetch", "origin", "main");
+    assert.equal(g(anchor, "rev-parse", "origin/main"), g(anchor, "rev-parse", "HEAD"));
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "9.9.7");
+  } finally {
+    if (fs.existsSync(offlineOrigin) && !fs.existsSync(origin)) fs.renameSync(offlineOrigin, origin);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runUpdate: failed kit fetch is reported before merging stale refs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
   try {

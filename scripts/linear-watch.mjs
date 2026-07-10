@@ -3187,7 +3187,14 @@ function commitAndPushSkillRefresh(root, marker, successReason) {
     return { ok: false, reason: sanitizeFailureMessage(`git add failed: ${add.err || add.out || `exit ${add.status}`}`) };
   }
   const staged = git(root, ["diff", "--cached", "--quiet", "--", ".claude/skills"], { allowFail: true });
-  if (staged.status === 0) return { ok: true, reason: `already current ${successReason}` };
+  if (staged.status === 0) {
+    const localMarker = git(root, ["show", "HEAD:.claude/skills/.sweep-version"], { allowFail: true });
+    if (localMarker.status !== 0 || localMarker.out !== marker) {
+      return { ok: false, reason: `no staged changes but local HEAD lacks expected sweep marker ${marker}` };
+    }
+    const pushed = pushWithRetry(root, "main");
+    return { ok: pushed.ok, reason: pushed.ok ? `already current ${successReason}` : "push failed" };
+  }
   if (staged.status !== 1) {
     return { ok: false, reason: sanitizeFailureMessage(`could not verify staged skill changes: ${staged.err || staged.out || `exit ${staged.status}`}`) };
   }
