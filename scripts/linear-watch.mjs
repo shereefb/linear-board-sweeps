@@ -4797,8 +4797,35 @@ export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
   return true;
 }
 
+export async function releaseFailedDispatchClaim(apiKey, pick, result, runtime, {
+  fetchClaimCardFn = fetchClaimCard,
+  applyLabelEditFn = applyLabelEdit,
+  addCommentFn = addComment,
+} = {}) {
+  const cfg = SWEEP_CFG[pick.sweep];
+  if (!cfg || !pick.issueId || !pick.ownerToken) return false;
+  const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+  if (!hasLabel(fresh, cfg.claim) || latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
+  const detail = result?.kind === "signal" ? String(result.signal || "signal").replace(/[^A-Za-z0-9_-]/g, "") : String(result?.exitCode ?? result?.code ?? "nonzero").replace(/[^A-Za-z0-9_-]/g, "");
+  const runtimeSummary = String(runtime || "runtime").replace(/[^A-Za-z0-9 ._/-]/g, "").slice(0, 120);
+  await addCommentFn(apiKey, fresh.id, `${RETRY_TAG} claim=${cfg.claim} owner=${pick.ownerToken}] ${ORPHAN_TAG} terminal failure observed (kind=${result?.kind || "unknown"}; detail=${detail || "unknown"}; runtime=${runtimeSummary}). Cooldown is based on this Linear timestamp.`);
+  const second = await fetchClaimCardFn(apiKey, pick.issueId);
+  if (!hasLabel(second, cfg.claim) || latestHeartbeatOwner(second, cfg.claim) !== pick.ownerToken) return false;
+  const expectedLabels = new Set((second.labelNames || []).filter((name) => name !== cfg.claim));
+  await applyLabelEditFn(apiKey, second, { remove: [cfg.claim] });
+  const verified = await fetchClaimCardFn(apiKey, pick.issueId);
+  const missing = [...expectedLabels].filter((name) => !hasLabel(verified, name));
+  if (hasLabel(verified, cfg.claim) || missing.length) {
+    const error = new Error(`terminal claim cleanup verification failed for ${pick.issueIdentifier}`);
+    error.code = "CLAIM_CLEANUP_UNVERIFIED";
+    throw error;
+  }
+  return true;
+}
+
 export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   releaseOwnedDispatchClaimFn = releaseOwnedDispatchClaim,
+  releaseFailedDispatchClaimFn = releaseFailedDispatchClaim,
 } = {}) {
   const pick = result?.pick || {};
   const cfg = SWEEP_CFG[pick.sweep];
@@ -4808,8 +4835,13 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const routingDeferred = result.kind === "repo-routing-deferred";
   const successfulCompletion = result.kind === "success";
   const interrupted = result.kind === "interrupted";
-  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted) {
+  const terminalFailure = result.kind === "exit" || result.kind === "signal";
+  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
     return { attempted: false, released: false, reasonKind: null };
+  }
+  if (terminalFailure) {
+    const released = await releaseFailedDispatchClaimFn(apiKey, pick, result, runtime);
+    return { attempted: true, released, reasonKind: "terminal failure cooldown" };
   }
   const reasonKind = successfulCompletion
     ? "successful same-state completion"

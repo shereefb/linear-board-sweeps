@@ -3556,6 +3556,43 @@ test("releaseOwnedDispatchClaim: successful completion only releases a claim whi
     addCommentFn: async () => {},
   }), false);
 });
+test("releaseFailedDispatchClaim writes the retry marker before removing and verifies the full label set", async () => {
+  const calls = [];
+  const pick = { sweep: "dev", issueId: "issue-148", issueIdentifier: "COD-148", ownerToken: "owner-148" };
+  const before = {
+    id: "issue-148", identifier: "COD-148", stateName: "Dev",
+    labelNames: ["dev:in-progress", "security"], labelIds: { "dev:in-progress": "claim", security: "security" },
+    comments: [{ id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-148 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  const verified = { ...before, labelNames: ["security"], labelIds: { security: "security" } };
+  let reads = 0;
+  const released = await watchModule.releaseFailedDispatchClaim("key", pick, { kind: "exit", exitCode: 1 }, "codex / gpt", {
+    fetchClaimCardFn: async () => { reads += 1; calls.push("fetch"); return reads === 3 ? verified : { ...before, labelIds: { ...before.labelIds }, labelNames: [...before.labelNames] }; },
+    addCommentFn: async (_key, _id, body) => calls.push(body),
+    applyLabelEditFn: async (_key, card, edit) => { calls.push(edit); card.labelNames = ["security"]; card.labelIds = { security: "security" }; },
+  });
+  assert.equal(released, true);
+  assert.equal(calls[0], "fetch");
+  assert.match(calls[1], /^\[auto-sweep-retry claim=dev:in-progress owner=owner-148\] \[auto-sweep-orphan\]/);
+  assert.equal(calls[2], "fetch");
+  assert.deepEqual(calls[3], { remove: ["dev:in-progress"] });
+  assert.equal(calls[4], "fetch");
+});
+test("releaseFailedDispatchClaim leaves the claim when the marker cannot be written", async () => {
+  let edits = 0;
+  const fresh = {
+    id: "issue-148", identifier: "COD-148", labelNames: ["dev:in-progress"], labelIds: { "dev:in-progress": "claim" },
+    comments: [{ id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-148 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  await assert.rejects(watchModule.releaseFailedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue-148", issueIdentifier: "COD-148", ownerToken: "owner-148",
+  }, { kind: "signal", signal: "SIGTERM" }, "codex", {
+    fetchClaimCardFn: async () => fresh,
+    addCommentFn: async () => { throw new Error("comment unavailable"); },
+    applyLabelEditFn: async () => { edits += 1; },
+  }), /comment unavailable/);
+  assert.equal(edits, 0);
+});
 test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
   assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
   const calls = [];
@@ -3573,12 +3610,14 @@ test("reconcileOwnedDispatchClaim: successful child completion invokes state-sco
   assert.match(calls[0][2], /successful child via codex \/ gpt-5\.6 exited/);
   assert.deepEqual(calls[0][3], { expectedStates: ["Dev"] });
 
+  const failureCalls = [];
   assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
     kind: "exit",
     pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
   }, "codex", {
-    releaseOwnedDispatchClaimFn: async () => { throw new Error("ordinary child failures keep their claim for stale-run handling"); },
-  }), { attempted: false, released: false, reasonKind: null });
+    releaseFailedDispatchClaimFn: async (...args) => { failureCalls.push(args); return true; },
+  }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" });
+  assert.equal(failureCalls.length, 1);
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
