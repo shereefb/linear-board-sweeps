@@ -29,7 +29,12 @@ import {
   normalizeBlockingRelations,
   WORKFLOW_STATES,
 } from "./linear.mjs";
-import { normalizeLearningRegistry } from "./learning.mjs";
+import {
+  appendLearningEvent,
+  buildLearningEvent,
+  normalizeLearningRegistry,
+  readLearningEvents,
+} from "./learning.mjs";
 
 // The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
 const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -46,6 +51,7 @@ const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
 const OBSERVATIONS = path.join(STATE_DIR, "observations.json");
+const LEARNING_RUNS_DIR = path.join(STATE_DIR, "runs");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
@@ -1016,11 +1022,14 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
     screenshotDir: path.join(logDir, "screenshots"),
     browserProfileDir: path.join(CACHE_DIR, parentRunId, childRunKey, "browser"),
     outcomePath: path.join(CACHE_DIR, parentRunId, childRunKey, "outcome.json"),
+    learningEventsPath: path.join(logDir, "learning-events.jsonl"),
+    globalRunsDir: LEARNING_RUNS_DIR,
   };
 }
 
 export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
   if (!pick.issueIdentifier) return pick;
+  const cardRunId = `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`;
   const paths = cardRunPaths(pick.anchorPath, pick.config, pick.sweep, {
     identifier: pick.issueIdentifier,
     slotIndex: pick.slotIndex || 0,
@@ -1028,11 +1037,13 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
   }, parentRunId, childIndex);
   return {
     ...pick,
-    cardRunId: `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`,
+    cardRunId,
     sameRepoLimit: sameRepoCardLimit(pick.config, pick.sweep),
     ...paths,
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
+      AUTO_SWEEP_CARD_RUN_ID: cardRunId,
+      AUTO_SWEEP_SWEEP: pick.sweep,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
       AUTO_SWEEP_ANCHOR: pick.anchorPath,
       AUTO_SWEEP_SOURCE_ANCHOR: pick.sourceAnchorPath || pick.anchorPath,
@@ -1049,6 +1060,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
       AUTO_SWEEP_SCREENSHOT_DIR: paths.screenshotDir,
       AUTO_SWEEP_BROWSER_PROFILE_DIR: paths.browserProfileDir,
       AUTO_SWEEP_OUTCOME_PATH: paths.outcomePath,
+      AUTO_SWEEP_LEARNING_EVENTS_PATH: paths.learningEventsPath,
     },
   };
 }
@@ -2197,6 +2209,15 @@ function writeLog(slug, sweep, msg) {
 const log = (msg) => writeLog("_", "_", msg);
 const logFor = (anchorPath, sweep, msg) => writeLog(anchorSlug(anchorPath), sweep, msg);
 
+export function rotateLearningRunIndexes(runsDir, { nowMs = Date.now(), retentionDays = LOG_RETENTION_DAYS } = {}) {
+  const cutoff = nowMs - retentionDays * 86400000;
+  for (const entry of fs.existsSync(runsDir) ? fs.readdirSync(runsDir, { withFileTypes: true }) : []) {
+    if (!entry.isFile() || !/^\d{8}\.jsonl$/.test(entry.name)) continue;
+    const full = path.join(runsDir, entry.name);
+    if (fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true });
+  }
+}
+
 function rotateLogs() {
   const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
   const walk = (dir) => {
@@ -2207,6 +2228,7 @@ function rotateLogs() {
     }
   };
   walk(STATE_DIR);
+  rotateLearningRunIndexes(LEARNING_RUNS_DIR);
 }
 
 // ── IO: tick lock (PID liveness) ─────────────────────────────────────────────
@@ -3625,6 +3647,14 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     metrics = { metricsUnavailable: [String(error?.message || error)] };
   }
   const telemetry = pick.telemetry || {};
+  const learningEvidence = readLearningEvents(pick.learningEventsPath, {
+    expectedIdentity: pick.cardRunId ? {
+      cardRunId: pick.cardRunId,
+      issueIdentifier: pick.issueIdentifier,
+      sweep: pick.sweep,
+      sourceAnchor: pick.sourceAnchorPath || pick.anchorPath,
+    } : null,
+  });
   const record = {
     parentRunId: pick.parentRunId,
     cardRunId: pick.cardRunId,
@@ -3654,6 +3684,8 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     metricsUnavailable: metrics.metricsUnavailable,
     dependencyDeferredCount: pick.dependencyDeferredCount,
     dependencyDeferredIssues: pick.dependencyDeferredIssues,
+    learningEvents: learningEvidence.events,
+    learningEventCoverageGaps: learningEvidence.coverageGaps,
     outcome,
     exitCode: outcome?.exitCode ?? null,
     startedAt,
@@ -3661,7 +3693,13 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
   };
   fs.mkdirSync(pick.logDir, { recursive: true });
   const f = path.join(pick.logDir, `run-records-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.jsonl`);
-  fs.appendFileSync(f, JSON.stringify(record) + "\n");
+  const line = JSON.stringify(record) + "\n";
+  fs.appendFileSync(f, line);
+  if (pick.globalRunsDir) {
+    fs.mkdirSync(pick.globalRunsDir, { recursive: true });
+    const daily = `${endedAt.slice(0, 10).replace(/-/g, "")}.jsonl`;
+    fs.appendFileSync(path.join(pick.globalRunsDir, daily), line);
+  }
 }
 
 function dispatchEnvironment(anchorPath, pick = {}) {
@@ -4788,6 +4826,24 @@ function cmdDoctor(args = []) {
   if (!report.ok) process.exit(1);
 }
 
+export function cmdLearningEvent(args = [], { env = process.env } = {}) {
+  const [kind, category, summary] = args;
+  if (!kind || !category || !summary) {
+    throw new Error("usage: learning-event <kind> <category> <summary> [--json-metrics <json>]");
+  }
+  const metricsIndex = args.indexOf("--json-metrics");
+  let metrics = {};
+  if (metricsIndex >= 0) {
+    if (!args[metricsIndex + 1]) throw new Error("--json-metrics requires a JSON object");
+    try { metrics = JSON.parse(args[metricsIndex + 1]); }
+    catch { throw new Error("--json-metrics requires valid JSON"); }
+  }
+  const event = buildLearningEvent({ kind, category, summary, metrics }, env);
+  appendLearningEvent(env.AUTO_SWEEP_LEARNING_EVENTS_PATH, event);
+  console.log(event.eventId);
+  return event;
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -4804,8 +4860,9 @@ async function main() {
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
     case "doctor": return cmdDoctor(args);
+    case "learning-event": return cmdLearningEvent(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | tick [--dry-run] | health | doctor [--json] [anchor]");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | learning-event <kind> <category> <summary> [--json-metrics <json>] | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }

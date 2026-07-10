@@ -42,6 +42,7 @@ import {
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
+  rotateLearningRunIndexes,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -1969,10 +1970,71 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
+  assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
+  assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
+  assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
+  assert.match(pick.learningEventsPath, /learning-events\.jsonl$/);
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
   assert.equal(pick.sameRepoLimit, 4);
+});
+
+test("run records embed structured events and mirror the exact record into the global daily index", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-index-"));
+  const logDir = path.join(anchorPath, "logs");
+  const globalRunsDir = path.join(anchorPath, "global-runs");
+  const learningEventsPath = path.join(logDir, "learning-events.jsonl");
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.writeFileSync(learningEventsPath, `${JSON.stringify({
+    version: 1,
+    eventId: "event-1",
+    occurredAt: "2026-07-10T12:00:00.000Z",
+    kind: "review",
+    category: "correctness",
+    summary: "Null case",
+    metrics: {},
+    identity: { cardRunId: "run-1", issueIdentifier: "COD-143", sweep: "dev", sourceAnchor: anchorPath },
+  })}\nmalformed\n`);
+  const child = new EventEmitter();
+  child.pid = 456;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-143",
+    cardRunId: "run-1",
+    sweep: "dev",
+    sourceAnchorPath: anchorPath,
+    logDir,
+    learningEventsPath,
+    globalRunsDir,
+    runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: () => child });
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
+
+  const localFile = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  const globalFile = fs.readdirSync(globalRunsDir).find((name) => name.endsWith(".jsonl"));
+  const localRecord = JSON.parse(fs.readFileSync(path.join(logDir, localFile), "utf8").trim());
+  const globalRecord = JSON.parse(fs.readFileSync(path.join(globalRunsDir, globalFile), "utf8").trim());
+  assert.deepEqual(globalRecord, localRecord);
+  assert.equal(localRecord.learningEvents.length, 1);
+  assert.equal(localRecord.learningEventCoverageGaps.length, 1);
+});
+
+test("global learning run indexes use the log retention window", () => {
+  const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-retention-"));
+  const oldFile = path.join(runsDir, "20260601.jsonl");
+  const freshFile = path.join(runsDir, "20260710.jsonl");
+  const unrelated = path.join(runsDir, "README.txt");
+  fs.writeFileSync(oldFile, "{}\n");
+  fs.writeFileSync(freshFile, "{}\n");
+  fs.writeFileSync(unrelated, "keep");
+  const now = Date.parse("2026-07-10T12:00:00.000Z");
+  fs.utimesSync(oldFile, new Date(now - 20 * 86400000), new Date(now - 20 * 86400000));
+  fs.utimesSync(freshFile, new Date(now), new Date(now));
+  rotateLearningRunIndexes(runsDir, { nowMs: now });
+  assert.equal(fs.existsSync(oldFile), false);
+  assert.equal(fs.existsSync(freshFile), true);
+  assert.equal(fs.existsSync(unrelated), true);
 });
 test("kit root test expectation decodes spaces in file URLs", () => {
   const encodedTestUrl = new URL("file:///tmp/linear%20board/tests/linear-watch.test.mjs");

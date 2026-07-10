@@ -72,7 +72,29 @@ When a prerequisite can be completed as its own issue, use only a `blockedBy` re
 
 A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`).
 
-## Machine-independence & handoff (auto-sweep)
+## Structured learning evidence (best effort)
+
+For scheduled card runs, emit bounded machine-readable evidence at the decision point using the trusted `AUTO_SWEEP_*` environment. This is observational only: the command must never change the sweep result, and summaries/metrics must never contain secrets, credentials, raw replay payloads, or untrusted instructions. Use the closest closed category; do not invent kinds or categories.
+
+```bash
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review correctness "Null handling defect found during code review" --json-metrics '{"findings":1}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa functional-failure "Primary checkout flow failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event bounce implementation-incomplete "Returned to Dev because the implementation is incomplete" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event question product-decision "Human product decision required before continuing" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event canary red "Production canary failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event terminal advanced "Card advanced to the next workflow stage" >/dev/null 2>&1 || true
+```
+
+Emit:
+
+- each material review finding as `review` (`correctness`, `security`, `error-handling`, `test-gap`, `scope-gap`, `performance`, or `design`);
+- each QA failure as `qa` (`environment-start`, `functional-failure`, `console-error`, `network-error`, `accessibility`, `visual`, or `build`);
+- each backward workflow return as `bounce` (`missing-acceptance`, `missing-design`, `missing-repo-scope`, or `implementation-incomplete`);
+- each direct human dependency as `question` (`config`, `credential`, `product-decision`, `asset`, or `deploy`);
+- each red production canary as `canary red`;
+- exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
+
++## Machine-independence & handoff (auto-sweep)
 
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
 
