@@ -115,6 +115,12 @@ test("operator docs and template explain the host ceiling and runtime preflight"
   assert.match(template, /reviewer subagents[^\n]*not counted/i, "templates/linear-sweep.json");
 });
 
+test("README limits application-bundle runtime fallbacks to Codex", () => {
+  const text = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.match(text, /`CODEX_BIN` or `CLAUDE_BIN`[^\n]*`PATH`[^\n]*for Codex only[^\n]*ChatGPT\.app[^\n]*legacy Codex\.app/);
+  assert.match(text, /Claude[^\n]*(?:stops after|requires)[^\n]*(?:override|`CLAUDE_BIN`)[^\n]*`PATH`/);
+});
+
 test("operator docs require health evidence and an observation window before tuning", () => {
   for (const file of ["../README.md", "../SETUP.md"]) {
     const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");

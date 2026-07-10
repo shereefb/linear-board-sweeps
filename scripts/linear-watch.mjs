@@ -538,12 +538,136 @@ export function bounceDecisions(cards, cfg, now, windowH = ESCALATE_WINDOW_H) {
   return out;
 }
 
+// Detect only cycles provable from one complete scheduled-state project snapshot.
+// Edges to cards outside that snapshot remain ordinary unresolved dependencies;
+// this intentionally does not crawl other states, projects, or teams.
+export function annotateBoundedDependencyCycles(cards = []) {
+  const input = cards.map((card) => ({ ...card }));
+  const byId = new Map();
+  const byIdentifier = new Map();
+  input.forEach((card, index) => {
+    if (card.blockersComplete !== true) return;
+    if (card.id) byId.set(card.id, index);
+    if (card.identifier) byIdentifier.set(card.identifier, index);
+  });
+  const label = (index) => input[index].identifier || input[index].id || `card-${index}`;
+  const adjacency = input.map((card) => {
+    if (card.blockersComplete !== true) return [];
+    const targets = new Set();
+    for (const blocker of card.blockers || []) {
+      let target;
+      if (blocker.id) target = byId.get(blocker.id);
+      if (target === undefined && blocker.identifier) target = byIdentifier.get(blocker.identifier);
+      if (target !== undefined) targets.add(target);
+    }
+    return [...targets].sort((a, b) => label(a).localeCompare(label(b)));
+  });
+
+  let nextIndex = 0;
+  const indexes = Array(input.length).fill(-1);
+  const lowLinks = Array(input.length).fill(-1);
+  const stack = [];
+  const onStack = new Set();
+  const components = [];
+  const visit = (node) => {
+    indexes[node] = nextIndex;
+    lowLinks[node] = nextIndex;
+    nextIndex += 1;
+    stack.push(node);
+    onStack.add(node);
+    for (const target of adjacency[node]) {
+      if (indexes[target] === -1) {
+        visit(target);
+        lowLinks[node] = Math.min(lowLinks[node], lowLinks[target]);
+      } else if (onStack.has(target)) {
+        lowLinks[node] = Math.min(lowLinks[node], indexes[target]);
+      }
+    }
+    if (lowLinks[node] !== indexes[node]) return;
+    const component = [];
+    while (stack.length) {
+      const member = stack.pop();
+      onStack.delete(member);
+      component.push(member);
+      if (member === node) break;
+    }
+    const selfCycle = component.length === 1 && adjacency[component[0]].includes(component[0]);
+    if (component.length > 1 || selfCycle) components.push(component);
+  };
+  input.forEach((_card, index) => {
+    if (indexes[index] === -1) visit(index);
+  });
+
+  const anomalyByIndex = new Map();
+  const cycles = components.map((component) => {
+    const membersSet = new Set(component);
+    const members = component.map(label).sort();
+    const edges = component.flatMap((from) => adjacency[from]
+      .filter((to) => membersSet.has(to))
+      .map((to) => ({ from: label(from), to: label(to) })))
+      .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+    const anomaly = {
+      kind: "dependency-cycle",
+      bounded: true,
+      members,
+      edges,
+      stableTarget: members.join(","),
+      message: `visible dependency cycle: ${edges.map((edge) => `${edge.from} -> ${edge.to}`).join("; ")}`,
+    };
+    for (const index of component) anomalyByIndex.set(index, anomaly);
+    return anomaly;
+  }).sort((a, b) => a.stableTarget.localeCompare(b.stableTarget));
+
+  return {
+    cards: input.map((card, index) => {
+      const dependencyAnomaly = anomalyByIndex.get(index);
+      if (!dependencyAnomaly) return card;
+      const dependency = card.dependency || dependencyEligibility(card.blockers, card.blockersComplete === true);
+      return {
+        ...card,
+        dependencyAnomaly,
+        dependency: { ...dependency, eligible: false, reason: "dependency-cycle" },
+      };
+    }),
+    cycles,
+  };
+}
+
+export function dependencyCycleFailureEvents(cards = [], {
+  anchorPath = "_",
+  projectId = "unknown",
+  seenAt = new Date().toISOString(),
+} = {}) {
+  const cycles = new Map();
+  for (const card of cards) {
+    const anomaly = card.dependencyAnomaly;
+    if (anomaly?.kind === "dependency-cycle") cycles.set(anomaly.stableTarget, anomaly);
+  }
+  return [...cycles.values()]
+    .sort((a, b) => a.stableTarget.localeCompare(b.stableTarget))
+    .map((anomaly) => ({
+      anchorPath,
+      anchorSlug: anchorSlug(anchorPath),
+      projectId,
+      scope: "dependency-cycle",
+      kind: "dependency-cycle",
+      stableTarget: anomaly.stableTarget,
+      message: anomaly.message,
+      seenAt,
+    }));
+}
+
+function cardDependencyEligibility(card) {
+  if (card?.dependencyAnomaly?.kind === "dependency-cycle") return card.dependency;
+  return dependencyEligibility(card?.blockers, card?.blockersComplete === true);
+}
+
 // The actionable subset: not blocked, and not owned by a live run. releasedIds =
 // cards whose claim was just released this tick (they become actionable again).
 export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
-    if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) return false;
+    if (!cardDependencyEligibility(card).eligible) return false;
     const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
@@ -746,7 +870,7 @@ export function claimConfirmed(card, cfg, owner, expectedStates = []) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
-  if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) return false;
+  if (!cardDependencyEligibility(card).eligible) return false;
   return latestHeartbeatOwner(card, cfg.claim) === owner;
 }
 
@@ -2041,7 +2165,15 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
       if (!byState.has(card.stateName)) byState.set(card.stateName, []);
       byState.get(card.stateName).push(card);
     }
-    if (!connection.pageInfo.hasNextPage) return byState;
+    if (!connection.pageInfo.hasNextPage) {
+      const annotated = annotateBoundedDependencyCycles([...byState.values()].flat()).cards;
+      const annotatedByState = new Map([...byState.keys()].map((state) => [state, []]));
+      for (const card of annotated) {
+        if (!annotatedByState.has(card.stateName)) annotatedByState.set(card.stateName, []);
+        annotatedByState.get(card.stateName).push(card);
+      }
+      return annotatedByState;
+    }
     const nextCursor = connection.pageInfo.endCursor;
     if (!nextCursor || seenCursors.has(nextCursor)) throw new Error("scheduled queue snapshot pagination is incomplete");
     seenCursors.add(nextCursor);
@@ -2530,6 +2662,7 @@ export function doctorReport({
     if (!report.tick.ok) report.ok = false;
   }
   if (currentTick) report.currentTickFailures = Array.isArray(currentTick.failures) ? currentTick.failures : [];
+  else if (lastTick) report.lastTickFailures = Array.isArray(lastTick.failures) ? lastTick.failures : [];
   const observations = observationState || createObservationStore({ observationPath, now: () => now }).snapshot();
   const waits = (observations.entries || [])
     .map((entry) => Number(entry.queueWaitMs))
@@ -2608,6 +2741,9 @@ export function formatDoctorReport(report) {
   if (report.tick) lines.push(`tick: ${report.tick.reason}`);
   for (const failure of report.currentTickFailures || []) {
     lines.push(`current tick failure: ${failure.kind || "unknown"}: ${failure.message || "(no detail)"}`);
+  }
+  for (const failure of report.lastTickFailures || []) {
+    lines.push(`latest tick failure: ${failure.kind || "unknown"}: ${failure.message || "(no detail)"}`);
   }
   const load = report.resources?.loadAverage1m;
   if (load) lines.push(`load: current=${load.end} peak=${load.max}`);
@@ -3257,6 +3393,7 @@ async function tick({ dryRun = false } = {}) {
     const activeByAnchor = new Map();
     const runtimeCache = new Map();
     const reportedRuntimeFailures = new Set();
+    const reportedDependencyCycleFailures = new Set();
     const activeSameRepo = createSameRepoActiveCounts();
     const childIndexAllocator = createChildIndexAllocator();
     const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
@@ -3682,6 +3819,22 @@ async function tick({ dryRun = false } = {}) {
         const cleanupCardsByState = scheduledPass.cleanupByState;
         if (!scheduledPass.admissionError) {
           for (const sweep of SWEEPS) active.checkedScopes.add(sweep);
+          active.checkedScopes.add("dependency-cycle");
+          const scheduledCards = [...scheduledCardsByState.values()].flat();
+          for (const failure of dependencyCycleFailureEvents(scheduledCards, {
+            anchorPath,
+            projectId: config.projectId,
+            seenAt: new Date().toISOString(),
+          })) {
+            active.failures.push(failure);
+            logFor(anchorPath, "_", `dependency anomaly: ${failure.message}`);
+            const fingerprint = failureFingerprint(failure);
+            if (!reportedDependencyCycleFailures.has(fingerprint)) {
+              reportedDependencyCycleFailures.add(fingerprint);
+              localFailures.push(failure);
+              writeCurrentTick();
+            }
+          }
         } else {
           for (const sweep of SWEEPS) {
             logFor(anchorPath, sweep, `fetch error: ${scheduledPass.admissionError.message}`);
@@ -3745,7 +3898,7 @@ async function tick({ dryRun = false } = {}) {
             }
           }
           for (const card of cards) {
-            const dependency = dependencyEligibility(card.blockers, card.blockersComplete === true);
+            const dependency = cardDependencyEligibility(card);
             if (!dependency.eligible) {
               const key = observationKey({ sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier });
               dependencyDeferredKeys.add(key);

@@ -16,6 +16,7 @@ import {
   worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
+  annotateBoundedDependencyCycles, dependencyCycleFailureEvents,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
   compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, dependencyDeferredIssue, admitDemand,
   runAdmissionDemands,
@@ -1151,6 +1152,65 @@ test("dependency telemetry: summaries are bounded and contain only stable identi
   assert.deepEqual(Object.keys(summary), ["sourceWorkspace", "sweep", "issueIdentifier", "reason", "blockers"]);
   assert.doesNotMatch(JSON.stringify(summary), /secret/);
 });
+
+test("bounded dependency cycles: self-cycle annotates the card and keeps it ineligible", () => {
+  const card = dependencyReadyCard({
+    id: "a-id", identifier: "COD-1", labelNames: [], comments: [],
+    blockers: [{ id: "a-id", identifier: "COD-1", stateName: "Dev" }],
+  });
+
+  const result = annotateBoundedDependencyCycles([card]);
+
+  assert.deepEqual(result.cycles, [{
+    kind: "dependency-cycle",
+    bounded: true,
+    members: ["COD-1"],
+    edges: [{ from: "COD-1", to: "COD-1" }],
+    stableTarget: "COD-1",
+    message: "visible dependency cycle: COD-1 -> COD-1",
+  }]);
+  assert.equal(result.cards[0].dependencyAnomaly, result.cycles[0]);
+  assert.equal(result.cards[0].dependency.eligible, false);
+  assert.equal(result.cards[0].dependency.reason, "dependency-cycle");
+  assert.deepEqual(actionableCards(result.cards, SWEEP_CFG.dev, NOW), []);
+});
+
+test("bounded dependency cycles: two-card cycle annotates every involved card", () => {
+  const cards = [
+    dependencyReadyCard({
+      id: "a-id", identifier: "COD-1", labelNames: [], comments: [],
+      blockers: [{ id: "b-id", identifier: "COD-2", stateName: "QA" }],
+    }),
+    dependencyReadyCard({
+      id: "b-id", identifier: "COD-2", labelNames: [], comments: [],
+      blockers: [{ id: "a-id", identifier: "COD-1", stateName: "Dev" }],
+    }),
+  ];
+
+  const result = annotateBoundedDependencyCycles(cards);
+
+  assert.equal(result.cycles.length, 1);
+  assert.deepEqual(result.cycles[0].members, ["COD-1", "COD-2"]);
+  assert.deepEqual(result.cycles[0].edges, [
+    { from: "COD-1", to: "COD-2" },
+    { from: "COD-2", to: "COD-1" },
+  ]);
+  assert.deepEqual(result.cards.map((card) => card.dependencyAnomaly?.stableTarget), ["COD-1,COD-2", "COD-1,COD-2"]);
+  assert.deepEqual(actionableCards(result.cards, SWEEP_CFG.dev, NOW), []);
+});
+
+test("bounded dependency cycles: an acyclic active-queue chain has no anomaly", () => {
+  const cards = [
+    dependencyReadyCard({ id: "a-id", identifier: "COD-1", blockers: [{ id: "b-id", identifier: "COD-2", stateName: "QA" }] }),
+    dependencyReadyCard({ id: "b-id", identifier: "COD-2", blockers: [{ id: "c-id", identifier: "COD-3", stateName: "Spec" }] }),
+    dependencyReadyCard({ id: "c-id", identifier: "COD-3", blockers: [] }),
+  ];
+
+  const result = annotateBoundedDependencyCycles(cards);
+
+  assert.deepEqual(result.cycles, []);
+  assert.equal(result.cards.some((card) => card.dependencyAnomaly), false);
+});
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
   const reapCard = dependencyReadyCard({ id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
@@ -1453,6 +1513,51 @@ test("queue snapshot requests all scheduled states once and partitions dependenc
   assert.deepEqual(byState.get("Dev").map((card) => card.identifier), ["COD-2"]);
   assert.equal(byState.get("Dev")[0].blockersComplete, true);
   assert.equal(byState.get("Dev")[0].dependency.eligible, true);
+});
+
+test("queue snapshot annotates a visible cycle and produces one deduplicated failure event for Todo and doctor", async () => {
+  const node = (id, identifier, state, blockerId, blockerIdentifier, blockerState) => ({
+    id, identifier, updatedAt: minsAgo(1), sortOrder: 10,
+    state: { name: state }, labels: { nodes: [] }, comments: { nodes: [] },
+    inverseRelations: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ id: `rel-${id}`, type: "blocks", issue: { id: blockerId, identifier: blockerIdentifier, state: { id: `${blockerId}-state`, name: blockerState, type: "started" } } }],
+    },
+  });
+  const gqlFn = async () => ({
+    issues: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [
+        node("a-id", "COD-1", "Dev", "b-id", "COD-2", "QA"),
+        node("b-id", "COD-2", "QA", "a-id", "COD-1", "Dev"),
+      ],
+    },
+  });
+
+  const byState = await fetchScheduledQueueCards("lin", "COD", "project-1", ["Dev", "QA"], { gqlFn });
+  const cards = [...byState.values()].flat();
+  const failures = dependencyCycleFailureEvents(cards, {
+    anchorPath: "/managed/app",
+    projectId: "project-1",
+    seenAt: "2026-07-09T00:00:00.000Z",
+  });
+
+  assert.deepEqual(cards.map((card) => card.dependency.reason), ["dependency-cycle", "dependency-cycle"]);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].scope, "dependency-cycle");
+  assert.equal(failures[0].kind, "dependency-cycle");
+  assert.equal(failures[0].stableTarget, "COD-1,COD-2");
+  assert.match(failures[0].message, /COD-1 -> COD-2; COD-2 -> COD-1/);
+  assert.deepEqual(failureTodoDecisions([...failures, ...failures], [], new Set(["dependency-cycle"])).map((decision) => decision.action), ["create"]);
+
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    currentTick: { status: "running", pid: 42, failures },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    isAlive: () => true,
+  });
+  assert.match(formatDoctorReport(report), /current tick failure: dependency-cycle: visible dependency cycle/);
 });
 
 test("queue snapshot completes relation overflow before the card becomes eligible", async () => {
@@ -2950,6 +3055,22 @@ test("doctor telemetry: malformed observations surface as a metrics gap without 
   assert.equal(report.ok, true);
   assert.deepEqual(report.metricsUnavailable, ["observation schema is malformed"]);
   assert.match(formatDoctorReport(report), /metrics unavailable: observation schema is malformed/);
+});
+test("doctor preserves exact dependency-cycle evidence after the tick completes", () => {
+  const lastTick = {
+    at: new Date(NOW).toISOString(),
+    failures: [{ kind: "dependency-cycle", message: "visible dependency cycle: COD-1 -> COD-2; COD-2 -> COD-1" }],
+  };
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    lastTick,
+    capacityState: { healthy: true, active: 0, max: 10, errors: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    now: NOW,
+  });
+
+  assert.deepEqual(report.lastTickFailures, lastTick.failures);
+  assert.match(formatDoctorReport(report), /latest tick failure: dependency-cycle: visible dependency cycle: COD-1 -> COD-2; COD-2 -> COD-1/);
 });
 
 test("pushWithRetry: succeeds on first attempt", () => {
