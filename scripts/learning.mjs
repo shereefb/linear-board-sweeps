@@ -250,54 +250,83 @@ export function buildLearningEvidenceSnapshot({
     events: boundedLimit(limits.events, MAX_LEARNING_SNAPSHOT_EVENTS),
     observations: boundedLimit(limits.observations, MAX_LEARNING_SNAPSHOT_OBSERVATIONS),
   };
-  const gaps = coverageGaps.slice(0, 100).map((gap) => ({
-    source: sanitizeLearningText(gap?.source || "unknown", 500),
-    reason: sanitizeLearningText(gap?.reason || "unspecified coverage gap", 500),
-  }));
-  if (coverageGaps.length > 100) gaps.push({ source: "snapshot", reason: "coverage gaps truncated at 100" });
+  const gaps = [];
+  const gapKeys = new Set();
+  const pushGap = (source, reason) => {
+    const gap = { source: sanitizeLearningText(source || "unknown", 500), reason: sanitizeLearningText(reason || "unspecified coverage gap", 500) };
+    const key = `${gap.source}\0${gap.reason}`;
+    if (gapKeys.has(key) || gaps.length >= 100) return;
+    gapKeys.add(key);
+    gaps.push(gap);
+  };
+  for (const gap of coverageGaps.slice(0, 100)) pushGap(gap?.source, gap?.reason);
+  if (coverageGaps.length > 100) pushGap("snapshot", "coverage gaps truncated at 100");
   const selectedRuns = [];
   const selectedRawRuns = [];
+  const runInspectionLimit = Math.max(4, bounded.runRecords * 4);
+  let inspectedRuns = 0;
   for (const record of Array.isArray(runRecords) ? runRecords : []) {
+    if (inspectedRuns >= runInspectionLimit) {
+      pushGap("runRecords", `run record inspection truncated at ${runInspectionLimit}`);
+      break;
+    }
+    inspectedRuns += 1;
     if (!inEvidenceWindow(record?.endedAt, fromMs, capturedThroughMs)) continue;
     if (selectedRuns.length >= bounded.runRecords) {
-      if (!gaps.some((gap) => gap.reason.includes("run records truncated"))) gaps.push({ source: "runRecords", reason: `run records truncated at ${bounded.runRecords}` });
+      pushGap("runRecords", `run records truncated at ${bounded.runRecords}`);
       continue;
     }
     try {
       selectedRuns.push(normalizeSnapshotRun(record));
       selectedRawRuns.push(record);
     } catch {
-      gaps.push({ source: "runRecords", reason: "malformed run record omitted" });
+      pushGap("runRecords", "malformed run record omitted");
     }
   }
   const eventById = new Map();
+  const eventInspectionLimit = Math.max(4, bounded.events * 4);
+  let inspectedEvents = 0;
   const addEvent = (candidate) => {
-    if (!inEvidenceWindow(candidate?.occurredAt, fromMs, capturedThroughMs)) return;
+    if (inspectedEvents >= eventInspectionLimit) {
+      pushGap("events", `event inspection truncated at ${eventInspectionLimit}`);
+      return false;
+    }
+    inspectedEvents += 1;
+    if (!inEvidenceWindow(candidate?.occurredAt, fromMs, capturedThroughMs)) return true;
     try {
       const event = sanitizeStoredEvent(candidate);
-      if (eventById.has(event.eventId)) return;
+      if (eventById.has(event.eventId)) return true;
       if (eventById.size >= bounded.events) {
-        if (!gaps.some((gap) => gap.reason.includes("events truncated"))) gaps.push({ source: "events", reason: `events truncated at ${bounded.events}` });
-        return;
+        pushGap("events", `events truncated at ${bounded.events}`);
+        return true;
       }
       eventById.set(event.eventId, event);
     } catch {
-      gaps.push({ source: "events", reason: "malformed learning event omitted" });
+      pushGap("events", "malformed learning event omitted");
     }
+    return true;
   };
-  for (const event of Array.isArray(events) ? events : []) addEvent(event);
+  for (const event of Array.isArray(events) ? events : []) if (!addEvent(event)) break;
   for (const record of selectedRawRuns) {
-    for (const event of Array.isArray(record.learningEvents) ? record.learningEvents : []) addEvent(event);
+    for (const event of Array.isArray(record.learningEvents) ? record.learningEvents : []) if (!addEvent(event)) break;
+    if (inspectedEvents >= eventInspectionLimit) break;
   }
   const selectedObservations = [];
+  const observationInspectionLimit = Math.max(4, bounded.observations * 4);
+  let inspectedObservations = 0;
   for (const observation of Array.isArray(observations) ? observations : []) {
+    if (inspectedObservations >= observationInspectionLimit) {
+      pushGap("observations", `observation inspection truncated at ${observationInspectionLimit}`);
+      break;
+    }
+    inspectedObservations += 1;
     if (!inEvidenceWindow(observation?.at || observation?.observedAt, fromMs, capturedThroughMs)) continue;
     if (selectedObservations.length >= bounded.observations) {
-      if (!gaps.some((gap) => gap.reason.includes("observations truncated"))) gaps.push({ source: "observations", reason: `observations truncated at ${bounded.observations}` });
+      pushGap("observations", `observations truncated at ${bounded.observations}`);
       continue;
     }
     try { selectedObservations.push(normalizeSnapshotObservation(observation)); }
-    catch { gaps.push({ source: "observations", reason: "malformed observation omitted" }); }
+    catch { pushGap("observations", "malformed observation omitted"); }
   }
   return {
     from,

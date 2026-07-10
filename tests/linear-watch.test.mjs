@@ -43,6 +43,7 @@ import {
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
+  rotateLearningEventFiles,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -2037,6 +2038,25 @@ test("global learning run indexes use the log retention window", () => {
   assert.equal(fs.existsSync(oldFile), false);
   assert.equal(fs.existsSync(freshFile), true);
   assert.equal(fs.existsSync(unrelated), true);
+});
+
+test("unique per-run learning event files use the log retention window", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-event-retention-"));
+  const nested = path.join(stateDir, "repo", "dev", "COD-143");
+  fs.mkdirSync(nested, { recursive: true });
+  const oldFile = path.join(nested, "learning-events-deadbeefdeadbeef.jsonl");
+  const freshFile = path.join(nested, "learning-events-cafebabecafebabe.jsonl");
+  const runRecord = path.join(nested, "run-records-20260710.jsonl");
+  fs.writeFileSync(oldFile, "{}\n");
+  fs.writeFileSync(freshFile, "{}\n");
+  fs.writeFileSync(runRecord, "{}\n");
+  const now = Date.parse("2026-07-10T12:00:00.000Z");
+  fs.utimesSync(oldFile, new Date(now - 20 * 86400000), new Date(now - 20 * 86400000));
+  fs.utimesSync(freshFile, new Date(now), new Date(now));
+  rotateLearningEventFiles(stateDir, { nowMs: now });
+  assert.equal(fs.existsSync(oldFile), false);
+  assert.equal(fs.existsSync(freshFile), true);
+  assert.equal(fs.existsSync(runRecord), true);
 });
 test("kit root test expectation decodes spaces in file URLs", () => {
   const encodedTestUrl = new URL("file:///tmp/linear%20board/tests/linear-watch.test.mjs");

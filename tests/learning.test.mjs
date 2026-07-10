@@ -193,6 +193,19 @@ test("learning evidence snapshots allowlist, redact, and bound every collection"
   assert.ok(snapshot.coverage.gaps.some((gap) => /truncated/.test(gap.reason)));
 });
 
+test("learning evidence snapshots bound malformed-input scanning and generated gaps", () => {
+  const malformed = Array.from({ length: 1_000 }, (_, index) => ({ endedAt: "2026-07-10T11:59:00.000Z", hostile: index }));
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    runRecords: malformed,
+    observations: malformed.map(() => ({ at: "2026-07-10T11:59:00.000Z" })),
+    events: malformed.map(() => ({ occurredAt: "2026-07-10T11:59:00.000Z" })),
+    limits: { runRecords: 1, events: 1, observations: 1 },
+  });
+  assert.ok(snapshot.coverage.gaps.length <= 10);
+  assert.ok(snapshot.coverage.gaps.some((gap) => /inspection truncated/.test(gap.reason)));
+});
+
 test("learning config defaults disabled and clamps the create budget", () => {
   assert.deepEqual(normalizeWorkspaceLearning({}), {
     enabled: false,

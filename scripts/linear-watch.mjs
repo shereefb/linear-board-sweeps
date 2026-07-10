@@ -2224,6 +2224,18 @@ export function rotateLearningRunIndexes(runsDir, { nowMs = Date.now(), retentio
   }
 }
 
+export function rotateLearningEventFiles(stateDir, { nowMs = Date.now(), retentionDays = LOG_RETENTION_DAYS } = {}) {
+  const cutoff = nowMs - retentionDays * 86400000;
+  const walk = (dir) => {
+    for (const entry of fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }) : []) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/^learning-events-[a-f0-9]+\.jsonl$/.test(entry.name) && fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true });
+    }
+  };
+  walk(stateDir);
+}
+
 function rotateLogs() {
   const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
   const walk = (dir) => {
@@ -2235,6 +2247,7 @@ function rotateLogs() {
   };
   walk(STATE_DIR);
   rotateLearningRunIndexes(LEARNING_RUNS_DIR);
+  rotateLearningEventFiles(STATE_DIR);
 }
 
 // ── IO: tick lock (PID liveness) ─────────────────────────────────────────────
