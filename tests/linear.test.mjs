@@ -12,8 +12,92 @@ import {
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
-  repoRouteEligibility, fetchIssueLabels,
+  repoRouteEligibility, fetchIssueLabels, qaHandoffDecision,
 } from "../scripts/linear.mjs";
+
+const QA_HANDOFF_BASE = Object.freeze({
+  fastPathEnabled: true,
+  requireShipApproval: false,
+  stateName: "QA",
+  labelNames: ["fast-path:eligible", "qa:passed", "qa:in-progress"],
+  issueIdentifier: "COD-142",
+  reviewedHead: "a".repeat(40),
+  finalHead: "a".repeat(40),
+  hasForeignClaim: false,
+});
+
+test("QA handoff sends an eligible fast path to Ship", () => {
+  assert.deepEqual(qaHandoffDecision(QA_HANDOFF_BASE), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+const QA_HANDOFF_DENIALS = [
+  [{ fastPathEnabled: false }, "fast-path-disabled"],
+  [{ requireShipApproval: true }, "ship-approval-required"],
+  [{ stateName: "Signoff" }, "not-in-qa"],
+  [{ labelNames: ["qa:passed"] }, "missing-fast-path-label"],
+  [{ labelNames: ["fast-path:eligible"] }, "missing-qa-pass"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "blocked:open-questions"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "blocked:needs-user"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "qa:needs-changes"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "sweep:manual-only"] }, "blocked"],
+  [{ hasForeignClaim: true }, "foreign-claim"],
+  [{ reviewedHead: null }, "missing-reviewed-head"],
+  [{ reviewedHead: "abc123" }, "invalid-reviewed-head"],
+  [{ finalHead: null }, "missing-final-head"],
+  [{ finalHead: "abc123" }, "invalid-final-head"],
+  [{ finalHead: "b".repeat(40) }, "head-mismatch"],
+];
+
+for (const [override, reason] of QA_HANDOFF_DENIALS) {
+  test(`QA handoff denies with ${reason}`, () => {
+    assert.deepEqual(qaHandoffDecision({ ...QA_HANDOFF_BASE, ...override }), {
+      destination: "Signoff",
+      eligible: false,
+      reason,
+    });
+  });
+}
+
+test("QA handoff defaults fast path on and ship approval off", () => {
+  const { fastPathEnabled: _fastPathEnabled, requireShipApproval: _requireShipApproval, ...input } = QA_HANDOFF_BASE;
+  assert.deepEqual(qaHandoffDecision(input), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+test("QA handoff compares full Git SHAs case-insensitively", () => {
+  assert.deepEqual(qaHandoffDecision({
+    ...QA_HANDOFF_BASE,
+    reviewedHead: "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    finalHead: "abcdef0123456789abcdef0123456789abcdef01",
+  }), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+test("QA handoff fails closed for malformed or missing input", () => {
+  for (const input of [undefined, null, "invalid", [], { labelNames: "fast-path:eligible" }]) {
+    const decision = qaHandoffDecision(input);
+    assert.equal(decision.destination, "Signoff");
+    assert.equal(decision.eligible, false);
+  }
+});
+
+test("QA handoff does not mutate the input or labels", () => {
+  const labelNames = Object.freeze([...QA_HANDOFF_BASE.labelNames]);
+  const input = Object.freeze({ ...QA_HANDOFF_BASE, labelNames });
+  const before = structuredClone(input);
+  qaHandoffDecision(input);
+  assert.deepEqual(input, before);
+});
 
 test("dependency eligibility releases only exact Done blockers", () => {
   assert.equal(WORKFLOW_STATES.done, "Done");

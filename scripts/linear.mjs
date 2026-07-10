@@ -80,6 +80,34 @@ export function repoRouteEligibility(labelNames, byLabel, expectedLabel, expecte
   return { eligible: true, reason: "ready", matches };
 }
 
+const QA_HANDOFF_BLOCKING_LABELS = new Set([
+  "blocked:open-questions",
+  "blocked:needs-user",
+  "qa:needs-changes",
+  "sweep:manual-only",
+]);
+const FULL_GIT_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+
+export function qaHandoffDecision(input = {}) {
+  const facts = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
+  const deny = (reason) => ({ destination: WORKFLOW_STATES.signoff, eligible: false, reason });
+
+  if (facts.fastPathEnabled === false) return deny("fast-path-disabled");
+  if (facts.requireShipApproval === true) return deny("ship-approval-required");
+  if (facts.stateName !== WORKFLOW_STATES.qa) return deny("not-in-qa");
+  if (!labels.has("fast-path:eligible")) return deny("missing-fast-path-label");
+  if (!labels.has("qa:passed")) return deny("missing-qa-pass");
+  if ([...QA_HANDOFF_BLOCKING_LABELS].some((label) => labels.has(label))) return deny("blocked");
+  if (facts.hasForeignClaim !== false) return deny("foreign-claim");
+  if (facts.reviewedHead == null || facts.reviewedHead === "") return deny("missing-reviewed-head");
+  if (typeof facts.reviewedHead !== "string" || !FULL_GIT_SHA.test(facts.reviewedHead)) return deny("invalid-reviewed-head");
+  if (facts.finalHead == null || facts.finalHead === "") return deny("missing-final-head");
+  if (typeof facts.finalHead !== "string" || !FULL_GIT_SHA.test(facts.finalHead)) return deny("invalid-final-head");
+  if (facts.reviewedHead.toLowerCase() !== facts.finalHead.toLowerCase()) return deny("head-mismatch");
+  return { destination: WORKFLOW_STATES.ship, eligible: true, reason: "eligible" };
+}
+
 // The canonical board definition the sweeps depend on:
 export const REQUIRED_STATES = [
   { name: WORKFLOW_STATES.spec, type: "unstarted", color: "#9b59b6" },
