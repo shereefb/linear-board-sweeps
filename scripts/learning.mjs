@@ -348,6 +348,264 @@ export function buildLearningEvidenceSnapshot({
   };
 }
 
+const detectorDefinitions = [
+  ["repeated-dispatch-failure", "reliability", "dispatch-failure", 2, "runId"],
+  ["stale-claim-pattern", "reliability", "stale-claim", 2, "runId"],
+  ["failed-recovery", "reliability", "failure-recovery", 2, "runId"],
+  ["safety-invariant-violation", "reliability", "safety-invariant", 1, "evidenceId"],
+  ["poison-card-cluster", "reliability", "poison-card", 2, "cardId"],
+  ["repeated-review-finding", "quality", "review-finding", 3, "cardId"],
+  ["qa-rework-regression", "quality", "qa-result", 8, "cardId"],
+  ["spec-quality-failure", "quality", "spec-bounce", 2, "cardId"],
+  ["recurring-human-question", "quality", "human-question", 3, "cardId"],
+  ["red-canary-pattern", "quality", "red-canary", 2, "runId"],
+  ["queue-delay-regression", "throughput", "queue-run", 20, "runId"],
+  ["stage-duration-regression", "throughput", "stage-run", 20, "runId"],
+  ["nonproductive-run", "throughput", "productive-run", 20, "runId"],
+  ["capacity-saturation", "throughput", "capacity-run", 20, "runId"],
+  ["review-overprocessing", "throughput", "review-run", 20, "runId"],
+];
+
+function detectorQualifies(id, observations, config = {}) {
+  const thresholds = config.thresholds || {};
+  if (id === "failed-recovery") return observations.some((item) => item.recoveryState === "recovered") && observations.some((item) => item.recoveryState === "recurred");
+  if (id === "safety-invariant-violation") return observations.some((item) => item.proven === true);
+  if (id === "poison-card-cluster") return observations.filter((item) => item.machineCorrectable === true).length >= 2;
+  if (id === "qa-rework-regression") {
+    const needsChanges = observations.filter((item) => item.result === "needs-changes").length;
+    const currentRate = observations.length ? needsChanges / observations.length : 0;
+    const baselineRate = Number(observations.find((item) => Number.isFinite(item.baselineRate))?.baselineRate || 0);
+    return observations.length >= 8 && currentRate - baselineRate >= Number(thresholds.qaReworkAbsoluteDelta ?? 0.15);
+  }
+  if (id === "red-canary-pattern") return observations.some((item) => item.seriousMissingGate === true) || observations.length >= 2;
+  if (id === "queue-delay-regression") {
+    const windows = new Set(observations.map((item) => item.window).filter(Boolean));
+    return observations.length >= 20 && windows.size >= 2 && observations.every((item) => {
+      const value = Number(item.metrics?.waitMs);
+      const baseline = Number(item.metrics?.baselineP90Ms);
+      return value >= Number(thresholds.queueDelayFloorMs ?? 60_000) && baseline > 0 && value / baseline >= Number(thresholds.relativeRegression ?? 1.25);
+    });
+  }
+  if (id === "stage-duration-regression") return observations.length >= 20 && observations.every((item) => {
+    const value = Number(item.metrics?.durationMs);
+    const baseline = Number(item.metrics?.baselineP90Ms);
+    return value >= Number(thresholds.stageDurationFloorMs ?? 300_000) && baseline > 0 && value / baseline >= Number(thresholds.relativeRegression ?? 1.25);
+  });
+  if (id === "nonproductive-run") return observations.length >= 20 && observations.filter((item) => item.success === true && item.productive === false).length >= 3;
+  if (id === "capacity-saturation") return observations.length >= 20
+    && observations.filter((item) => item.deferred === true).length / observations.length >= Number(thresholds.capacityDeferralRate ?? 0.2)
+    && observations.some((item) => Number(item.metrics?.waitMs) >= Number(thresholds.queueDelayFloorMs ?? 60_000));
+  if (id === "review-overprocessing") return observations.length >= 20 && observations.every((item) => item.riskClass === "low"
+    && item.findingCount === 0
+    && item.safetyFloorSatisfied === true
+    && Number(item.metrics?.reviewDurationMs) >= Number(thresholds.reviewCostFloorMs ?? 300_000));
+  return true;
+}
+
+export const LEARNING_DETECTORS = Object.freeze(detectorDefinitions.map(([id, lens, signal, minimumSample, distinctBy]) => Object.freeze({
+  id,
+  version: "v1",
+  lens,
+  signal,
+  minimumSample,
+  distinctBy,
+  qualify: (observations, config) => detectorQualifies(id, observations, config),
+  fingerprintParts: (observations) => [...new Set(observations.map((item) => item.rootCauseKey || item.fingerprint || item.category || item.relatedKey || signal))].sort(),
+  metric: Object.freeze({ name: lens === "throughput" ? "p90" : "occurrenceCount", direction: "decrease" }),
+  evaluationWindow: Object.freeze({ durationDays: lens === "reliability" ? 7 : 14 }),
+})));
+
+const severityOrder = Object.freeze({ critical: 4, high: 3, medium: 2, low: 1 });
+const confidenceOrder = Object.freeze({ high: 3, medium: 2, low: 1 });
+
+function stableHash(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function detectorEvidence(snapshot, detector) {
+  return (snapshot?.observations || []).filter((item) => item?.signal === detector.signal);
+}
+
+function distinctEvidence(observations, key) {
+  const seen = new Set();
+  return observations.filter((item) => {
+    const identity = item?.[key] || item?.evidenceId || item?.eventId;
+    if (!identity || seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+function detectorFinding(detector, observations, snapshot, config) {
+  const sourceWorkspaces = [...new Set(observations.map((item) => item.sourceWorkspace).filter(Boolean))].sort();
+  const localProjects = [...new Set(observations.map((item) => item.projectId).filter(Boolean))];
+  const localRepos = [...new Set(observations.map((item) => item.repoEntry).filter(Boolean))];
+  const local = sourceWorkspaces.length === 1 && localProjects.length === 1 && localRepos.length === 1;
+  const scope = local ? "workspace" : "core";
+  const projectId = local ? localProjects[0] : config.coreProjectId;
+  const repoEntry = local ? localRepos[0] : config.coreRepoEntry;
+  const parts = detector.fingerprintParts(observations);
+  const rootFingerprint = stableHash({ scope, source: local ? sourceWorkspaces[0] : "shared-core", parts });
+  const detectorVersion = config.detectorVersions?.[detector.id] || detector.version;
+  const occurrenceIds = [...new Set(observations.map((item) => item.evidenceId || item.eventId || item.runId || item.cardId).filter(Boolean))].sort();
+  const timestamps = observations.map((item) => item.occurredAt).filter((value) => !Number.isNaN(Date.parse(value))).sort();
+  const complete = snapshot?.coverage?.complete !== false;
+  const severe = detector.id === "safety-invariant-violation" || observations.some((item) => item.seriousMissingGate === true);
+  const baseConfidence = severe || detector.lens === "reliability" ? "high" : "medium";
+  const confidence = complete ? baseConfidence : baseConfidence === "high" ? "medium" : "low";
+  const category = observations.find((item) => item.category)?.category || detector.signal;
+  const metricName = detector.lens === "throughput" ? detector.metric.name : `${detector.id}Rate`;
+  return {
+    schemaVersion: 1,
+    detectorId: detector.id,
+    detectorVersion,
+    lenses: [detector.lens],
+    scope,
+    sourceWorkspaces,
+    projectId,
+    repoEntry,
+    fingerprint: stableHash({ detectorId: detector.id, detectorVersion, rootFingerprint, occurrenceIds }),
+    rootFingerprint,
+    generation: 0,
+    firstSeenAt: timestamps[0] || snapshot.from || snapshot.capturedThrough,
+    lastSeenAt: timestamps.at(-1) || snapshot.capturedThrough,
+    occurrenceIds,
+    occurrenceCount: occurrenceIds.length,
+    trend: "recurrent",
+    baseline: { value: observations.length, unit: detector.lens === "throughput" ? "runs" : "occurrences" },
+    impact: `Repeated ${category} evidence affects factory ${detector.lens}.`,
+    severity: severe ? "critical" : detector.lens === "throughput" ? "medium" : "high",
+    confidence,
+    coverage: { complete, gaps: clone(snapshot?.coverage?.gaps || []) },
+    evidenceReferences: [...new Set(observations.flatMap((item) => item.references || []).filter(Boolean))].sort(),
+    rootCauseHypothesis: `A shared ${category} factory condition may be causing the observed pattern.`,
+    desiredOutcome: `Reduce repeated ${category} evidence without weakening safety gates.`,
+    acceptanceMetric: { name: metricName, direction: "decrease", target: 0 },
+    evaluationWindow: clone(detector.evaluationWindow),
+    exclusions: ["Do not bypass review, QA, Signoff, or the human Ship gate."],
+    actionable: Boolean(projectId && repoEntry),
+  };
+}
+
+export function runLearningDetectors(snapshot = {}, config = {}) {
+  const enabled = config.enabledDetectors ? new Set(config.enabledDetectors) : null;
+  const findings = [];
+  for (const detector of LEARNING_DETECTORS) {
+    if (enabled && !enabled.has(detector.id)) continue;
+    let observations = distinctEvidence(detectorEvidence(snapshot, detector), detector.distinctBy);
+    if (observations.length < detector.minimumSample) {
+      if (!(detector.id === "red-canary-pattern" && observations.some((item) => item.seriousMissingGate === true))) continue;
+    }
+    observations = observations.sort((a, b) => String(a.evidenceId || "").localeCompare(String(b.evidenceId || "")));
+    if (!detector.qualify(observations, config)) continue;
+    findings.push(detectorFinding(detector, observations, snapshot, config));
+  }
+  return findings.sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.detectorId.localeCompare(b.detectorId));
+}
+
+export function aggregateLearningFindings(findings = []) {
+  const grouped = new Map();
+  for (const finding of findings) {
+    const key = [finding.rootFingerprint, finding.generation || 0, finding.scope, finding.projectId, finding.repoEntry].join("\0");
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(finding);
+  }
+  return [...grouped.values()].map((group) => {
+    const sorted = [...group].sort((a, b) => a.detectorId.localeCompare(b.detectorId));
+    const base = clone(sorted[0]);
+    base.lenses = [...new Set(sorted.flatMap((item) => item.lenses || []))].sort();
+    base.occurrenceIds = [...new Set(sorted.flatMap((item) => item.occurrenceIds || []))].sort();
+    base.occurrenceCount = base.occurrenceIds.length;
+    base.evidenceReferences = [...new Set(sorted.flatMap((item) => item.evidenceReferences || []))].sort();
+    base.detectorProvenance = [...new Set(sorted.map((item) => `${item.detectorId}/${item.detectorVersion}`))].sort();
+    base.firstSeenAt = sorted.map((item) => item.firstSeenAt).sort()[0];
+    base.lastSeenAt = sorted.map((item) => item.lastSeenAt).sort().at(-1);
+    base.severity = sorted.map((item) => item.severity).sort((a, b) => (severityOrder[b] || 0) - (severityOrder[a] || 0))[0];
+    base.confidence = sorted.map((item) => item.confidence).sort((a, b) => (confidenceOrder[b] || 0) - (confidenceOrder[a] || 0))[0];
+    base.contributingFindings = sorted.map((item) => ({ detectorId: item.detectorId, detectorVersion: item.detectorVersion, fingerprint: item.fingerprint }));
+    return base;
+  }).sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.scope.localeCompare(b.scope));
+}
+
+function rankFinding(a, b) {
+  return (severityOrder[b.severity] || 0) - (severityOrder[a.severity] || 0)
+    || (confidenceOrder[b.confidence] || 0) - (confidenceOrder[a.confidence] || 0)
+    || (b.sourceWorkspaces?.length || 0) - (a.sourceWorkspaces?.length || 0)
+    || (b.occurrenceCount || 0) - (a.occurrenceCount || 0)
+    || String(a.firstSeenAt || "").localeCompare(String(b.firstSeenAt || ""))
+    || String(a.rootFingerprint || "").localeCompare(String(b.rootFingerprint || ""));
+}
+
+export function rankQualifiedFindings(findings = [], maxNewCards = MAX_NEW_LEARNING_CARDS_PER_RUN) {
+  const qualified = [...findings].filter((item) => item.actionable !== false && ["medium", "high"].includes(item.confidence)).sort(rankFinding);
+  const updates = qualified.filter((item) => item.existingCardId);
+  const creates = qualified.filter((item) => !item.existingCardId);
+  const createLimit = Math.max(0, Math.floor(Number(maxNewCards)) || 0);
+  const admittedCreates = creates.slice(0, createLimit);
+  const admittedSet = new Set([...updates, ...admittedCreates]);
+  return { admitted: [...updates, ...admittedCreates], deferred: findings.filter((item) => !admittedSet.has(item)) };
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+export function renderFindingCard(finding) {
+  const marker = `[factory-learning root=${finding.rootFingerprint} generation=${finding.generation || 0}]`;
+  return [
+    `# Factory improvement: ${finding.impact}`,
+    "",
+    `## Observed pattern\n${finding.impact}`,
+    `## Occurrences\n${finding.occurrenceCount}: ${(finding.occurrenceIds || []).join(", ")}`,
+    `## Evidence\n${(finding.evidenceReferences || []).join("\n") || "Structured evidence IDs are recorded above."}`,
+    `## Coverage\n${finding.coverage?.complete ? "complete" : `partial: ${(finding.coverage?.gaps || []).map((gap) => `${gap.source}: ${gap.reason}`).join("; ")}`}`,
+    `## Root-cause hypothesis\n${finding.rootCauseHypothesis}`,
+    `## Desired outcome\n${finding.desiredOutcome}`,
+    `## Acceptance metric\n${stableJson(finding.acceptanceMetric)}`,
+    `## Baseline\n${stableJson(finding.baseline)}`,
+    `## Evaluation window\n${stableJson(finding.evaluationWindow)}`,
+    `## Exclusions\n${(finding.exclusions || []).join("\n")}`,
+    `## Detector provenance\n${(finding.detectorProvenance || [`${finding.detectorId}/${finding.detectorVersion}`]).join(", ")}`,
+    "",
+    marker,
+  ].join("\n\n");
+}
+
+export function renderEvidenceDelta(finding, occurrenceIds = []) {
+  const known = new Set(finding?.occurrenceIds || []);
+  const fresh = [...new Set(occurrenceIds)].filter((id) => !known.has(id)).sort();
+  return `[factory-learning evidence-delta root=${finding.rootFingerprint}]\nFresh occurrences: ${fresh.join(", ") || "none"}`;
+}
+
+export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
+  const coverageComplete = snapshot?.coverage?.complete !== false;
+  const observations = (snapshot.observations || []).filter((item) => Date.parse(item.occurredAt || item.at || "") > Date.parse(evaluation.completedAt || ""));
+  const values = observations.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
+  let status = "inconclusive-evidence";
+  if (coverageComplete && values.length) {
+    const value = values.at(-1);
+    const baseline = Number(evaluation.baseline);
+    const change = Number(evaluation.minimumChange || 0);
+    const improved = evaluation.expectedDirection === "increase" ? value - baseline >= change : baseline - value >= change;
+    const regressed = evaluation.expectedDirection === "increase" ? value < baseline : value > baseline;
+    status = improved ? "verified-improvement" : regressed ? "regression" : "no-measurable-change";
+  }
+  const recurrence = { action: "none", generation: evaluation.generation || 0, rootFingerprint: evaluation.rootFingerprint };
+  if (["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration === null) {
+    const prior = new Set(evaluation.priorEvidenceIds || []);
+    const fresh = (snapshot.qualifiedFindings || []).find((finding) => finding.rootFingerprint === evaluation.rootFingerprint
+      && Date.parse(finding.lastSeenAt || "") > Date.parse(evaluation.completedAt || "")
+      && (finding.occurrenceIds || []).some((id) => !prior.has(id)));
+    if (fresh) {
+      if ((evaluation.generation || 0) >= 3) Object.assign(recurrence, { action: "block-needs-user", generation: 3 });
+      else Object.assign(recurrence, { action: "create", generation: (evaluation.generation || 0) + 1 });
+    }
+  }
+  return { status, evaluatedAt: snapshot.capturedThrough, recurrence };
+}
+
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
 }
