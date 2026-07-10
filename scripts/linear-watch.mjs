@@ -20,6 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -5173,6 +5174,10 @@ export function createCodexUsageEvidenceCollector() {
   let line = "";
   let lineBytes = 0;
   let discardingLine = false;
+  let rawLineChunks = [];
+  let rawLineBytes = 0;
+  let rawLineTooLong = false;
+  const completedLineUtf8 = [];
   let candidateCount = 0;
   let candidateBytes = 0;
   let classificationDisabled = false;
@@ -5199,10 +5204,43 @@ export function createCodexUsageEvidenceCollector() {
     discardingLine = false;
   };
 
+  const rawLineIsUtf8 = () => !rawLineTooLong && isUtf8(Buffer.concat(rawLineChunks, rawLineBytes));
+
+  const resetRawLine = () => {
+    rawLineChunks = [];
+    rawLineBytes = 0;
+    rawLineTooLong = false;
+  };
+
+  const appendRaw = (chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let start = 0;
+    while (start < bytes.length) {
+      const newline = bytes.indexOf(0x0a, start);
+      const end = newline === -1 ? bytes.length : newline;
+      const segment = bytes.subarray(start, end);
+      if (!rawLineTooLong) {
+        if (rawLineBytes + segment.length <= CODEX_USAGE_MAX_LINE_BYTES) {
+          rawLineChunks.push(segment);
+          rawLineBytes += segment.length;
+        } else {
+          rawLineChunks = [];
+          rawLineBytes = 0;
+          rawLineTooLong = true;
+        }
+      }
+      if (newline === -1) break;
+      completedLineUtf8.push(rawLineIsUtf8());
+      resetRawLine();
+      start = newline + 1;
+    }
+  };
+
   const appendDecoded = (text) => {
     for (const character of text) {
       if (character === "\n") {
-        if (!discardingLine) classifyLine();
+        const utf8Line = completedLineUtf8.shift() === true;
+        if (!discardingLine && utf8Line) classifyLine();
         resetLine();
         continue;
       }
@@ -5222,14 +5260,16 @@ export function createCodexUsageEvidenceCollector() {
   return {
     push(chunk) {
       if (finished || chunk == null) return;
+      appendRaw(chunk);
       appendDecoded(decoder.write(chunk));
     },
     finish() {
       if (finished) return;
       finished = true;
       appendDecoded(decoder.end());
-      if (!discardingLine) classifyLine();
+      if (!discardingLine && rawLineIsUtf8()) classifyLine();
       resetLine();
+      resetRawLine();
     },
     exhausted() {
       return exhausted;

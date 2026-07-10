@@ -4373,6 +4373,17 @@ test("Codex usage evidence: fails closed on oversized, malformed, and bounded ca
   assert.equal(Object.values(byteOverflow).some(Array.isArray), false);
 });
 
+test("Codex usage evidence: rejects a malformed UTF-8 positive error line", () => {
+  const collector = createCodexUsageEvidenceCollector();
+  collector.push(Buffer.concat([
+    Buffer.from('{"type":"error","message":"You\'ve hit your usage limit.'),
+    Buffer.from([0xff]),
+    Buffer.from('"}\n'),
+  ]));
+  collector.finish();
+  assert.equal(collector.exhausted(), false);
+});
+
 test("Codex usage evidence: finish parses a bounded final stdout line", () => {
   const bounded = createCodexUsageEvidenceCollector();
   bounded.push(Buffer.from(JSON.stringify(PERSONAL_LIMIT_ERROR)));
