@@ -5,10 +5,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn as spawnProcess } from "node:child_process";
+import { spawn as spawnProcess, spawnSync as spawnProcessSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
+import { aggregateLearningFindings } from "../scripts/learning.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -22,6 +23,7 @@ import {
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
   compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, dependencyDeferredIssue, admitDemand,
   withCapacityLedgerMutationLock, shouldStartPostDeliveryLearning,
+  dispatchLearningAsync,
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
@@ -44,7 +46,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
-  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
+  failureTodoTitle, failureTodoBody, failureTodoDecisions, reconcileFailureTodos, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
   buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
@@ -1916,7 +1918,7 @@ test("cross-lens learning mutation uses one Linear write and every lens WAL", as
     createIssueFn: async (input) => {
       creates += 1;
       const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
-      const created = { id: "created", identifier: "COD-2", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      const created = { id: "created", identifier: "COD-2", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"] };
       live.push(created);
       return created;
     },
@@ -2033,7 +2035,7 @@ test("learning writer fails closed without provenance and confirms retry-safe cr
     fetchIssuesFn: async () => live,
     createIssueFn: async (input) => {
       calls.push(["create", input]);
-      live = [{ id: "new", identifier: "COD-10", stateName: "Spec", sortOrder: -3, rootFingerprint: "root-a", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated", "app:main"] }];
+      live = [{ id: "new", identifier: "COD-10", stateName: "Spec", sortOrder: -3, rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], labelNames: ["factory:learning-generated", "app:main"] }];
       return live[0];
     },
   });
@@ -2056,7 +2058,7 @@ test("learning writer treats timeout-after-success as confirmed and updates by c
     fetchSpecCardsFn: async () => [],
     fetchIssuesFn: async () => live,
     createIssueFn: async () => {
-      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated"] }];
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1", "e2"], labelNames: ["factory:learning-generated"] }];
       throw new Error("timeout");
     },
   });
@@ -2090,19 +2092,141 @@ test("learning writer rejects unproven marker collisions and accepts a human-adv
   }), /provenance collision/i);
   const result = await executeLearningMutations({ mutations: [mutation] }, {
     loadLabelsFn: async () => labels,
-    fetchIssuesFn: async () => [{ id: "advanced", stateName: "Dev", rootFingerprint: finding.rootFingerprint, generation: 0, labelNames: ["factory:learning-generated", "app:main"] }],
+    fetchIssuesFn: async () => [{ id: "advanced", stateName: "Dev", rootFingerprint: finding.rootFingerprint, generation: 0, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated", "app:main"] }],
   });
   assert.equal(result.confirmed, 1);
+});
+
+test("learning create race converges every intended occurrence before WAL confirmation", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  const mutation = { mutationId: "create-race", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const live = [{
+    id: "raced", identifier: "COD-12", stateName: "Dev", rootFingerprint: "root-a", generation: 0,
+    occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"],
+  }];
+  const calls = [];
+  const stateStore = {
+    stageWindow: () => {},
+    confirmMutation: (_lens, mutationId) => calls.push(["confirm", mutationId]),
+    commitLens: () => true,
+  };
+  const result = await executeLearningMutations({ mutations: [mutation], stateStore }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => live,
+    addCommentFn: async (_issueId, body) => {
+      calls.push(["comment", body]);
+      assert.match(body, /Fresh occurrences:\s*e2/);
+      live[0].occurrenceIds.push("e2");
+      throw new Error("timeout after comment success");
+    },
+  });
+  assert.equal(result.confirmed, 1);
+  assert.deepEqual(live[0].occurrenceIds, ["e1", "e2"]);
+  assert.deepEqual(calls.map(([kind]) => kind), ["comment", "confirm"]);
+});
+
+test("learning create race does not confirm its WAL when evidence append is a no-op", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  const mutation = { mutationId: "create-race-noop", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const live = [{
+    id: "raced", identifier: "COD-12", stateName: "Dev", rootFingerprint: "root-a", generation: 0,
+    occurrenceIds: ["e1"], labelNames: ["factory:learning-generated"],
+  }];
+  const stateStore = {
+    stageWindow: () => {},
+    confirmMutation: () => assert.fail("unconfirmed create race must not confirm"),
+    commitLens: () => assert.fail("unconfirmed create race must not commit"),
+  };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation], stateStore }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => live,
+    addCommentFn: async () => {},
+  }), /occurrences were not confirmed/);
 });
 
 test("automatic learning admits only due contributing lenses while attended learning forces all", () => {
   const findings = [
     learningFindingForWatcher({ rootFingerprint: "quality", lenses: ["quality"] }),
+    learningFindingForWatcher({ rootFingerprint: "reliability", lenses: ["reliability"] }),
     learningFindingForWatcher({ rootFingerprint: "cross", lenses: ["quality", "reliability"] }),
   ];
   const due = { lenses: { quality: { due: false }, reliability: { due: true }, throughput: { due: false } } };
-  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: true }).map((finding) => [finding.rootFingerprint, finding.lenses]), [["cross", ["reliability"]]]);
-  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: false }).map((finding) => finding.rootFingerprint), ["quality", "cross"]);
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: true }).map((finding) => [finding.rootFingerprint, finding.lenses]), [["reliability", ["reliability"]]]);
+  assert.deepEqual(filterLearningFindingsForRun(findings, due, { automatic: false }).map((finding) => finding.rootFingerprint), ["quality", "reliability", "cross"]);
+});
+
+test("automatic due-lens filtering rebuilds every aggregate field from due contributors only", () => {
+  const reliability = learningFindingForWatcher({
+    rootFingerprint: "cross", fingerprint: "reliability-fingerprint", lenses: ["reliability"],
+    detectorId: "stale-claim-pattern", detectorVersion: "r1", occurrenceIds: ["r1"],
+    occurrences: [{ id: "r1", occurredAt: "2026-07-08T00:00:00.000Z" }], occurrenceCount: 1,
+    evidenceReferences: ["ref:r1"], baseline: { value: 1, unit: "reaps" },
+    acceptanceMetric: { name: "staleClaimCount", direction: "decrease", target: 0 },
+  });
+  const quality = learningFindingForWatcher({
+    rootFingerprint: "cross", fingerprint: "quality-fingerprint", lenses: ["quality"],
+    detectorId: "repeated-review-finding", detectorVersion: "q1", occurrenceIds: ["q1", "q2"],
+    occurrences: [
+      { id: "q1", occurredAt: "2026-07-08T00:01:00.000Z" },
+      { id: "q2", occurredAt: "2026-07-08T00:02:00.000Z" },
+    ], occurrenceCount: 2, evidenceReferences: ["ref:q1", "ref:q2"],
+    baseline: { value: 2, unit: "reviews" },
+    acceptanceMetric: { name: "reviewFindingCount", direction: "decrease", target: 0 },
+  });
+  const aggregate = aggregateLearningFindings([reliability, quality])[0];
+  const due = { lenses: { quality: { due: false }, reliability: { due: true }, throughput: { due: false } } };
+  const [filtered] = filterLearningFindingsForRun([aggregate], due, { automatic: true });
+  assert.deepEqual(filtered.lenses, ["reliability"]);
+  assert.deepEqual(filtered.occurrenceIds, ["r1"]);
+  assert.deepEqual(filtered.occurrences, reliability.occurrences);
+  assert.equal(filtered.occurrenceCount, 1);
+  assert.deepEqual(filtered.evidenceReferences, ["ref:r1"]);
+  assert.deepEqual(filtered.detectorProvenance, ["stale-claim-pattern/r1"]);
+  assert.equal(filtered.measurementContracts.length, 1);
+  assert.equal(filtered.measurementContracts[0].detector, "stale-claim-pattern/r1");
+  assert.equal(filtered.detectorId, "stale-claim-pattern");
+  assert.equal(filtered.detectorVersion, "r1");
+  assert.deepEqual(filtered.baseline, reliability.baseline);
+  assert.deepEqual(filtered.acceptanceMetric, reliability.acceptanceMetric);
+  assert.doesNotMatch(JSON.stringify(filtered), /q1|q2|quality-fingerprint|reviewFindingCount/);
+});
+
+test("core detector routing selects the anchor repo entry with one label and fails closed when ambiguous", () => {
+  const stale = Array.from({ length: 2 }, (_, index) => ({
+    evidenceId: `stale-${index}`, signal: "stale-claim", occurredAt: `2026-07-10T11:0${index}:00.000Z`,
+    sourceWorkspace: "/source/app", projectId: "app-project", repoEntry: "app", runId: `run-${index}`,
+    stage: "dev", subsystem: "launcher", fingerprint: "claim-reaper", metrics: {},
+  }));
+  const snapshot = { capturedThrough: "2026-07-10T12:00:00.000Z", observations: stale, events: [], runRecords: [], coverage: { complete: true, gaps: [] } };
+  const workspace = (byLabel) => ({
+    sourceAnchorPath: "/source/core", apiKey: "key", learning: { enabled: true },
+    config: { projectId: "core-project", repos: ["core", "worker"], repoRouting: { byLabel } },
+  });
+  const registry = { learning: { enabled: true, coreSourceAnchor: "/source/core", maxNewCardsPerRun: 6 } };
+  const valid = watchModule.buildLearningCyclePreview({
+    registry, workspaces: [workspace({ "app:core": "core", "app:worker": "worker" })], state: {}, snapshot,
+  });
+  assert.equal(valid.findings[0].scope, "core");
+  assert.equal(valid.findings[0].projectId, "core-project");
+  assert.equal(valid.findings[0].repoEntry, "core");
+  assert.equal(valid.findings[0].actionable, true);
+
+  const ambiguous = watchModule.buildLearningCyclePreview({
+    registry, workspaces: [workspace({ "app:core": "core", "app:also-core": "core", "app:worker": "worker" })], state: {}, snapshot,
+  });
+  assert.equal(ambiguous.findings[0].scope, "core");
+  assert.equal(ambiguous.findings[0].repoEntry, undefined);
+  assert.equal(ambiguous.findings[0].actionable, false);
+
+  const singleRepo = watchModule.buildLearningCyclePreview({
+    registry,
+    workspaces: [{ sourceAnchorPath: "/source/core", apiKey: "key", learning: { enabled: true }, config: { projectId: "core-project", repos: ["core"] } }],
+    state: {}, snapshot,
+  });
+  assert.equal(singleRepo.coreRoute.error, null);
+  assert.equal(singleRepo.coreRoute.repoEntry, "core");
+  assert.equal(singleRepo.coreRoute.routeLabel, null);
+  assert.equal(singleRepo.findings[0].actionable, true);
 });
 
 test("production learning replays persisted pending WAL before staging a new evidence window", async () => {
@@ -2134,7 +2258,7 @@ test("production learning replays persisted pending WAL before staging a new evi
     loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
     loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }), fetchSpecCardsFn: async () => live,
     createIssueFn: async (input) => {
-      const created = { id: "created", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: "resume-root", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      const created = { id: "created", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: "resume-root", generation: 0, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated"] };
       live.push(created); return created;
     },
   });
@@ -2252,7 +2376,7 @@ test("learning writer confirms recurrence links and reconciles timeout-after-suc
     fetchSpecCardsFn: async () => [],
     fetchIssuesFn: async () => live,
     createIssueFn: async () => {
-      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 1, occurrenceIds: [], labelNames: ["factory:learning-generated"] }];
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 1, occurrenceIds: finding.occurrenceIds, labelNames: ["factory:learning-generated"] }];
       return live[0];
     },
     relationExistsFn: async () => linked,
@@ -2291,7 +2415,7 @@ test("production learning cycle stages one WAL and globally caps creates across 
     fetchSpecCardsFn: async () => live,
     createIssueFn: async (input) => {
       const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
-      const issue = { id: `issue-${live.length}`, identifier: `COD-${live.length}`, stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      const issue = { id: `issue-${live.length}`, identifier: `COD-${live.length}`, stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [`e-${marker[1].slice("root-".length)}`], labelNames: ["factory:learning-generated"] };
       live.push(issue);
       return issue;
     },
@@ -4847,6 +4971,46 @@ test("failureTodoDecisions: dirty-checkout Todos recover when the stable target 
   const decisions = failureTodoDecisions([], [todo], new Set(["dev"]), NOW, { recoveredTargets: new Set(["managed-anchor:/managed/app"]) });
   assert.equal(decisions[0].action, "close");
 });
+test("failure Todo recovery emits open-after-healthy only after a fresh read proves the exact healthy card remains Todo", async () => {
+  const event = failureEvent({ scope: "dev:dispatch", kind: "dirty-checkout", stableTarget: "managed-anchor:/managed/app" });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, {
+    scope: "dev:dispatch",
+    description: failureTodoBody(event, fingerprint),
+  });
+  const emitted = [];
+  let freshReads = 0;
+  await assert.rejects(reconcileFailureTodos("key", { teamKey: "COD", projectId: "project-1" }, "/managed/app", [], new Set(), [], {
+    recoveredTargets: new Set(["managed-anchor:/managed/app"]),
+    fetchFailureTodosFn: async () => [todo],
+    teamMetaFn: async () => ({ stateIds: { Done: "done" } }),
+    closeFailureTodoFn: async () => {},
+    fetchClaimCardFn: async () => {
+      freshReads += 1;
+      return { ...todo, stateName: "Todo", labelNames: [] };
+    },
+    onLauncherEvidence: (evidence) => emitted.push(evidence),
+  }), /remained Todo/);
+  assert.equal(freshReads, 1);
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.state, "open-after-healthy");
+  assert.equal(emitted[0].evidence.reason, "recovered-target:managed-anchor:/managed/app");
+});
+test("failure Todo recovery does not fabricate open-after-healthy for an unchecked scope", async () => {
+  const event = failureEvent({ scope: "dev:dispatch", stableTarget: null });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, { scope: "dev:dispatch", description: failureTodoBody(event, fingerprint) });
+  const emitted = [];
+  let freshReads = 0;
+  const decisions = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "project-1" }, "/managed/app", [], new Set(["qa:dispatch"]), [], {
+    fetchFailureTodosFn: async () => [todo],
+    fetchClaimCardFn: async () => { freshReads += 1; return { ...todo, stateName: "Todo" }; },
+    onLauncherEvidence: (evidence) => emitted.push(evidence),
+  });
+  assert.deepEqual(decisions, []);
+  assert.equal(freshReads, 0);
+  assert.deepEqual(emitted, []);
+});
 test("failureTodoDecisions: holding-state failures use the holding recovery scope", () => {
   const event = failureEvent({ scope: "holding", kind: "holding-state-fetch" });
   const fp = failureFingerprint(event);
@@ -5415,4 +5579,153 @@ test("doctorReport: distinguishes source advisory dirtiness from managed blockin
   assert.equal(report.anchors[0].managedBlockers[0].stableTarget, "managed-anchor:/managed/app/app");
   assert.match(formatDoctorReport(report), /source advisory dirty/);
   assert.match(formatDoctorReport(report), /dispatch: BLOCKED/);
+});
+
+function runIsolatedWatcherCli(args, { registry = null, prepare = null } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watcher-cli-"));
+  const preparedRegistry = prepare ? prepare(home) : registry;
+  if (preparedRegistry) {
+    const configDir = path.join(home, ".config", "linear-board-sweeps");
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(path.join(configDir, "registry.json"), `${JSON.stringify(preparedRegistry)}\n`);
+  }
+  const script = fileURLToPath(new URL("../scripts/linear-watch.mjs", import.meta.url));
+  const result = spawnProcessSync(process.execPath, [script, ...args], {
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+  });
+  return { ...result, home };
+}
+
+function prepareCredentiallessLearningWorkspace(home) {
+  const anchor = path.join(home, "app");
+  fs.mkdirSync(path.join(anchor, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(anchor, ".claude", "linear-sweep.json"), JSON.stringify({
+    team: "Codex", teamKey: "COD", project: "Linear Sweep", projectId: "project-1",
+    repos: ["app"], learning: { enabled: true },
+  }));
+  return {
+    repos: [anchor], capacity: { maxActiveChildren: 10 },
+    learning: { enabled: true, runner: true, coreSourceAnchor: anchor, maxNewCardsPerRun: 6, runtime: null },
+  };
+}
+
+test("learning CLI status and dry-run operate without credentials in an isolated empty registry", () => {
+  const status = runIsolatedWatcherCli(["learning-status", "--json"]);
+  assert.equal(status.status, 0, status.stderr);
+  const report = JSON.parse(status.stdout);
+  assert.equal(report.enabled, false);
+  assert.deepEqual(report.workspaces, []);
+  assert.equal(report.coverage.complete, true);
+  assert.equal(report.due.due, false);
+
+  const dryRun = runIsolatedWatcherCli(["learning-run", "--dry-run"]);
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.equal(plan.mode, "dry-run");
+  assert.deepEqual(plan.mutations, []);
+  assert.deepEqual(plan.evaluations, []);
+});
+
+test("learning CLI reports registered workspace credential gaps without attempting Linear writes", () => {
+  const status = runIsolatedWatcherCli(["learning-status", "--json"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(status.status, 0, status.stderr);
+  const report = JSON.parse(status.stdout);
+  assert.equal(report.workspaces.length, 1);
+  assert.equal(report.workspaces[0].hasApiKey, false);
+  assert.equal(report.coverage.complete, false);
+  assert.ok(report.coverage.gaps.some((gap) => /LINEAR_API_KEY missing/.test(gap.reason)));
+
+  const dryRun = runIsolatedWatcherCli(["learning-run", "--dry-run"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const plan = JSON.parse(dryRun.stdout);
+  assert.ok(plan.coverageGaps.some((gap) => /destination credential is missing/.test(gap.reason)));
+  assert.deepEqual(plan.mutations, []);
+});
+
+test("learning CLI refuses attended writes when this host is not the configured runner", () => {
+  const result = runIsolatedWatcherCli(["learning-run"]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /learning runner is not enabled on this host/);
+});
+
+test("attended learning CLI uses the deterministic writer under the runner singleton", () => {
+  const registry = {
+    repos: [],
+    capacity: { maxActiveChildren: 10 },
+    learning: { enabled: true, runner: true, coreSourceAnchor: null, maxNewCardsPerRun: 6, runtime: null },
+  };
+  const result = runIsolatedWatcherCli(["learning-run"], { registry });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.mode, "deterministic");
+  assert.deepEqual(report.findings, []);
+  assert.equal(report.writes.mutations, 0);
+  assert.deepEqual(report.writes.plannedDestinations, []);
+  assert.equal(fs.existsSync(path.join(result.home, ".local", "state", "linear-board-sweeps", "capacity-ledger.json")), true);
+});
+
+test("learning synthesis subprocess accepts only known bounded annotations and cleans temporary evidence", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "learning-synthesis-"));
+  let spawnedPid = null;
+  const result = await dispatchLearningAsync({
+    findings: [{ rootFingerprint: "known-root", impact: "bounded" }],
+    runtimeConfig: { runtime: "codex" },
+    tempRoot,
+  }, {
+    resolveExecutableFn: () => "/fake/codex",
+    onSpawn: (pid) => { spawnedPid = pid; },
+    spawnFn: (_executable, args) => {
+      const child = new EventEmitter();
+      child.pid = 4321;
+      const outputPath = args.find((value) => String(value).endsWith("output.json"));
+      queueMicrotask(() => {
+        fs.writeFileSync(outputPath, JSON.stringify({ annotations: [
+          { rootFingerprint: "known-root", summary: "useful\u0000annotation" },
+          { rootFingerprint: "unknown-root", summary: "must be ignored" },
+        ] }));
+        child.emit("close", 0, null);
+      });
+      return child;
+    },
+  });
+  assert.equal(spawnedPid, 4321);
+  assert.deepEqual(result, {
+    mode: "synthesized",
+    available: true,
+    annotations: [{ rootFingerprint: "known-root", summary: "useful annotation" }],
+  });
+  assert.deepEqual(fs.readdirSync(tempRoot), []);
+});
+
+test("learning synthesis subprocess fails closed on spawn errors and still removes temporary files", async () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "learning-synthesis-failure-"));
+  const result = await dispatchLearningAsync({
+    findings: [{ rootFingerprint: "root" }],
+    runtimeConfig: { runtime: "codex" },
+    tempRoot,
+  }, {
+    resolveExecutableFn: () => "/fake/codex",
+    spawnFn: () => { throw new Error("spawn unavailable"); },
+  });
+  assert.equal(result.mode, "deterministic");
+  assert.equal(result.available, false);
+  assert.match(result.reason, /spawn unavailable/);
+  assert.deepEqual(fs.readdirSync(tempRoot), []);
+});
+
+test("scheduled dry-run traverses delivery and learning orchestration without mutating an empty registry", () => {
+  const result = runIsolatedWatcherCli(["tick", "--dry-run"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /no actionable work/);
+  assert.match(result.stderr, /\[dry-run\] learning due=false admitted=0 deferred=0/);
+  assert.equal(fs.existsSync(path.join(result.home, ".local", "state", "linear-board-sweeps", "last-tick")), false);
+});
+
+test("scheduled dry-run isolates a registered workspace with missing credentials and still previews learning", () => {
+  const result = runIsolatedWatcherCli(["tick", "--dry-run"], { prepare: prepareCredentiallessLearningWorkspace });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /FATAL no LINEAR_API_KEY/);
+  assert.match(result.stderr, /no actionable work/);
+  assert.match(result.stderr, /\[dry-run\] learning due=false admitted=0 deferred=0/);
 });

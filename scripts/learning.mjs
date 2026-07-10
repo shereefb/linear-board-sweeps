@@ -982,6 +982,14 @@ function detectorSemanticKey(detectorId, item, signal = "unknown") {
   return item.fingerprint || item.rootCauseKey || item.reason || signal;
 }
 
+const CORE_SYSTEMIC_DETECTORS = new Set([
+  "stale-claim-pattern",
+  "failed-recovery",
+  "safety-invariant-violation",
+  "poison-card-cluster",
+  "capacity-saturation",
+]);
+
 function evaluationOwnershipContract(observations, scope) {
   const contributors = [...new Map(observations.map((item) => {
     const contributor = {
@@ -999,7 +1007,8 @@ function detectorFinding(detector, observations, snapshot, config) {
   const sourceWorkspaces = [...new Set(observations.map((item) => item.sourceWorkspace).filter(Boolean))].sort();
   const localProjects = [...new Set(observations.map((item) => item.projectId).filter(Boolean))];
   const localRepos = [...new Set(observations.map((item) => item.repoEntry).filter(Boolean))];
-  const local = sourceWorkspaces.length === 1 && localProjects.length === 1 && localRepos.length === 1;
+  const local = !CORE_SYSTEMIC_DETECTORS.has(detector.id)
+    && sourceWorkspaces.length === 1 && localProjects.length === 1 && localRepos.length === 1;
   const scope = local ? "workspace" : "core";
   const projectId = local ? localProjects[0] : config.coreProjectId;
   const repoEntry = local ? localRepos[0] : config.coreRepoEntry;
@@ -1088,8 +1097,14 @@ export function runLearningDetectors(snapshot = {}, config = {}) {
 }
 
 export function aggregateLearningFindings(findings = []) {
+  const detailedContributions = (finding) => {
+    const nested = Array.isArray(finding?.contributingFindings) ? finding.contributingFindings : [];
+    const complete = nested.length && nested.every((item) => item?.detectorId && Array.isArray(item?.occurrenceIds)
+      && item?.baseline && item?.acceptanceMetric && Array.isArray(item?.lenses));
+    return complete ? nested.flatMap(detailedContributions) : [finding];
+  };
   const grouped = new Map();
-  for (const finding of findings) {
+  for (const finding of findings.flatMap(detailedContributions)) {
     const key = [finding.rootFingerprint, finding.generation || 0, finding.scope, finding.projectId, finding.repoEntry].join("\0");
     if (!grouped.has(key)) grouped.set(key, []);
     grouped.get(key).push(finding);
@@ -1118,7 +1133,13 @@ export function aggregateLearningFindings(findings = []) {
       evaluationWindow: clone(item.evaluationWindow),
       coverage: clone(item.coverage),
     }));
-    base.contributingFindings = sorted.map((item) => ({ detectorId: item.detectorId, detectorVersion: item.detectorVersion, fingerprint: item.fingerprint }));
+    base.contributingFindings = sorted.map((item) => {
+      const contribution = clone(item);
+      delete contribution.contributingFindings;
+      delete contribution.measurementContracts;
+      delete contribution.detectorProvenance;
+      return contribution;
+    });
     return base;
   }).sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.scope.localeCompare(b.scope));
 }

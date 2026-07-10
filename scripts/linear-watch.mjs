@@ -1019,6 +1019,39 @@ function readLearningStateSafe(statePath = LEARNING_STATE_PATH) {
   }
 }
 
+export function resolveCoreLearningRoute(registry = {}, workspaces = [], {
+  canonicalFn = canonicalAnchorIdentity,
+  resolveReposFn = resolveRepos,
+} = {}) {
+  const configuredAnchor = registry?.learning?.coreSourceAnchor;
+  if (!configuredAnchor) return { projectId: undefined, repoEntry: undefined, routeLabel: undefined, error: "coreSourceAnchor is not configured" };
+  const coreAnchor = canonicalFn(configuredAnchor);
+  const matches = workspaces.filter((item) => canonicalFn(item?.sourceAnchorPath) === coreAnchor);
+  if (matches.length !== 1) return { projectId: undefined, repoEntry: undefined, routeLabel: undefined, error: "coreSourceAnchor does not resolve to exactly one learning workspace" };
+  const core = matches[0];
+  const entries = Array.isArray(core.config?.repos) && core.config.repos.length
+    ? core.config.repos
+    : [path.basename(coreAnchor)];
+  const resolved = resolveReposFn(core.sourceAnchorPath, core.config);
+  const anchorEntries = entries.filter((_entry, index) => {
+    try { return canonicalFn(resolved[index]?.path) === coreAnchor; }
+    catch { return false; }
+  });
+  if (anchorEntries.length !== 1) return { projectId: core.config?.projectId, repoEntry: undefined, routeLabel: undefined, error: "core anchor repository entry is missing or ambiguous" };
+  const repoEntry = anchorEntries[0];
+  if (!Object.hasOwn(core.config || {}, "repoRouting")) {
+    return repoEntry === entries[0]
+      ? { projectId: core.config?.projectId, repoEntry, routeLabel: null, error: null }
+      : { projectId: core.config?.projectId, repoEntry: undefined, routeLabel: undefined, error: "core repository is not the default unrouted repo entry" };
+  }
+  const byLabel = core.config?.repoRouting?.byLabel;
+  const routeLabels = byLabel && typeof byLabel === "object" && !Array.isArray(byLabel)
+    ? Object.entries(byLabel).filter(([, target]) => target === repoEntry).map(([label]) => label).sort()
+    : [];
+  if (routeLabels.length !== 1) return { projectId: core.config?.projectId, repoEntry: undefined, routeLabel: undefined, error: "core repository must have exactly one route label" };
+  return { projectId: core.config?.projectId, repoEntry, routeLabel: routeLabels[0], error: null };
+}
+
 export function buildLearningCyclePreview({ registry, workspaces, state, snapshot, now = new Date().toISOString() } = {}) {
   const calculatedDue = learningDueDecisions({ state, snapshot, workspaces, now });
   for (const [lens, decision] of Object.entries(calculatedDue.lenses || {})) {
@@ -1037,14 +1070,15 @@ export function buildLearningCyclePreview({ registry, workspaces, state, snapsho
     anyDue: false,
   };
   const workspaceConfigs = workspaces || [];
+  const coreRoute = resolveCoreLearningRoute(registry, workspaceConfigs);
   const detectorConfig = {
-    coreProjectId: workspaceConfigs.find((item) => item.sourceAnchorPath === registry?.learning?.coreSourceAnchor)?.config?.projectId,
-    coreRepoEntry: registry?.learning?.coreSourceAnchor,
+    coreProjectId: coreRoute.projectId,
+    coreRepoEntry: coreRoute.repoEntry,
   };
   const findings = aggregateLearningFindings(runLearningDetectors(snapshot, detectorConfig));
   const qualified = findings.filter((finding) => finding.actionable !== false && ["medium", "high"].includes(finding.confidence));
   const ranked = rankQualifiedFindings(findings, registry?.learning?.maxNewCardsPerRun);
-  return { due, findings, qualified, ...ranked, rendered: ranked.admitted.map((finding) => ({ rootFingerprint: finding.rootFingerprint, body: renderFindingCard(finding) })) };
+  return { due, findings, qualified, ...ranked, coreRoute, rendered: ranked.admitted.map((finding) => ({ rootFingerprint: finding.rootFingerprint, body: renderFindingCard(finding) })) };
 }
 
 export async function dispatchLearningAsync({ findings = [], runtimeConfig = {}, tempRoot = CACHE_DIR } = {}, {
@@ -1824,8 +1858,11 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
     const primary = todos[0];
     const scope = failureTodoScope(primary);
     const stableTarget = failureTodoStableTarget(primary);
-    if ((checkedScopes && checkedScopes.has(scope)) || (stableTarget && recoveredTargets?.has?.(stableTarget))) {
-      decisions.push({ action: "close", fingerprint: fp, todo: primary });
+    const recoveryProof = checkedScopes?.has?.(scope)
+      ? { type: "checked-scope", value: scope }
+      : (stableTarget && recoveredTargets?.has?.(stableTarget) ? { type: "recovered-target", value: stableTarget } : null);
+    if (recoveryProof) {
+      decisions.push({ action: "close", fingerprint: fp, todo: primary, recoveryProof });
     }
   }
 
@@ -3082,6 +3119,28 @@ export async function executeLearningMutations(plan = {}, deps = {}) {
           throw new Error(`learning create ${mutation.mutationId} failed Spec/rank/label confirmation`);
         }
       }
+      const intendedOccurrenceIds = [...new Set(mutation.finding?.occurrenceIds || [])];
+      live = await fetchIssuesFn();
+      let confirmedIssue = live.find((issue) => learningIssueMatches(issue, mutation));
+      if (!confirmedIssue) throw new Error(`learning create ${mutation.mutationId} was not visible before evidence confirmation`);
+      const collision = learningIssueProvenanceError(confirmedIssue, mutation);
+      if (collision) throw new Error(collision);
+      const missingOccurrenceIds = intendedOccurrenceIds.filter((id) => !confirmedIssue.occurrenceIds?.includes(id));
+      let evidenceWriteError = null;
+      if (missingOccurrenceIds.length) {
+        try {
+          await addCommentFn(confirmedIssue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, missingOccurrenceIds));
+        } catch (error) {
+          evidenceWriteError = error;
+        }
+      }
+      live = await fetchIssuesFn();
+      confirmedIssue = live.find((issue) => learningIssueMatches(issue, mutation));
+      if (!confirmedIssue || intendedOccurrenceIds.some((id) => !confirmedIssue.occurrenceIds?.includes(id))) {
+        if (evidenceWriteError) throw evidenceWriteError;
+        throw new Error(`learning create ${mutation.mutationId} occurrences were not confirmed`);
+      }
+      created = confirmedIssue;
       if (mutation.relatedIssueId && created?.id) {
         if (!(await relationExistsFn(created.id, mutation.relatedIssueId))) {
           try {
@@ -3194,7 +3253,13 @@ export function filterLearningFindingsForRun(findings = [], dueDecisions = {}, {
   const dueLenses = new Set(Object.entries(dueDecisions?.lenses || {}).filter(([, decision]) => decision?.due).map(([lens]) => lens));
   return findings.flatMap((finding) => {
     const lenses = [...new Set(finding?.lenses || [])].filter((lens) => dueLenses.has(lens));
-    return lenses.length ? [{ ...structuredClone(finding), lenses }] : [];
+    if (!lenses.length) return [];
+    const contributions = Array.isArray(finding?.contributingFindings) ? finding.contributingFindings : [];
+    if (!contributions.length) return lenses.length === (finding?.lenses || []).length
+      ? [structuredClone(finding)]
+      : [];
+    const dueContributions = contributions.filter((item) => (item?.lenses || []).some((lens) => dueLenses.has(lens)));
+    return aggregateLearningFindings(dueContributions);
   });
 }
 
@@ -3980,16 +4045,20 @@ async function commentDuplicateFailureTodo(apiKey, decision) {
   await addComment(apiKey, decision.todo.id, `${FAILURE_DUPLICATE_NOTE} for \`${decision.fingerprint}\`. Keeping ${decision.primary.identifier} as the primary tracking card; this duplicate can be closed after manual review.`);
 }
 
-async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, {
+export async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, {
   dryRun = false,
   recoveredTargets = new Set(),
   onLauncherEvidence = null,
+  fetchFailureTodosFn = fetchFailureTodos,
+  teamMetaFn = teamMeta,
+  fetchClaimCardFn = fetchClaimCard,
+  closeFailureTodoFn = closeFailureTodo,
 } = {}) {
-  const existing = await fetchFailureTodos(apiKey, config.teamKey, config.projectId);
+  const existing = await fetchFailureTodosFn(apiKey, config.teamKey, config.projectId);
   const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues, recoveredTargets });
   if (dryRun) return decisions;
   if (!decisions.length) return decisions;
-  const meta = await teamMeta(apiKey, config.teamKey);
+  const meta = await teamMetaFn(apiKey, config.teamKey);
   const recoveredFingerprints = onLauncherEvidence && decisions.some((decision) => decision.action === "create")
     ? await fetchRecoveredFailureTodoFingerprints(apiKey, config.teamKey, config.projectId)
     : new Set();
@@ -4019,10 +4088,36 @@ async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures
       await updateFailureTodo(apiKey, d.todo, d.event, d.fingerprint, envValues);
       logFor(anchorPath, "_", `failure-todo update ${d.todo.identifier} ${d.fingerprint}`);
     } else if (d.action === "close") {
-      await closeFailureTodo(apiKey, meta, d);
-      const fresh = await fetchClaimCard(apiKey, d.todo.id);
+      let closeError = null;
+      try {
+        await closeFailureTodoFn(apiKey, meta, d);
+      } catch (error) {
+        closeError = error;
+      }
+      const fresh = await fetchClaimCardFn(apiKey, d.todo.id);
       const recoveredMarker = `${FAILURE_RECOVERED_TAG} ${d.fingerprint} `;
+      if (fresh.stateName === "Todo") {
+        if (onLauncherEvidence && d.recoveryProof) {
+          const occurredAt = new Date().toISOString();
+          onLauncherEvidence({
+            card: fresh,
+            sweep: "launcher",
+            evidence: {
+              type: "recovery-transition",
+              state: "open-after-healthy",
+              occurredAt,
+              key: d.fingerprint,
+              subsystem: "failure-todo",
+              reason: `${d.recoveryProof.type}:${d.recoveryProof.value}`,
+              summary: `Failure Todo ${fresh.identifier} remained open after its exact ${d.recoveryProof.type === "checked-scope" ? "scope" : "target"} was confirmed healthy.`,
+            },
+          });
+        }
+        if (closeError) throw closeError;
+        throw new Error(`${d.todo.identifier} remained Todo after its recovery condition was confirmed healthy`);
+      }
       if (fresh.stateName !== "Done" || !(fresh.comments || []).some((comment) => String(comment.body || "").includes(recoveredMarker))) {
+        if (closeError) throw closeError;
         throw new Error(`${d.todo.identifier} recovery could not be confirmed after moving to Done`);
       }
       logFor(anchorPath, "_", `failure-todo recovered ${d.todo.identifier} ${d.fingerprint}`);

@@ -746,6 +746,34 @@ test("ownership routes proven single-workspace findings locally and ambiguous br
   assert.deepEqual(JSON.parse(core.acceptanceMetric.semanticKey).ownership, core.acceptanceMetric.ownership);
 });
 
+test("launcher-owned systemic remedies route core with one contributor while card-specific findings stay local", () => {
+  const systemicIds = ["stale-claim-pattern", "failed-recovery", "safety-invariant-violation", "poison-card-cluster", "capacity-saturation"];
+  const evidenceByDetector = {
+    "stale-claim-pattern": repeat("stale-claim", 2, { stage: "dev", subsystem: "launcher" }),
+    "failed-recovery": [
+      detectorObservation("failure-recovery", 1, { recoveryState: "recovered" }),
+      detectorObservation("failure-recovery", 0, { recoveryState: "recurred" }),
+    ],
+    "safety-invariant-violation": repeat("safety-invariant", 1, { proven: true }),
+    "poison-card-cluster": repeat("poison-card", 2, { machineCorrectable: true }),
+    "capacity-saturation": repeat("capacity-run", 20, { deferred: true, baselineRate: 0.1, metrics: { waitMs: 200, baselineP90Ms: 100 } }),
+  };
+  for (const detectorId of systemicIds) {
+    const finding = runLearningDetectors(detectorSnapshot(evidenceByDetector[detectorId]), {
+      ...detectorConfig, enabledDetectors: [detectorId],
+    })[0];
+    assert.equal(finding.scope, "core", detectorId);
+    assert.equal(finding.projectId, detectorConfig.coreProjectId, detectorId);
+    assert.equal(finding.repoEntry, detectorConfig.coreRepoEntry, detectorId);
+  }
+  const local = runLearningDetectors(detectorSnapshot(repeat("review-finding", 3, { category: "correctness" })), {
+    ...detectorConfig, enabledDetectors: ["repeated-review-finding"],
+  })[0];
+  assert.equal(local.scope, "workspace");
+  assert.equal(local.projectId, "project-a");
+  assert.equal(local.repoEntry, "/workspace/a");
+});
+
 function aggregateFixture(overrides = {}) {
   return {
     schemaVersion: 1,
@@ -992,8 +1020,9 @@ test("production-shaped run records and structured events reach all 15 detectors
   for (const detector of LEARNING_DETECTORS) {
     const findings = runLearningDetectors(snapshot, { ...detectorConfig, enabledDetectors: [detector.id] });
     assert.equal(findings.length, 1, detector.id);
-    assert.equal(findings[0].projectId, "project-a", detector.id);
-    assert.equal(findings[0].repoEntry, "app", detector.id);
+    const systemic = ["stale-claim-pattern", "failed-recovery", "safety-invariant-violation", "poison-card-cluster", "capacity-saturation"].includes(detector.id);
+    assert.equal(findings[0].projectId, systemic ? detectorConfig.coreProjectId : "project-a", detector.id);
+    assert.equal(findings[0].repoEntry, systemic ? detectorConfig.coreRepoEntry : "app", detector.id);
     assert.ok(snapshot.observations.some((item) => Number.isFinite(item.metrics?.[findings[0].acceptanceMetric.name])), `${detector.id} acceptance metric must exist in projected evidence`);
   }
 });
