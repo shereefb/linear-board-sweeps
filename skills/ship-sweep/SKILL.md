@@ -55,6 +55,8 @@ Also inspect the latest issue-specific comment beginning `[auto-sweep-auto-ship 
 
 **Any missing or malformed gate → comment exactly what's wrong, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive valid enabled fast-path evidence, or (when required) wasn't explicitly approved. If origin advanced or changed after QA, the auto marker mismatch must block rather than ship the newer commit.
 
+**Blocking-label defense in depth.** Fresh-read the card before merge and reject `blocked:open-questions` before merge; reject `blocked:needs-user` before merge; reject `qa:needs-changes` before merge; and reject `sweep:manual-only` before merge. This check remains mandatory even though QA's delta claim removal preserves labels added concurrently after its final guard read.
+
 ## 3. Optional final security gate
 
 If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the merged diff before deploying. A P0/P1 finding blocks: comment it, add `blocked:needs-user`, keep the card in "Ship", stop.

@@ -4,7 +4,7 @@
 
 **Goal:** Move a fully QA-passed, commit-bound `fast-path:eligible` card directly from `QA` to `Ship`, while every missing, stale, changed, blocked, or explicitly approval-gated case continues to `Signoff`.
 
-**Architecture:** Keep the pure QA policy function, add a minimal guarded Linear terminal-move helper, and make both QA and Ship re-read origin at their final mutation boundaries. Dev records the exact reviewed origin SHA; QA passes the raw optional config value and uses one guarded status/claim mutation; Ship binds an auto-promoted card to that SHA at sanity and again immediately before merge. Synchronize both cross-runtime skill distributions, installer/operator docs, and configuration comments.
+**Architecture:** Keep the pure QA policy function and harden the guarded Linear terminal move with end-to-end owner proof and a delta claim-label removal. Dev records the exact reviewed origin SHA; QA passes the raw optional config plus `AUTO_SWEEP_OWNER_TOKEN`; the helper calculates destination placement before its final complete fact read and uses `removedLabelIds`; Ship binds an auto-promoted card to the reviewed SHA and rechecks blocking labels. Synchronize both cross-runtime skill distributions, launcher/operator docs, and tests.
 
 **Tech Stack:** Node.js 18+ ESM, `node:test`, Markdown cross-runtime skills, JSON configuration templates.
 
@@ -17,7 +17,8 @@
 - Any false, missing, malformed, unreadable, or ambiguous condition selects `Signoff`; it is not a QA failure and must not add `qa:needs-changes` or `blocked:needs-user`.
 - Dev audit marker format is exactly `[auto-sweep-fast-path COD-### head=<full-git-sha>]` and is written only after the reviewed branch is pushed.
 - QA automatic Ship marker format is exactly `[auto-sweep-auto-ship COD-### head=<full-git-sha>]`.
-- QA terminal handoffs use `move-card-bottom-if-current`, which removes only the owned claim in one `issueUpdate` mutation after a fresh state/label guard. Linear has no atomic compare-and-swap, so the plan makes no CAS claim.
+- The launcher conditionally exports `AUTO_SWEEP_OWNER_TOKEN`; scheduled/manual QA heartbeats retain the same `owner=<token> claim=qa:in-progress` identity through the terminal call.
+- QA terminal handoffs use `move-card-bottom-if-current`, which obtains destination pagination/rank before the final state/labels/comments guard, proves the latest exact-claim owner, and removes only the claim ID with `removedLabelIds` in one `issueUpdate` mutation. Linear has no atomic compare-and-swap, so the plan makes no CAS claim.
 - Ship's fresh path validates the latest issue-specific auto-ship marker against current origin, then must re-fetch origin immediately before merge. If origin advanced, the mismatch blocks before merge; human/legacy cards with no auto marker retain their existing admission path.
 - A reviewed/final SHA mismatch removes stale `fast-path:eligible`, records both SHAs, and sends the passing card to `Signoff`.
 - Legacy fast-path comments without `head=` never authorize automatic Ship.
@@ -192,8 +193,8 @@ assert.match(qa, /`requireShipApproval: config\.requireShipApproval`/);
 assert.match(qa, /final origin[^\n]*SHA[^\n]*reviewed SHA/i);
 assert.match(qa, /remove `fast-path:eligible`[^\n]*stale/i);
 assert.match(qa, /policy denial[^\n]*not a QA failure/i);
-assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress"/);
-assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Signoff" "qa:in-progress"/);
+assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress" "\$AUTO_SWEEP_OWNER_TOKEN"/);
+assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Signoff" "qa:in-progress" "\$AUTO_SWEEP_OWNER_TOKEN"/);
 assert.match(ship, /automatically promoted by qa-sweep/i);
 assert.match(ship, /only sweep that merges and deploys/i);
 ```
@@ -229,15 +230,16 @@ Keep the existing smoke/build gate. Replace the unconditional §4 `Signoff` dest
 3. reads the latest well-formed issue-specific reviewed-SHA marker;
 4. evaluates the exact Task 1 policy;
 5. passes `fastPathEnabled: config.fastPath?.enabled`, then fetches origin and Linear again and reruns the full policy immediately before handoff;
-6. posts `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` and uses `move-card-bottom-if-current` to move eligible cards to `Ship` while removing only `qa:in-progress`;
-7. removes stale `fast-path:eligible`, records both SHAs, and uses the same guarded helper for a SHA-mismatched `Signoff` move;
-8. routes every other denial to `Signoff` and explicitly states that a policy denial is not a QA failure.
+6. propagates `AUTO_SWEEP_OWNER_TOKEN`, requires same-token `owner=<token> claim=qa:in-progress` heartbeats, and denies changed ownership;
+7. posts `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` and uses `move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken>` to move eligible cards to `Ship` while delta-removing only `qa:in-progress`;
+8. removes stale `fast-path:eligible`, records both SHAs, and uses the same guarded helper for a SHA-mismatched `Signoff` move;
+9. routes every other denial to `Signoff` and explicitly states that a policy denial is not a QA failure.
 
 Update the final re-read, machine handoff, and guardrail text to name the selected terminal destination while preserving the no-merge/no-deploy rule.
 
 - [ ] **Step 5: Update Ship sweep wording in both distributions**
 
-Describe `Ship` cards as either human-approved or automatically promoted by `qa-sweep` under the commit-bound fast-path policy. For auto-promoted fresh-path cards, validate the latest issue-specific marker against current origin during sanity and re-fetch origin immediately before merge for the same exact comparison. If origin advanced or the marker is malformed/missing its SHA, block before merge with evidence. Preserve legacy/human-moved behavior when no auto marker exists and state that `requireShipApproval: true` remains a deliberate human act.
+Describe `Ship` cards as either human-approved or automatically promoted by `qa-sweep` under the commit-bound fast-path policy. For auto-promoted fresh-path cards, validate the latest issue-specific marker against current origin during sanity and re-fetch origin immediately before merge for the same exact comparison. If origin advanced or the marker is malformed/missing its SHA, block before merge with evidence. As defense in depth, fresh-read and reject `blocked:open-questions`, `blocked:needs-user`, `qa:needs-changes`, and `sweep:manual-only` before merge. Preserve legacy/human-moved behavior when no auto marker exists and state that `requireShipApproval: true` remains a deliberate human act.
 
 - [ ] **Step 6: Update configuration and operator docs**
 

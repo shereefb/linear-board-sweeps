@@ -1952,16 +1952,21 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.match(paths.logDir, /linear-board-sweeps\/repo\/dev\/COD-6$/);
   assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
-  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2);
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "run-id", 2);
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
+  assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-6");
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
   assert.equal(pick.sameRepoLimit, 4);
+});
+test("card dispatch env omits owner token when the pick has none", () => {
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6" }, "run-id");
+  assert.equal(Object.hasOwn(pick.childEnv, "AUTO_SWEEP_OWNER_TOKEN"), false);
 });
 test("kit root test expectation decodes spaces in file URLs", () => {
   const encodedTestUrl = new URL("file:///tmp/linear%20board/tests/linear-watch.test.mjs");
@@ -2019,6 +2024,7 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   }], { dryRun: false, parentRunId: "ship-run", activeByAnchor: new Map(), now: NOW });
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
   assert.equal(pick.issueId, "ship-id");
   assert.match(pick.logDir, /ship\/COD-77$/);
 
@@ -2031,6 +2037,7 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   child.emit("close", 0, null);
   assert.equal((await run).kind, "success");
   assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(spawnedEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
   const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
 });
@@ -2500,6 +2507,7 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
   assert.equal(result.dispatches[0].triggeredBy.kind, "same-repo-refill");
   assert.equal(result.dispatches[0].triggeredBy.issue, "COD-4");
   assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_APP_PORT, "47040");
+  assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-COD-5");
   assert.equal(refillBudget.remaining, 7);
   assert.match(logs.find((line) => line.includes("refill-trigger")), /COD-4: dev 1\/4/);
 });

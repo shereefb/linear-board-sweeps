@@ -39,6 +39,12 @@ test("sweep distributions document the commit-bound QA handoff", () => {
   assert.match(qa, /policy denial[^\n]*not a QA failure/i);
   assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress"/);
   assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Signoff" "qa:in-progress"/);
+  assert.match(qa, /AUTO_SWEEP_OWNER_TOKEN/);
+  assert.match(qa, /owner=<token> claim=qa:in-progress/);
+  assert.match(qa, /manual QA[^\n]*nonempty[^\n]*token/i);
+  assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress" "\$AUTO_SWEEP_OWNER_TOKEN"/);
+  assert.match(qa, /`removedLabelIds`/);
+  assert.doesNotMatch(qa, /full `labelIds` replacement/i);
   assert.match(qa, /one `issueUpdate` mutation/i);
   assert.match(qa, /no compare-and-swap/i);
   assert.match(qa, /immediately before[^\n]*handoff[^\n]*fetch origin[^\n]*rerun the full[^\n]*policy/i);
@@ -48,6 +54,9 @@ test("sweep distributions document the commit-bound QA handoff", () => {
   assert.match(ship, /current origin branch SHA[^\n]*exact/i);
   assert.match(ship, /re-fetch[^\n]*immediately before[^\n]*merge/i);
   assert.match(ship, /origin[^\n]*(?:advanced|changed|mismatch)[^\n]*block/i);
+  for (const label of ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]) {
+    assert.match(ship, new RegExp(`${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^\\n]*before merge`, "i"));
+  }
   assert.match(dev, /malformed[^\n]*fastPath\.enabled[^\n]*fail[^\n]*closed/i);
 });
 
@@ -62,6 +71,17 @@ test("approved COD-142 artifacts preserve raw config and commit binding through 
     assert.match(body, /one `issueUpdate` mutation/i, `${path}: one-mutation boundary missing`);
     assert.match(body, /re-fetch[^\n]*immediately before[^\n]*merge/i, `${path}: pre-merge origin recheck missing`);
     assert.match(body, /origin[^\n]*(?:advanced|changed|mismatch)[^\n]*block/i, `${path}: post-QA origin advancement denial missing`);
+    assert.match(body, /AUTO_SWEEP_OWNER_TOKEN/, `${path}: owner-token propagation missing`);
+    assert.match(body, /removedLabelIds/, `${path}: delta label removal missing`);
+    assert.match(body, /destination[^\n]*(?:pagination|rank)[^\n]*final[^\n]*(?:read|guard)/i, `${path}: final-read ordering missing`);
+  }
+});
+
+test("operator claim docs preserve owner-token handoff semantics", () => {
+  for (const path of ["AGENTS.md", "templates/AGENTS.snippet.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /AUTO_SWEEP_OWNER_TOKEN/, `${path}: owner token environment missing`);
+    assert.match(body, /owner=<token> claim=<claim>/, `${path}: heartbeat ownership shape missing`);
   }
 });
 

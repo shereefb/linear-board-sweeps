@@ -56,6 +56,8 @@ Any false, missing, malformed, unreadable, or ambiguous condition selects `Signo
 
 `qa-sweep` obtains the final branch SHA from origin immediately before its terminal transition. It must not rely on a local worktree SHA because worktrees are disposable and a resumed run may start after another machine pushed a change.
 
+Claim ownership is commit-independent but equally fail-closed. The launcher propagates the claim's owner as `AUTO_SWEEP_OWNER_TOKEN`; manual QA creates a nonempty token when claiming. Every claim heartbeat uses `owner=<token> claim=qa:in-progress`, and the terminal helper accepts only the latest complete comment history proving the supplied token still owns the exact QA claim.
+
 If QA changes the branch, the origin SHA no longer matches the reviewed SHA. QA then:
 
 1. removes `fast-path:eligible` because it is stale;
@@ -119,9 +121,9 @@ After the existing smoke-test and green-build gate succeeds, QA performs the fol
    The comment also states that QA passed, the reviewed and final SHAs match, fast path is enabled, and explicit ship approval is not required.
 7. If ineligible because the SHA changed, remove `fast-path:eligible` and record the stale marker. Other denial reasons leave the historical label unchanged unless it is demonstrably stale.
 8. Immediately before terminal handoff, fetch origin and Linear again and rerun the full decision with `fastPathEnabled: config.fastPath?.enabled` and all fresh facts.
-9. Move with `move-card-bottom-if-current <Issue> QA <Destination> qa:in-progress`; do not separately release the claim.
+9. Move with `move-card-bottom-if-current <Issue> QA <Destination> qa:in-progress <OwnerToken>` using `AUTO_SWEEP_OWNER_TOKEN`; do not separately release the claim.
 
-The guarded helper fresh-reads exact state and every label ID. It denies a changed source state, missing owned claim, blocking/manual label, or foreign `*:in-progress` claim. When eligible it performs one `issueUpdate` mutation containing destination state, bottom sort order, and label IDs with only the owned claim removed. Linear provides no atomic compare-and-swap for this transition, so this is the narrowest supported mutation boundary, not a CAS.
+The guarded helper obtains destination pagination/rank before the final state/labels/comments guard read. It fails closed on incomplete labels/comments, a changed source state, an arbitrary or missing state-mapped claim, blocking/manual labels, foreign `*:in-progress` claims, or missing/malformed/mismatched latest heartbeat ownership. When eligible it looks up the owned claim ID from that final read and performs one `issueUpdate` mutation containing destination state, bottom sort order, and `removedLabelIds: [ownedClaimId]`. It never replaces the full label set, so unrelated or concurrently added labels survive. Linear provides no atomic compare-and-swap for this transition, so this is the narrowest supported mutation boundary, not a CAS.
 
 As today, a final re-read that finds the card no longer in `QA` prevents QA from overriding the human or another run. A transient Linear or git read failure fails closed to `Signoff` when enough evidence exists to complete the QA handoff; otherwise the existing unreadable/blocking behavior applies.
 
@@ -142,6 +144,8 @@ The new auto-ship marker supplements rather than replaces those checks. On Ship'
 
 Ship must re-fetch origin immediately before merge and compare the current branch SHA with the auto marker a second time. If origin advanced or changed after QA or after the initial Ship sanity gate, the mismatch blocks before merge; the card stays in `Ship` for review.
 
+Ship also fresh-reads and rejects `blocked:open-questions`, `blocked:needs-user`, `qa:needs-changes`, and `sweep:manual-only` before merge. This is defense in depth for a blocker added after QA's last read: the delta claim removal preserves that label, and Ship refuses it.
+
 QA never merges, pushes `main`, deploys, or performs canary verification.
 
 ## Configuration semantics
@@ -161,6 +165,7 @@ Documentation and the config template will be updated so `fastPath.enabled` clea
 - Reviewed and final SHA differ: remove stale eligibility and use `Signoff`.
 - `requireShipApproval` is true: `Signoff`.
 - Card moved out of `QA` during work: do not override; release the owned claim and stop.
+- Missing `AUTO_SWEEP_OWNER_TOKEN`, incomplete comments, malformed latest exact-claim heartbeat, or a newer owner: deny the terminal move and never remove the newer claim.
 - Automatic Ship comment succeeds but status move fails: the card remains outside Ship and is safe to retry; the marker is idempotent evidence, not production authorization by itself.
 - The guarded status-and-claim mutation succeeds: the normal Ship queue and single-runner rules take over.
 - Origin advances after QA: Ship's marker comparison blocks before merge, including on the immediate pre-merge recheck.
