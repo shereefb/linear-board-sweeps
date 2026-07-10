@@ -49,7 +49,11 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND raw `config.fastPath?.enabled` is exactly `true` or omitted, never malformed); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present.
+
+Also inspect the latest issue-specific comment beginning `[auto-sweep-auto-ship <KEY>`. When such a comment is present, it must exactly match `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` with the matching issue key and a full Git SHA. Fetch origin, resolve the current origin branch SHA, and require exact equality with that marker before continuing. A missing/malformed SHA or mismatch blocks before merge with the marker and current-origin evidence; leave the card in `Ship`, add `blocked:needs-user`, and remove `ship:in-progress`. If no issue-specific auto-ship marker exists, preserve the legacy/human-moved Ship behavior and the other sanity gates. This binding applies only on the fresh path; resume-after-merge still keys on the merge commit.
+
+**Any missing or malformed gate → comment exactly what's wrong, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive valid enabled fast-path evidence, or (when required) wasn't explicitly approved. If origin advanced or changed after QA, the auto marker mismatch must block rather than ship the newer commit.
 
 ## 3. Optional final security gate
 
@@ -57,9 +61,10 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 
 ## 4. Merge → cleanup
 
-1. **Merge to `main`** (`--no-ff`), resolving against `origin/main` first (merge origin/main, rebuild, retest if needed).
-2. **Push `main`** with the shared push discipline (fetch → rebase/merge origin/main → push; retry up to 2×; never force). Push **every** repo you merged.
-3. **Only after the push lands**, clean up: delete the merged branch, `git worktree prune`, close/merge the PR. (Order matters — resume detection in §2 finds the merge commit on `main`, so the branch may safely be gone, but the push must have landed first.)
+1. **Pre-merge commit-binding recheck.** For a card with an auto-ship marker, re-fetch origin immediately before the merge, resolve the current origin branch SHA again, and compare it exactly with the marker SHA again. If origin advanced, changed, disappeared, or mismatches, block before merge with exact evidence as in §2. This second fetch closes the window after initial sanity/build/security work.
+2. **Merge to `main`** (`--no-ff`), resolving against `origin/main` first (merge origin/main, rebuild, retest if needed).
+3. **Push `main`** with the shared push discipline (fetch → rebase/merge origin/main → push; retry up to 2×; never force). Push **every** repo you merged.
+4. **Only after the push lands**, clean up: delete the merged branch, `git worktree prune`, close/merge the PR. (Order matters — resume detection in §2 finds the merge commit on `main`, so the branch may safely be gone, but the push must have landed first.)
 
 ## 5. Deploy
 
@@ -105,7 +110,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 ## Guardrails
 
-- **Ships to production** — the highest-risk sweep. Only ever ship a card that reached `Ship` through human approval or commit-bound QA auto-promotion, is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and — if `requireShipApproval` — carries `ship:approved`. When in doubt, `blocked:needs-user` and stop; never deploy a card that did not satisfy the unchanged sanity gate.
+- **Ships to production** — the highest-risk sweep. Only ever ship a card that reached `Ship` through human approval or commit-bound QA auto-promotion, is `qa:passed` or has `fast-path:eligible` with valid raw fast-path config, is green-building, has no live foreign in-progress claim, and — if `requireShipApproval` — carries `ship:approved`. A present auto-ship marker must equal current origin both at sanity and immediately before merge. When in doubt, `blocked:needs-user` and stop; never deploy a card that did not satisfy the unchanged sanity gate.
 - Never treat a docs/spec merge in the anchor repo as proof that sibling app code shipped. If implementation/QA evidence is in another repo, that repo must be configured and shipped, or the card must be split/manual-shipped with explicit audit comments.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - One card at a time, but keep draining until the actionable "Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.

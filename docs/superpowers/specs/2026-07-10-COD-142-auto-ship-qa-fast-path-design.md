@@ -35,7 +35,7 @@ That manual step adds little value for appropriately bounded changes. However, t
 
 A QA-passed card may move directly to `Ship` only when every condition below is true at the final handoff re-read:
 
-1. `config.fastPath.enabled !== false`.
+1. The raw optional value is mapped as `fastPathEnabled: config.fastPath?.enabled`; omitted means enabled, exact `false` disables, and any other non-boolean value fails closed. Callers must not normalize it with `!== false`.
 2. `config.requireShipApproval === false`.
 3. The card is still in `QA` in the configured project.
 4. The card carries both `fast-path:eligible` and `qa:passed`.
@@ -97,7 +97,7 @@ It returns:
 }
 ```
 
-The helper centralizes the high-risk allow/deny matrix and is unit-tested. The sweep remains responsible for reading Linear, obtaining the final origin SHA, parsing the latest matching audit marker, applying/removing labels, posting comments, and invoking the existing `move-card-bottom` command.
+The helper centralizes the high-risk allow/deny matrix and is unit-tested. The sweep remains responsible for reading Linear, obtaining the final origin SHA, parsing the latest matching audit marker, applying labels, posting comments, and invoking the guarded terminal-move command.
 
 The allow path requires positive evidence for every condition. Unknown input never defaults to `Ship`.
 
@@ -118,8 +118,10 @@ After the existing smoke-test and green-build gate succeeds, QA performs the fol
 
    The comment also states that QA passed, the reviewed and final SHAs match, fast path is enabled, and explicit ship approval is not required.
 7. If ineligible because the SHA changed, remove `fast-path:eligible` and record the stale marker. Other denial reasons leave the historical label unchanged unless it is demonstrably stale.
-8. Release `qa:in-progress` immediately before the terminal move.
-9. Move the card to the bottom of the selected destination with `move-card-bottom`.
+8. Immediately before terminal handoff, fetch origin and Linear again and rerun the full decision with `fastPathEnabled: config.fastPath?.enabled` and all fresh facts.
+9. Move with `move-card-bottom-if-current <Issue> QA <Destination> qa:in-progress`; do not separately release the claim.
+
+The guarded helper fresh-reads exact state and every label ID. It denies a changed source state, missing owned claim, blocking/manual label, or foreign `*:in-progress` claim. When eligible it performs one `issueUpdate` mutation containing destination state, bottom sort order, and label IDs with only the owned claim removed. Linear provides no atomic compare-and-swap for this transition, so this is the narrowest supported mutation boundary, not a CAS.
 
 As today, a final re-read that finds the card no longer in `QA` prevents QA from overriding the human or another run. A transient Linear or git read failure fails closed to `Signoff` when enough evidence exists to complete the QA handoff; otherwise the existing unreadable/blocking behavior applies.
 
@@ -136,13 +138,17 @@ No launcher handoff is added. Once a card reaches `Ship`, the designated ship ru
 - repository and deploy scope match;
 - `ship:approved` exists when `requireShipApproval` is true.
 
-The new auto-ship marker supplements rather than replaces those checks. QA never merges, pushes `main`, deploys, or performs canary verification.
+The new auto-ship marker supplements rather than replaces those checks. On Ship's fresh path, inspect the latest issue-specific comment beginning `[auto-sweep-auto-ship COD-###`; if present, it must exactly match `[auto-sweep-auto-ship COD-### head=<full-git-sha>]` and becomes commit authorization. The current origin branch SHA must exactly equal it. Missing SHA or mismatch blocks before merge with exact evidence. Legacy or human-moved cards with no auto marker retain existing behavior.
+
+Ship must re-fetch origin immediately before merge and compare the current branch SHA with the auto marker a second time. If origin advanced or changed after QA or after the initial Ship sanity gate, the mismatch blocks before merge; the card stays in `Ship` for review.
+
+QA never merges, pushes `main`, deploys, or performs canary verification.
 
 ## Configuration semantics
 
 No new configuration key is introduced.
 
-- `fastPath.enabled: false` disables Dev eligibility and QA automatic Ship routing.
+- Omitted `fastPath.enabled` enables the feature; exact `false` disables Dev eligibility and QA automatic Ship routing; malformed `null`, string, number, object, or array values fail closed in both Dev and QA.
 - `requireShipApproval: true` always sends QA-passed cards to `Signoff`, even if they otherwise qualify.
 - Existing size, diff-line, allowed-label, disallowed-label, risk-surface, green-check, and reviewer-confidence settings continue to determine whether Dev may add `fast-path:eligible`.
 
@@ -156,7 +162,8 @@ Documentation and the config template will be updated so `fastPath.enabled` clea
 - `requireShipApproval` is true: `Signoff`.
 - Card moved out of `QA` during work: do not override; release the owned claim and stop.
 - Automatic Ship comment succeeds but status move fails: the card remains outside Ship and is safe to retry; the marker is idempotent evidence, not production authorization by itself.
-- Status move succeeds after claim release: the normal Ship queue and single-runner rules take over.
+- The guarded status-and-claim mutation succeeds: the normal Ship queue and single-runner rules take over.
+- Origin advances after QA: Ship's marker comparison blocks before merge, including on the immediate pre-merge recheck.
 - A crash after moving to Ship is safe because QA has not merged or deployed anything; ship-sweep reconstructs production progress from its existing merge and deploy markers.
 
 ## Testing
@@ -209,6 +216,8 @@ Update the following canonical and distributed copies together:
 - The same card moves to `Signoff` when its final origin SHA differs from the reviewed SHA.
 - Any QA branch change invalidates and removes stale fast-path eligibility.
 - Legacy or malformed markers never authorize automatic Ship.
+- Malformed caller-level `fastPath.enabled` values cannot auto-ship.
+- A post-QA origin push is blocked at Ship before merge, even if the initial Ship sanity read passed.
 - `requireShipApproval: true` always retains human Signoff.
 - Non-fast-path passing cards retain the existing QA-to-Signoff behavior.
 - QA never merges or deploys; ship-sweep remains the only production actor.

@@ -4,7 +4,7 @@
 
 **Goal:** Move a fully QA-passed, commit-bound `fast-path:eligible` card directly from `QA` to `Ship`, while every missing, stale, changed, blocked, or explicitly approval-gated case continues to `Signoff`.
 
-**Architecture:** Add one pure policy function to `scripts/linear.mjs` so the allow/deny matrix is executable and unit-tested. Update both cross-runtime skill distributions so Dev records the exact reviewed origin SHA and QA compares that SHA at the final re-read before choosing `Ship` or `Signoff`; then synchronize the operator docs and configuration comments with the conditional human gate.
+**Architecture:** Keep the pure QA policy function, add a minimal guarded Linear terminal-move helper, and make both QA and Ship re-read origin at their final mutation boundaries. Dev records the exact reviewed origin SHA; QA passes the raw optional config value and uses one guarded status/claim mutation; Ship binds an auto-promoted card to that SHA at sanity and again immediately before merge. Synchronize both cross-runtime skill distributions, installer/operator docs, and configuration comments.
 
 **Tech Stack:** Node.js 18+ ESM, `node:test`, Markdown cross-runtime skills, JSON configuration templates.
 
@@ -12,10 +12,13 @@
 
 - `qa-sweep` never merges, pushes `main`, deploys, or performs canary verification.
 - `ship-sweep` remains the only merge/deploy actor and retains branch, build, repository-scope, single-runner, deploy, and canary gates.
-- Automatic Ship requires `config.fastPath.enabled !== false`, `config.requireShipApproval === false`, `fast-path:eligible`, `qa:passed`, exact `QA` state, no blocking/manual label, no foreign in-progress claim, and matching full reviewed/final origin SHAs.
+- QA maps `fastPathEnabled: config.fastPath?.enabled` without `!== false`; omitted defaults on, while malformed values fail closed in Dev and QA and cannot auto-ship.
+- Automatic Ship requires valid raw fast-path config, `config.requireShipApproval === false`, `fast-path:eligible`, `qa:passed`, exact `QA` state, no blocking/manual label, no foreign in-progress claim, and matching full reviewed/final origin SHAs.
 - Any false, missing, malformed, unreadable, or ambiguous condition selects `Signoff`; it is not a QA failure and must not add `qa:needs-changes` or `blocked:needs-user`.
 - Dev audit marker format is exactly `[auto-sweep-fast-path COD-### head=<full-git-sha>]` and is written only after the reviewed branch is pushed.
 - QA automatic Ship marker format is exactly `[auto-sweep-auto-ship COD-### head=<full-git-sha>]`.
+- QA terminal handoffs use `move-card-bottom-if-current`, which removes only the owned claim in one `issueUpdate` mutation after a fresh state/label guard. Linear has no atomic compare-and-swap, so the plan makes no CAS claim.
+- Ship's fresh path validates the latest issue-specific auto-ship marker against current origin, then must re-fetch origin immediately before merge. If origin advanced, the mismatch blocks before merge; human/legacy cards with no auto marker retain their existing admission path.
 - A reviewed/final SHA mismatch removes stale `fast-path:eligible`, records both SHAs, and sends the passing card to `Signoff`.
 - Legacy fast-path comments without `head=` never authorize automatic Ship.
 - `requireShipApproval: true` always preserves human Signoff.
@@ -113,6 +116,7 @@ export function qaHandoffDecision(input = {}) {
   const labels = new Set(Array.isArray(input.labelNames) ? input.labelNames : []);
   const deny = (reason) => ({ destination: "Signoff", eligible: false, reason });
 
+  if (input.fastPathEnabled !== undefined && typeof input.fastPathEnabled !== "boolean") return deny("invalid-fast-path-enabled");
   if (input.fastPathEnabled === false) return deny("fast-path-disabled");
   if (input.requireShipApproval === true) return deny("ship-approval-required");
   if (input.stateName !== WORKFLOW_STATES.qa) return deny("not-in-qa");
@@ -169,7 +173,7 @@ git commit -m "feat(COD-142): add QA fast-path handoff policy"
 - Modify: `docs/linear-rules.md`
 
 **Interfaces:**
-- Consumes: `qaHandoffDecision` policy and existing `move-card-bottom` helper.
+- Consumes: `qaHandoffDecision` policy and guarded `move-card-bottom-if-current` helper.
 - Produces: exact reviewed-SHA Dev marker, exact automatic-Ship QA marker, and conditional `QA -> Ship` transition.
 - Preserves: existing `QA -> Signoff` behavior for every denial and the existing Ship queue/sanity behavior.
 
@@ -183,13 +187,13 @@ assert.match(dev, /only after[^\n]*push/i);
 assert.match(qa, /\[auto-sweep-auto-ship <KEY> head=<full-git-sha>\]/);
 assert.match(qa, /`fast-path:eligible`/);
 assert.match(qa, /`qa:passed`/);
-assert.match(qa, /`config\.fastPath\.enabled !== false`/);
-assert.match(qa, /`config\.requireShipApproval === false`/);
+assert.match(qa, /`fastPathEnabled: config\.fastPath\?\.enabled`/);
+assert.match(qa, /`requireShipApproval: config\.requireShipApproval`/);
 assert.match(qa, /final origin[^\n]*SHA[^\n]*reviewed SHA/i);
 assert.match(qa, /remove `fast-path:eligible`[^\n]*stale/i);
 assert.match(qa, /policy denial[^\n]*not a QA failure/i);
-assert.match(qa, /move-card-bottom <PREFIX-###> "Ship"/);
-assert.match(qa, /move-card-bottom <PREFIX-###> "Signoff"/);
+assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress"/);
+assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Signoff" "qa:in-progress"/);
 assert.match(ship, /automatically promoted by qa-sweep/i);
 assert.match(ship, /only sweep that merges and deploys/i);
 ```
@@ -224,19 +228,20 @@ Keep the existing smoke/build gate. Replace the unconditional §4 `Signoff` dest
 2. obtains the final full SHA from origin, not the local worktree;
 3. reads the latest well-formed issue-specific reviewed-SHA marker;
 4. evaluates the exact Task 1 policy;
-5. posts `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]`, releases `qa:in-progress`, and moves eligible cards to the bottom of `Ship`;
-6. removes stale `fast-path:eligible`, records both SHAs, releases the claim, and moves a SHA-mismatched passing card to `Signoff`;
-7. routes every other denial to `Signoff` and explicitly states that a policy denial is not a QA failure.
+5. passes `fastPathEnabled: config.fastPath?.enabled`, then fetches origin and Linear again and reruns the full policy immediately before handoff;
+6. posts `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` and uses `move-card-bottom-if-current` to move eligible cards to `Ship` while removing only `qa:in-progress`;
+7. removes stale `fast-path:eligible`, records both SHAs, and uses the same guarded helper for a SHA-mismatched `Signoff` move;
+8. routes every other denial to `Signoff` and explicitly states that a policy denial is not a QA failure.
 
 Update the final re-read, machine handoff, and guardrail text to name the selected terminal destination while preserving the no-merge/no-deploy rule.
 
 - [ ] **Step 5: Update Ship sweep wording in both distributions**
 
-Describe `Ship` cards as either human-approved or automatically promoted by `qa-sweep` under the commit-bound fast-path policy. Keep the existing sanity gate unchanged and state that `requireShipApproval: true` remains a deliberate human act.
+Describe `Ship` cards as either human-approved or automatically promoted by `qa-sweep` under the commit-bound fast-path policy. For auto-promoted fresh-path cards, validate the latest issue-specific marker against current origin during sanity and re-fetch origin immediately before merge for the same exact comparison. If origin advanced or the marker is malformed/missing its SHA, block before merge with evidence. Preserve legacy/human-moved behavior when no auto marker exists and state that `requireShipApproval: true` remains a deliberate human act.
 
 - [ ] **Step 6: Update configuration and operator docs**
 
-Update `.claude/linear-sweep.json` and `templates/linear-sweep.json` comments without adding a new key. Update `AGENTS.md`, `README.md`, `SETUP.md`, and `docs/linear-rules.md` so they consistently say:
+Update `.claude/linear-sweep.json` and `templates/linear-sweep.json` comments without adding a new key. Update `AGENTS.md`, `README.md`, `SETUP.md`, `docs/linear-rules.md`, and `templates/AGENTS.snippet.md` so they consistently say:
 
 - normal passing cards: `QA -> Signoff -> [human] -> Ship`;
 - eligible unchanged fast paths: `QA -> Ship` automatically after full QA;

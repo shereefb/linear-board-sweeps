@@ -12,7 +12,8 @@ import {
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
-  repoRouteEligibility, fetchIssueLabels, qaHandoffDecision,
+  repoRouteEligibility, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
+  guardedTerminalMoveInput, moveCardBottomIfCurrent,
 } from "../scripts/linear.mjs";
 
 const QA_HANDOFF_BASE = Object.freeze({
@@ -125,6 +126,89 @@ test("QA handoff does not mutate the input or labels", () => {
   const before = structuredClone(input);
   qaHandoffDecision(input);
   assert.deepEqual(input, before);
+});
+
+const GUARDED_MOVE_BASE = Object.freeze({
+  stateName: "QA",
+  expectedState: "QA",
+  labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress"],
+  ownedClaim: "qa:in-progress",
+});
+
+test("guarded terminal move allows only a current source card with its owned claim", () => {
+  assert.deepEqual(guardedTerminalMoveDecision(GUARDED_MOVE_BASE), { eligible: true, reason: "ready" });
+});
+
+for (const [override, reason] of [
+  [{ stateName: "Signoff" }, "source-state-changed"],
+  [{ labelNames: ["qa:passed"] }, "owned-claim-missing"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "blocked:needs-user"] }, "blocking-label"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "sweep:manual-only"] }, "blocking-label"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "dev:in-progress"] }, "foreign-claim"],
+]) {
+  test(`guarded terminal move denies ${reason}`, () => {
+    assert.deepEqual(guardedTerminalMoveDecision({ ...GUARDED_MOVE_BASE, ...override }), { eligible: false, reason });
+  });
+}
+
+test("guarded terminal move input removes only the owned claim", () => {
+  assert.deepEqual(guardedTerminalMoveInput(
+    "ship-state",
+    [{ sortOrder: 7 }, { sortOrder: -3 }],
+    [{ id: "passed", name: "qa:passed" }, { id: "claim", name: "qa:in-progress" }, { id: "product", name: "frontend" }],
+    "qa:in-progress",
+  ), {
+    stateId: "ship-state",
+    sortOrder: -4,
+    labelIds: ["passed", "product"],
+  });
+});
+
+test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUpdate", async () => {
+  const calls = [];
+  const gqlFn = async (query, variables) => {
+    calls.push({ query, variables });
+    if (query.includes("issue(id:$id)")) return { issue: {
+      id: "issue-142", identifier: "COD-142", project: { id: "project" }, state: { name: "QA" },
+      labels: { pageInfo: { hasNextPage: false }, nodes: [
+        { id: "passed", name: "qa:passed" }, { id: "claim", name: "qa:in-progress" }, { id: "product", name: "frontend" },
+      ] },
+      team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
+    } };
+    if (query.includes("issues(first:100")) return {
+      issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ id: "other", sortOrder: -8 }] },
+    };
+    if (query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: {
+      identifier: "COD-142", state: { name: "Ship" }, sortOrder: -9, url: "https://linear/COD-142",
+    } } };
+    throw new Error(`unexpected query: ${query}`);
+  };
+
+  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", { gqlFn, log: () => {} });
+  assert.equal(result.moved, true);
+  assert.deepEqual(calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{
+    id: "issue-142",
+    input: { stateId: "ship-state", sortOrder: -9, labelIds: ["passed", "product"] },
+  }]);
+});
+
+test("moveCardBottomIfCurrent denies live blockers without mutation", async () => {
+  const calls = [];
+  const gqlFn = async (query) => {
+    calls.push(query);
+    return { issue: {
+      id: "issue-142", identifier: "COD-142", project: { id: "project" }, state: { name: "QA" },
+      labels: { pageInfo: { hasNextPage: false }, nodes: [
+        { id: "claim", name: "qa:in-progress" }, { id: "blocked", name: "blocked:needs-user" },
+      ] },
+      team: { states: { nodes: [{ id: "ship-state", name: "Ship" }] } },
+    } };
+  };
+  assert.deepEqual(
+    await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", { gqlFn, log: () => {} }),
+    { moved: false, issue: "COD-142", reason: "blocking-label" },
+  );
+  assert.equal(calls.some((query) => query.includes("issueUpdate")), false);
 });
 
 test("dependency eligibility releases only exact Done blockers", () => {
@@ -240,6 +324,42 @@ test("fetchIssueDependencies rejects query failures instead of returning an empt
 });
 
 const linearCli = fileURLToPath(new URL("../scripts/linear.mjs", import.meta.url));
+function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in-progress"], unreadable = false } = {}) {
+  const issue = unreadable ? null : {
+    id: "issue-142", identifier: "COD-142", project: { id: "project" }, state: { name: stateName },
+    labels: { pageInfo: { hasNextPage: false }, nodes: labelNames.map((name, index) => ({ id: `label-${index}`, name })) },
+    team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
+  };
+  const preloadSource = `globalThis.fetch = async (_url, options) => {
+    const { query } = JSON.parse(options.body);
+    let data;
+    if (query.includes("issue(id:$id)")) data = { issue: ${JSON.stringify(issue)} };
+    else if (query.includes("issues(first:100")) data = { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    else if (query.includes("issueUpdate")) data = { issueUpdate: { success: true, issue: { identifier: "COD-142", state: { name: "Ship" }, sortOrder: 0, url: "https://linear/COD-142" } } };
+    else throw new Error("unexpected query: " + query);
+    return { json: async () => ({ data }) };
+  };`;
+  const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "move-card-bottom-if-current", "COD-142", "QA", "Ship", "qa:in-progress"], {
+    encoding: "utf8",
+    env: { ...process.env, LINEAR_API_KEY: "key" },
+  });
+}
+
+test("move-card-bottom-if-current CLI maps moved, denied, and unreadable outcomes to 0/3/2", () => {
+  const moved = runGuardedMoveCli();
+  assert.equal(moved.status, 0, moved.stderr);
+  assert.equal(JSON.parse(moved.stdout).moved, true);
+
+  const denied = runGuardedMoveCli({ stateName: "Signoff" });
+  assert.equal(denied.status, 3, denied.stderr);
+  assert.deepEqual(JSON.parse(denied.stdout), { moved: false, issue: "COD-142", reason: "source-state-changed" });
+
+  const unreadable = runGuardedMoveCli({ unreadable: true });
+  assert.equal(unreadable.status, 2);
+  assert.match(unreadable.stderr, /not found.*unreadable/i);
+});
+
 function runDependencyStatusCli(inverseRelations, env = {}) {
   const response = { data: { issue: { identifier: "COD-9", inverseRelations } } };
   const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
