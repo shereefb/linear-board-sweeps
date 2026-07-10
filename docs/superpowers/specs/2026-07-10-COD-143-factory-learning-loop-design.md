@@ -133,9 +133,13 @@ reliability quality   throughput
 
 ### Component boundaries
 
-The first implementation remains inside the zero-dependency launcher module and
-its tests, following the repository's existing large-module style. Pure helpers
-are exported for tests. A later split is not required to ship COD-143.
+The implementation adds one zero-dependency `scripts/learning.mjs` module for
+learning schemas, bounded evidence reads, detectors, aggregation, state, and pure
+mutation planning. `scripts/linear-watch.mjs` retains launcher orchestration,
+capacity admission, runtime dispatch, Linear IO, and CLI wiring. This is a real
+responsibility boundary rather than a broad launcher refactor: the existing watcher
+is already large, and putting the full learning engine inside it would make both
+systems harder to test and review.
 
 1. **Learning configuration normalizer**
    - Normalizes registry-global scheduling and core routing.
@@ -143,7 +147,8 @@ are exported for tests. A later split is not required to ship COD-143.
    - Rejects or disables mutation when core routing cannot be proven.
 
 2. **Evidence snapshot builder**
-   - Reads local JSON/JSONL state and bounded Linear audit metadata.
+   - Reads a launcher-global bounded run index, structured sweep learning events,
+     local JSON state, and bounded Linear audit metadata.
    - Uses one immutable `capturedThrough` cutoff per run.
    - Returns normalized evidence plus explicit coverage gaps.
    - Never exposes raw secrets, prompts, stdout, or arbitrary attachment bodies.
@@ -154,6 +159,8 @@ are exported for tests. A later split is not required to ship COD-143.
      fingerprint inputs, and evaluation metric.
    - Detector code, not synthesis, decides whether evidence is low, medium, or
      high confidence.
+   - Semantic quality signals use a versioned enum emitted by sweep helpers; a
+     model may not invent a category that changes admission.
 
 4. **Finding aggregator**
    - Groups compatible detector findings by stable root-cause key.
@@ -197,6 +204,7 @@ child runtime live in the launcher registry rather than being duplicated per rep
 {
   "learning": {
     "enabled": true,
+    "runner": true,
     "coreSourceAnchor": "/source/path/to/linear-board-sweeps",
     "maxNewCardsPerRun": 6,
     "runtime": {
@@ -208,8 +216,15 @@ child runtime live in the launcher registry rather than being duplicated per rep
 }
 ```
 
-`coreSourceAnchor` must equal one registered source anchor after canonical path
-resolution. The normalizer does not guess by basename. If it is missing or invalid,
+`runner` pins automatic learning analysis and Linear writes to one designated host,
+matching the existing Ship runner posture. Cross-host markers remain a retry and
+reconciliation defense, not the primary mutual-exclusion mechanism.
+
+`coreSourceAnchor` must equal one registered source anchor after canonical identity
+resolution (`realpath` when the path exists, resolved fallback otherwise). Registry
+normalization rejects two source paths that resolve to the same identity, preventing
+symlink aliases from splitting evidence or routing. The normalizer does not guess by
+basename. If the core anchor is missing or invalid,
 workspace-local findings may still be evaluated and written locally; shared-core
 findings remain pending with a diagnostic instead of being misfiled.
 
@@ -292,6 +307,35 @@ Raw card text and logs are untrusted. Parsers extract known audit markers and
 bounded summaries. No evidence content may become a shell command, tool call,
 runtime instruction, arbitrary URL fetch, or secret-bearing Linear comment.
 
+### Structured sweep event bridge
+
+Quality and human-friction evidence cannot be inferred reliably from arbitrary card
+prose. Scheduled children therefore receive a unique
+`AUTO_SWEEP_LEARNING_EVENTS_PATH` and record validated events through:
+
+```text
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event \
+  <kind> <category> <summary> [--json-metrics <json>]
+```
+
+The helper validates a closed `kind/category` taxonomy, bounds and redacts the
+summary, takes run/card/workspace identity from trusted environment variables, and
+appends one JSONL event to the unique path. Sweep instructions emit events for
+review findings, QA failures, bounce reasons, direct human questions, terminal
+outcomes, and red canaries. Unknown kinds/categories fail locally without failing
+the sweep.
+
+After the child exits, the launcher validates and embeds these events in the card
+run record. It also appends that sanitized record to a launcher-global daily index:
+
+```text
+~/.local/state/linear-board-sweeps/runs/YYYYMMDD.jsonl
+```
+
+The per-card record remains the detailed local artifact; the global index is the
+bounded evidence source that prevents recursive directory scans on every learning
+run.
+
 ## Finding contract
 
 Every detector and aggregate emits a stable schema:
@@ -317,14 +361,15 @@ acceptanceMetric
 evaluationWindow
 ```
 
-The stable card marker is:
+The version-independent stable card identity marker is:
 
 ```text
-[factory-learning <detector-version> <root-fingerprint> generation=<n>]
+[factory-learning root=<root-fingerprint> generation=<n>]
 ```
 
-Occurrence IDs appear in evidence-delta comments so a retry cannot add the same
-observation twice.
+Detector IDs and versions remain provenance fields in the card body and evidence
+comments; upgrading a detector must not change card identity. Occurrence IDs appear
+in evidence-delta comments so a retry cannot add the same observation twice.
 
 ## Initial detector set
 
@@ -407,8 +452,16 @@ Created cards include:
 - exclusions and safety constraints;
 - stable provenance marker and `factory:learning-generated` label.
 
-Setup must create `factory:learning-generated` when absent. Lens provenance remains
-in the structured marker/card body rather than adding a label per detector.
+Setup must create `factory:learning-generated` when absent. The dedicated writer
+requires the label ID before `issueCreate` and fails closed rather than silently
+creating an unmarked auto-swept card. Lens provenance remains in the structured
+marker/card body rather than adding a label per detector.
+
+Generated cards are never eligible for the existing fast path. Dev-sweep must
+explicitly refuse `fast-path:eligible` when `factory:learning-generated` is present,
+and ship-sweep must require `qa:passed` for that provenance even if a stale or
+incorrect fast-path label exists. This enforces the approved QA -> Signoff path in
+both the producer and the production gate.
 
 ## Routing
 
@@ -427,8 +480,12 @@ in the structured marker/card body rather than adding a label per detector.
 
 ## Scheduling and capacity
 
-Every normal tick performs a zero-model due check after active anchors are resolved.
-The check reads bounded lens state and evidence timestamps.
+Every normal tick performs a zero-model due check after registered workspaces are
+resolved. Learning observation uses every registered workspace whose repo config has
+`learning.enabled=true`, even when its project is paused for delivery by removing the
+`auto-sweep` project label. Delivery activation continues to gate only the canonical
+Spec/Dev/QA/Ship queues. The due check reads bounded lens state and evidence
+timestamps.
 
 Default cadence:
 
@@ -437,7 +494,11 @@ Default cadence:
 - throughput: due weekly after at least twenty relevant new runs;
 - outcome evaluations: due when an active evaluation window ends.
 
-The learning child is a new admission demand class, not a `SWEEP_CFG` entry. It:
+The learning child is a new admission demand class, not a `SWEEP_CFG` board-sweep
+entry. Capacity-ledger validation explicitly accepts stage `learning`, trigger
+`learning-due`, a stable registry-scoped demand key, and at most one surviving
+learning reservation. Its priority is explicitly below Spec rather than relying on
+unknown-stage fallback behavior. It:
 
 - counts against `capacity.maxActiveChildren`;
 - has lower priority than Ship, QA, Dev, and Spec;
@@ -450,6 +511,15 @@ The learning child is a new admission demand class, not a `SWEEP_CFG` entry. It:
 The deterministic collector and detectors run in the launcher process. Model-backed
 synthesis, when needed, runs in the bounded learning child. This keeps an idle tick
 cheap and prevents arbitrary evidence from controlling the parent process.
+
+Only the designated `learning.runner` host dispatches that child or performs Linear
+writes. The child runs from an isolated temporary directory, receives a sanitized
+evidence file and JSON output schema, and receives no Linear key or repo `.env`
+values. Codex uses an ephemeral, ignored-user-config, read-only invocation with
+structured output; Claude uses safe/bare print mode, strict empty MCP config,
+`--tools ""`, and JSON schema validation. Model output can only annotate already
+qualified fingerprints and is rejected if it changes route, confidence, occurrences,
+or admission.
 
 ## Idempotency and concurrency
 
@@ -467,6 +537,11 @@ candidate
   -> advance durable cursor
 ```
 
+The dedicated marker/evidence scanner paginates issue comments to completion with a
+seen-cursor guard. It fails closed on partial GraphQL data or cursor cycles. The
+existing `comments(last:100)` snapshots are not sufficient for occurrence
+idempotency because an older marker may fall outside the most recent page.
+
 Expected crash/race outcomes:
 
 - create succeeds and local state write fails: the next run finds the marker;
@@ -474,10 +549,17 @@ Expected crash/race outcomes:
 - two hosts race: both search and re-read, and duplicate reconciliation selects one
   primary if Linear's non-atomic create still permits two issues;
 - a human changes state while analysis runs: the writer preserves the live state;
-- a detector version changes: the root fingerprint remains stable while marker
-  provenance records the new version;
+- a detector version changes: the version-independent root marker remains stable
+  while body/comment provenance records the new detector version;
 - local state is corrupt: diagnostics go red, Linear evidence remains authoritative,
   and no cursor advances until state is repaired/rebuilt.
+
+Each lens uses a small write-ahead protocol. Before Linear IO, the launcher atomically
+persists the fixed evidence window, qualified findings, and planned mutations as
+pending. After each Linear create/update is re-read and confirmed, the mutation is
+marked complete. The lens watermark advances only when every planned mutation is
+confirmed; a failed write leaves the window and occurrence IDs pending for an
+idempotent retry.
 
 ## Outcome evaluation and recursion control
 
@@ -497,6 +579,11 @@ symptom, and lineage is capped at three automatic generations. Beyond that, new
 evidence updates the latest card and adds `blocked:needs-user` for explicit review
 rather than recursively creating more work.
 
+The manual unblock query includes Done cards only when they carry both
+`factory:learning-generated` and `blocked:needs-user`, after the normal downstream
+Signoff/QA/Dev/Spec ordering. This keeps a generation-cap review discoverable without
+turning every blocked Done card into unblock work.
+
 Generated cards remain observable: their run/review/QA evidence can reveal defects
 in the learning loop itself. Proven learning-loop failures route to the core project
 under distinct root fingerprints.
@@ -507,7 +594,7 @@ under distinct root fingerprints.
 | --- | --- |
 | One workspace evidence read fails | Mark partial coverage and continue other workspaces. |
 | One detector fails | Record detector error; other detectors and lenses continue. |
-| Model synthesis fails | Keep deterministic qualified findings pending; do not emit speculative text. |
+| Model synthesis fails | Use the deterministic schema-based card body, record synthesis unavailable, and continue qualified writes without speculative text. |
 | Linear read/write fails | Do not advance the affected cursor; retry later. |
 | Route becomes ambiguous | Leave pending and surface exact route evidence. |
 | State file is malformed | Fail learning closed, preserve ordinary sweeps, and expose a diagnostic. |
@@ -597,6 +684,8 @@ CODE PATHS                                         OPERATOR / BOARD FLOWS
   [ ] bounded run/observation reads                  [ ] active match receives evidence delta
   [ ] partial/malformed source coverage              [ ] Done match creates one generation
   [ ] secret/untrusted-content redaction             [ ] concurrent writers converge/reconcile
+  [ ] structured event taxonomy/validation           [ ] synthesis has no mutation credentials/tools
+  [ ] global run index retention/bounds               [ ] only designated learning runner writes
 [ ] detector registry                              [ ] human state/edits are preserved
   [ ] every initial detector below/at threshold      [ ] six-card admission budget defers overflow
   [ ] medium/high/low confidence                     [ ] Linear failure preserves cursor
@@ -644,12 +733,15 @@ asserts that synthesis:
 
 1. Ship the complete implementation disabled by default for existing workspace
    configs.
-2. Enable all three lenses in this repository's config and registry for dogfooding.
-3. Run one historical `--dry-run` as installation verification, then enable automatic
+2. Add `factory:learning-generated` to the canonical required label set and rerun the
+   idempotent team setup for every workspace before enabling automatic writes.
+3. Enable all three lenses in this repository's config and pin this host as the
+   learning runner for dogfooding.
+4. Run one historical `--dry-run` as installation verification, then enable automatic
    writes immediately; there is no ongoing shadow period.
-4. Throughput remains naturally dormant until its twenty-run baseline exists.
-5. Review `doctor` and the first live generated/updated cards as QA evidence.
-6. Preserve a reversible registry `learning.enabled=false` kill switch that disables
+5. Throughput remains naturally dormant until its twenty-run baseline exists.
+6. Review `doctor` and the first live generated/updated cards as QA evidence.
+7. Preserve a reversible registry `learning.enabled=false` kill switch that disables
    new learning dispatch without affecting existing generated cards or normal sweeps.
 
 ## Alternatives considered
