@@ -17,7 +17,7 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
-  compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, admitDemand,
+  compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, dependencyDeferredIssue, admitDemand,
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
@@ -28,7 +28,7 @@ import {
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
-  OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS,
+  OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS, MAX_DEPENDENCY_DEFERRED_ISSUES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -528,6 +528,27 @@ test("capacity ledger: malformed or unverifiable entries fail closed and consume
   assert.equal(unverifiable.reconcile().healthy, false);
   assert.equal(unverifiable.reserve({ stage: "qa", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-2" }), null);
 });
+test("capacity ledger: read-only inspect reports confirmed stale entries and preserves a live child", () => {
+  const entries = [
+    { token: "dead-child", parentPid: 10, childPid: 20, issueIdentifier: "COD-1", workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z" },
+    { token: "dead-reservation", parentPid: 11, childPid: null, issueIdentifier: "COD-2", workspace: "/managed", stage: "qa", trigger: "handoff", reservedAt: "2026-07-09T00:00:00.000Z" },
+    { token: "live-child-dead-parent", parentPid: 12, childPid: 22, issueIdentifier: "COD-3", workspace: "/managed", stage: "spec", trigger: "refill", reservedAt: "2026-07-09T00:00:00.000Z" },
+  ];
+  const state = createCapacityLedger({
+    maxActiveChildren: 10,
+    readJsonFn: () => ({ version: 1, entries: structuredClone(entries) }),
+    writeJsonFn: () => assert.fail("doctor inspect must remain read-only"),
+    isAlive: (pid) => pid === 22,
+  }).inspect();
+
+  assert.equal(state.healthy, false);
+  assert.equal(state.active, 3);
+  assert.deepEqual(state.errors, [
+    "stale entry dead-child: child PID 20 is dead",
+    "stale entry dead-reservation: parent PID 11 is dead before child spawn",
+  ]);
+  assert.deepEqual(state.entries.map((entry) => entry.token), entries.map((entry) => entry.token));
+});
 test("capacity ledger: duplicate tokens are malformed and release never removes corrupt entries", () => {
   const entry = (issueIdentifier) => ({
     token: "duplicate-token", parentPid: 10, childPid: null, issueIdentifier,
@@ -644,6 +665,59 @@ test("queue observations: unseen entries prune after seven days", () => {
   now += OBSERVATION_RETENTION_MS + 1;
   store.sync({ observations: [], scannedScopes: [] });
   assert.equal(store.get(identity), null);
+});
+test("queue observations: reserved demand with no confirmed dispatch clears its persisted wait", async () => {
+  let observations = null;
+  let ledgerState = null;
+  const identity = { sourceWorkspace: "/source/app", workspace: "/managed/app", sweep: "dev", issueIdentifier: "COD-8" };
+  const store = createObservationStore({
+    now: () => NOW,
+    readJsonFn: () => observations,
+    writeJsonFn: (_target, value) => { observations = structuredClone(value); },
+  });
+  store.markCapacityDeferred(identity);
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    readJsonFn: () => ledgerState,
+    writeJsonFn: (_target, value) => { ledgerState = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => "claim-rejected-token",
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async () => null,
+    onUnconfirmedDemand: (demand) => store.clear(demand),
+  });
+
+  assert.equal(await admitDemand(identity, { queue }), null);
+  assert.equal(store.get(identity), null);
+  assert.deepEqual(ledgerState, { version: 1, entries: [] });
+});
+test("queue observations: rejected claim expansion also clears its persisted wait", async () => {
+  let observations = null;
+  let ledgerState = null;
+  const identity = { sourceWorkspace: "/source/app", workspace: "/managed/app", sweep: "qa", issueIdentifier: "COD-9" };
+  const store = createObservationStore({
+    now: () => NOW,
+    readJsonFn: () => observations,
+    writeJsonFn: (_target, value) => { observations = structuredClone(value); },
+  });
+  store.markCapacityDeferred(identity);
+  const queue = createAdmissionQueue({
+    ledger: createCapacityLedger({
+      maxActiveChildren: 1,
+      readJsonFn: () => ledgerState,
+      writeJsonFn: (_target, value) => { ledgerState = structuredClone(value); },
+      isAlive: () => true,
+      randomUUID: () => "claim-error-token",
+    }),
+    executeDemand: async () => { throw new Error("claim confirmation failed"); },
+    onUnconfirmedDemand: (demand) => store.clear(demand),
+  });
+
+  await assert.rejects(admitDemand(identity, { queue }), /claim confirmation failed/);
+  assert.equal(store.get(identity), null);
+  assert.deepEqual(ledgerState, { version: 1, entries: [] });
 });
 test("capacity admission: eleven simultaneous demands never run more than ten", async () => {
   let stored = null;
@@ -775,6 +849,41 @@ test("resource sampler: failures are recorded and never thrown", () => {
   });
   assert.doesNotThrow(() => sampler.start());
   assert.match(sampler.snapshot().metricsUnavailable.join("; "), /host metrics denied/);
+});
+test("resource sampler: Darwin pressure spawn, exit, and parse failures name only the optional metric", () => {
+  const cases = [
+    { result: { status: null, error: new Error("spawn ENOENT") }, detail: /spawn ENOENT/ },
+    { result: { status: 2, stdout: "", stderr: "permission denied" }, detail: /exited 2.*permission denied/ },
+    { result: { status: 0, stdout: "unexpected output", stderr: "" }, detail: /could not parse/ },
+  ];
+  for (const { result, detail } of cases) {
+    const sampler = createResourceSampler({
+      osModule: {
+        loadavg: () => [1, 1, 1], freemem: () => 500, totalmem: () => 1_000, platform: () => "darwin",
+      },
+      memoryPressureSpawnFn: () => result,
+      setIntervalFn: () => 1,
+      clearIntervalFn: () => {},
+    });
+    assert.doesNotThrow(() => sampler.start());
+    const snapshot = sampler.snapshot();
+    assert.deepEqual(snapshot.freeMemoryBytes, { start: 500, end: 500, min: 500 });
+    assert.match(snapshot.metricsUnavailable.join("; "), /memoryPressureAvailablePercent/);
+    assert.match(snapshot.metricsUnavailable.join("; "), detail);
+    assert.equal(snapshot.memoryPressureAvailablePercent, undefined);
+  }
+});
+test("resource sampler: non-Darwin pressure absence is unsupported rather than unavailable", () => {
+  const sampler = createResourceSampler({
+    osModule: {
+      loadavg: () => [1, 1, 1], freemem: () => 500, totalmem: () => 1_000, platform: () => "linux",
+    },
+    memoryPressureSpawnFn: () => assert.fail("non-Darwin must not spawn memory_pressure"),
+    setIntervalFn: () => 1,
+    clearIntervalFn: () => {},
+  });
+  sampler.start();
+  assert.deepEqual(sampler.snapshot().metricsUnavailable, []);
 });
 test("resource sampler: timer failures remain observational", () => {
   const sampler = createResourceSampler({
@@ -1001,6 +1110,25 @@ test("actionableCards excludes unresolved and incomplete dependencies", () => {
 test("actionableCards rejects cards with absent relation metadata", () => {
   const missing = { id: "missing", labelNames: [], comments: [] };
   assert.deepEqual(actionableCards([missing], SWEEP_CFG.dev, NOW), []);
+});
+test("dependency telemetry: summaries are bounded and contain only stable identity/state fields", () => {
+  const blockers = Array.from({ length: MAX_DEPENDENCY_DEFERRED_ISSUES + 5 }, (_, index) => ({
+    identifier: `COD-${index}`,
+    stateName: "QA",
+    title: `secret blocker title ${index}`,
+  }));
+  const card = { identifier: "COD-99", title: "secret deferred title", comments: [{ body: "secret comment" }] };
+  const summary = dependencyDeferredIssue({
+    sourceWorkspace: "/source/app",
+    sweep: "dev",
+    card,
+    dependency: { reason: "blocked", unresolved: blockers },
+  });
+
+  assert.equal(summary.blockers.length, MAX_DEPENDENCY_DEFERRED_ISSUES);
+  assert.deepEqual(summary.blockers[0], { identifier: "COD-0", stateName: "QA" });
+  assert.deepEqual(Object.keys(summary), ["sourceWorkspace", "sweep", "issueIdentifier", "reason", "blockers"]);
+  assert.doesNotMatch(JSON.stringify(summary), /secret/);
 });
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
@@ -2135,6 +2263,14 @@ test("run records: optional queue, capacity, trigger, runtime, and host metrics 
       capacitySlot: 3,
       capacityHighWater: 7,
     },
+    dependencyDeferredCount: 2,
+    dependencyDeferredIssues: [{
+      sourceWorkspace: "/source/app",
+      sweep: "spec",
+      issueIdentifier: "COD-90",
+      reason: "blocked",
+      blockers: [{ identifier: "COD-80", stateName: "QA" }],
+    }],
     resourceSampler: {
       snapshot: () => ({
         loadAverage1m: { start: 1, end: 2, max: 4 },
@@ -2158,6 +2294,15 @@ test("run records: optional queue, capacity, trigger, runtime, and host metrics 
   assert.deepEqual(record.freeMemoryBytes, { start: 800, end: 600, min: 400 });
   assert.deepEqual(record.memoryPressureAvailablePercent, { start: 50, end: 40, min: 30 });
   assert.deepEqual(record.metricsUnavailable, []);
+  assert.equal(record.dependencyDeferredCount, 2);
+  assert.deepEqual(record.dependencyDeferredIssues, [{
+    sourceWorkspace: "/source/app",
+    sweep: "spec",
+    issueIdentifier: "COD-90",
+    reason: "blocked",
+    blockers: [{ identifier: "COD-80", stateName: "QA" }],
+  }]);
+  assert.equal(Object.hasOwn(record, "dependencyBlockers"), false);
 });
 test("run records: sampler failure does not change child success", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-metrics-gap-"));
@@ -2690,6 +2835,31 @@ test("capacity doctor: malformed ledger is unhealthy and reports active/max", ()
   assert.deepEqual(report.capacity, { healthy: false, active: 1, max: 10, errors: ["entry broken"] });
   assert.match(formatDoctorReport(report), /capacity: 1\/10 BLOCKED/);
   assert.match(formatDoctorReport(report), /entry broken/);
+});
+test("capacity doctor: real ledger inspection surfaces stale entries without mutation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-doctor-ledger-"));
+  const ledgerPath = path.join(dir, "capacity-ledger.json");
+  const ledger = {
+    version: 1,
+    entries: [
+      { token: "stale-child", parentPid: 30, childPid: 31, issueIdentifier: "COD-30", workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z" },
+      { token: "live-child", parentPid: 40, childPid: 41, issueIdentifier: "COD-40", workspace: "/managed", stage: "qa", trigger: "handoff", reservedAt: "2026-07-09T00:00:00.000Z" },
+    ],
+  };
+  atomicWriteJson(ledgerPath, ledger);
+  const before = fs.readFileSync(ledgerPath, "utf8");
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, capacity: { maxActiveChildren: 10 } },
+    capacityLedgerPath: ledgerPath,
+    observationState: { healthy: true, errors: [], entries: [] },
+    isAlive: (pid) => pid === 41,
+  });
+
+  assert.equal(report.ok, false);
+  assert.equal(report.capacity.active, 2);
+  assert.deepEqual(report.capacity.errors, ["stale entry stale-child: child PID 31 is dead"]);
+  assert.match(formatDoctorReport(report), /capacity error: stale entry stale-child: child PID 31 is dead/);
+  assert.equal(fs.readFileSync(ledgerPath, "utf8"), before);
 });
 test("doctor telemetry: JSON and human summaries expose scheduler health and tuning evidence", () => {
   const source = "/source/app";

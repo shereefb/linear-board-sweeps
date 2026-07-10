@@ -49,6 +49,7 @@ export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
+export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
@@ -549,6 +550,19 @@ export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
 }
 export function countActionable(cards, cfg, now, releasedIds = new Set()) {
   return actionableCards(cards, cfg, now, releasedIds).length;
+}
+
+export function dependencyDeferredIssue({ sourceWorkspace, sweep, card = {}, dependency = {} } = {}) {
+  return {
+    sourceWorkspace,
+    sweep,
+    issueIdentifier: card.identifier,
+    reason: dependency.reason,
+    blockers: (dependency.unresolved || []).slice(0, MAX_DEPENDENCY_DEFERRED_ISSUES).map((blocker) => ({
+      identifier: blocker.identifier || blocker.id || "unknown",
+      stateName: blocker.stateName || "unknown",
+    })),
+  };
 }
 
 // Linear's Issue.sortOrder is the board-rank field for a card within its
@@ -1352,10 +1366,14 @@ export function createObservationStore({
   return { observationPath, sync, markCapacityDeferred, clear, get, snapshot };
 }
 
-function defaultMemoryPressureSample() {
-  if (os.platform() !== "darwin") return null;
-  const result = spawnSync("/usr/bin/memory_pressure", [], { encoding: "utf8" });
-  return result.status === 0 ? result.stdout : null;
+function defaultMemoryPressureSample(spawnFn = spawnSync) {
+  const result = spawnFn("/usr/bin/memory_pressure", [], { encoding: "utf8" });
+  if (result?.error) throw result.error;
+  if (result?.status !== 0) {
+    const detail = String(result?.stderr || "").trim();
+    throw new Error(`memory_pressure exited ${result?.status ?? "unknown"}${detail ? `: ${detail}` : ""}`);
+  }
+  return result.stdout;
 }
 
 function memoryPressureAvailablePercent(output) {
@@ -1365,7 +1383,8 @@ function memoryPressureAvailablePercent(output) {
 
 export function createResourceSampler({
   osModule = os,
-  memoryPressureFn = defaultMemoryPressureSample,
+  memoryPressureSpawnFn = spawnSync,
+  memoryPressureFn = () => defaultMemoryPressureSample(memoryPressureSpawnFn),
   intervalMs = 30_000,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
@@ -1380,21 +1399,32 @@ export function createResourceSampler({
   let capacityHighWater = 0;
   const metricsUnavailable = new Set();
   const sample = () => {
+    let loadAverage1m;
+    let freeMemoryBytes;
+    let totalMemoryBytes;
     try {
-      const loadAverage1m = Number(osModule.loadavg()[0]);
-      const freeMemoryBytes = Number(osModule.freemem());
-      const totalMemoryBytes = Number(osModule.totalmem());
-      let memoryPressure = null;
-      if (osModule.platform() === "darwin") memoryPressure = memoryPressureAvailablePercent(memoryPressureFn());
-      const point = { loadAverage1m, freeMemoryBytes, totalMemoryBytes, memoryPressure };
-      if (!first) first = point;
-      latest = point;
-      maxLoad = maxLoad === null ? loadAverage1m : Math.max(maxLoad, loadAverage1m);
-      minFree = minFree === null ? freeMemoryBytes : Math.min(minFree, freeMemoryBytes);
-      if (memoryPressure !== null) minPressure = minPressure === null ? memoryPressure : Math.min(minPressure, memoryPressure);
+      loadAverage1m = Number(osModule.loadavg()[0]);
+      freeMemoryBytes = Number(osModule.freemem());
+      totalMemoryBytes = Number(osModule.totalmem());
     } catch (error) {
       metricsUnavailable.add(String(error?.message || error));
+      return;
     }
+    let memoryPressure = null;
+    if (osModule.platform() === "darwin") {
+      try {
+        memoryPressure = memoryPressureAvailablePercent(memoryPressureFn());
+        if (memoryPressure === null) throw new Error("could not parse memory_pressure output");
+      } catch (error) {
+        metricsUnavailable.add(`memoryPressureAvailablePercent: ${String(error?.message || error)}`);
+      }
+    }
+    const point = { loadAverage1m, freeMemoryBytes, totalMemoryBytes, memoryPressure };
+    if (!first) first = point;
+    latest = point;
+    maxLoad = maxLoad === null ? loadAverage1m : Math.max(maxLoad, loadAverage1m);
+    minFree = minFree === null ? freeMemoryBytes : Math.min(minFree, freeMemoryBytes);
+    if (memoryPressure !== null) minPressure = minPressure === null ? memoryPressure : Math.min(minPressure, memoryPressure);
   };
   const start = () => {
     if (running) return;
@@ -1449,6 +1479,16 @@ function capacityEntryError(entry) {
   return null;
 }
 
+function capacityStaleError(entry, parentAlive, childAlive) {
+  if (entry.childPid === null && parentAlive === false) {
+    return `stale entry ${entry.token}: parent PID ${entry.parentPid} is dead before child spawn`;
+  }
+  if (entry.childPid !== null && childAlive === false) {
+    return `stale entry ${entry.token}: child PID ${entry.childPid} is dead`;
+  }
+  return null;
+}
+
 export function createCapacityLedger({
   ledgerPath = CAPACITY_LEDGER,
   maxActiveChildren = DEFAULT_MAX_ACTIVE_CHILDREN,
@@ -1489,15 +1529,21 @@ export function createCapacityLedger({
     }
     if (checkLiveness && !errors.length) {
       for (const entry of entries) {
+        let parentAlive;
+        let childAlive = null;
         for (const [kind, pid] of [["parent", entry.parentPid], ["child", entry.childPid]]) {
           if (kind === "child" && pid === null) continue;
           try {
             const live = isAlive(pid);
             if (typeof live !== "boolean") errors.push(`entry ${entry.token} ${kind} PID ${pid} is unverifiable`);
+            else if (kind === "parent") parentAlive = live;
+            else childAlive = live;
           } catch (error) {
             errors.push(`entry ${entry.token} ${kind} PID ${pid} is unverifiable: ${error.message}`);
           }
         }
+        const staleError = capacityStaleError(entry, parentAlive, childAlive);
+        if (staleError) errors.push(staleError);
       }
     }
     return { version: CAPACITY_LEDGER_VERSION, entries, active: entries.length, max, healthy: errors.length === 0, errors, opaque: false };
@@ -1524,7 +1570,7 @@ export function createCapacityLedger({
         kept.push(entry);
         continue;
       }
-      const stale = entry.childPid === null ? !parentAlive : !parentAlive && !childAlive;
+      const stale = entry.childPid === null ? !parentAlive : !childAlive;
       if (!stale) kept.push(entry);
     }
     if (errors.length) return { ...state, entries: kept, active: kept.length, healthy: false, errors };
@@ -1596,7 +1642,7 @@ export function createCapacityLedger({
   return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
 }
 
-export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null } = {}) {
+export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null, onUnconfirmedDemand = null } = {}) {
   if (!ledger || typeof ledger.reserve !== "function") throw new Error("capacity ledger is required");
   if (typeof executeDemand !== "function") throw new Error("executeDemand is required");
   const pending = [];
@@ -1633,11 +1679,16 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
     sampler?.observeCapacity?.(capacityState.active);
     if (localActive === 1) sampler?.start?.();
     (async () => {
+      let confirmed = false;
       try {
         const result = await executeDemand(item.demand, reservation);
+        confirmed = Boolean(result);
         if (result && beforeRelease) await beforeRelease(result, item.demand, { admitDemand: enqueue });
         return result;
       } finally {
+        if (!confirmed && onUnconfirmedDemand) {
+          try { await onUnconfirmedDemand(item.demand); } catch { /* telemetry cleanup must not change admission outcome */ }
+        }
         reservation.release();
       }
     })().then(item.resolve, item.reject).finally(() => {
@@ -2726,7 +2777,8 @@ export async function expandDispatchBatch(batch, {
         runtimeStableTarget: pick.runtimeStableTarget,
         telemetry: pick.telemetry,
         resourceSampler: pick.resourceSampler,
-        dependencyBlockers: pick.dependencyBlockers,
+        dependencyDeferredCount: pick.dependencyDeferredCount,
+        dependencyDeferredIssues: pick.dependencyDeferredIssues,
       }, parentRunId, childIndexAllocator.next()));
     }
   }
@@ -3046,7 +3098,8 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     totalMemoryBytes: metrics.totalMemoryBytes,
     memoryPressureAvailablePercent: metrics.memoryPressureAvailablePercent,
     metricsUnavailable: metrics.metricsUnavailable,
-    dependencyBlockers: pick.dependencyBlockers,
+    dependencyDeferredCount: pick.dependencyDeferredCount,
+    dependencyDeferredIssues: pick.dependencyDeferredIssues,
     outcome,
     exitCode: outcome?.exitCode ?? null,
     startedAt,
@@ -3210,6 +3263,7 @@ async function tick({ dryRun = false } = {}) {
     const observationStore = createObservationStore({ dryRun });
     const resourceSampler = createResourceSampler();
     const dependencyDeferredKeys = new Set();
+    const dependencyDeferredIssues = new Map();
     const capacityDeferredKeys = new Set();
     const refillBudget = { remaining: 0 };
     observationStore.sync();
@@ -3434,6 +3488,7 @@ async function tick({ dryRun = false } = {}) {
           ...resourceMetrics,
           capacityHighWater: resourceMetrics.capacityHighWater || 0,
           dependencyDeferredCount: dependencyDeferredKeys.size,
+          dependencyDeferredIssues: [...dependencyDeferredIssues.values()].slice(0, MAX_DEPENDENCY_DEFERRED_ISSUES),
           capacityDeferredCount: capacityDeferredKeys.size,
         },
       };
@@ -3507,13 +3562,18 @@ async function tick({ dryRun = false } = {}) {
         }
         writeCurrentTick();
       },
+      onUnconfirmedDemand: (demand) => {
+        observationStore.clear(demand);
+        capacityDeferredKeys.delete(observationKey(demand));
+      },
       executeDemand: async (demand, reservation) => {
         activeSameRepo.increment(demand);
         try {
           const observation = observationStore.get(demand);
           if (observation) demand.telemetry = { ...(demand.telemetry || {}), ...observation };
           demand.resourceSampler = resourceSampler;
-          demand.dependencyBlockers = demand.topCard?.blockers || [];
+          demand.dependencyDeferredCount = dependencyDeferredKeys.size;
+          demand.dependencyDeferredIssues = [...dependencyDeferredIssues.values()].slice(0, MAX_DEPENDENCY_DEFERRED_ISSUES);
           const [pick] = await expandDispatchBatch([demand], {
             dryRun: false,
             parentRunId,
@@ -3679,11 +3739,24 @@ async function tick({ dryRun = false } = {}) {
           const scopeKey = JSON.stringify([active.sourceAnchorPath, sweep]);
           for (const key of [...dependencyDeferredKeys]) {
             const [sourceWorkspace, deferredSweep] = JSON.parse(key);
-            if (JSON.stringify([sourceWorkspace, deferredSweep]) === scopeKey) dependencyDeferredKeys.delete(key);
+            if (JSON.stringify([sourceWorkspace, deferredSweep]) === scopeKey) {
+              dependencyDeferredKeys.delete(key);
+              dependencyDeferredIssues.delete(key);
+            }
           }
           for (const card of cards) {
-            if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) {
-              dependencyDeferredKeys.add(observationKey({ sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier }));
+            const dependency = dependencyEligibility(card.blockers, card.blockersComplete === true);
+            if (!dependency.eligible) {
+              const key = observationKey({ sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier });
+              dependencyDeferredKeys.add(key);
+              if (dependencyDeferredIssues.has(key) || dependencyDeferredIssues.size < MAX_DEPENDENCY_DEFERRED_ISSUES) {
+                dependencyDeferredIssues.set(key, dependencyDeferredIssue({
+                  sourceWorkspace: active.sourceAnchorPath,
+                  sweep,
+                  card,
+                  dependency,
+                }));
+              }
             }
           }
           observationStore.sync({
