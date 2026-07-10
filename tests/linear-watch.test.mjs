@@ -16,7 +16,7 @@ import {
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
   recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures, handoffRepoRoutingDecision,
   dirtyCheckoutEvent, doctorReport, formatDoctorReport,
-  worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
+  worktreePath, runtimeConfigForSweep, fallbackRuntimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   annotateBoundedDependencyCycles, dependencyCycleFailureEvents,
@@ -567,6 +567,41 @@ test("runtimeConfigForSweep: review is role config only and never scheduled", ()
     runtimes: { review: { runtime: "claude", model: "claude-opus-4-8" } },
   }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
 });
+test("fallbackRuntimeConfigForSweep: accepts only scheduled codex-to-claude fallback", () => {
+  const config = { runtimes: {
+    dev: {
+      runtime: "codex", model: "gpt-5.6-terra", effort: "high",
+      fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "high" },
+    },
+    review: { runtime: "claude", model: "claude-opus-4-8", fallback: { runtime: "codex" } },
+  } };
+  const original = structuredClone(config);
+  assert.deepEqual(fallbackRuntimeConfigForSweep(config, "dev"), {
+    runtime: "claude", model: "claude-sonnet-5", effort: "high",
+  });
+  assert.equal(fallbackRuntimeConfigForSweep(config, "review"), null);
+  assert.equal(fallbackRuntimeConfigForSweep({}, "dev"), null);
+  assert.deepEqual(config, original);
+});
+test("fallbackRuntimeConfigForSweep: rejects malformed, unsupported, and incomplete fallbacks", () => {
+  const valid = { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } };
+  const cases = [
+    ["malformed fallback", { runtime: "codex", fallback: [] }],
+    ["non-Codex primary", { runtime: "claude", fallback: { runtime: "claude", model: "claude-sonnet-5" } }],
+    ["non-Claude fallback", { runtime: "codex", fallback: { runtime: "codex", model: "claude-sonnet-5" } }],
+    ["missing model", { runtime: "codex", fallback: { runtime: "claude" } }],
+    ["blank model", { runtime: "codex", fallback: { runtime: "claude", model: "   " } }],
+    ["non-string model", { runtime: "codex", fallback: { runtime: "claude", model: 5 } }],
+    ["invalid effort", { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "ultra" } }],
+  ];
+  for (const [name, stage] of cases) {
+    assert.equal(fallbackRuntimeConfigForSweep({ runtimes: { dev: stage } }, "dev"), null, name);
+  }
+  assert.equal(fallbackRuntimeConfigForSweep({ runtimes: { dev: valid } }, "unknown"), null);
+  assert.deepEqual(fallbackRuntimeConfigForSweep({ runtimes: { dev: valid } }, "dev"), {
+    runtime: "claude", model: "claude-sonnet-5", effort: undefined,
+  });
+});
 test("default configs use the stage-specific GPT-5.6 models", () => {
   const expected = {
     spec: { runtime: "codex", model: "gpt-5.6-sol", effort: "high" },
@@ -599,12 +634,13 @@ test("SWEEP_CFG.dev fetches Dev only; active dev is the claim label", () => {
 test("buildCommand: codex with model + effort emits both flags before the prompt", () => {
   const { cmd, args } = buildCommand({ runtime: "codex", sweep: "dev", model: "gpt-5.5-codex", effort: "high", anchorPath: "/ws/a" });
   assert.equal(cmd, "codex");
-  assert.deepEqual(args.slice(0, 6), ["exec", "--cd", "/ws/a", "-m", "gpt-5.5-codex", "-c"]);
-  assert.equal(args[6], "model_reasoning_effort=high");
+  assert.deepEqual(args.slice(0, 7), ["exec", "--json", "--cd", "/ws/a", "-m", "gpt-5.5-codex", "-c"]);
+  assert.equal(args[7], "model_reasoning_effort=high");
   assert.match(args[args.length - 1], /Follow the dev-sweep skill/);
 });
 test("buildCommand: omitted model/effort emit no flags (runtime default)", () => {
   const { args } = buildCommand({ runtime: "codex", sweep: "spec", anchorPath: "/ws/a" });
+  assert.ok(args.includes("--json"));
   assert.ok(!args.includes("-m"));
   assert.ok(!args.includes("-c"));
 });
@@ -613,11 +649,16 @@ test("buildCommand: single-card dispatch names the issue and forbids other cards
   assert.match(args.at(-1), /COD-123 only/);
   assert.match(args.at(-1), /Do not process other cards/);
 });
-test("buildCommand: claude passes --model and -p prompt", () => {
-  const { cmd, args } = buildCommand({ runtime: "claude", sweep: "qa", model: "claude-opus-4-8", anchorPath: "/ws/a" });
+test("buildCommand: claude passes model, effort, and -p prompt", () => {
+  const { cmd, args } = buildCommand({ runtime: "claude", sweep: "ship", model: "claude-sonnet-5", effort: "medium", anchorPath: "/ws" });
   assert.equal(cmd, "claude");
   assert.equal(args[0], "-p");
-  assert.deepEqual(args.slice(2), ["--model", "claude-opus-4-8"]);
+  assert.deepEqual(args.slice(-4), ["--model", "claude-sonnet-5", "--effort", "medium"]);
+});
+test("buildCommand: claude omits effort when unset", () => {
+  const { args } = buildCommand({ runtime: "claude", sweep: "qa", model: "claude-opus-4-8", anchorPath: "/ws/a" });
+  assert.ok(!args.includes("--effort"));
+  assert.deepEqual(args.slice(-2), ["--model", "claude-opus-4-8"]);
 });
 
 // ── PID lock ─────────────────────────────────────────────────────────────────

@@ -440,6 +440,17 @@ export function runtimeConfigForSweep(config = {}, sweep) {
   };
 }
 
+export function fallbackRuntimeConfigForSweep(config = {}, sweep) {
+  if (!SWEEPS.includes(sweep)) return null;
+  const primary = runtimeConfigForSweep(config, sweep);
+  const fallback = config?.runtimes?.[sweep]?.fallback;
+  const model = typeof fallback?.model === "string" ? fallback.model.trim() : "";
+  const validEfforts = new Set(["low", "medium", "high", "xhigh", "max"]);
+  if (primary.runtime !== "codex" || fallback?.runtime !== "claude" || !model) return null;
+  if (fallback.effort !== undefined && !validEfforts.has(fallback.effort)) return null;
+  return { runtime: "claude", model, effort: fallback.effort };
+}
+
 function whichRuntime(runtime, env) {
   const result = spawnSync("/usr/bin/which", [runtime], { env, encoding: "utf8" });
   return result.status === 0 ? result.stdout.trim() : null;
@@ -539,12 +550,11 @@ export function buildCommand({ runtime, sweep, model, effort, anchorPath, issueI
   if (runtime === "claude") {
     const args = ["-p", prompt];
     if (model) args.push("--model", model);
-    // NOTE: Claude Code reasoning-effort flag to be confirmed against the CLI;
-    // effort is currently not emitted for claude (codex is the primary runtime).
+    if (effort) args.push("--effort", effort);
     return { cmd: "claude", args, cwd: anchorPath };
   }
   // default: codex
-  const args = ["exec", "--cd", anchorPath];
+  const args = ["exec", "--json", "--cd", anchorPath];
   if (model) args.push("-m", model);
   if (effort) args.push("-c", `model_reasoning_effort=${effort}`);
   args.push(prompt);
