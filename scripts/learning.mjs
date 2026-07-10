@@ -804,7 +804,7 @@ export function learningDueDecisions({ state = emptyLearningState(), snapshot = 
 const detectorDefinitions = [
   ["repeated-dispatch-failure", "reliability", "dispatch-failure", 2, "runId"],
   ["stale-claim-pattern", "reliability", "stale-claim", 2, "runId"],
-  ["failed-recovery", "reliability", "failure-recovery", 2, "runId"],
+  ["failed-recovery", "reliability", "failure-recovery", 1, "runId"],
   ["safety-invariant-violation", "reliability", "safety-invariant", 1, "evidenceId"],
   ["poison-card-cluster", "reliability", "poison-card", 2, "cardId"],
   ["repeated-review-finding", "quality", "review-finding", 3, "cardId"],

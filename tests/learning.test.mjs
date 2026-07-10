@@ -688,6 +688,16 @@ test("severe red canary and safety invariant qualify once while ordinary canarie
   assert.equal(runLearningDetectors(detectorSnapshot([ordinary]), { ...detectorConfig, enabledDetectors: ["red-canary-pattern"] }).length, 0);
 });
 
+test("failed recovery qualifies from one open-after-healthy proof while recovered or recurred alone stays below threshold", () => {
+  const run = (recoveryState) => runLearningDetectors(
+    detectorSnapshot(repeat("failure-recovery", 1, { recoveryState })),
+    { ...detectorConfig, enabledDetectors: ["failed-recovery"] },
+  );
+  assert.equal(run("recovered").length, 0);
+  assert.equal(run("recurred").length, 0);
+  assert.equal(run("open-after-healthy").length, 1);
+});
+
 test("throughput detectors require twenty relevant runs and both absolute and relative regressions", () => {
   const enough = repeat("queue-run", 20, (i) => ({ window: i % 2 ? "w2" : "w1", metrics: { waitMs: 200, baselineP90Ms: 100 } }));
   const belowAbsolute = enough.map((item) => ({ ...item, metrics: { waitMs: 140, baselineP90Ms: 100 } }));
