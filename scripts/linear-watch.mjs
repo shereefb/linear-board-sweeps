@@ -44,8 +44,11 @@ const TICK_LOCK = path.join(STATE_DIR, "tick.lock");
 const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
+const OBSERVATIONS = path.join(STATE_DIR, "observations.json");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
+export const OBSERVATION_STATE_VERSION = 1;
+export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
@@ -1237,6 +1240,202 @@ export function atomicWriteJson(filePath, value) {
   }
 }
 
+function observationIdentity(value = {}) {
+  return {
+    sourceWorkspace: value.sourceWorkspace || value.sourceAnchorPath || value.workspace || value.anchorPath,
+    sweep: value.sweep || value.stage,
+    issueIdentifier: value.issueIdentifier || value.topCard?.identifier,
+  };
+}
+
+function observationKey(value) {
+  const identity = observationIdentity(value);
+  return JSON.stringify([identity.sourceWorkspace || "", identity.sweep || "", identity.issueIdentifier || ""]);
+}
+
+export function createObservationStore({
+  observationPath = OBSERVATIONS,
+  dryRun = false,
+  now = Date.now,
+  readJsonFn = (target) => {
+    if (!fs.existsSync(target)) return null;
+    return JSON.parse(fs.readFileSync(target, "utf8"));
+  },
+  writeJsonFn = atomicWriteJson,
+} = {}) {
+  const read = () => {
+    try {
+      const raw = readJsonFn(observationPath);
+      if (raw === null || raw === undefined) return { version: OBSERVATION_STATE_VERSION, entries: {}, healthy: true, errors: [] };
+      if (!raw || raw.version !== OBSERVATION_STATE_VERSION || !raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)) {
+        return { version: OBSERVATION_STATE_VERSION, entries: {}, healthy: false, errors: ["observation schema is malformed"] };
+      }
+      return { version: OBSERVATION_STATE_VERSION, entries: structuredClone(raw.entries), healthy: true, errors: [] };
+    } catch (error) {
+      return { version: OBSERVATION_STATE_VERSION, entries: {}, healthy: false, errors: [`observations unreadable: ${error.message}`] };
+    }
+  };
+  const persist = (state) => {
+    if (!dryRun) writeJsonFn(observationPath, { version: OBSERVATION_STATE_VERSION, entries: state.entries });
+  };
+  const markCapacityDeferred = (value) => {
+    const identity = observationIdentity(value);
+    if (!identity.sourceWorkspace || !identity.sweep || !identity.issueIdentifier) return null;
+    const state = read();
+    if (!state.healthy) return null;
+    const key = observationKey(identity);
+    const timestamp = new Date(now()).toISOString();
+    state.entries[key] = {
+      ...identity,
+      firstObservedActionableAt: state.entries[key]?.firstObservedActionableAt || timestamp,
+      lastSeenAt: timestamp,
+    };
+    persist(state);
+    return { ...state.entries[key], queueWaitMs: Math.max(0, now() - Date.parse(state.entries[key].firstObservedActionableAt)) };
+  };
+  const clear = (value) => {
+    const state = read();
+    if (!state.healthy) return false;
+    const key = observationKey(value);
+    if (!Object.hasOwn(state.entries, key)) return false;
+    delete state.entries[key];
+    persist(state);
+    return true;
+  };
+  const sync = ({ observations = [], scannedScopes = [] } = {}) => {
+    const state = read();
+    if (!state.healthy) return state;
+    const timestamp = new Date(now()).toISOString();
+    const seen = new Map(observations.map((entry) => [observationKey(entry), entry]));
+    const scopes = new Set(scannedScopes.map((scope) => JSON.stringify([
+      scope.sourceWorkspace || scope.sourceAnchorPath || scope.workspace || scope.anchorPath || "",
+      scope.sweep || scope.stage || "",
+    ])));
+    let changed = false;
+    for (const [key, entry] of Object.entries(state.entries)) {
+      const scopeKey = JSON.stringify([entry.sourceWorkspace || "", entry.sweep || ""]);
+      const observed = seen.get(key);
+      if (scopes.has(scopeKey) && (!observed || observed.eligible === false)) {
+        delete state.entries[key];
+        changed = true;
+        continue;
+      }
+      if (observed?.eligible !== false && observed && entry.lastSeenAt !== timestamp) {
+        entry.lastSeenAt = timestamp;
+        changed = true;
+      }
+      const lastSeen = Date.parse(entry.lastSeenAt || entry.firstObservedActionableAt);
+      if (Number.isFinite(lastSeen) && now() - lastSeen > OBSERVATION_RETENTION_MS) {
+        delete state.entries[key];
+        changed = true;
+      }
+    }
+    if (changed) persist(state);
+    return state;
+  };
+  const get = (value) => {
+    const state = read();
+    const entry = state.healthy ? state.entries[observationKey(value)] : null;
+    if (!entry) return null;
+    return { ...entry, queueWaitMs: Math.max(0, now() - Date.parse(entry.firstObservedActionableAt)) };
+  };
+  const snapshot = () => {
+    const state = read();
+    return {
+      ...state,
+      entries: Object.values(state.entries).map((entry) => ({
+        ...entry,
+        queueWaitMs: Math.max(0, now() - Date.parse(entry.firstObservedActionableAt)),
+      })),
+    };
+  };
+  return { observationPath, sync, markCapacityDeferred, clear, get, snapshot };
+}
+
+function defaultMemoryPressureSample() {
+  if (os.platform() !== "darwin") return null;
+  const result = spawnSync("/usr/bin/memory_pressure", [], { encoding: "utf8" });
+  return result.status === 0 ? result.stdout : null;
+}
+
+function memoryPressureAvailablePercent(output) {
+  const match = String(output || "").match(/System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%/i);
+  return match ? Number(match[1]) : null;
+}
+
+export function createResourceSampler({
+  osModule = os,
+  memoryPressureFn = defaultMemoryPressureSample,
+  intervalMs = 30_000,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+} = {}) {
+  let timer = null;
+  let running = false;
+  let first = null;
+  let latest = null;
+  let maxLoad = null;
+  let minFree = null;
+  let minPressure = null;
+  let capacityHighWater = 0;
+  const metricsUnavailable = new Set();
+  const sample = () => {
+    try {
+      const loadAverage1m = Number(osModule.loadavg()[0]);
+      const freeMemoryBytes = Number(osModule.freemem());
+      const totalMemoryBytes = Number(osModule.totalmem());
+      let memoryPressure = null;
+      if (osModule.platform() === "darwin") memoryPressure = memoryPressureAvailablePercent(memoryPressureFn());
+      const point = { loadAverage1m, freeMemoryBytes, totalMemoryBytes, memoryPressure };
+      if (!first) first = point;
+      latest = point;
+      maxLoad = maxLoad === null ? loadAverage1m : Math.max(maxLoad, loadAverage1m);
+      minFree = minFree === null ? freeMemoryBytes : Math.min(minFree, freeMemoryBytes);
+      if (memoryPressure !== null) minPressure = minPressure === null ? memoryPressure : Math.min(minPressure, memoryPressure);
+    } catch (error) {
+      metricsUnavailable.add(String(error?.message || error));
+    }
+  };
+  const start = () => {
+    if (running) return;
+    running = true;
+    sample();
+    try {
+      timer = setIntervalFn(sample, intervalMs);
+      timer?.unref?.();
+    } catch (error) {
+      metricsUnavailable.add(String(error?.message || error));
+      timer = null;
+    }
+  };
+  const stop = () => {
+    if (!running) return;
+    sample();
+    running = false;
+    if (timer !== null) {
+      try { clearIntervalFn(timer); } catch (error) { metricsUnavailable.add(String(error?.message || error)); }
+    }
+    timer = null;
+  };
+  const observeCapacity = (active) => {
+    const value = Math.max(0, Math.floor(Number(active)) || 0);
+    capacityHighWater = Math.max(capacityHighWater, value);
+  };
+  const snapshot = () => ({
+    ...(first && latest ? {
+      loadAverage1m: { start: first.loadAverage1m, end: latest.loadAverage1m, max: maxLoad },
+      freeMemoryBytes: { start: first.freeMemoryBytes, end: latest.freeMemoryBytes, min: minFree },
+      totalMemoryBytes: latest.totalMemoryBytes,
+      ...(first.memoryPressure !== null || latest.memoryPressure !== null ? {
+        memoryPressureAvailablePercent: { start: first.memoryPressure, end: latest.memoryPressure, min: minPressure },
+      } : {}),
+    } : {}),
+    ...(capacityHighWater > 0 ? { capacityHighWater } : {}),
+    metricsUnavailable: [...metricsUnavailable],
+  });
+  return { start, stop, sample, observeCapacity, snapshot };
+}
+
 function capacityEntryError(entry) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "entry is not an object";
   if (typeof entry.token !== "string" || !entry.token) return "token is missing";
@@ -1397,7 +1596,7 @@ export function createCapacityLedger({
   return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
 }
 
-export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null } = {}) {
+export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null } = {}) {
   if (!ledger || typeof ledger.reserve !== "function") throw new Error("capacity ledger is required");
   if (typeof executeDemand !== "function") throw new Error("executeDemand is required");
   const pending = [];
@@ -1405,6 +1604,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
   let localActive = 0;
   let drainScheduled = false;
   let draining = false;
+  let capacityHighWater = 0;
   const idleWaiters = [];
 
   const demandKey = (demand) => [demand.workspace || demand.anchorPath || "", demand.stage || demand.sweep || "", demand.issueIdentifier || demand.topCard?.identifier || ""].join("\0");
@@ -1422,6 +1622,16 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
   };
   const settleRun = (item, reservation) => {
     localActive += 1;
+    const capacityState = ledger.reconcile();
+    capacityHighWater = Math.max(capacityHighWater, capacityState.active);
+    item.demand.telemetry = {
+      ...(item.demand.telemetry || {}),
+      admittedAt: new Date().toISOString(),
+      capacitySlot: capacityState.active,
+      capacityHighWater,
+    };
+    sampler?.observeCapacity?.(capacityState.active);
+    if (localActive === 1) sampler?.start?.();
     (async () => {
       try {
         const result = await executeDemand(item.demand, reservation);
@@ -1432,6 +1642,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
       }
     })().then(item.resolve, item.reject).finally(() => {
       localActive -= 1;
+      if (localActive === 0) sampler?.stop?.();
       byKey.delete(item.key);
       scheduleDrain();
       notifyIdle();
@@ -1446,6 +1657,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
         const state = ledger.reconcile();
         if (!state.healthy) break;
         if (state.active >= state.max) {
+          for (const item of pending) onCapacityDeferred?.(item.demand, state);
           if (localActive === 0) {
             for (const item of pending.splice(0)) {
               byKey.delete(item.key);
@@ -1456,6 +1668,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
         }
         const shipIndex = pending.findIndex((item) => (item.demand.stage || item.demand.sweep) === "ship");
         if (shipIndex >= 0 && state.active > 0) {
+          for (const item of pending) onCapacityDeferred?.(item.demand, state);
           if (localActive === 0) {
             for (const item of pending.splice(0)) {
               byKey.delete(item.key);
@@ -1465,6 +1678,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
           break;
         }
         if (shipIndex < 0 && state.entries.some((entry) => entry.stage === "ship")) {
+          for (const item of pending) onCapacityDeferred?.(item.demand, state);
           if (localActive === 0) {
             for (const item of pending.splice(0)) {
               byKey.delete(item.key);
@@ -2224,6 +2438,10 @@ export function doctorReport({
   lastTick = null,
   capacityState = null,
   capacityLedgerPath = CAPACITY_LEDGER,
+  observationState = null,
+  observationPath = OBSERVATIONS,
+  resolveRuntimeFn = resolveRuntimeExecutable,
+  runtimeEnvBySource = null,
   isAlive = isAlivePid,
   now = Date.now(),
 } = {}) {
@@ -2251,11 +2469,37 @@ export function doctorReport({
     maxActiveChildren: reg.capacity.maxActiveChildren,
     isAlive,
   }).inspect();
+  const telemetry = currentTick?.telemetry || lastTick?.telemetry || {};
+  if (telemetry.capacityHighWater !== undefined) {
+    report.capacity = { ...report.capacity, highWater: telemetry.capacityHighWater };
+  }
   if (!report.capacity.healthy) report.ok = false;
   if (currentTick || lastTick) {
     report.tick = healthStatus({ currentTick, lastTick, isAlive, now });
     if (!report.tick.ok) report.ok = false;
   }
+  if (currentTick) report.currentTickFailures = Array.isArray(currentTick.failures) ? currentTick.failures : [];
+  const observations = observationState || createObservationStore({ observationPath, now: () => now }).snapshot();
+  const waits = (observations.entries || [])
+    .map((entry) => Number(entry.queueWaitMs))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const percentile = (fraction) => waits.length ? waits[Math.max(0, Math.ceil(fraction * waits.length) - 1)] : null;
+  report.queue = { observed: waits.length, p50Ms: percentile(0.5), p90Ms: percentile(0.9) };
+  report.deferred = {
+    dependency: telemetry.dependencyDeferredCount || 0,
+    capacity: telemetry.capacityDeferredCount ?? waits.length,
+  };
+  report.resources = {
+    loadAverage1m: telemetry.loadAverage1m,
+    freeMemoryBytes: telemetry.freeMemoryBytes,
+    totalMemoryBytes: telemetry.totalMemoryBytes,
+    memoryPressureAvailablePercent: telemetry.memoryPressureAvailablePercent,
+  };
+  report.metricsUnavailable = [...new Set([
+    ...(telemetry.metricsUnavailable || []),
+    ...(observations.healthy === false ? observations.errors || ["observations unavailable"] : []),
+  ])];
 
   for (const sourceAnchorPath of reg.repos || []) {
     const record = workspaceRecordForSourceAnchor(sourceAnchorPath, reg);
@@ -2282,6 +2526,16 @@ export function doctorReport({
       managedBlockers,
       env: envPath ? { path: envPath, exists: existsFn(envPath) } : null,
     };
+    if (config) {
+      const runtimeEnv = runtimeEnvBySource instanceof Map
+        ? (runtimeEnvBySource.get(sourceAnchorPath) || process.env)
+        : (record?.managedAnchorPath ? dispatchEnvironment(record.managedAnchorPath) : process.env);
+      anchor.runtimes = Object.fromEntries(SWEEPS.map((sweep) => {
+        const runtime = runtimeConfigForSweep(config, sweep).runtime || "codex";
+        return [sweep, resolveRuntimeFn(runtime, runtimeEnv)];
+      }));
+      if (Object.values(anchor.runtimes).some((resolution) => !resolution.ok)) report.ok = false;
+    }
     if (managedBlockers.length) report.ok = false;
     report.anchors.push(anchor);
   }
@@ -2289,17 +2543,35 @@ export function doctorReport({
 }
 
 export function formatDoctorReport(report) {
+  const highWater = report.capacity.highWater === undefined ? "" : `, high-water ${report.capacity.highWater}`;
   const lines = [
     `registry: ${report.registryPath}`,
     `host: ${report.host} user: ${report.user}`,
     `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
     `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
-    `capacity: ${report.capacity.active}/${report.capacity.max}${report.capacity.healthy ? "" : " BLOCKED"}`,
+    `capacity: ${report.capacity.active}/${report.capacity.max}${highWater}${report.capacity.healthy ? "" : " BLOCKED"}`,
   ];
   if (!report.capacity.healthy) {
     for (const error of report.capacity.errors || []) lines.push(`  capacity error: ${error}`);
   }
   if (report.tick) lines.push(`tick: ${report.tick.reason}`);
+  for (const failure of report.currentTickFailures || []) {
+    lines.push(`current tick failure: ${failure.kind || "unknown"}: ${failure.message || "(no detail)"}`);
+  }
+  const load = report.resources?.loadAverage1m;
+  if (load) lines.push(`load: current=${load.end} peak=${load.max}`);
+  const memory = report.resources?.freeMemoryBytes;
+  const pressure = report.resources?.memoryPressureAvailablePercent;
+  if (memory) {
+    lines.push(`memory: free=${memory.end} minimum=${memory.min}${pressure ? ` pressure-available=${pressure.end}% minimum=${pressure.min}%` : ""}`);
+  }
+  const minutes = (milliseconds) => milliseconds === null ? "n/a" : `${Math.round(milliseconds / 60000)}m`;
+  if (report.queue) lines.push(`queue: p50=${minutes(report.queue.p50Ms)} p90=${minutes(report.queue.p90Ms)}`);
+  if (report.deferred) {
+    lines.push(`dependency deferred=${report.deferred.dependency}`);
+    lines.push(`capacity deferred=${report.deferred.capacity}`);
+  }
+  for (const gap of report.metricsUnavailable || []) lines.push(`metrics unavailable: ${gap}`);
   if (report.kit.dirty) lines.push(`  kit dirty: ${report.kit.dirty.message.replace(/\n/g, "\n  ")}`);
   for (const anchor of report.anchors) {
     lines.push("");
@@ -2308,6 +2580,9 @@ export function formatDoctorReport(report) {
     if (anchor.sourceDirty) lines.push(`  source advisory dirty: ${anchor.sourceDirty.message.replace(/\n/g, "\n    ")}`);
     lines.push(`  managed: ${anchor.managedAnchorPath || "(missing metadata)"}${anchor.managedExists ? "" : " (missing)"}`);
     if (anchor.env) lines.push(`  env:     ${anchor.env.path}${anchor.env.exists ? "" : " (missing)"}`);
+    for (const [sweep, runtime] of Object.entries(anchor.runtimes || {})) {
+      lines.push(`  runtime ${sweep}: ${runtime.runtime} ${runtime.ok ? `${runtime.path} (${runtime.source})` : "MISSING"}`);
+    }
     if (anchor.managedBlockers.length) {
       lines.push("  dispatch: BLOCKED");
       for (const blocker of anchor.managedBlockers) lines.push(`    ${blocker.message.replace(/\n/g, "\n    ")}`);
@@ -2449,6 +2724,9 @@ export async function expandDispatchBatch(batch, {
         runtimeLaneKey: pick.runtimeLaneKey,
         runtimeScope: pick.runtimeScope,
         runtimeStableTarget: pick.runtimeStableTarget,
+        telemetry: pick.telemetry,
+        resourceSampler: pick.resourceSampler,
+        dependencyBlockers: pick.dependencyBlockers,
       }, parentRunId, childIndexAllocator.next()));
     }
   }
@@ -2733,6 +3011,14 @@ function interruptedSignalFor(signal, fallback = null) {
 
 function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
   if (!pick.issueIdentifier || !pick.logDir) return;
+  let metrics = {};
+  try {
+    pick.resourceSampler?.sample?.();
+    metrics = pick.resourceSampler?.snapshot?.() || {};
+  } catch (error) {
+    metrics = { metricsUnavailable: [String(error?.message || error)] };
+  }
+  const telemetry = pick.telemetry || {};
   const record = {
     parentRunId: pick.parentRunId,
     cardRunId: pick.cardRunId,
@@ -2747,6 +3033,20 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     model: runtimeCfg.model,
     effort: runtimeCfg.effort,
     triggeredBy: pick.triggeredBy,
+    trigger: pick.trigger,
+    firstObservedActionableAt: telemetry.firstObservedActionableAt,
+    claimAt: telemetry.claimAt,
+    dispatchAt: startedAt,
+    queueWaitMs: telemetry.queueWaitMs,
+    resolvedRuntimeExecutable: pick.runtimeExecutable,
+    capacitySlot: telemetry.capacitySlot,
+    capacityHighWater: Math.max(telemetry.capacityHighWater || 0, metrics.capacityHighWater || 0) || undefined,
+    loadAverage1m: metrics.loadAverage1m,
+    freeMemoryBytes: metrics.freeMemoryBytes,
+    totalMemoryBytes: metrics.totalMemoryBytes,
+    memoryPressureAvailablePercent: metrics.memoryPressureAvailablePercent,
+    metricsUnavailable: metrics.metricsUnavailable,
+    dependencyBlockers: pick.dependencyBlockers,
     outcome,
     exitCode: outcome?.exitCode ?? null,
     startedAt,
@@ -2907,7 +3207,12 @@ async function tick({ dryRun = false } = {}) {
     const activeSameRepo = createSameRepoActiveCounts();
     const childIndexAllocator = createChildIndexAllocator();
     const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
+    const observationStore = createObservationStore({ dryRun });
+    const resourceSampler = createResourceSampler();
+    const dependencyDeferredKeys = new Set();
+    const capacityDeferredKeys = new Set();
     const refillBudget = { remaining: 0 };
+    observationStore.sync();
     const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
       anchorPath,
       anchorSlug: anchorSlug(anchorPath),
@@ -2972,6 +3277,8 @@ async function tick({ dryRun = false } = {}) {
         recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
         writeCurrentTick();
       }
+      observationStore.clear(pick);
+      capacityDeferredKeys.delete(observationKey(pick));
       return active;
     };
     const runHandoffTriggers = async (current, firedHandoffs, handoffBudget) => {
@@ -3116,12 +3423,19 @@ async function tick({ dryRun = false } = {}) {
     };
     const writeCurrentTick = () => {
       if (dryRun) return;
+      const resourceMetrics = resourceSampler.snapshot();
       tickState = {
         ...tickState,
         status: "running",
         at: new Date().toISOString(),
         kit: reg.kitPath ? kitMarker(reg.kitPath) : null,
         failures: [...localFailures],
+        telemetry: {
+          ...resourceMetrics,
+          capacityHighWater: resourceMetrics.capacityHighWater || 0,
+          dependencyDeferredCount: dependencyDeferredKeys.size,
+          capacityDeferredCount: capacityDeferredKeys.size,
+        },
       };
       atomicWriteJson(CURRENT_TICK, tickState);
     };
@@ -3174,6 +3488,7 @@ async function tick({ dryRun = false } = {}) {
       return checked;
     };
     const initialCapacity = capacityLedger.reconcile();
+    resourceSampler.observeCapacity(initialCapacity.active);
     if (!initialCapacity.healthy) {
       localFailures.push(failureEventFor("_", null, "capacity", "capacity-ledger", CAPACITY_LEDGER, initialCapacity.errors.join("; ")));
       writeCurrentTick();
@@ -3181,9 +3496,24 @@ async function tick({ dryRun = false } = {}) {
     let completionDiscovery = async () => {};
     const admissionQueue = createAdmissionQueue({
       ledger: capacityLedger,
+      sampler: resourceSampler,
+      onCapacityDeferred: (demand) => {
+        try {
+          const observation = observationStore.markCapacityDeferred(demand);
+          capacityDeferredKeys.add(observationKey(demand));
+          if (observation) demand.telemetry = { ...(demand.telemetry || {}), ...observation };
+        } catch (error) {
+          logFor(demand.anchorPath, demand.sweep, `queue observation error: ${error.message}`);
+        }
+        writeCurrentTick();
+      },
       executeDemand: async (demand, reservation) => {
         activeSameRepo.increment(demand);
         try {
+          const observation = observationStore.get(demand);
+          if (observation) demand.telemetry = { ...(demand.telemetry || {}), ...observation };
+          demand.resourceSampler = resourceSampler;
+          demand.dependencyBlockers = demand.topCard?.blockers || [];
           const [pick] = await expandDispatchBatch([demand], {
             dryRun: false,
             parentRunId,
@@ -3192,6 +3522,7 @@ async function tick({ dryRun = false } = {}) {
             childIndexAllocator,
           });
           if (!pick) return null;
+          pick.telemetry = { ...(pick.telemetry || {}), claimAt: new Date().toISOString() };
           const [result] = await dispatchBatch([pick], {
             signal: dispatchAbortContext?.signal,
             dispatchOptions: { onSpawn: (pid) => reservation.attachChildPid(pid) },
@@ -3344,6 +3675,26 @@ async function tick({ dryRun = false } = {}) {
             continue;
           }
           const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
+          const actionableIds = new Set(actionable.map((card) => card.identifier));
+          const scopeKey = JSON.stringify([active.sourceAnchorPath, sweep]);
+          for (const key of [...dependencyDeferredKeys]) {
+            const [sourceWorkspace, deferredSweep] = JSON.parse(key);
+            if (JSON.stringify([sourceWorkspace, deferredSweep]) === scopeKey) dependencyDeferredKeys.delete(key);
+          }
+          for (const card of cards) {
+            if (!dependencyEligibility(card.blockers, card.blockersComplete === true).eligible) {
+              dependencyDeferredKeys.add(observationKey({ sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier }));
+            }
+          }
+          observationStore.sync({
+            scannedScopes: [{ sourceWorkspace: active.sourceAnchorPath, sweep }],
+            observations: cards.map((card) => ({
+              sourceWorkspace: active.sourceAnchorPath,
+              sweep,
+              issueIdentifier: card.identifier,
+              eligible: actionableIds.has(card.identifier),
+            })),
+          });
           const topCard = actionable[0] || null;
           logFor(anchorPath, sweep, `${actionable.length} actionable${topCard ? `; top ${topCard.identifier} sortOrder=${topCard.sortOrder}` : ""}`);
           // ship merges + deploys to prod. Only the single designated runner may
@@ -3496,6 +3847,7 @@ async function tick({ dryRun = false } = {}) {
     };
 
     await runDrainLoop({ maxDrainPasses: drainPassLimit(anchors.map((a) => a.config)), runPass: runSweepPass, log });
+    writeCurrentTick();
   } catch (error) {
     if (!dryRun) {
       localFailures.push({

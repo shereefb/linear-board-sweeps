@@ -17,7 +17,7 @@ import {
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, preflightAndSelectDispatchBatch, rotateNonShipCandidates,
-  compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, admitDemand,
+  compareAdmissionDemand, createCapacityLedger, createAdmissionQueue, createObservationStore, createResourceSampler, admitDemand,
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
@@ -28,6 +28,7 @@ import {
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
+  OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -568,6 +569,82 @@ test("capacity ledger: UUID collision retries without overwriting an existing re
   assert.equal(reservation.token, "unique");
   assert.deepEqual(stored.entries.map((entry) => entry.token), ["collision", "unique"]);
 });
+test("queue observations: first capacity wait survives restart and accumulates", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-observations-"));
+  const observationPath = path.join(dir, "observations.json");
+  let now = Date.parse("2026-07-01T00:00:00.000Z");
+  const identity = { sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-1" };
+  const first = createObservationStore({ observationPath, now: () => now });
+
+  first.sync({
+    scannedScopes: [{ sourceWorkspace: "/source/app", sweep: "dev" }],
+    observations: [{ ...identity, eligible: true }],
+  });
+  first.markCapacityDeferred(identity);
+  assert.equal(first.get(identity).firstObservedActionableAt, "2026-07-01T00:00:00.000Z");
+
+  now += 10 * 60_000;
+  const restarted = createObservationStore({ observationPath, now: () => now });
+  restarted.markCapacityDeferred(identity);
+  assert.equal(restarted.get(identity).firstObservedActionableAt, "2026-07-01T00:00:00.000Z");
+  assert.equal(restarted.get(identity).queueWaitMs, 10 * 60_000);
+  assert.equal(JSON.parse(fs.readFileSync(observationPath, "utf8")).version, OBSERVATION_STATE_VERSION);
+});
+test("queue observations: relation, label, or claim blocking clears persisted waits", () => {
+  for (const blockedBy of ["relation", "label", "claim"]) {
+    let stored = null;
+    const identity = { sourceWorkspace: "/source/app", sweep: "qa", issueIdentifier: `COD-${blockedBy}` };
+    const store = createObservationStore({
+      observationPath: "/state/observations.json",
+      now: () => NOW,
+      readJsonFn: () => stored,
+      writeJsonFn: (_target, value) => { stored = structuredClone(value); },
+    });
+    store.markCapacityDeferred(identity);
+    store.sync({
+      scannedScopes: [{ sourceWorkspace: identity.sourceWorkspace, sweep: identity.sweep }],
+      observations: [{ ...identity, eligible: false, blockedBy }],
+    });
+    assert.equal(store.get(identity), null, blockedBy);
+  }
+});
+test("queue observations: dry-run reads existing waits without writing", () => {
+  const existing = {
+    version: OBSERVATION_STATE_VERSION,
+    entries: {
+      '["/source/app","dev","COD-1"]': {
+        sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-1",
+        firstObservedActionableAt: "2026-07-01T00:00:00.000Z", lastSeenAt: "2026-07-01T00:00:00.000Z",
+      },
+    },
+  };
+  let writes = 0;
+  const store = createObservationStore({
+    dryRun: true,
+    now: () => Date.parse("2026-07-01T00:10:00.000Z"),
+    readJsonFn: () => structuredClone(existing),
+    writeJsonFn: () => { writes += 1; },
+  });
+
+  store.markCapacityDeferred({ sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-2" });
+  store.clear({ sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-1" });
+  assert.equal(store.get({ sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-1" }).queueWaitMs, 10 * 60_000);
+  assert.equal(writes, 0);
+});
+test("queue observations: unseen entries prune after seven days", () => {
+  let stored = null;
+  let now = Date.parse("2026-07-01T00:00:00.000Z");
+  const identity = { sourceWorkspace: "/source/app", sweep: "spec", issueIdentifier: "COD-7" };
+  const store = createObservationStore({
+    now: () => now,
+    readJsonFn: () => stored,
+    writeJsonFn: (_target, value) => { stored = structuredClone(value); },
+  });
+  store.markCapacityDeferred(identity);
+  now += OBSERVATION_RETENTION_MS + 1;
+  store.sync({ observations: [], scannedScopes: [] });
+  assert.equal(store.get(identity), null);
+});
 test("capacity admission: eleven simultaneous demands never run more than ten", async () => {
   let stored = null;
   let active = 0;
@@ -656,6 +733,88 @@ test("capacity admission: each completed child is handled before later siblings 
   assert.deepEqual(handled, ["COD-1"]);
   resolvers.get("COD-2")({ issueIdentifier: "COD-2" });
   assert.deepEqual((await run).map((result) => result.issueIdentifier), ["COD-1", "COD-2"]);
+});
+test("resource sampler: records free bytes and separately named macOS pressure percentage", () => {
+  const loads = [[1.5, 1, 0.5], [3.5, 2, 1], [2.5, 2, 1]];
+  const free = [800, 400, 600];
+  const pressure = ["System-wide memory free percentage: 42%", "System-wide memory free percentage: 24%", "System-wide memory free percentage: 30%"];
+  let sampleAgain;
+  const sampler = createResourceSampler({
+    osModule: {
+      loadavg: () => loads.shift(),
+      freemem: () => free.shift(),
+      totalmem: () => 1_000,
+      platform: () => "darwin",
+    },
+    memoryPressureFn: () => pressure.shift(),
+    setIntervalFn: (fn) => { sampleAgain = fn; return 17; },
+    clearIntervalFn: () => {},
+  });
+
+  sampler.start();
+  sampleAgain();
+  sampler.stop();
+  assert.deepEqual(sampler.snapshot(), {
+    loadAverage1m: { start: 1.5, end: 2.5, max: 3.5 },
+    freeMemoryBytes: { start: 800, end: 600, min: 400 },
+    totalMemoryBytes: 1_000,
+    memoryPressureAvailablePercent: { start: 42, end: 30, min: 24 },
+    metricsUnavailable: [],
+  });
+});
+test("resource sampler: failures are recorded and never thrown", () => {
+  const sampler = createResourceSampler({
+    osModule: {
+      loadavg: () => { throw new Error("host metrics denied"); },
+      freemem: () => assert.fail("sampling stops after the failed read"),
+      totalmem: () => 1_000,
+      platform: () => "linux",
+    },
+    setIntervalFn: () => 1,
+    clearIntervalFn: () => {},
+  });
+  assert.doesNotThrow(() => sampler.start());
+  assert.match(sampler.snapshot().metricsUnavailable.join("; "), /host metrics denied/);
+});
+test("resource sampler: timer failures remain observational", () => {
+  const sampler = createResourceSampler({
+    osModule: {
+      loadavg: () => [1, 1, 1], freemem: () => 500, totalmem: () => 1_000, platform: () => "linux",
+    },
+    setIntervalFn: () => { throw new Error("timers unavailable"); },
+    clearIntervalFn: () => { throw new Error("timer cleanup unavailable"); },
+  });
+  assert.doesNotThrow(() => sampler.start());
+  assert.doesNotThrow(() => sampler.stop());
+  assert.match(sampler.snapshot().metricsUnavailable.join("; "), /timers unavailable/);
+});
+test("capacity admission: one sampler spans first admitted child through last release", async () => {
+  let stored = null;
+  const releases = [];
+  const lifecycle = [];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 2,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `sample-token-${++n}`; })(),
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    sampler: { start: () => lifecycle.push("start"), stop: () => lifecycle.push("stop") },
+    executeDemand: async () => new Promise((resolve) => releases.push(resolve)),
+  });
+  const runs = ["COD-1", "COD-2"].map((issueIdentifier) => admitDemand({
+    stage: "dev", trigger: "initial", issueIdentifier, workspace: "/managed",
+  }, { queue }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lifecycle, ["start"]);
+  releases.shift()("one");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(lifecycle, ["start"]);
+  releases.shift()("two");
+  await Promise.all(runs);
+  assert.deepEqual(lifecycle, ["start", "stop"]);
 });
 test("capacity admission: same-stage handoff discovered under the held token runs before queued initial work", async () => {
   let stored = null;
@@ -1959,6 +2118,67 @@ test("capacity ledger: dispatch attaches the live child PID immediately after sp
   child.emit("close", 0, null);
   assert.equal((await run).kind, "success");
 });
+test("run records: optional queue, capacity, trigger, runtime, and host metrics are additive", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-telemetry-"));
+  const logDir = path.join(anchorPath, "logs");
+  const child = new EventEmitter();
+  child.pid = 456;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-12",
+    logDir,
+    runtimeExecutable: "/resolved/codex",
+    trigger: "handoff",
+    telemetry: {
+      firstObservedActionableAt: "2026-07-09T11:59:00.000Z",
+      claimAt: "2026-07-09T12:00:00.000Z",
+      queueWaitMs: 60_000,
+      capacitySlot: 3,
+      capacityHighWater: 7,
+    },
+    resourceSampler: {
+      snapshot: () => ({
+        loadAverage1m: { start: 1, end: 2, max: 4 },
+        freeMemoryBytes: { start: 800, end: 600, min: 400 },
+        totalMemoryBytes: 1_000,
+        memoryPressureAvailablePercent: { start: 50, end: 40, min: 30 },
+        metricsUnavailable: [],
+      }),
+    },
+  }, { spawnFn: () => child });
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
+
+  const recordFile = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(logDir, recordFile), "utf8").trim());
+  assert.equal(record.firstObservedActionableAt, "2026-07-09T11:59:00.000Z");
+  assert.equal(record.queueWaitMs, 60_000);
+  assert.equal(record.capacityHighWater, 7);
+  assert.equal(record.trigger, "handoff");
+  assert.equal(record.resolvedRuntimeExecutable, "/resolved/codex");
+  assert.deepEqual(record.freeMemoryBytes, { start: 800, end: 600, min: 400 });
+  assert.deepEqual(record.memoryPressureAvailablePercent, { start: 50, end: 40, min: 30 });
+  assert.deepEqual(record.metricsUnavailable, []);
+});
+test("run records: sampler failure does not change child success", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-metrics-gap-"));
+  const logDir = path.join(anchorPath, "logs");
+  const child = new EventEmitter();
+  let completionSamples = 0;
+  const run = dispatchAsync(anchorPath, "qa", {}, {
+    issueIdentifier: "COD-13", logDir, runtimeExecutable: "/resolved/codex",
+    resourceSampler: {
+      sample: () => { completionSamples += 1; },
+      snapshot: () => ({ metricsUnavailable: ["host metrics denied"] }),
+    },
+  }, { spawnFn: () => child });
+  child.emit("close", 0, null);
+  assert.equal((await run).kind, "success");
+  const recordFile = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(logDir, recordFile), "utf8").trim());
+  assert.deepEqual(record.metricsUnavailable, ["host metrics denied"]);
+  assert.equal(record.outcome.kind, "success");
+  assert.equal(completionSamples, 1);
+});
 test("capacity ledger: PID attachment failure terminates child and retains token until close", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-attach-failure-"));
   let stored = null;
@@ -2470,6 +2690,75 @@ test("capacity doctor: malformed ledger is unhealthy and reports active/max", ()
   assert.deepEqual(report.capacity, { healthy: false, active: 1, max: 10, errors: ["entry broken"] });
   assert.match(formatDoctorReport(report), /capacity: 1\/10 BLOCKED/);
   assert.match(formatDoctorReport(report), /entry broken/);
+});
+test("doctor telemetry: JSON and human summaries expose scheduler health and tuning evidence", () => {
+  const source = "/source/app";
+  const currentTick = {
+    status: "running",
+    pid: 42,
+    at: new Date(NOW).toISOString(),
+    failures: [{ kind: "runtime-missing", message: "claude unavailable" }],
+    telemetry: {
+      capacityHighWater: 8,
+      dependencyDeferredCount: 12,
+      capacityDeferredCount: 3,
+      loadAverage1m: { start: 1.5, end: 4.2, max: 8.7 },
+      freeMemoryBytes: { start: 6_100_000_000, end: 5_000_000_000, min: 3_800_000_000 },
+      totalMemoryBytes: 16_000_000_000,
+      memoryPressureAvailablePercent: { start: 38, end: 31, min: 24 },
+      metricsUnavailable: ["memory_pressure unavailable"],
+    },
+  };
+  const report = doctorReport({
+    registry: { repos: [source], kitPath: null, capacity: { maxActiveChildren: 10 } },
+    configsBySource: new Map([[source, { runtimes: { dev: { runtime: "codex" } } }]]),
+    existsFn: () => true,
+    gitFn: () => ({ status: 0, out: "", err: "" }),
+    resolveRuntimeFn: (runtime) => ({ ok: true, runtime, path: `/opt/bin/${runtime}`, source: "path" }),
+    currentTick,
+    capacityState: { healthy: false, active: 7, max: 10, errors: ["malformed entry token-x", "stale entry token-y"] },
+    observationState: {
+      healthy: true,
+      errors: [],
+      entries: [60_000, 180_000, 840_000].map((queueWaitMs, index) => ({ issueIdentifier: `COD-${index}`, queueWaitMs })),
+    },
+    isAlive: () => true,
+    now: NOW,
+  });
+
+  assert.equal(report.capacity.highWater, 8);
+  assert.deepEqual(report.queue, { observed: 3, p50Ms: 180_000, p90Ms: 840_000 });
+  assert.deepEqual(report.deferred, { dependency: 12, capacity: 3 });
+  assert.equal(report.resources.freeMemoryBytes.min, 3_800_000_000);
+  assert.equal(report.resources.memoryPressureAvailablePercent.min, 24);
+  assert.deepEqual(report.metricsUnavailable, ["memory_pressure unavailable"]);
+  assert.deepEqual(report.currentTickFailures, currentTick.failures);
+  assert.deepEqual(report.anchors[0].runtimes.dev, {
+    ok: true, runtime: "codex", path: "/opt/bin/codex", source: "path",
+  });
+
+  const human = formatDoctorReport(report);
+  assert.match(human, /capacity: 7\/10, high-water 8 BLOCKED/);
+  assert.match(human, /malformed entry token-x/);
+  assert.match(human, /stale entry token-y/);
+  assert.match(human, /current tick failure: runtime-missing: claude unavailable/);
+  assert.match(human, /runtime dev: codex \/opt\/bin\/codex \(path\)/);
+  assert.match(human, /load: current=4\.2 peak=8\.7/);
+  assert.match(human, /memory: free=5000000000 minimum=3800000000 pressure-available=31% minimum=24%/);
+  assert.match(human, /queue: p50=3m p90=14m/);
+  assert.match(human, /dependency deferred=12/);
+  assert.match(human, /capacity deferred=3/);
+  assert.match(human, /metrics unavailable: memory_pressure unavailable/);
+});
+test("doctor telemetry: malformed observations surface as a metrics gap without hiding ledger health", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [] },
+    observationState: { healthy: false, entries: [], errors: ["observation schema is malformed"] },
+  });
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.metricsUnavailable, ["observation schema is malformed"]);
+  assert.match(formatDoctorReport(report), /metrics unavailable: observation schema is malformed/);
 });
 
 test("pushWithRetry: succeeds on first attempt", () => {
