@@ -564,6 +564,10 @@ function consecutiveWindows(left, right) {
     if (week) {
       const year = Number(week[1]);
       const number = Number(week[2]);
+      const jan1Day = new Date(Date.UTC(year, 0, 1)).getUTCDay() || 7;
+      const leap = new Date(Date.UTC(year, 1, 29)).getUTCMonth() === 1;
+      const maxWeek = jan1Day === 4 || (jan1Day === 3 && leap) ? 53 : 52;
+      if (number < 1 || number > maxWeek) return null;
       const jan4 = new Date(Date.UTC(year, 0, 4));
       const jan4Day = jan4.getUTCDay() || 7;
       return jan4.getTime() - (jan4Day - 1) * 86400000 + (number - 1) * 7 * 86400000;
@@ -826,6 +830,116 @@ export function renderEvidenceDelta(finding, occurrenceIds = []) {
   const known = new Set(finding?.occurrenceIds || []);
   const fresh = [...new Set(occurrenceIds)].filter((id) => !known.has(id)).sort();
   return sanitizeLearningText(`[factory-learning evidence-delta root=${finding.rootFingerprint}]\nFresh occurrences: ${fresh.join(", ") || "none"}`, 5_000);
+}
+
+function learningRouteLabel(finding, config = {}) {
+  const byLabel = config?.repoRouting?.byLabel;
+  if (!byLabel || typeof byLabel !== "object") return null;
+  const matches = Object.entries(byLabel)
+    .filter(([, repoEntry]) => repoEntry === finding.repoEntry)
+    .map(([label]) => label)
+    .sort();
+  if (matches.length !== 1) return undefined;
+  return matches[0];
+}
+
+function learningMutationId(action, rootFingerprint, generation, suffix = "") {
+  return `${action}:${stableHash({ rootFingerprint, generation, suffix }).slice(0, 24)}`;
+}
+
+function isLearningActiveState(stateName) {
+  return !["Done", "Canceled", "Duplicate", "Archived"].includes(stateName);
+}
+
+function learningIssueOrder(a, b) {
+  return Number(isLearningActiveState(b.stateName)) - Number(isLearningActiveState(a.stateName))
+    || Number(b.generation || 0) - Number(a.generation || 0)
+    || String(a.identifier || a.id).localeCompare(String(b.identifier || b.id));
+}
+
+// Pure, retry-stable planning. Linear remains authoritative: callers must build
+// liveIssues from complete marker/comment pagination immediately before using it.
+export function planLearningMutations(findings = [], liveIssues = [], config = {}) {
+  const maxCreates = Math.min(MAX_NEW_LEARNING_CARDS_PER_RUN,
+    Math.max(0, Math.floor(Number(config.maxNewCardsPerRun ?? MAX_NEW_LEARNING_CARDS_PER_RUN)) || 0));
+  const mutations = [];
+  const deferred = [];
+  let creates = 0;
+  const orderedFindings = [...findings].sort(rankFinding);
+  for (const finding of orderedFindings) {
+    const rootFingerprint = String(finding.rootFingerprint || "");
+    if (!rootFingerprint) {
+      deferred.push({ finding, reason: "missing-root-fingerprint" });
+      continue;
+    }
+    const routeLabel = learningRouteLabel(finding, config);
+    if (routeLabel === undefined) {
+      deferred.push({ finding, reason: "ambiguous-or-missing-route-label" });
+      continue;
+    }
+    const lineage = liveIssues
+      .filter((issue) => issue.rootFingerprint === rootFingerprint)
+      .sort(learningIssueOrder);
+    const active = lineage.filter((issue) => isLearningActiveState(issue.stateName));
+    const primary = active[0] || lineage[0] || null;
+    for (const duplicate of (active.length > 1 ? active.slice(1) : [])) {
+      mutations.push({
+        mutationId: learningMutationId("audit-duplicate", rootFingerprint, duplicate.generation || 0, duplicate.id),
+        action: "audit-duplicate",
+        rootFingerprint,
+        generation: duplicate.generation || 0,
+        issueId: duplicate.id,
+        primaryIssueId: primary.id,
+      });
+    }
+    if (primary) {
+      const known = new Set(primary.occurrenceIds || []);
+      const fresh = [...new Set(finding.occurrenceIds || [])].filter((id) => !known.has(id)).sort();
+      if (!fresh.length) continue;
+      if (isLearningActiveState(primary.stateName)) {
+        mutations.push({
+          mutationId: learningMutationId("append-evidence", rootFingerprint, primary.generation || 0, fresh.join(",")),
+          action: "append-evidence", rootFingerprint, generation: primary.generation || 0,
+          issueId: primary.id, occurrenceIds: fresh, finding,
+        });
+        continue;
+      }
+      const generation = Number(primary.generation || 0);
+      if (primary.stateName === "Done" && generation >= 3) {
+        mutations.push({
+          mutationId: learningMutationId("block-generation-cap", rootFingerprint, generation, fresh.join(",")),
+          action: "block-generation-cap", rootFingerprint, generation, issueId: primary.id,
+          occurrenceIds: fresh, finding,
+        });
+        continue;
+      }
+      if (primary.stateName === "Done") {
+        if (creates >= maxCreates) {
+          deferred.push({ finding, reason: "new-card-budget", generation: generation + 1 });
+          continue;
+        }
+        const recurrenceFinding = { ...clone(finding), generation: generation + 1 };
+        mutations.push({
+          mutationId: learningMutationId("create", rootFingerprint, generation + 1),
+          action: "create", rootFingerprint, generation: generation + 1,
+          routeLabel, relatedIssueId: primary.id, finding: recurrenceFinding,
+        });
+        creates += 1;
+        continue;
+      }
+    }
+    if (creates >= maxCreates) {
+      deferred.push({ finding, reason: "new-card-budget", generation: finding.generation || 0 });
+      continue;
+    }
+    mutations.push({
+      mutationId: learningMutationId("create", rootFingerprint, finding.generation || 0),
+      action: "create", rootFingerprint, generation: finding.generation || 0,
+      routeLabel, finding,
+    });
+    creates += 1;
+  }
+  return { mutations, deferred };
 }
 
 export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {

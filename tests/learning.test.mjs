@@ -21,6 +21,7 @@ import {
   learningDueDecisions,
   normalizeLearningRegistry,
   normalizeWorkspaceLearning,
+  planLearningMutations,
   readLearningEvents,
   readLearningRunIndex,
   rankQualifiedFindings,
@@ -64,6 +65,68 @@ test("learning contracts expose stable stage, trigger, lenses, and taxonomy", ()
     canary: ["red"],
     terminal: ["advanced", "blocked", "failed"],
   });
+});
+
+const learningFinding = (overrides = {}) => ({
+  rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1", "e2"],
+  confidence: "high", severity: "high", actionable: true, projectId: "project-1",
+  repoEntry: "app", impact: "Repeated failures", ...overrides,
+});
+
+test("learning mutation planner creates, updates active cards, and preserves Signoff/Ship", () => {
+  const created = planLearningMutations([learningFinding()], [], {
+    repoRouting: { byLabel: { "app:main": "app" } }, maxNewCardsPerRun: 6,
+  });
+  assert.equal(created.mutations[0].action, "create");
+  assert.equal(created.mutations[0].routeLabel, "app:main");
+  for (const stateName of ["Dev", "Signoff", "Ship"]) {
+    const live = [{
+      id: `issue-${stateName}`, identifier: `COD-${stateName}`, stateName,
+      rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"],
+    }];
+    const planned = planLearningMutations([learningFinding()], live, {});
+    assert.equal(planned.mutations[0].action, "append-evidence");
+    assert.equal(planned.mutations[0].issueId, `issue-${stateName}`);
+    assert.deepEqual(planned.mutations[0].occurrenceIds, ["e2"]);
+    assert.equal(Object.hasOwn(planned.mutations[0], "stateName"), false);
+  }
+});
+
+test("learning mutation planner handles Done recurrence, duplicates, cap, and six-create budget", () => {
+  const done = [{ id: "done-0", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] }];
+  const recurrence = planLearningMutations([learningFinding()], done, {});
+  assert.equal(recurrence.mutations.find((item) => item.action === "create")?.generation, 1);
+  assert.equal(recurrence.mutations.find((item) => item.action === "create")?.relatedIssueId, "done-0");
+
+  const capped = planLearningMutations([learningFinding({ generation: 3 })], [{
+    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"],
+  }], {});
+  assert.equal(capped.mutations.some((item) => item.action === "create"), false);
+  assert.equal(capped.mutations.find((item) => item.action === "block-generation-cap")?.issueId, "done-3");
+
+  const duplicates = planLearningMutations([learningFinding()], [
+    { id: "b", identifier: "COD-2", stateName: "Dev", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] },
+    { id: "a", identifier: "COD-1", stateName: "Spec", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] },
+  ], {});
+  assert.equal(duplicates.mutations.find((item) => item.action === "append-evidence")?.issueId, "a");
+  assert.equal(duplicates.mutations.find((item) => item.action === "audit-duplicate")?.issueId, "b");
+
+  const many = planLearningMutations(Array.from({ length: 8 }, (_, index) => learningFinding({
+    rootFingerprint: `root-${index}`, occurrenceIds: [`e-${index}`],
+  })), [], { maxNewCardsPerRun: 6 });
+  assert.equal(many.mutations.filter((item) => item.action === "create").length, 6);
+  assert.equal(many.deferred.length, 2);
+});
+
+test("learning mutation planner never budgets updates and emits no duplicate occurrence", () => {
+  const findings = Array.from({ length: 10 }, (_, index) => learningFinding({ rootFingerprint: `r-${index}`, occurrenceIds: [`old-${index}`, `new-${index}`] }));
+  const live = findings.map((finding, index) => ({
+    id: `issue-${index}`, identifier: `COD-${index}`, stateName: "QA",
+    rootFingerprint: finding.rootFingerprint, generation: 0, occurrenceIds: [`old-${index}`],
+  }));
+  const result = planLearningMutations(findings, live, { maxNewCardsPerRun: 1 });
+  assert.equal(result.mutations.filter((item) => item.action === "append-evidence").length, 10);
+  assert.ok(result.mutations.every((item) => !item.occurrenceIds?.includes("old-0") || item.issueId !== "issue-0"));
 });
 
 test("learning due decisions preserve pending work and enforce independent cadences", () => {
@@ -845,6 +908,13 @@ test("human questions share an answer key and duration regressions stay stage-sp
 test("queue windows recognize ISO-week adjacency across year boundaries", () => {
   const observations = repeat("queue-run", 20, (i) => ({ window: i < 10 ? "2025-W52" : "2026-W01", metrics: { waitMs: 200, baselineP90Ms: 100 } }));
   assert.equal(runLearningDetectors(detectorSnapshot(observations), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 1);
+});
+
+test("queue windows reject nonexistent ISO week numbers", () => {
+  for (const windows of [["2026-W53", "2026-W54"], ["2025-W53", "2025-W54"], ["2026-W00", "2026-W01"]]) {
+    const observations = repeat("queue-run", 20, (i) => ({ window: windows[i < 10 ? 0 : 1], metrics: { waitMs: 200, baselineP90Ms: 100 } }));
+    assert.equal(runLearningDetectors(detectorSnapshot(observations), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 0, windows.join(" -> "));
+  }
 });
 
 test("learning due decisions enforce cadence, sample floors, pending resumes, and evaluation deadlines", () => {

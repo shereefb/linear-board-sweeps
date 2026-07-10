@@ -46,6 +46,8 @@ import {
   rotateLearningEventFiles,
   buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
   resolveRegisteredLearningWorkspaces, readLearningRunIndex, runPostDeliveryLearning,
+  fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations,
+  executeLearningCycleWrites,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -1638,6 +1640,254 @@ test("post-delivery learning reserves directly without same-repo or observation 
   assert.equal(result.mode, "deterministic");
   assert.match(result.synthesisUnavailable, /model unavailable/);
 });
+
+test("learning issue comments paginate past 100 and fail closed on cursor cycles or partial data", async () => {
+  const pages = [
+    { comments: { nodes: Array.from({ length: 100 }, (_, index) => ({ id: `c${index}`, body: "ordinary" })), pageInfo: { hasNextPage: true, endCursor: "next" } } },
+    { comments: { nodes: [{ id: "marker", body: "[factory-learning root=root-a generation=0]\nFresh occurrences: e1" }], pageInfo: { hasNextPage: false, endCursor: null } } },
+  ];
+  let call = 0;
+  const comments = await fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({ issue: pages[call++] }) });
+  assert.equal(comments.length, 101);
+  assert.equal(comments.at(-1).id, "marker");
+
+  await assert.rejects(fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({
+    issue: { comments: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "same" } } },
+  }) }), /pagination.*incomplete|cursor/i);
+  await assert.rejects(fetchLearningIssueComments("key", "issue-1", { gqlFn: async () => ({
+    data: { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } },
+    errors: [{ message: "partial" }],
+  }) }), /partial GraphQL/i);
+});
+
+test("learning recurrence relations paginate and fail closed on incomplete confirmation", async () => {
+  let page = 0;
+  assert.equal(await learningRelationExists("key", "new", "done", { gqlFn: async () => {
+    page += 1;
+    return { issue: { inverseRelations: page === 1
+      ? { nodes: [{ type: "related", issue: { id: "other" } }], pageInfo: { hasNextPage: true, endCursor: "next" } }
+      : { nodes: [{ type: "related", issue: { id: "new" } }], pageInfo: { hasNextPage: false, endCursor: null } } } };
+  } }), true);
+
+  await assert.rejects(learningRelationExists("key", "new", "done", { gqlFn: async () => ({
+    issue: { inverseRelations: { nodes: [], pageInfo: { hasNextPage: true, endCursor: "same" } } },
+  }) }), /pagination incomplete|cursor cycle/i);
+});
+
+test("learning issue discovery paginates, scans stable markers, and rejects incomplete pages", async () => {
+  let page = 0;
+  const result = await fetchLearningIssues("key", { teamKey: "COD", projectId: "project-1" }, {
+    gqlFn: async (query) => {
+      if (query.includes("comments(first:100")) return { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } };
+      page += 1;
+      return { issues: {
+        nodes: page === 1 ? [{ id: "one", identifier: "COD-1", description: "[factory-learning root=root-a generation=0]", state: { name: "Dev" }, labels: { nodes: [] } }] : [],
+        pageInfo: page === 1 ? { hasNextPage: true, endCursor: "p2" } : { hasNextPage: false, endCursor: null },
+      } };
+    },
+  });
+  assert.equal(result[0].rootFingerprint, "root-a");
+  assert.equal(result[0].generation, 0);
+  assert.deepEqual(result[0].occurrenceIds, []);
+});
+
+test("learning writer fails closed without provenance and confirms retry-safe create at bottom of Spec", async () => {
+  const mutation = {
+    mutationId: "create:root-a:0", action: "create", rootFingerprint: "root-a", generation: 0,
+    routeLabel: "app:main", finding: learningFindingForWatcher(),
+  };
+  await assert.rejects(executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => ({ "app:main": "route-id" }),
+  }), /factory:learning-generated/);
+
+  const calls = [];
+  let live = [];
+  const stateStore = {
+    stageWindow: (_lens, value) => calls.push(["stage", value.mutations.map((item) => item.mutationId)]),
+    confirmMutation: (_lens, id) => calls.push(["confirm", id]),
+    commitLens: () => true,
+  };
+  const executed = await executeLearningMutations({
+    mutations: [mutation], lens: "reliability", capturedThrough: "2026-07-10T12:00:00.000Z", stateStore,
+  }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov-id", "app:main": "route-id", "sweep:manual-only": "manual-id" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec-id" } }),
+    fetchSpecCardsFn: async () => [{ sortOrder: 5 }, { sortOrder: -2 }],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async (input) => {
+      calls.push(["create", input]);
+      live = [{ id: "new", identifier: "COD-10", stateName: "Spec", sortOrder: -3, rootFingerprint: "root-a", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated", "app:main"] }];
+      return live[0];
+    },
+  });
+  const input = calls.find(([kind]) => kind === "create")[1];
+  assert.equal(input.stateId, "spec-id");
+  assert.equal(input.sortOrder, -3);
+  assert.deepEqual(input.labelIds.sort(), ["prov-id", "route-id"]);
+  assert.equal(input.labelIds.includes("manual-id"), false);
+  assert.deepEqual(calls.filter(([kind]) => kind === "confirm").map(([, id]) => id), [mutation.mutationId]);
+  assert.equal(executed.confirmed, 1);
+});
+
+test("learning writer treats timeout-after-success as confirmed and updates by comments only", async () => {
+  const finding = learningFindingForWatcher({ occurrenceIds: ["e1", "e2"] });
+  let live = [];
+  const create = { mutationId: "m-create", action: "create", rootFingerprint: "root-a", generation: 0, finding };
+  const createResult = await executeLearningMutations({ mutations: [create] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => [],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async () => {
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 0, occurrenceIds: [], labelNames: ["factory:learning-generated"] }];
+      throw new Error("timeout");
+    },
+  });
+  assert.equal(createResult.confirmed, 1);
+
+  const before = { id: "active", identifier: "COD-11", title: "Human title", description: "Human body", stateName: "Ship", labelNames: ["human"], rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] };
+  let current = [structuredClone(before)];
+  const calls = [];
+  await executeLearningMutations({ mutations: [{ mutationId: "m-update", action: "append-evidence", issueId: "active", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e2"], finding }] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    fetchIssuesFn: async () => current,
+    addCommentFn: async (issueId, body) => {
+      calls.push({ issueId, body });
+      current[0].occurrenceIds.push("e2");
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual({ title: current[0].title, description: current[0].description, stateName: current[0].stateName, labelNames: current[0].labelNames }, {
+    title: before.title, description: before.description, stateName: before.stateName, labelNames: before.labelNames,
+  });
+});
+
+test("learning writer confirms recurrence links and reconciles timeout-after-success", async () => {
+  const finding = learningFindingForWatcher();
+  const mutation = {
+    mutationId: "create:root-a:1", action: "create", rootFingerprint: "root-a", generation: 1,
+    relatedIssueId: "done", finding,
+  };
+  let live = [];
+  let linked = false;
+  let relationWrites = 0;
+  const result = await executeLearningMutations({ mutations: [mutation] }, {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => [],
+    fetchIssuesFn: async () => live,
+    createIssueFn: async () => {
+      live = [{ id: "new", stateName: "Spec", sortOrder: 0, rootFingerprint: "root-a", generation: 1, occurrenceIds: [], labelNames: ["factory:learning-generated"] }];
+      return live[0];
+    },
+    relationExistsFn: async () => linked,
+    createRelationFn: async () => {
+      relationWrites += 1;
+      linked = true;
+      throw new Error("timeout");
+    },
+  });
+  assert.equal(result.confirmed, 1);
+  assert.equal(relationWrites, 1);
+});
+
+test("production learning cycle stages one WAL and globally caps creates across its qualified set", async () => {
+  const live = [];
+  const wal = [];
+  const confirmed = new Set();
+  const stateStore = {
+    stageWindow: (lens, value) => wal.push(["stage", lens, value.mutations.length]),
+    confirmMutation: (lens, mutationId) => { wal.push(["confirm", lens, mutationId]); confirmed.add(mutationId); },
+    commitLens: (lens) => { wal.push(["commit", lens]); return true; },
+  };
+  const findings = Array.from({ length: 8 }, (_, index) => learningFindingForWatcher({
+    rootFingerprint: `root-${index}`, occurrenceIds: [`e-${index}`], lenses: ["reliability"],
+  }));
+  const result = await executeLearningCycleWrites({
+    findings,
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } },
+    stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
+      const issue = { id: `issue-${live.length}`, identifier: `COD-${live.length}`, stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      live.push(issue);
+      return issue;
+    },
+  });
+  assert.equal(result.confirmed, 6);
+  assert.equal(result.deferred.length, 2);
+  assert.deepEqual(wal.filter(([kind]) => kind === "stage").map((entry) => entry.slice(1)), [["reliability", 6]]);
+  assert.equal(confirmed.size, 6);
+  assert.deepEqual(wal.at(-1), ["commit", "reliability"]);
+});
+
+test("production learning cycle routes same-project findings to their exact source workspace", async () => {
+  const finding = learningFindingForWatcher({ sourceWorkspaces: ["/z-source"] });
+  const visited = [];
+  await executeLearningCycleWrites({
+    findings: [finding],
+    registry: { learning: { maxNewCardsPerRun: 0 } },
+    workspaces: [
+      { sourceAnchorPath: "/a-source", apiKey: "a", config: { teamKey: "COD", projectId: finding.projectId } },
+      { sourceAnchorPath: "/z-source", apiKey: "z", config: { teamKey: "COD", projectId: finding.projectId } },
+    ],
+    stateStore: { stageWindow: () => {}, confirmMutation: () => {}, commitLens: () => true },
+  }, {
+    fetchIssuesFn: async (destination) => { visited.push(destination.sourceAnchorPath); return []; },
+  });
+  assert.deepEqual(visited, ["/z-source"]);
+});
+
+test("generation cap appends fresh evidence and one blocker audit while preserving Done", async () => {
+  const issue = {
+    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3,
+    occurrenceIds: ["e1"], comments: [], labelNames: ["factory:learning-generated"], labelIds: { "factory:learning-generated": "prov" },
+  };
+  const commentBodies = [];
+  const deps = {
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov", "blocked:needs-user": "blocked" }),
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      commentBodies.push(body);
+      issue.comments.push({ body });
+      for (const id of body.match(/Fresh occurrences:\s*([^\n]+)/)?.[1]?.split(",").map((item) => item.trim()) || []) issue.occurrenceIds.push(id);
+    },
+    setLabelsFn: async (_issueId, ids) => {
+      assert.deepEqual(new Set(ids), new Set(["prov", "blocked"]));
+      issue.labelIds["blocked:needs-user"] = "blocked";
+      issue.labelNames.push("blocked:needs-user");
+    },
+  };
+  const mutation = {
+    mutationId: "cap", action: "block-generation-cap", issueId: issue.id,
+    rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e2"], finding: learningFindingForWatcher({ generation: 3 }),
+  };
+  await executeLearningMutations({ mutations: [mutation] }, deps);
+  assert.equal(issue.stateName, "Done");
+  assert.equal(commentBodies.filter((body) => body.includes("generation-cap")).length, 1);
+  assert.equal(commentBodies.filter((body) => body.includes("Fresh occurrences: e2")).length, 1);
+  const countAfterFirst = commentBodies.length;
+  await executeLearningMutations({ mutations: [mutation] }, deps);
+  assert.equal(commentBodies.length, countAfterFirst);
+});
+
+function learningFindingForWatcher(overrides = {}) {
+  return {
+    rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], occurrenceCount: 1,
+    confidence: "high", severity: "high", impact: "Repeated failures", actionable: true,
+    projectId: "project-1", repoEntry: "app", lenses: ["reliability"], coverage: { complete: true, gaps: [] },
+    rootCauseHypothesis: "A factory condition may recur.", desiredOutcome: "Reduce failures.",
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0 }, baseline: { value: 2, unit: "occurrences" },
+    evaluationWindow: { durationDays: 7 }, exclusions: ["Keep safety gates."], detectorId: "test", detectorVersion: "v1", ...overrides,
+  };
+}
 test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
   assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);
   assert.equal(parallelLimit({}), 2);
@@ -3670,6 +3920,14 @@ test("orderUnblockCards: keeps pipeline states downstream-first and oldest-first
   assert.deepEqual(cards.map((card) => card.identifier), [
     "SPEC", "BACKLOG", "SIGNOFF-NEW", "DEV", "QA", "SIGNOFF-OLD", "SHIP", "UNKNOWN",
   ]);
+});
+test("unblock ordering includes only capped generated Done cards after normal states", () => {
+  const cards = [
+    { identifier: "DONE-GENERATED", state: "Done", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["factory:learning-generated", "blocked:needs-user"] },
+    { identifier: "DONE-PLAIN", state: "Done", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["blocked:needs-user"] },
+    { identifier: "SPEC", state: "Spec", updatedAt: "2026-07-01T00:00:00Z", labelNames: ["blocked:needs-user"] },
+  ];
+  assert.deepEqual(orderUnblockCards(cards).map((card) => card.identifier), ["SPEC", "DONE-GENERATED"]);
 });
 test("blockingLabelsForIssue: detects only unblockable blocking labels", () => {
   assert.deepEqual(BLOCKING_LABELS, ["blocked:open-questions", "blocked:needs-user", "qa:needs-changes", "sweep:manual-only"]);

@@ -108,6 +108,7 @@ export const REQUIRED_LABELS = [
   { name: "blocked:open-questions", color: "#eb5757" },
   { name: "blocked:needs-user", color: "#eb5757" },
   { name: "sweep:manual-only", color: "#95a2b3" },
+  { name: "factory:learning-generated", color: "#5e6ad2" },
 ];
 
 // Compute a board position that slots a new state directly after `afterName`:

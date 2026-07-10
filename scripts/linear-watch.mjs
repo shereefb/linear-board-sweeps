@@ -23,6 +23,7 @@ import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
+  bottomSortOrder,
   dependencyEligibility,
   fetchIssueDependencies,
   gql,
@@ -35,6 +36,7 @@ import {
   buildLearningEvidenceSnapshot,
   aggregateLearningFindings,
   canonicalAnchorIdentity,
+  createLearningStateStore,
   emptyLearningState,
   LEARNING_STAGE,
   LEARNING_TRIGGER,
@@ -43,6 +45,8 @@ import {
   normalizeWorkspaceLearning,
   readLearningEvents,
   rankQualifiedFindings,
+  planLearningMutations,
+  renderEvidenceDelta,
   renderFindingCard,
   runLearningDetectors,
 } from "./learning.mjs";
@@ -970,6 +974,7 @@ export async function runPostDeliveryLearning({
   findings = [],
   ledger,
   dispatchFn,
+  writerFn = null,
   deterministicFn = (items, error) => ({ mode: "deterministic", findings: items, synthesisUnavailable: error?.message || null }),
 } = {}) {
   if (!registry.learning?.enabled || !registry.learning?.runner || !(dueDecisions.due || dueDecisions.anyDue)) return { mode: "idle", findings };
@@ -977,9 +982,17 @@ export async function runPostDeliveryLearning({
   const reservation = ledger?.reserve?.(demand);
   if (!reservation) return { mode: "deferred", findings };
   try {
-    return await dispatchFn({ demand, findings }, { onSpawn: (pid) => reservation.attachChildPid(pid) });
+    let synthesis;
+    try {
+      synthesis = await dispatchFn({ demand, findings }, { onSpawn: (pid) => reservation.attachChildPid(pid) });
+    } catch (error) {
+      synthesis = deterministicFn(findings, error);
+    }
+    if (!writerFn) return synthesis;
+    const writes = await writerFn({ findings, synthesis, demand });
+    return { ...synthesis, writes };
   } catch (error) {
-    return deterministicFn(findings, error);
+    throw error;
   } finally {
     reservation.release();
   }
@@ -1004,8 +1017,9 @@ export function buildLearningCyclePreview({ registry, workspaces, state, snapsho
     coreRepoEntry: registry?.learning?.coreSourceAnchor,
   };
   const findings = aggregateLearningFindings(runLearningDetectors(snapshot, detectorConfig));
+  const qualified = findings.filter((finding) => finding.actionable !== false && ["medium", "high"].includes(finding.confidence));
   const ranked = rankQualifiedFindings(findings, registry?.learning?.maxNewCardsPerRun);
-  return { due, findings, ...ranked, rendered: ranked.admitted.map((finding) => ({ rootFingerprint: finding.rootFingerprint, body: renderFindingCard(finding) })) };
+  return { due, findings, qualified, ...ranked, rendered: ranked.admitted.map((finding) => ({ rootFingerprint: finding.rootFingerprint, body: renderFindingCard(finding) })) };
 }
 
 export async function dispatchLearningAsync({ findings = [], runtimeConfig = {}, tempRoot = CACHE_DIR } = {}, {
@@ -1561,9 +1575,11 @@ export const BLOCKING_LABELS = ["blocked:open-questions", "blocked:needs-user", 
 export const UNBLOCK_STATE_ORDER = Object.freeze(["Signoff", "QA", "Dev", "Spec"]);
 
 export function orderUnblockCards(cards) {
-  const priority = new Map(UNBLOCK_STATE_ORDER.map((state, index) => [state, index]));
+  const priority = new Map([...UNBLOCK_STATE_ORDER, "Done"].map((state, index) => [state, index]));
   return (cards || [])
-    .filter((card) => priority.has(card.state))
+    .filter((card) => priority.has(card.state)
+      && (card.state !== "Done" || ((card.labelNames || card.labels || []).includes("factory:learning-generated")
+        && (card.labelNames || card.labels || []).includes("blocked:needs-user"))))
     .sort((a, b) => {
       const stateDelta = priority.get(a.state) - priority.get(b.state);
       if (stateDelta) return stateDelta;
@@ -2563,6 +2579,374 @@ function unwrapGraphQlData(result, context) {
     throw new Error(`${context} returned partial GraphQL data: ${result.errors.map((error) => error.message || String(error)).join("; ")}`);
   }
   return result?.data || result;
+}
+
+const LEARNING_PROVENANCE_LABEL = "factory:learning-generated";
+const LEARNING_MARKER_RE = /\[factory-learning root=([^\s\]]+) generation=(\d+)\]/g;
+
+function learningMarkers(text) {
+  const out = [];
+  for (const match of String(text || "").matchAll(LEARNING_MARKER_RE)) {
+    out.push({ rootFingerprint: match[1], generation: Number(match[2]) });
+  }
+  return out;
+}
+
+function learningOccurrenceIds(text) {
+  const ids = new Set();
+  const value = String(text || "");
+  for (const match of value.matchAll(/Fresh occurrences:\s*([^\n]+)/g)) {
+    for (const id of match[1].split(",").map((item) => item.trim()).filter((item) => item && item !== "none")) ids.add(id);
+  }
+  for (const match of value.matchAll(/## Occurrences\s*\n\s*\d+\s*:\s*([^\n]+)/g)) {
+    for (const id of match[1].split(",").map((item) => item.trim()).filter(Boolean)) ids.add(id);
+  }
+  return [...ids].sort();
+}
+
+export async function fetchLearningIssueComments(apiKey, issueId, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`,
+      { id: issueId, cursor },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, `learning comments for ${issueId}`);
+    const connection = data?.issue?.comments;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error(`learning comments for ${issueId} are missing data or pageInfo`);
+    }
+    comments.push(...connection.nodes);
+    if (!connection.pageInfo.hasNextPage) return comments;
+    const next = connection.pageInfo.endCursor;
+    if (!next || seenCursors.has(next)) throw new Error(`learning comments pagination incomplete for ${issueId}: cursor cycle`);
+    seenCursors.add(next);
+    cursor = next;
+  }
+}
+
+export async function learningRelationExists(apiKey, issueId, relatedIssueId, { gqlFn = gql } = {}) {
+  const seenCursors = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($id:String!,$cursor:String){ issue(id:$id){ inverseRelations(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ type issue{ id } } } } }`,
+      { id: relatedIssueId, cursor },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, `learning relation scan for ${issueId}`);
+    const connection = data?.issue?.inverseRelations;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error(`learning relation scan for ${issueId} is missing data or pageInfo`);
+    }
+    if (connection.nodes.some((relation) => relation?.type === "related" && relation?.issue?.id === issueId)) return true;
+    if (!connection.pageInfo.hasNextPage) return false;
+    const next = connection.pageInfo.endCursor;
+    if (!next || seenCursors.has(next)) throw new Error(`learning relation pagination incomplete for ${issueId}: cursor cycle`);
+    seenCursors.add(next);
+    cursor = next;
+  }
+}
+
+export async function fetchLearningIssues(apiKey, { teamKey, projectId } = {}, {
+  gqlFn = gql,
+  fetchCommentsFn = fetchLearningIssueComments,
+} = {}) {
+  if (!teamKey || !projectId) throw new Error("learning issue scan requires teamKey and projectId");
+  const nodes = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($cursor:String,$teamKey:String!,$projectId:ID!){ issues(first:100, after:$cursor, filter:{ team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$projectId } } }){ pageInfo{ hasNextPage endCursor } nodes{ id identifier title description sortOrder updatedAt state{ name } labels{ nodes{ id name } } } } }`,
+      { cursor, teamKey, projectId },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, "learning issue scan");
+    const connection = data?.issues;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("learning issue scan is missing issues data or pageInfo");
+    }
+    nodes.push(...connection.nodes);
+    if (!connection.pageInfo.hasNextPage) break;
+    const next = connection.pageInfo.endCursor;
+    if (!next || seenCursors.has(next)) throw new Error("learning issue pagination is incomplete: cursor cycle");
+    seenCursors.add(next);
+    cursor = next;
+  }
+  const issues = [];
+  for (const node of nodes) {
+    const comments = await fetchCommentsFn(apiKey, node.id, { gqlFn });
+    const text = [node.description || "", ...comments.map((comment) => comment.body || "")].join("\n");
+    const markers = learningMarkers(text);
+    if (!markers.length) continue;
+    const marker = [...markers].sort((a, b) => b.generation - a.generation || a.rootFingerprint.localeCompare(b.rootFingerprint))[0];
+    issues.push({
+      id: node.id,
+      identifier: node.identifier,
+      title: node.title,
+      description: node.description || "",
+      sortOrder: node.sortOrder,
+      updatedAt: node.updatedAt,
+      stateName: node.state?.name || null,
+      labelNames: (node.labels?.nodes || []).map((label) => label.name),
+      labelIds: Object.fromEntries((node.labels?.nodes || []).map((label) => [label.name, label.id])),
+      comments,
+      rootFingerprint: marker.rootFingerprint,
+      generation: marker.generation,
+      occurrenceIds: learningOccurrenceIds(text),
+    });
+  }
+  return issues;
+}
+
+async function fetchLearningSpecCards(apiKey, teamKey, projectId, { gqlFn = gql } = {}) {
+  const cards = [];
+  const seen = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($cursor:String,$teamKey:String!,$projectId:ID!){ issues(first:100, after:$cursor, filter:{ team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$projectId } }, state:{ name:{ eq:"Spec" } } }){ pageInfo{ hasNextPage endCursor } nodes{ id sortOrder } } }`,
+      { cursor, teamKey, projectId }, apiKey,
+    );
+    const data = unwrapGraphQlData(result, "learning Spec rank scan");
+    const connection = data?.issues;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") throw new Error("learning Spec rank scan is incomplete");
+    cards.push(...connection.nodes);
+    if (!connection.pageInfo.hasNextPage) return cards;
+    const next = connection.pageInfo.endCursor;
+    if (!next || seen.has(next)) throw new Error("learning Spec rank pagination is incomplete");
+    seen.add(next);
+    cursor = next;
+  }
+}
+
+function learningIssueMatches(issue, mutation) {
+  return issue?.rootFingerprint === mutation.rootFingerprint && Number(issue.generation || 0) === Number(mutation.generation || 0);
+}
+
+export async function executeLearningMutations(plan = {}, deps = {}) {
+  const mutations = Array.isArray(plan.mutations) ? plan.mutations : [];
+  const {
+    apiKey,
+    teamKey,
+    projectId,
+    stateStore = plan.stateStore,
+    lens = plan.lens || "reliability",
+    capturedThrough = plan.capturedThrough || new Date().toISOString(),
+  } = plan;
+  const loadLabelsFn = deps.loadLabelsFn || (() => teamLabelMap(apiKey, teamKey));
+  const loadTeamFn = deps.loadTeamFn || (() => teamMeta(apiKey, teamKey));
+  const fetchIssuesFn = deps.fetchIssuesFn || (() => fetchLearningIssues(apiKey, { teamKey, projectId }));
+  const fetchSpecCardsFn = deps.fetchSpecCardsFn || (() => fetchLearningSpecCards(apiKey, teamKey, projectId));
+  const createIssueFn = deps.createIssueFn || (async (input) => {
+    const result = await gql(`mutation($input:IssueCreateInput!){ issueCreate(input:$input){ success issue{ id identifier } } }`, { input }, apiKey);
+    if (!result?.issueCreate?.success || !result.issueCreate.issue) throw new Error("learning issueCreate failed");
+    return result.issueCreate.issue;
+  });
+  const addCommentFn = deps.addCommentFn || ((issueId, body) => addComment(apiKey, issueId, body));
+  const setLabelsFn = deps.setLabelsFn || ((issueId, labelIds) => setIssueLabels(apiKey, issueId, labelIds));
+  const createRelationFn = deps.createRelationFn || (async (issueId, relatedIssueId) => {
+    const result = await gql(`mutation($input:IssueRelationCreateInput!){ issueRelationCreate(input:$input){ success } }`, {
+      input: { issueId, relatedIssueId, type: "related" },
+    }, apiKey);
+    if (!result?.issueRelationCreate?.success) throw new Error("learning recurrence relation create failed");
+  });
+  const relationExistsFn = deps.relationExistsFn || ((issueId, relatedIssueId) => learningRelationExists(apiKey, issueId, relatedIssueId));
+
+  if (stateStore && mutations.length && !plan.walManagedExternally) {
+    stateStore.stageWindow(lens, {
+      from: plan.from || null,
+      capturedThrough,
+      mutations: mutations.map((mutation) => ({ ...mutation, finding: mutation.finding ? structuredClone(mutation.finding) : undefined })),
+    });
+  }
+  const labels = await loadLabelsFn();
+  let confirmed = 0;
+  for (const mutation of mutations) {
+    if (mutation.action === "create") {
+      const provenanceId = labels[LEARNING_PROVENANCE_LABEL];
+      if (!provenanceId) throw new Error(`required label ${LEARNING_PROVENANCE_LABEL} is missing; run setup-team`);
+      const routeId = mutation.routeLabel ? labels[mutation.routeLabel] : null;
+      if (mutation.routeLabel && !routeId) throw new Error(`required route label ${mutation.routeLabel} is missing`);
+      let live = await fetchIssuesFn();
+      let existing = live.find((issue) => learningIssueMatches(issue, mutation));
+      let created = existing;
+      if (!existing) {
+        const meta = await loadTeamFn();
+        if (!meta?.teamId || !meta?.stateIds?.Spec) throw new Error("learning create requires the exact Spec state");
+        const specCards = await fetchSpecCardsFn();
+        const sortOrder = bottomSortOrder(specCards);
+        const finding = { ...mutation.finding, generation: mutation.generation };
+        const input = {
+          teamId: meta.teamId,
+          projectId,
+          stateId: meta.stateIds.Spec,
+          title: `Factory improvement: ${String(finding.impact || "qualified factory pattern").replace(/[\u0000-\u001F\u007F]/g, " ").slice(0, 220)}`,
+          description: renderFindingCard(finding),
+          labelIds: [provenanceId, ...(routeId ? [routeId] : [])],
+          sortOrder,
+        };
+        try { created = await createIssueFn(input); }
+        catch (error) {
+          live = await fetchIssuesFn();
+          existing = live.find((issue) => learningIssueMatches(issue, mutation));
+          if (!existing) throw error;
+          created = existing;
+        }
+        live = await fetchIssuesFn();
+        existing = live.find((issue) => learningIssueMatches(issue, mutation));
+        if (!existing) throw new Error(`learning create ${mutation.mutationId} was not visible after write`);
+        const expectedLabels = [LEARNING_PROVENANCE_LABEL, ...(mutation.routeLabel ? [mutation.routeLabel] : [])];
+        if (existing.stateName !== "Spec" || expectedLabels.some((label) => !existing.labelNames?.includes(label))
+          || (Number.isFinite(input.sortOrder) && existing.sortOrder > input.sortOrder)) {
+          throw new Error(`learning create ${mutation.mutationId} failed Spec/rank/label confirmation`);
+        }
+      }
+      if (mutation.relatedIssueId && created?.id) {
+        if (!(await relationExistsFn(created.id, mutation.relatedIssueId))) {
+          try {
+            await createRelationFn(created.id, mutation.relatedIssueId);
+          } catch (error) {
+            if (!(await relationExistsFn(created.id, mutation.relatedIssueId))) throw error;
+          }
+        }
+        if (!(await relationExistsFn(created.id, mutation.relatedIssueId))) {
+          throw new Error(`learning recurrence relation ${mutation.mutationId} was not confirmed`);
+        }
+      }
+    } else if (mutation.action === "append-evidence") {
+      let live = await fetchIssuesFn();
+      const issue = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!issue) throw new Error(`learning update target missing: ${mutation.issueId}`);
+      const known = new Set(issue.occurrenceIds || []);
+      const fresh = (mutation.occurrenceIds || []).filter((id) => !known.has(id));
+      if (fresh.length) await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh));
+      live = await fetchIssuesFn();
+      const confirmedIssue = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!confirmedIssue || fresh.some((id) => !confirmedIssue.occurrenceIds?.includes(id))) throw new Error(`learning update ${mutation.mutationId} was not confirmed`);
+    } else if (mutation.action === "audit-duplicate") {
+      const live = await fetchIssuesFn();
+      const duplicate = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!duplicate) throw new Error(`learning duplicate target missing: ${mutation.issueId}`);
+      const marker = `[factory-learning duplicate root=${mutation.rootFingerprint} primary=${mutation.primaryIssueId}]`;
+      if (!(duplicate.comments || []).some((comment) => String(comment.body || "").includes(marker))) await addCommentFn(duplicate.id, marker);
+    } else if (mutation.action === "block-generation-cap") {
+      let live = await fetchIssuesFn();
+      const issue = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!issue) throw new Error(`learning generation-cap target missing: ${mutation.issueId}`);
+      const fresh = (mutation.occurrenceIds || []).filter((id) => !(issue.occurrenceIds || []).includes(id));
+      if (fresh.length) await addCommentFn(issue.id, renderEvidenceDelta({ ...mutation.finding, occurrenceIds: [] }, fresh));
+      const capMarker = `[factory-learning generation-cap root=${mutation.rootFingerprint} generation=${mutation.generation}]`;
+      if (!(issue.comments || []).some((comment) => String(comment.body || "").includes(capMarker))) await addCommentFn(issue.id, `${capMarker}\nAutomatic recurrence stopped after generation 3; human review is required.`);
+      if (!issue.labelNames?.includes("blocked:needs-user")) {
+        const blockerId = labels["blocked:needs-user"];
+        if (!blockerId) throw new Error("required label blocked:needs-user is missing");
+        await setLabelsFn(issue.id, [...Object.values(issue.labelIds || {}), blockerId]);
+      }
+      live = await fetchIssuesFn();
+      const confirmedIssue = live.find((candidate) => candidate.id === mutation.issueId);
+      if (!confirmedIssue?.labelNames?.includes("blocked:needs-user")) throw new Error(`learning generation cap ${mutation.mutationId} was not confirmed`);
+    } else {
+      throw new Error(`unknown learning mutation action: ${mutation.action}`);
+    }
+    stateStore?.confirmMutation?.(lens, mutation.mutationId);
+    confirmed += 1;
+  }
+  const committed = plan.walManagedExternally ? false : (stateStore?.commitLens?.(lens) ?? true);
+  return { confirmed, committed };
+}
+
+function openLearningStateStore(statePath = LEARNING_STATE_PATH) {
+  return createLearningStateStore({
+    statePath,
+    readJsonFn: (target) => fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : null,
+    writeJsonFn: atomicWriteJson,
+  });
+}
+
+export async function executeLearningCycleWrites({
+  findings = [],
+  workspaces = [],
+  registry = {},
+  stateStore = null,
+  capturedThrough = new Date().toISOString(),
+  from = null,
+} = {}, deps = {}) {
+  const destinations = new Map();
+  const deferred = [];
+  for (const finding of findings) {
+    const candidates = workspaces.filter((workspace) => workspace.config?.projectId === finding.projectId);
+    const sourceScoped = candidates.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
+    const destination = (sourceScoped.length ? sourceScoped : candidates)
+      .sort((a, b) => a.sourceAnchorPath.localeCompare(b.sourceAnchorPath))[0];
+    if (!destination?.apiKey) {
+      deferred.push({ finding, reason: destination ? "destination-credential-missing" : "destination-workspace-missing" });
+      continue;
+    }
+    const key = `${destination.sourceAnchorPath}\0${finding.projectId}`;
+    if (!destinations.has(key)) destinations.set(key, { destination, findings: [] });
+    destinations.get(key).findings.push(finding);
+  }
+
+  const prepared = [];
+  let remainingCreates = Math.min(6, Math.max(0, Math.floor(Number(registry.learning?.maxNewCardsPerRun ?? 6)) || 0));
+  for (const { destination, findings: destinationFindings } of [...destinations.values()].sort((a, b) => a.destination.sourceAnchorPath.localeCompare(b.destination.sourceAnchorPath))) {
+    const fetchIssuesFn = deps.fetchIssuesFn
+      ? () => deps.fetchIssuesFn(destination)
+      : () => fetchLearningIssues(destination.apiKey, { teamKey: destination.config.teamKey, projectId: destination.config.projectId });
+    const liveIssues = await fetchIssuesFn();
+    const planned = planLearningMutations(destinationFindings, liveIssues, {
+      ...destination.config,
+      maxNewCardsPerRun: remainingCreates,
+    });
+    remainingCreates -= planned.mutations.filter((mutation) => mutation.action === "create").length;
+    deferred.push(...planned.deferred);
+    prepared.push({ destination, mutations: planned.mutations, fetchIssuesFn });
+  }
+  const mutations = prepared.flatMap((entry) => entry.mutations);
+  const store = stateStore || openLearningStateStore();
+  const byLens = new Map();
+  for (const mutation of mutations) {
+    const lens = mutation.finding?.lenses?.[0] || "reliability";
+    mutation.lens = lens;
+    if (!byLens.has(lens)) byLens.set(lens, []);
+    byLens.get(lens).push(mutation);
+  }
+  for (const [lens, lensMutations] of byLens) {
+    store.stageWindow(lens, { from, capturedThrough, mutations: lensMutations });
+  }
+  let confirmed = 0;
+  for (const entry of prepared) {
+    for (const [lens, lensMutations] of [...byLens]) {
+      const destinationIds = new Set(entry.mutations.map((mutation) => mutation.mutationId));
+      const selected = lensMutations.filter((mutation) => destinationIds.has(mutation.mutationId));
+      if (!selected.length) continue;
+      const destination = entry.destination;
+      const result = await executeLearningMutations({
+        mutations: selected,
+        lens,
+        capturedThrough,
+        from,
+        stateStore: store,
+        walManagedExternally: true,
+        apiKey: destination.apiKey,
+        teamKey: destination.config.teamKey,
+        projectId: destination.config.projectId,
+      }, {
+        ...deps,
+        fetchIssuesFn: entry.fetchIssuesFn,
+      });
+      confirmed += result.confirmed;
+    }
+  }
+  for (const lens of byLens.keys()) {
+    if (!store.commitLens(lens)) throw new Error(`learning WAL for ${lens} did not fully confirm`);
+  }
+  return { mutations: mutations.length, confirmed, deferred };
 }
 
 function normalizeCardFields(node) {
@@ -4929,9 +5313,15 @@ async function tick({ dryRun = false } = {}) {
         const learningResult = await runPostDeliveryLearning({
           registry: reg,
           dueDecisions: preview.due,
-          findings: preview.admitted,
+          findings: preview.qualified,
           ledger: capacityLedger,
           dispatchFn: (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: reg.learning?.runtime || {} }, { onSpawn }),
+          writerFn: ({ findings }) => executeLearningCycleWrites({
+            findings,
+            workspaces: learningResolved.workspaces,
+            registry: reg,
+            capturedThrough: learningNow,
+          }),
         });
         log(`learning ${learningResult.mode}`);
       }
@@ -5181,9 +5571,15 @@ async function cmdLearningRun(args = []) {
   const result = await runPostDeliveryLearning({
     registry,
     dueDecisions: preview.due,
-    findings: preview.admitted,
+    findings: preview.qualified,
     ledger,
     dispatchFn: (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: registry.learning?.runtime || {} }, { onSpawn }),
+    writerFn: ({ findings }) => executeLearningCycleWrites({
+      findings,
+      workspaces: resolved.workspaces,
+      registry,
+      capturedThrough: now,
+    }),
   });
   console.log(JSON.stringify({ ...result, due: preview.due }, null, 2));
 }

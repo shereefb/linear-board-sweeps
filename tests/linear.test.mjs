@@ -15,6 +15,10 @@ import {
   repoRouteEligibility, fetchIssueLabels,
 } from "../scripts/linear.mjs";
 
+test("required setup taxonomy includes the exact learning provenance label", () => {
+  assert.equal(REQUIRED_LABELS.filter((label) => label.name === "factory:learning-generated").length, 1);
+});
+
 test("dependency eligibility releases only exact Done blockers", () => {
   assert.equal(WORKFLOW_STATES.done, "Done");
   const connection = {
