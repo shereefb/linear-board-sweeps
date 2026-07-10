@@ -2608,12 +2608,17 @@ async function executeReap(apiKey, card, decision, labelMap, sweep) {
   }
 }
 
-export function dirtyCheckoutEvent(pick, checkout, { gitFn = git } = {}) {
+export function dirtyCheckoutEvent(pick, checkout, { gitFn = git, existsFn = fs.existsSync } = {}) {
   if (!checkout?.path) return null;
   const status = gitFn(checkout.path, ["status", "--porcelain", "-uall"], { allowFail: true });
   const scope = `${pick.sweep}:dispatch`;
   const stableTarget = `${checkout.role}:${checkout.path}`;
   if (status.status !== 0) {
+    // A per-card worktree is disposable. Successful sweeps normally remove it
+    // before the parent considers a same-repo refill, and a brand-new card has
+    // no worktree yet. In both cases absence is the clean state; managed anchors,
+    // sibling repos, and the kit must still exist and pass `git status`.
+    if (checkout.role === "worktree" && !existsFn(checkout.path) && /no such file or directory/i.test(status.err || "")) return null;
     return {
       scope,
       kind: "checkout-status",
