@@ -32,14 +32,18 @@ scheduled launcher behavior for ordinary cards.
 2. The skill creates the configured-project issue in `Spec` with
    `sweep:manual-only`, unless the invocation explicitly resumes an existing
    card.
-3. It performs the normal interactive brainstorming needed to produce the
-   Spec design and plan. Where `plan-eng-review` is required, it uses the
-   existing prose fallback and automatically records the recommended decision.
-4. After the Spec is approved, it asks once whether to fast-track shipping.
+3. It invokes the canonical Spec skill through an interactive direct handoff.
+   Spec alone performs brainstorming, its required prose reviews, and lands the
+   committed design and plan.
+4. Only after that successful Spec handoff does it ask once whether to
+   fast-track shipping.
 5. A `yes` adds `manual-sweep:fast-track-requested` and posts one immutable
    approval marker: `[manual-sweep-ship-approval <issue-id> <spec-path>
    <spec-commit> <nonce>]`. The marker must be human-authored, postdate the
-   final approved spec, and be unique for the issue. Missing, malformed,
+   final approved spec, and be unique for the issue. The comment query must
+   return `createdAt` and author identity; only the interactive requesting user
+   is trusted. A later `[manual-sweep-ship-revoked <approval-nonce>]` comment
+   by that user revokes the marker. Missing, malformed,
    agent-authored, stale, superseded, or revoked markers fail closed. A `no`
    leaves the card in the normal manual-only flow.
 6. For a confirmed request, the orchestrator invokes the canonical sweeps in
@@ -59,10 +63,12 @@ expected source state, an opaque handoff ID, and deterministic worktree/log
 paths. Before its first mutation it performs the scheduled single-card
 dependency and repository-routing preflights, verifies the expected state and
 absence of a live foreign claim, and writes a stage-specific handoff marker.
-Only that named invocation may ignore `sweep:manual-only`; scheduled selection
-continues to reject it. Resume reads the marker and authoritative post-state
-before continuing, so it cannot repeat a completed stage or make a parallel
-claim.
+Only that named invocation may ignore `sweep:manual-only`; it claims only that
+stage's claim label, writes an owner heartbeat, and releases only its owned
+claim on every terminal path. It must never drain another card. Scheduled
+selection continues to reject it. Resume reads the marker and authoritative
+post-state before continuing, so it cannot repeat a completed stage or make a
+parallel claim.
 
 The required state is intentionally explicit:
 

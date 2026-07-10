@@ -4,7 +4,7 @@
 
 **Goal:** Add `/manual-sweep`, a human-invoked, resumable orchestration skill that can create a card and, after recorded human fast-track approval, pass it through the existing sweeps without enrolling it in scheduled automation.
 
-**Architecture:** The new skill owns creation, interactive brainstorming, approval evidence, and stage invocation. It uses a named direct-handoff contract so canonical sweeps can process one manual-only card without removing the exclusion that protects scheduled selection. Dev preserves its existing fast-path proof obligations; only size and allowed-label limits can be overridden for a requested manual fast track.
+**Architecture:** The new skill owns creation, approval evidence, and stage invocation; canonical Spec owns the interactive brainstorming and lands the artifact before approval is requested. A named direct-handoff contract lets canonical sweeps process one manual-only card without removing the scheduled exclusion. Each direct stage claims only its own card, heartbeats, and releases only its own claim. Dev preserves its existing fast-path proof obligations; only size and allowed-label limits can be overridden for a requested manual fast track.
 
 **Tech stack:** Markdown skills, Node.js 18+ and `node:test`, existing Linear commands and issue/comment APIs.
 
@@ -29,7 +29,7 @@
 
 ## Direct-handoff contract
 
-`manual-sweep` invokes a named canonical stage with `MANUAL_SWEEP_ISSUE`, `MANUAL_SWEEP_STAGE`, `MANUAL_SWEEP_EXPECTED_STATE`, `MANUAL_SWEEP_HANDOFF_ID`, and (for Ship) `MANUAL_SWEEP_APPROVAL_MARKER`. The stage checks those fields, its required repository/dependency preflights, and card state before writing `[manual-sweep-handoff <stage> <id>]`. It re-reads before terminal movement. Normal scheduled runs never honor this contract.
+`manual-sweep` creates/resumes then invokes direct Spec. After Spec commits its artifact, it asks for fast-track and writes a marker bound to the actual path and commit. Each named stage receives `MANUAL_SWEEP_ISSUE`, `MANUAL_SWEEP_STAGE`, `MANUAL_SWEEP_EXPECTED_STATE`, `MANUAL_SWEEP_HANDOFF_ID`, and (for Ship) `MANUAL_SWEEP_APPROVAL_MARKER`. The stage checks those fields, route/dependency/card state, and absence of every foreign claim before writing `[manual-sweep-handoff <stage> <id>]`; it claims only its own card, heartbeats, and releases only its claim. Approval validation queries `createdAt` and author identity, trusts only the requesting user, and rejects a later `[manual-sweep-ship-revoked <nonce>]` marker. Normal scheduled runs never honor this contract.
 
 ### Task 1: Create and propagate the manual skill
 
