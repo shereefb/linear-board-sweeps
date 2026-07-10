@@ -2,6 +2,12 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.2] - 2026-07-10
+
+### Fixed
+
+- Allow independently actionable Spec, Dev, and QA stages from one registered workspace to use the configured non-Ship batch together, while preserving exclusive Ship dispatch and repository-overlap protection between different registered workspaces.
+
 ## [1.2.0.1] - 2026-07-10
 
 ### Fixed

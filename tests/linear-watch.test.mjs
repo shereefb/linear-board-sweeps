@@ -2787,14 +2787,56 @@ test("selectDispatchBatch: a serial candidate runs alone or waits for another ti
   ], { maxNonShipDispatches: 2 });
   assert.deepEqual(serialSecond.map((c) => c.anchorPath), ["/ws/default-a", "/ws/default-b"]);
 });
-test("selectDispatchBatch: dedupes same anchor and overlapping resolved repos", () => {
+test("selectDispatchBatch: dispatches distinct stages from the same anchor", () => {
   const batch = selectDispatchBatch([
-    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
-    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
-    { anchorPath: "/ws/b", config: { repos: ["/ws/a"] }, sweep: "spec", count: 1, oldestUpdatedAt: 2 },
-    { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "spec", count: 1, oldestUpdatedAt: 3 },
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
   ], { maxNonShipDispatches: 3 });
-  assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
+  assert.deepEqual(batch.map((c) => `${c.anchorPath}:${c.sweep}`), [
+    "/ws/a:qa",
+    "/ws/a:dev",
+    "/ws/a:spec",
+  ]);
+});
+test("selectDispatchBatch: caps distinct stages from the same anchor", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "spec", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "dev", count: 1, oldestUpdatedAt: 1 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((c) => c.sweep), ["qa", "dev"]);
+});
+test("selectDispatchBatch: overlapping resolved repos remain exclusive across anchors", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/ws/a", managedRepoPaths: ["/managed/shared"], config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1 },
+    { anchorPath: "/ws/a", managedRepoPaths: ["/managed/shared"], config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "dev", count: 1 },
+    { anchorPath: "/ws/b", managedRepoPaths: ["/managed/shared"], config: { repos: ["b"], parallel: { maxNonShipDispatches: 4 } }, sweep: "spec", count: 1 },
+    { anchorPath: "/ws/c", managedRepoPaths: ["/managed/other"], config: { repos: ["c"], parallel: { maxNonShipDispatches: 4 } }, sweep: "spec", count: 1 },
+  ], { maxNonShipDispatches: 4 });
+  assert.deepEqual(batch.map((c) => `${c.anchorPath}:${c.sweep}`), [
+    "/ws/a:qa",
+    "/ws/a:dev",
+    "/ws/c:spec",
+  ]);
+});
+test("selectDispatchBatch: registered source anchors remain exclusive when managed anchors collide", () => {
+  const batch = selectDispatchBatch([
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/shared", managedRepoPaths: ["/managed/shared"], config: { parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1 },
+    { sourceAnchorPath: "/registered/b", anchorPath: "/managed/shared", managedRepoPaths: ["/managed/shared"], config: { parallel: { maxNonShipDispatches: 4 } }, sweep: "dev", count: 1 },
+  ], { maxNonShipDispatches: 4 });
+  assert.deepEqual(batch.map((c) => `${c.sourceAnchorPath}:${c.sweep}`), ["/registered/a:qa"]);
+});
+test("selectDispatchBatch: duplicate workspace stages consume one batch slot", () => {
+  const batch = selectDispatchBatch([
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1 },
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/a", config: { repos: ["a"], parallel: { maxNonShipDispatches: 4 } }, sweep: "qa", count: 1 },
+    { sourceAnchorPath: "/registered/b", anchorPath: "/managed/b", config: { repos: ["b"], parallel: { maxNonShipDispatches: 4 } }, sweep: "spec", count: 1 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((c) => `${c.sourceAnchorPath}:${c.sweep}`), [
+    "/registered/a:qa",
+    "/registered/b:spec",
+  ]);
 });
 test("selectDispatchBatch: dedupes nested repo path overlap", () => {
   const batch = selectDispatchBatch([

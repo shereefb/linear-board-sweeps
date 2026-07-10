@@ -1191,19 +1191,26 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT
   let limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
   const rotated = rotateNonShipCandidates(ranked.filter((candidate) => candidate.sweep !== "ship"), rotationSeed);
   const picked = [];
-  const usedAnchors = new Set();
-  const usedRepos = new Set();
+  const pickedRepoSets = [];
+  const pickedWorkspaceKeys = [];
+  const seenWorkspaceStages = new Set();
   for (const c of rotated) {
     if (picked.length >= limit) break;
+    const workspaceKey = path.resolve(c.sourceAnchorPath || c.anchorPath);
+    const workspaceStageKey = `${workspaceKey}\0${c.sweep}`;
+    if (seenWorkspaceStages.has(workspaceStageKey)) continue;
+    seenWorkspaceStages.add(workspaceStageKey);
     const candidateLimit = parallelLimit(c.config);
     if (picked.length + 1 > Math.min(limit, candidateLimit)) continue;
-    if (usedAnchors.has(c.anchorPath)) continue;
     const repos = repoSet(c);
-    if (overlapsAny(repos, usedRepos)) continue;
+    const conflictsWithAnotherWorkspace = picked.some((_selected, index) => (
+      pickedWorkspaceKeys[index] !== workspaceKey && overlapsAny(repos, pickedRepoSets[index])
+    ));
+    if (conflictsWithAnotherWorkspace) continue;
     picked.push(c);
+    pickedRepoSets.push(repos);
+    pickedWorkspaceKeys.push(workspaceKey);
     limit = Math.min(limit, candidateLimit);
-    usedAnchors.add(c.anchorPath);
-    for (const repo of repos) usedRepos.add(repo);
   }
   return picked;
 }
