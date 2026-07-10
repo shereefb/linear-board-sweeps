@@ -32,7 +32,7 @@ import {
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
-  fetchScheduledPassCards, fetchScheduledQueueCards,
+  fetchScheduledPassCards, fetchScheduledQueueCards, completeRecentIssueComments,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
   OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS, MAX_DEPENDENCY_DEFERRED_ISSUES,
@@ -2736,6 +2736,25 @@ test("claimConfirmed rejects cards with absent relation metadata", () => {
 });
 
 // ── dependency-aware queue snapshots ────────────────────────────────────────
+test("coordination comments complete the active window and fail closed on a cursor cycle", async () => {
+  const cutoff = NOW - MAX_STALE_MIN * 60_000;
+  const seed = {
+    pageInfo: { hasPreviousPage: true, startCursor: "page-1" },
+    nodes: [{ id: "new", body: "new", createdAt: minsAgo(1) }],
+  };
+  const calls = [];
+  const comments = await completeRecentIssueComments("key", "issue-1", seed, cutoff, {
+    gqlFn: async (_query, variables) => {
+      calls.push(variables.cursor);
+      return { issue: { comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [{ id: "retry", body: "retry", createdAt: minsAgo(120) }] } } };
+    },
+  });
+  assert.deepEqual(calls, ["page-1"]);
+  assert.deepEqual(comments.map((comment) => comment.id), ["new", "retry"]);
+  await assert.rejects(completeRecentIssueComments("key", "issue-1", seed, cutoff, {
+    gqlFn: async () => ({ issue: { comments: { pageInfo: { hasPreviousPage: true, startCursor: "page-1" }, nodes: [{ id: "older", body: "old", createdAt: minsAgo(1) }] } } }),
+  }), /cursor cycle/);
+});
 test("queue snapshot requests all scheduled states once and partitions dependency-normalized cards", async () => {
   const states = SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states);
   const calls = [];
@@ -2747,12 +2766,12 @@ test("queue snapshot requests all scheduled states once and partitions dependenc
         nodes: [
           {
             id: "spec-id", identifier: "COD-1", updatedAt: minsAgo(1), sortOrder: 20,
-            state: { name: "Spec" }, labels: { nodes: [] }, comments: { nodes: [] },
+            state: { name: "Spec" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
             inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
           },
           {
             id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-            state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+            state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
             inverseRelations: {
               pageInfo: { hasNextPage: false, endCursor: null },
               nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
@@ -2777,7 +2796,7 @@ test("queue snapshot requests all scheduled states once and partitions dependenc
 test("queue snapshot annotates a visible cycle and produces one deduplicated failure event for Todo and doctor", async () => {
   const node = (id, identifier, state, blockerId, blockerIdentifier, blockerState) => ({
     id, identifier, updatedAt: minsAgo(1), sortOrder: 10,
-    state: { name: state }, labels: { nodes: [] }, comments: { nodes: [] },
+    state: { name: state }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
     inverseRelations: {
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{ id: `rel-${id}`, type: "blocks", issue: { id: blockerId, identifier: blockerIdentifier, state: { id: `${blockerId}-state`, name: blockerState, type: "started" } } }],
@@ -2826,7 +2845,7 @@ test("queue snapshot completes relation overflow before the card becomes eligibl
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{
         id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
         inverseRelations: {
           pageInfo: { hasNextPage: true, endCursor: "relations-1" },
           nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
@@ -2854,7 +2873,7 @@ test("queue snapshot rejects relation overflow that cannot be completed", async 
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{
         id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
         inverseRelations: { pageInfo: { hasNextPage: true, endCursor: "relations-1" }, nodes: [] },
       }],
     },
@@ -2876,7 +2895,7 @@ test("partial GraphQL queue snapshot fails closed before selecting returned card
         pageInfo: { hasNextPage: false, endCursor: null },
         nodes: [{
           id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-          state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+          state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
           inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
         }],
       },

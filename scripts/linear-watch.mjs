@@ -3704,6 +3704,46 @@ export function dependencyReadFailureEvents(error, { anchorPath, projectId, seen
   }];
 }
 
+// Admission needs the complete coordination window, while cleanup only needs a
+// recent snapshot. Work backwards from Linear's newest-100 page, stopping as
+// soon as the oldest valid comment covers the largest claim window.
+export async function completeRecentIssueComments(apiKey, issueId, seedConnection, cutoff, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seenCursors = new Set();
+  let connection = seedConnection;
+  let pages = 0;
+  const covered = () => comments.some((comment) => {
+    const timestamp = Date.parse(comment.createdAt);
+    return !Number.isNaN(timestamp) && timestamp <= cutoff;
+  });
+  while (true) {
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasPreviousPage !== "boolean") {
+      throw new Error(`coordination comments for ${issueId} are missing data or pageInfo`);
+    }
+    comments.push(...connection.nodes);
+    pages += 1;
+    if (covered() || !connection.pageInfo.hasPreviousPage) {
+      const byId = new Map();
+      for (const comment of comments) {
+        const timestamp = Date.parse(comment.createdAt);
+        if (!Number.isNaN(timestamp) && timestamp >= cutoff && !byId.has(comment.id)) byId.set(comment.id, comment);
+      }
+      return [...byId.values()];
+    }
+    if (pages >= 20 || comments.length >= 2000) throw new Error(`coordination comments for ${issueId} reached the active-window cap before cutoff`);
+    const cursor = connection.pageInfo.startCursor;
+    if (!cursor || seenCursors.has(cursor)) throw new Error(`coordination comments for ${issueId} pagination cursor cycle or incomplete page`);
+    seenCursors.add(cursor);
+    const result = await gqlFn(
+      `query($id:String!,$cursor:String!){ issue(id:$id){ comments(last:100, before:$cursor){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } } } }`,
+      { id: issueId, cursor },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, `coordination comments for ${issueId}`);
+    connection = data?.issue?.comments;
+  }
+}
+
 export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, states, {
   gqlFn = gql,
   fetchIssueDependenciesFn = fetchIssueDependencies,
@@ -3720,7 +3760,7 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
          nodes{ id identifier updatedAt sortOrder
            state{ name }
            labels{ nodes{ id name } }
-           comments(last:100){ nodes{ body createdAt } }
+           comments(last:100){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } }
            inverseRelations(first:50){
              pageInfo{ hasNextPage endCursor }
              nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3734,6 +3774,10 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
       throw new Error("scheduled queue snapshot is missing issues data or pageInfo");
     }
     for (const node of connection.nodes) {
+      node.comments = {
+        ...node.comments,
+        nodes: await completeRecentIssueComments(apiKey, node.id, node.comments, Date.now() - MAX_STALE_MIN * 60_000, { gqlFn }),
+      };
       const card = await normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesFn });
       if (!byState.has(card.stateName)) byState.set(card.stateName, []);
       byState.get(card.stateName).push(card);
@@ -3825,7 +3869,7 @@ async function fetchCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } }
+       comments(last:100){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } }
        inverseRelations(first:50){
          pageInfo{ hasNextPage endCursor }
          nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3835,6 +3879,10 @@ async function fetchCard(apiKey, issueId) {
   );
   const n = d.issue;
   if (!n) throw new Error(`issue not found: ${issueId}`);
+  n.comments = {
+    ...n.comments,
+    nodes: await completeRecentIssueComments(apiKey, n.id, n.comments, Date.now() - MAX_STALE_MIN * 60_000, { gqlFn: gql }),
+  };
   return normalizeQueueCard(n, apiKey, { gqlFn: gql, fetchIssueDependenciesFn: fetchIssueDependencies });
 }
 
