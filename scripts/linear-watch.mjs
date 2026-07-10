@@ -41,6 +41,7 @@ const REGISTRY_PATH = path.join(CONFIG_DIR, "registry.json");
 const STATE_DIR = path.join(HOME, ".local", "state", "linear-board-sweeps");
 const CACHE_DIR = path.join(HOME, ".cache", "linear-board-sweeps");
 const TICK_LOCK = path.join(STATE_DIR, "tick.lock");
+const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 
 export const INTERVAL_S = 600;
@@ -298,6 +299,65 @@ export function runtimeConfigForSweep(config = {}, sweep) {
     model: modelCfg.model,
     effort: modelCfg.effort,
   };
+}
+
+function whichRuntime(runtime, env) {
+  const result = spawnSync("/usr/bin/which", [runtime], { env, encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+export function resolveRuntimeExecutable(runtime, env = process.env, {
+  existsFn = fs.existsSync,
+  whichFn = whichRuntime,
+} = {}) {
+  const name = runtime || "codex";
+  const override = env?.[`${name.toUpperCase()}_BIN`];
+  if (override) {
+    const candidate = path.resolve(override);
+    if (existsFn(candidate)) return { ok: true, runtime: name, path: candidate, source: "override" };
+  }
+
+  const fromPath = whichFn(name, env || {});
+  if (fromPath) return { ok: true, runtime: name, path: path.resolve(fromPath), source: "path" };
+
+  if (name === "codex") {
+    for (const candidate of [
+      "/Applications/ChatGPT.app/Contents/Resources/codex",
+      "/Applications/Codex.app/Contents/Resources/codex",
+    ]) {
+      if (existsFn(candidate)) return { ok: true, runtime: name, path: candidate, source: "application" };
+    }
+  }
+
+  return { ok: false, runtime: name, code: "ENOENT", path: null, source: null };
+}
+
+function runtimeLaneKey(anchorPath, runtime, host) {
+  return `${path.resolve(anchorPath || ".")}\0${runtime}\0${host}`;
+}
+
+export function preflightRuntimeCandidates(candidates, {
+  host = os.hostname(),
+  cache = new Map(),
+  envForCandidate = () => process.env,
+  resolveFn = resolveRuntimeExecutable,
+} = {}) {
+  const ready = [];
+  const failures = [];
+  for (const pick of candidates || []) {
+    const runtime = runtimeConfigForSweep(pick.config || {}, pick.sweep).runtime || "codex";
+    const key = runtimeLaneKey(pick.anchorPath, runtime, host);
+    let resolution = cache.get(key);
+    if (!resolution) {
+      resolution = resolveFn(runtime, envForCandidate(pick));
+      cache.set(key, resolution);
+    }
+    const scope = `runtime:${runtime}:${host}`;
+    const stableTarget = JSON.stringify({ anchorPath: pick.anchorPath, runtime, host });
+    if (resolution.ok) ready.push({ ...pick, runtimeExecutable: resolution.path, runtimeLaneKey: key });
+    else failures.push({ pick, runtime, host, key, scope, stableTarget, resolution });
+  }
+  return { ready, failures, cache };
 }
 
 export function runtimeSummary({ runtime, model, effort } = {}) {
@@ -1056,7 +1116,15 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
   return decisions;
 }
 
-export function healthStatus({ lastTick, lockPid = null, isAlive = isAlivePid, now = Date.now(), intervalS = INTERVAL_S } = {}) {
+export function healthStatus({ currentTick = null, lastTick, lockPid = null, isAlive = isAlivePid, now = Date.now(), intervalS = INTERVAL_S } = {}) {
+  if (currentTick?.status === "running") {
+    if (!currentTick.pid || !isAlive(currentTick.pid)) {
+      return { ok: false, reason: `STALE current tick: dead pid ${currentTick.pid || "unknown"}` };
+    }
+    const failures = Array.isArray(currentTick.failures) ? currentTick.failures : [];
+    if (failures.length) return { ok: false, reason: `current tick has ${failures.length} systemic failure(s) (pid ${currentTick.pid})` };
+    return { ok: true, reason: `tick in progress (pid ${currentTick.pid})` };
+  }
   if (lockPid && isAlive(lockPid)) return { ok: true, reason: `tick in progress (pid ${lockPid})` };
   if (!lastTick) return { ok: false, reason: "no successful tick recorded" };
   if (Array.isArray(lastTick.failures) && lastTick.failures.length) return { ok: false, reason: `latest tick had ${lastTick.failures.length} local failure(s)` };
@@ -1064,6 +1132,30 @@ export function healthStatus({ lastTick, lockPid = null, isAlive = isAlivePid, n
   if (!Number.isFinite(ageS)) return { ok: false, reason: "last tick timestamp unreadable" };
   if (ageS > 3 * intervalS) return { ok: false, reason: `STALE: > 3× interval (${3 * intervalS}s)`, ageS };
   return { ok: true, reason: `last tick ${lastTick.at} (${Math.round(ageS)}s ago)`, ageS };
+}
+
+export function atomicWriteJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`);
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(value) + "\n");
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try { fs.rmSync(tempPath, { force: true }); } catch { /* ignore cleanup failure */ }
+    throw error;
+  }
+}
+
+export function finalizeTickState(state, {
+  currentPath = CURRENT_TICK,
+  lastTickPath = LAST_TICK,
+  now = () => new Date().toISOString(),
+} = {}) {
+  const endedAt = now();
+  const completed = { ...state, status: "complete", at: endedAt, endedAt };
+  atomicWriteJson(currentPath, completed);
+  atomicWriteJson(lastTickPath, completed);
+  return completed;
 }
 
 // ── IO: filesystem / registry ────────────────────────────────────────────────
@@ -1729,6 +1821,10 @@ export function doctorReport({
   existsFn = fs.existsSync,
   gitFn = git,
   registryPath = REGISTRY_PATH,
+  currentTick = null,
+  lastTick = null,
+  isAlive = isAlivePid,
+  now = Date.now(),
 } = {}) {
   const reg = normalizeRegistry(registry);
   const kitDirty = reg.kitPath && existsFn(reg.kitPath)
@@ -1749,6 +1845,10 @@ export function doctorReport({
     },
     anchors: [],
   };
+  if (currentTick || lastTick) {
+    report.tick = healthStatus({ currentTick, lastTick, isAlive, now });
+    if (!report.tick.ok) report.ok = false;
+  }
 
   for (const sourceAnchorPath of reg.repos || []) {
     const record = workspaceRecordForSourceAnchor(sourceAnchorPath, reg);
@@ -1788,6 +1888,7 @@ export function formatDoctorReport(report) {
     `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
     `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
   ];
+  if (report.tick) lines.push(`tick: ${report.tick.reason}`);
   if (report.kit.dirty) lines.push(`  kit dirty: ${report.kit.dirty.message.replace(/\n/g, "\n  ")}`);
   for (const anchor of report.anchors) {
     lines.push("");
@@ -1930,6 +2031,8 @@ export async function expandDispatchBatch(batch, {
         ownerToken: slot.ownerToken,
         parentRunId,
         triggeredBy: pick.triggeredBy,
+        runtimeExecutable: pick.runtimeExecutable,
+        runtimeLaneKey: pick.runtimeLaneKey,
       }, parentRunId, childIndexAllocator.next()));
     }
   }
@@ -2033,6 +2136,8 @@ export async function buildSameRepoRefillDispatches({
     cards: actionable,
     slotLimit: availableSlots,
     triggeredBy: { issue: result.issueIdentifier, sweep, kind: "same-repo-refill" },
+    runtimeExecutable: pick.runtimeExecutable,
+    runtimeLaneKey: pick.runtimeLaneKey,
   }];
   const dispatches = await expandDispatchBatch(batch, {
     dryRun: false,
@@ -2152,7 +2257,30 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
 
-function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, exitCode, startedAt, endedAt }) {
+export function classifyDispatchOutcome(event = {}) {
+  const base = {
+    code: null,
+    exitCode: event.exitCode ?? null,
+    signal: event.signal ?? null,
+    path: event.path ?? null,
+    cwd: event.cwd ?? null,
+  };
+  if (event.type === "interruption") return { kind: "interrupted", ...base, code: "INTERRUPTED" };
+  if (event.type === "error") {
+    const code = event.error?.code || event.code || "SPAWN_ERROR";
+    if (code === "ENOENT") return { kind: event.cwdExists === false ? "cwd-enoent" : "executable-enoent", ...base, code };
+    return { kind: "spawn-error", ...base, code };
+  }
+  if (base.signal) return { kind: "signal", ...base };
+  if (base.exitCode === 0) return { kind: "success", ...base };
+  return { kind: "exit", ...base };
+}
+
+export function runtimeDisabledByOutcome(outcome) {
+  return outcome?.kind === "executable-enoent";
+}
+
+function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
   if (!pick.issueIdentifier || !pick.logDir) return;
   const record = {
     parentRunId: pick.parentRunId,
@@ -2168,7 +2296,8 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, exitCode, started
     model: runtimeCfg.model,
     effort: runtimeCfg.effort,
     triggeredBy: pick.triggeredBy,
-    exitCode,
+    outcome,
+    exitCode: outcome?.exitCode ?? null,
     startedAt,
     endedAt,
   };
@@ -2177,10 +2306,20 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, exitCode, started
   fs.appendFileSync(f, JSON.stringify(record) + "\n");
 }
 
+function dispatchEnvironment(anchorPath, pick = {}) {
+  const envFile = path.join(anchorPath, ".env");
+  return {
+    ...process.env,
+    ...parseEnv(fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : ""),
+    ...(pick.childEnv || {}),
+  };
+}
+
 function dispatch(anchorPath, sweep, config, pick = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : ""), ...(pick.childEnv || {}) };
+  const executable = pick.runtimeExecutable || cmd;
+  const env = dispatchEnvironment(anchorPath, pick);
   const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
   if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
@@ -2189,23 +2328,23 @@ function dispatch(anchorPath, sweep, config, pick = {}) {
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
   const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
-  const r = spawnSync(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
+  const r = spawnSync(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
   fs.closeSync(fd);
-  // A missing runtime binary (ENOENT) sets r.error and leaves r.status null — that
-  // is NOT a successful no-op. Surface it loudly so `health` / logs show the launcher
-  // is dispatching nothing rather than silently "succeeding".
-  const status = r.error ? 127 : r.status;
-  if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${r.error.message}`);
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (exit ${status})`);
-  writeRunRecord({ pick, runtimeCfg, logFile, exitCode: status, startedAt, endedAt: new Date().toISOString() });
-  return status;
+  const outcome = r.error
+    ? classifyDispatchOutcome({ type: "error", error: r.error, path: executable, cwd, cwdExists: fs.existsSync(cwd) })
+    : classifyDispatchOutcome({ type: "close", exitCode: r.status, signal: r.signal, path: executable, cwd });
+  if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${r.error.message}`);
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
+  writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
+  return outcome;
 }
 
 function dispatchAsync(anchorPath, sweep, config, pick = {}) {
   const runtimeCfg = runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const env = { ...process.env, ...parseEnv(fs.existsSync(path.join(anchorPath, ".env")) ? fs.readFileSync(path.join(anchorPath, ".env"), "utf8") : ""), ...(pick.childEnv || {}) };
+  const executable = pick.runtimeExecutable || cmd;
+  const env = dispatchEnvironment(anchorPath, pick);
   const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
   fs.mkdirSync(dir, { recursive: true });
   if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
@@ -2214,38 +2353,39 @@ function dispatchAsync(anchorPath, sweep, config, pick = {}) {
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
   const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${cmd} ${args.slice(0, 3).join(" ")} …`);
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, env, stdio: ["ignore", fd, fd] });
+    const child = spawn(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
     let settled = false;
-    const finish = (status) => {
+    const finish = (outcome) => {
       if (settled) return;
       settled = true;
       fs.closeSync(fd);
-      logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (exit ${status})`);
-      writeRunRecord({ pick, runtimeCfg, logFile, exitCode: status, startedAt, endedAt: new Date().toISOString() });
-      resolve(status);
+      logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
+      writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
+      resolve(outcome);
     };
     child.on("error", (e) => {
-      logFor(anchorPath, sweep, `FATAL dispatch could not start ${cmd}: ${e.message}`);
-      finish(127);
+      logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
+      finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd) }));
     });
-    child.on("close", (status) => finish(status));
+    child.on("close", (exitCode, signal) => finish(classifyDispatchOutcome({ type: "close", exitCode, signal, path: executable, cwd })));
   });
 }
 
 export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResult } = {}) {
   return Promise.all(batch.map(async (c) => {
     const startedAt = new Date().toISOString();
-    const exitCode = await dispatchFn(c.anchorPath, c.sweep, c.config, c);
+    const outcome = await dispatchFn(c.anchorPath, c.sweep, c.config, c);
     const completedAt = new Date().toISOString();
     const result = {
       anchorPath: c.anchorPath,
       sweep: c.sweep,
       issueIdentifier: c.issueIdentifier,
       dispatchScope: c.issueIdentifier ? `${c.sweep}:${c.issueIdentifier}:dispatch` : `${c.sweep}:dispatch`,
-      exitCode,
-      success: exitCode === 0,
+      ...outcome,
+      outcome,
+      success: outcome.kind === "success",
       startedAt,
       completedAt,
       pick: c,
@@ -2260,13 +2400,19 @@ export async function dispatchBatch(batch, { dispatchFn = dispatchAsync, onResul
 async function tick({ dryRun = false } = {}) {
   const reg = readRegistry();
   const parentRunId = `${os.hostname()}-${process.pid}-${Date.now().toString(36)}`;
+  const localFailures = [];
+  let tickState = null;
   if (!dryRun) {
     if (!acquireTickLock()) { log("another tick holds the lock — exit"); return; }
+    const startedAt = new Date().toISOString();
+    tickState = { status: "running", pid: process.pid, parentRunId, startedAt, at: startedAt, kit: null, failures: [] };
   }
   try {
-    const localFailures = [];
+    if (!dryRun) atomicWriteJson(CURRENT_TICK, tickState);
     const updateFailures = [];
     const activeByAnchor = new Map();
+    const runtimeCache = new Map();
+    const reportedRuntimeFailures = new Set();
     const activeSameRepo = createSameRepoActiveCounts();
     const childIndexAllocator = createChildIndexAllocator();
     const refillBudget = { remaining: 0 };
@@ -2282,7 +2428,6 @@ async function tick({ dryRun = false } = {}) {
     });
     const reconcileDispatchResult = async (result) => {
       const pick = result.pick;
-      const exitCode = result.exitCode;
       const active = activeByAnchor.get(pick.anchorPath);
       if (!active) return null;
       const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
@@ -2294,26 +2439,45 @@ async function tick({ dryRun = false } = {}) {
         worktreePath: pick.worktreePath,
         logDir: pick.logDir,
       }) : runtime;
-      const failures = exitCode === 0 ? [] : [
-        failureEventFor(pick.anchorPath, pick.config, dispatchScope, exitCode === 127 ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} exited ${exitCode}`),
+      const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
+      const detail = result.signal || result.code || result.exitCode;
+      const failures = result.kind === "success" ? [] : [
+        failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
       ];
-      if (exitCode === 127 && pick.issueIdentifier) {
+      if (runtimeDisabledByOutcome(result)) {
+        const runtimeName = runtimeCfg.runtime || "codex";
+        const key = pick.runtimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
+        runtimeCache.set(key, { ok: false, runtime: runtimeName, code: "ENOENT", path: null, source: null });
+        if (!reportedRuntimeFailures.has(key)) {
+          reportedRuntimeFailures.add(key);
+          localFailures.push(failureEventFor(
+            pick.anchorPath,
+            pick.config,
+            `runtime:${runtimeName}:${os.hostname()}`,
+            "runtime-disappeared",
+            JSON.stringify({ anchorPath: pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
+            `${runtimeName} executable disappeared after preflight on ${os.hostname()}`,
+          ));
+          writeCurrentTick();
+        }
+      }
+      if (startFailure && pick.issueIdentifier) {
         try {
           const released = await releaseOwnedDispatchClaim(active.apiKey, pick, `dispatcher via ${runtime} could not start`);
           if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after dispatch-start failure ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
-          writeLastTick();
+          writeCurrentTick();
         }
       }
       try {
         await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, { dryRun: false });
       } catch (e) {
-        const kind = exitCode === 0 ? "failure-todo-recovery" : "failure-todo";
+        const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
         logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
         recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
-        writeLastTick();
+        writeCurrentTick();
       }
       return active;
     };
@@ -2418,7 +2582,7 @@ async function tick({ dryRun = false } = {}) {
           } catch (e) {
             logFor(candidate.anchorPath, "_", `FATAL failure-todo handoff dirty-checkout reconciliation failed: ${e.message}`);
             recordLocalFailure(candidate.anchorPath, candidate.config, `${candidate.sweep}:dispatch`, "failure-todo", candidate.anchorPath, e.message);
-            writeLastTick();
+            writeCurrentTick();
           }
           return;
         }
@@ -2427,12 +2591,17 @@ async function tick({ dryRun = false } = {}) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
           return;
         }
+        const [runtimeReadyCandidate] = await preflightCandidatesForTick(batch);
+        if (!runtimeReadyCandidate) {
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: runtime-preflight`);
+          return;
+        }
         handoffBudget.remaining -= 1;
         firedHandoffs.add(key);
         const reservation = { anchorPath: pick.anchorPath, sweep: nextSweep, issueIdentifier: issue.identifier };
         activeSameRepo.increment(reservation);
         logFor(pick.anchorPath, nextSweep, `handoff-trigger ${issue.identifier}: ${pick.sweep}->${nextSweep}`);
-        const downstream = (await expandDispatchBatch(batch, {
+        const downstream = (await expandDispatchBatch([runtimeReadyCandidate], {
           dryRun: false,
           parentRunId,
           activeByAnchor,
@@ -2455,9 +2624,65 @@ async function tick({ dryRun = false } = {}) {
     };
     const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
       localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+      writeCurrentTick();
     };
-    const writeLastTick = () => {
-      if (!dryRun) fs.writeFileSync(LAST_TICK, JSON.stringify({ at: new Date().toISOString(), kit: reg.kitPath ? kitMarker(reg.kitPath) : null, failures: localFailures }) + "\n");
+    const writeCurrentTick = () => {
+      if (dryRun) return;
+      tickState = {
+        ...tickState,
+        status: "running",
+        at: new Date().toISOString(),
+        kit: reg.kitPath ? kitMarker(reg.kitPath) : null,
+        failures: [...localFailures],
+      };
+      atomicWriteJson(CURRENT_TICK, tickState);
+    };
+    const preflightCandidatesForTick = async (candidates) => {
+      const checked = preflightRuntimeCandidates(candidates, {
+        host: os.hostname(),
+        cache: runtimeCache,
+        envForCandidate: (pick) => dispatchEnvironment(pick.anchorPath, pick),
+      });
+      for (const failure of checked.failures) {
+        const active = activeByAnchor.get(failure.pick.anchorPath);
+        if (!active) continue;
+        const event = failureEventFor(
+          failure.pick.anchorPath,
+          failure.pick.config,
+          failure.scope,
+          "runtime-missing",
+          failure.stableTarget,
+          `${failure.runtime} executable unavailable on ${failure.host}`,
+        );
+        active.failures.push(event);
+        if (!reportedRuntimeFailures.has(failure.key)) {
+          reportedRuntimeFailures.add(failure.key);
+          localFailures.push(event);
+          logFor(failure.pick.anchorPath, failure.pick.sweep, `dispatch blocked: ${event.message}`);
+          writeCurrentTick();
+        }
+        try {
+          await reconcileFailureTodos(active.apiKey, failure.pick.config, failure.pick.anchorPath, [event], new Set(), active.envValues, { dryRun: false });
+        } catch (error) {
+          logFor(failure.pick.anchorPath, "_", `FATAL failure-todo runtime reconciliation failed: ${error.message}`);
+          recordLocalFailure(failure.pick.anchorPath, failure.pick.config, failure.scope, "failure-todo", failure.stableTarget, error.message);
+          writeCurrentTick();
+        }
+      }
+      for (const pick of checked.ready) {
+        const active = activeByAnchor.get(pick.anchorPath);
+        if (!active) continue;
+        const runtime = runtimeConfigForSweep(pick.config, pick.sweep).runtime || "codex";
+        const scope = `runtime:${runtime}:${os.hostname()}`;
+        try {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [], new Set([scope]), active.envValues, { dryRun: false });
+        } catch (error) {
+          logFor(pick.anchorPath, "_", `FATAL failure-todo runtime recovery failed: ${error.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, scope, "failure-todo-recovery", pick.runtimeExecutable, error.message);
+          writeCurrentTick();
+        }
+      }
+      return checked.ready;
     };
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
@@ -2640,7 +2865,7 @@ async function tick({ dryRun = false } = {}) {
 
       // Cheap phase done — stamp liveness BEFORE the (possibly long) foreground
       // dispatch, so `health` doesn't read STALE during a legitimately long run.
-      writeLastTick();
+      writeCurrentTick();
 
       const maxNonShipDispatches = Math.max(1, ...candidates.map((c) => parallelLimit(c.config)));
       const rotationSeed = Math.floor(Date.now() / 600000);
@@ -2670,14 +2895,19 @@ async function tick({ dryRun = false } = {}) {
         } catch (e) {
           logFor(pick.anchorPath, "_", `FATAL failure-todo dirty-checkout reconciliation failed: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, `${pick.sweep}:dispatch`, "failure-todo", pick.anchorPath, e.message);
-          writeLastTick();
+          writeCurrentTick();
         }
       }
       if (!cleanBatch.length) {
         log("dispatch blocked by dirty checkout(s)");
         return { candidates, selectedBatch: [], dispatched: false };
       }
-      const dispatches = await expandDispatchBatch(cleanBatch, { dryRun: false, parentRunId, activeByAnchor, now, childIndexAllocator });
+      const runtimeReadyBatch = await preflightCandidatesForTick(cleanBatch);
+      if (!runtimeReadyBatch.length) {
+        log("dispatch blocked by runtime preflight");
+        return { candidates, selectedBatch: [], dispatched: false };
+      }
+      const dispatches = await expandDispatchBatch(runtimeReadyBatch, { dryRun: false, parentRunId, activeByAnchor, now, childIndexAllocator });
       if (!dispatches.length) {
         log("no confirmed card slots — cheap tick");
         return { candidates, selectedBatch: [], dispatched: false };
@@ -2691,6 +2921,10 @@ async function tick({ dryRun = false } = {}) {
         await Promise.all([
           runHandoffTriggers(result, firedHandoffs, handoffBudget, dispatchChildren),
           (async () => {
+            if (result.pick.runtimeLaneKey && runtimeCache.get(result.pick.runtimeLaneKey)?.ok === false) {
+              logFor(result.pick.anchorPath, result.pick.sweep, `refill-skip ${result.pick.sweep}: runtime-disabled`);
+              return;
+            }
             const refill = await buildSameRepoRefillDispatches({
               result,
               activeByAnchor,
@@ -2711,7 +2945,7 @@ async function tick({ dryRun = false } = {}) {
                 } catch (e) {
                   logFor(result.pick.anchorPath, "_", `FATAL failure-todo refill dirty-checkout reconciliation failed: ${e.message}`);
                   recordLocalFailure(result.pick.anchorPath, result.pick.config, `${result.pick.sweep}:dispatch`, "failure-todo", result.pick.anchorPath, e.message);
-                  writeLastTick();
+                  writeCurrentTick();
                 }
               }
             }
@@ -2735,8 +2969,30 @@ async function tick({ dryRun = false } = {}) {
     };
 
     await runDrainLoop({ maxDrainPasses: drainPassLimit(anchors.map((a) => a.config)), runPass: runSweepPass, log });
+  } catch (error) {
+    if (!dryRun) {
+      localFailures.push({
+        anchorPath: "_",
+        anchorSlug: "_",
+        projectId: "unknown",
+        scope: "tick",
+        kind: "tick-exception",
+        stableTarget: os.hostname(),
+        message: String(error?.message || error),
+        seenAt: new Date().toISOString(),
+      });
+      tickState = { ...tickState, at: new Date().toISOString(), failures: [...localFailures] };
+      atomicWriteJson(CURRENT_TICK, tickState);
+    }
+    throw error;
   } finally {
-    if (!dryRun) releaseTickLock();
+    if (!dryRun) {
+      try {
+        finalizeTickState({ ...tickState, failures: [...localFailures] });
+      } finally {
+        releaseTickLock();
+      }
+    }
   }
 }
 
@@ -2859,14 +3115,13 @@ async function cmdUnblockResolve(args) {
 }
 
 function cmdHealth() {
-  // A bounded dispatch batch runs under one foreground launcher and can
-  // legitimately exceed 3× interval, so a live tick lock (held by a running PID)
-  // counts as healthy even if the stamp is old.
   let lockPid = null;
   try { lockPid = JSON.parse(fs.readFileSync(TICK_LOCK, "utf8")).pid; } catch { lockPid = null; }
+  let currentTick = null;
+  try { currentTick = JSON.parse(fs.readFileSync(CURRENT_TICK, "utf8")); } catch { currentTick = null; }
   let lastTick = null;
   try { lastTick = JSON.parse(fs.readFileSync(LAST_TICK, "utf8")); } catch { lastTick = null; }
-  const status = healthStatus({ lastTick, lockPid });
+  const status = healthStatus({ currentTick, lastTick, lockPid });
   console.log(status.reason);
   if (!status.ok) process.exit(1);
 }
@@ -2879,7 +3134,11 @@ function cmdDoctor(args = []) {
     const wanted = path.resolve(anchorArg);
     reg = { ...reg, repos: reg.repos.filter((p) => path.resolve(p) === wanted) };
   }
-  const report = doctorReport({ registry: reg });
+  let currentTick = null;
+  try { currentTick = JSON.parse(fs.readFileSync(CURRENT_TICK, "utf8")); } catch { currentTick = null; }
+  let lastTick = null;
+  try { lastTick = JSON.parse(fs.readFileSync(LAST_TICK, "utf8")); } catch { lastTick = null; }
+  const report = doctorReport({ registry: reg, currentTick, lastTick });
   if (json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatDoctorReport(report));
   if (!report.ok) process.exit(1);

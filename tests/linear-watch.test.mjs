@@ -12,7 +12,7 @@ import {
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
   recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures,
   dirtyCheckoutEvent, doctorReport, formatDoctorReport,
-  worktreePath, runtimeConfigForSweep, buildCommand, lockIsReclaimable, isNewerVersion,
+  worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   boardOrderValue, sortByBoardPosition, selectDispatch, selectDispatchBatch, rotateNonShipCandidates,
@@ -20,7 +20,7 @@ import {
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
@@ -32,7 +32,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
   FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
-  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus,
+  failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, finalizeTickState,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -218,6 +218,91 @@ test("worktreePath is deterministic under the repo", () => {
 });
 
 // ── runtime config ───────────────────────────────────────────────────────────
+test("resolveRuntimeExecutable: explicit override wins and is validated", () => {
+  const seen = [];
+  const resolved = resolveRuntimeExecutable("codex", { CODEX_BIN: "/custom/codex", PATH: "/bin" }, {
+    existsFn: (candidate) => { seen.push(candidate); return candidate === "/custom/codex"; },
+    whichFn: () => { throw new Error("PATH lookup should not run"); },
+  });
+  assert.deepEqual(resolved, { ok: true, runtime: "codex", path: "/custom/codex", source: "override" });
+  assert.deepEqual(seen, ["/custom/codex"]);
+});
+test("resolveRuntimeExecutable: PATH lookup returns an absolute executable", () => {
+  const resolved = resolveRuntimeExecutable("claude", { PATH: "/opt/bin:/usr/bin" }, {
+    existsFn: () => false,
+    whichFn: (runtime, env) => {
+      assert.equal(runtime, "claude");
+      assert.equal(env.PATH, "/opt/bin:/usr/bin");
+      return "/opt/bin/claude";
+    },
+  });
+  assert.deepEqual(resolved, { ok: true, runtime: "claude", path: "/opt/bin/claude", source: "path" });
+});
+test("resolveRuntimeExecutable: falls back to ChatGPT.app then Codex.app for codex", () => {
+  const chatGpt = resolveRuntimeExecutable("codex", {}, {
+    existsFn: (candidate) => candidate === "/Applications/ChatGPT.app/Contents/Resources/codex",
+    whichFn: () => null,
+  });
+  assert.deepEqual(chatGpt, {
+    ok: true,
+    runtime: "codex",
+    path: "/Applications/ChatGPT.app/Contents/Resources/codex",
+    source: "application",
+  });
+
+  const codexApp = resolveRuntimeExecutable("codex", {}, {
+    existsFn: (candidate) => candidate === "/Applications/Codex.app/Contents/Resources/codex",
+    whichFn: () => null,
+  });
+  assert.equal(codexApp.path, "/Applications/Codex.app/Contents/Resources/codex");
+  assert.equal(codexApp.source, "application");
+});
+test("resolveRuntimeExecutable: missing runtime is a typed preflight failure", () => {
+  const resolved = resolveRuntimeExecutable("codex", { PATH: "/missing" }, {
+    existsFn: () => false,
+    whichFn: () => null,
+  });
+  assert.deepEqual(resolved, {
+    ok: false,
+    runtime: "codex",
+    code: "ENOENT",
+    path: null,
+    source: null,
+  });
+});
+test("preflightRuntimeCandidates: scopes a missing runtime by anchor/runtime/host and keeps other lanes ready", () => {
+  const calls = [];
+  const cache = new Map();
+  const candidates = [
+    { anchorPath: "/managed/app", sweep: "dev", config: { runtimes: { dev: { runtime: "codex" } } } },
+    { anchorPath: "/managed/app", sweep: "qa", config: { runtimes: { qa: { runtime: "claude" } } } },
+  ];
+  const result = preflightRuntimeCandidates(candidates, {
+    host: "builder-1",
+    cache,
+    envForCandidate: () => ({ PATH: "/opt/bin" }),
+    resolveFn: (runtime) => {
+      calls.push(runtime);
+      return runtime === "claude"
+        ? { ok: true, runtime, path: "/opt/bin/claude", source: "path" }
+        : { ok: false, runtime, code: "ENOENT", path: null, source: null };
+    },
+  });
+
+  assert.deepEqual(result.ready.map((pick) => [pick.sweep, pick.runtimeExecutable]), [["qa", "/opt/bin/claude"]]);
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.failures[0].scope, "runtime:codex:builder-1");
+  assert.equal(result.failures[0].stableTarget, JSON.stringify({ anchorPath: "/managed/app", runtime: "codex", host: "builder-1" }));
+  assert.deepEqual(calls, ["codex", "claude"]);
+
+  preflightRuntimeCandidates(candidates, {
+    host: "builder-1",
+    cache,
+    envForCandidate: () => ({}),
+    resolveFn: () => { throw new Error("cached lane should not resolve again"); },
+  });
+});
+
 test("runtimeConfigForSweep: per-sweep runtimes override legacy runtime/models", () => {
   const resolved = runtimeConfigForSweep({
     runtime: "codex",
@@ -1323,7 +1408,7 @@ test("dispatchBatch: dispatches every selected child and returns structured resu
   ], {
     dispatchFn: async (anchorPath, sweep, config, pick) => {
       calls.push({ anchorPath, sweep, config, pick });
-      return sweep === "dev" ? 0 : 7;
+      return classifyDispatchOutcome({ type: "close", exitCode: sweep === "dev" ? 0 : 7, path: "/bin/codex", cwd: anchorPath });
     },
   });
   assert.deepEqual(results.map((r) => r.exitCode), [0, 7]);
@@ -1337,13 +1422,17 @@ test("dispatchBatch: dispatches every selected child and returns structured resu
 });
 test("dispatchBatch: reports each child result as soon as that child completes", async () => {
   let releaseSlow;
-  const slow = new Promise((resolve) => { releaseSlow = () => resolve(7); });
+  const slow = new Promise((resolve) => {
+    releaseSlow = () => resolve(classifyDispatchOutcome({ type: "close", exitCode: 7, path: "/bin/codex", cwd: "/ws/slow" }));
+  });
   const seen = [];
   const run = dispatchBatch([
     { anchorPath: "/ws/fast", sweep: "dev", config: {}, issueIdentifier: "COD-1" },
     { anchorPath: "/ws/slow", sweep: "spec", config: {}, issueIdentifier: "COD-2" },
   ], {
-    dispatchFn: async (anchorPath, sweep) => (sweep === "spec" ? slow : 0),
+    dispatchFn: async (anchorPath, sweep) => (sweep === "spec"
+      ? slow
+      : classifyDispatchOutcome({ type: "close", exitCode: 0, path: "/bin/codex", cwd: anchorPath })),
     onResult: async (result) => { seen.push(`${result.issueIdentifier}:${result.exitCode}`); },
   });
 
@@ -1353,6 +1442,57 @@ test("dispatchBatch: reports each child result as soon as that child completes",
   const results = await run;
   assert.deepEqual(seen, ["COD-1:0", "COD-2:7"]);
   assert.deepEqual(results.map((r) => r.exitCode), [0, 7]);
+});
+test("classifyDispatchOutcome: executable ENOENT and cwd ENOENT are distinct", () => {
+  const executable = classifyDispatchOutcome({
+    type: "error",
+    error: { code: "ENOENT" },
+    path: "/resolved/codex",
+    cwd: "/workspace",
+    cwdExists: true,
+  });
+  const cwd = classifyDispatchOutcome({
+    type: "error",
+    error: { code: "ENOENT" },
+    path: "/resolved/codex",
+    cwd: "/missing-workspace",
+    cwdExists: false,
+  });
+  assert.deepEqual(executable, {
+    kind: "executable-enoent", code: "ENOENT", exitCode: null, signal: null,
+    path: "/resolved/codex", cwd: "/workspace",
+  });
+  assert.deepEqual(cwd, {
+    kind: "cwd-enoent", code: "ENOENT", exitCode: null, signal: null,
+    path: "/resolved/codex", cwd: "/missing-workspace",
+  });
+});
+test("classifyDispatchOutcome: exit 127, signal, interruption, and success remain typed", () => {
+  const base = { path: "/resolved/codex", cwd: "/workspace" };
+  assert.deepEqual(classifyDispatchOutcome({ ...base, type: "close", exitCode: 127 }), {
+    kind: "exit", code: null, exitCode: 127, signal: null, ...base,
+  });
+  assert.deepEqual(classifyDispatchOutcome({ ...base, type: "close", exitCode: null, signal: "SIGTERM" }), {
+    kind: "signal", code: null, exitCode: null, signal: "SIGTERM", ...base,
+  });
+  assert.deepEqual(classifyDispatchOutcome({ ...base, type: "interruption", signal: "SIGINT" }), {
+    kind: "interrupted", code: "INTERRUPTED", exitCode: null, signal: "SIGINT", ...base,
+  });
+  assert.deepEqual(classifyDispatchOutcome({ ...base, type: "close", exitCode: 0 }), {
+    kind: "success", code: null, exitCode: 0, signal: null, ...base,
+  });
+});
+test("runtimeDisabledByOutcome: only executable disappearance disables a runtime lane", () => {
+  const base = { path: "/resolved/codex", cwd: "/workspace" };
+  const outcomes = [
+    classifyDispatchOutcome({ ...base, type: "error", error: { code: "ENOENT" }, cwdExists: true }),
+    classifyDispatchOutcome({ ...base, type: "error", error: { code: "ENOENT" }, cwdExists: false }),
+    classifyDispatchOutcome({ ...base, type: "close", exitCode: 127 }),
+    classifyDispatchOutcome({ ...base, type: "close", exitCode: null, signal: "SIGTERM" }),
+    classifyDispatchOutcome({ ...base, type: "interruption", signal: "SIGINT" }),
+    classifyDispatchOutcome({ ...base, type: "close", exitCode: 0 }),
+  ];
+  assert.deepEqual(outcomes.map(runtimeDisabledByOutcome), [true, false, false, false, false, false]);
 });
 
 // ── ship sweep: config + dispatch priority ───────────────────────────────────
@@ -1703,6 +1843,59 @@ test("healthStatus: config/key failures make health non-zero even after recent t
 });
 
 // ── push discipline ──────────────────────────────────────────────────────────
+test("healthStatus: live current tick remains unhealthy after a systemic failure", () => {
+  const failed = healthStatus({
+    currentTick: { status: "running", pid: 42, at: new Date(NOW).toISOString(), failures: [{ kind: "runtime-missing" }] },
+    lastTick: { at: new Date(NOW).toISOString(), failures: [] },
+    isAlive: (pid) => pid === 42,
+    now: NOW,
+  });
+  assert.equal(failed.ok, false);
+  assert.match(failed.reason, /current tick has 1 systemic failure/);
+
+  const healthy = healthStatus({
+    currentTick: { status: "running", pid: 42, at: new Date(NOW).toISOString(), failures: [] },
+    isAlive: () => true,
+    now: NOW,
+  });
+  assert.deepEqual(healthy, { ok: true, reason: "tick in progress (pid 42)" });
+});
+test("finalizeTickState: atomically writes the completed current tick and copies it to last-tick", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-"));
+  const currentPath = path.join(dir, "current-tick.json");
+  const lastTickPath = path.join(dir, "last-tick");
+  const completed = finalizeTickState({
+    status: "running",
+    pid: 42,
+    startedAt: "2026-07-09T12:00:00.000Z",
+    at: "2026-07-09T12:00:00.000Z",
+    failures: [],
+  }, {
+    currentPath,
+    lastTickPath,
+    now: () => "2026-07-09T12:03:00.000Z",
+  });
+
+  assert.equal(completed.status, "complete");
+  assert.equal(completed.endedAt, "2026-07-09T12:03:00.000Z");
+  assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, "utf8")), completed);
+  assert.deepEqual(JSON.parse(fs.readFileSync(lastTickPath, "utf8")), completed);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ["current-tick.json", "last-tick"]);
+});
+test("doctorReport: a running current tick owned by a dead PID is stale", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    currentTick: { status: "running", pid: 404, at: new Date(NOW).toISOString(), failures: [] },
+    lastTick: { at: new Date(NOW).toISOString(), failures: [] },
+    isAlive: () => false,
+    now: NOW,
+  });
+  assert.equal(report.ok, false);
+  assert.equal(report.tick.ok, false);
+  assert.match(report.tick.reason, /STALE.*dead pid 404/i);
+  assert.match(formatDoctorReport(report), /tick: +STALE.*dead pid 404/i);
+});
+
 test("pushWithRetry: succeeds on first attempt", () => {
   const calls = [];
   const gitFn = (repo, args) => { calls.push(args[0]); return { status: 0 }; };

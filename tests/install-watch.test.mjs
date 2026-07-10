@@ -24,6 +24,9 @@ test("install-watch uses a managed clean kit clone for launchd runtime", () => {
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const linkTarget = fs.readlinkSync(path.join(home, ".local", "bin", "linear-watch.sh"));
   assert.equal(linkTarget, path.join(managedKit, "scripts", "linear-watch.sh"));
+  const wrapper = fs.readFileSync(linkTarget, "utf8");
+  assert.match(wrapper, /\/Applications\/ChatGPT\.app\/Contents\/Resources/);
+  assert.match(wrapper, /\/Applications\/Codex\.app\/Contents\/Resources/);
 
   const registry = JSON.parse(fs.readFileSync(path.join(home, ".config", "linear-board-sweeps", "registry.json"), "utf8"));
   assert.equal(registry.kitPath, managedKit);
