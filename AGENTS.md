@@ -29,6 +29,12 @@ Four Linear board sweeps drive features from idea -> shipped on the **Codex** te
 
 **Auth:** `LINEAR_API_KEY` lives in the gitignored `.env` at repo root (`set -a && . ./.env && set +a`), never committed.
 
+## Factory Learning Loop
+
+Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and never receives repository write tools or secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
+
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. Use `node scripts/linear-watch.mjs learning-status --json` for read-only diagnostics and `node scripts/linear-watch.mjs learning-run --dry-run` to preview deterministic create/update/evaluation decisions without Linear writes or cursor movement. Disable the workspace `learning.enabled` setting or the registry learning runner as the kill switch. Automatic recurrence is capped at three generations before `blocked:needs-user` human review.
+
 ## Linear feature tracking (going forward)
 
 Track every product/engineering feature, bug, or product-impacting change on the Linear Sweep board. Find or create a `COD-*` issue for the work itself (not meta "design X" cards - attach specs/plans/review notes to the feature card). Put the `COD-###` key in the branch name / commit subjects where practical. Cards created or moved during direct user conversations, or by any non-sweep skill, should carry `sweep:manual-only` unless the user explicitly wants the unattended sweeps to pick them up immediately; clear it only when handing the card back to the normal sweep pipeline. Raw ideas -> Backlog; selected-but-underspecified -> Spec; designed/active -> Dev (active work carries `dev:in-progress`); PR/review -> QA; QA-passed, awaiting sign-off -> Signoff; human-approved to ship -> Ship; shipped/verified -> Done. Work discovered after the fact -> a `Done` card titled `Completed: ...` with a short summary + evidence.

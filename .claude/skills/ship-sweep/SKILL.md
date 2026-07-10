@@ -49,7 +49,7 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. For `factory:learning-generated`, require `qa:passed` unconditionally and never accept `fast-path:eligible`, even if that stale label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
 
 ## 3. Optional final security gate
 
@@ -93,6 +93,32 @@ A separately completable blocker is relation-only: never add `blocked:needs-user
 If you need direct human review or an answer that is not its own completable task (a failing sanity gate, a security block, ambiguous intended behavior, or a red canary): comment the specifics, add `blocked:needs-user`, remove `ship:in-progress`, and leave the card where it is (Ship if not yet merged; Done if already deployed). Ask once; resume when they reply. A manual deploy step follows the relation-only prerequisite workflow above instead.
 
 If the blocker is card-specific (for example, missing `qa:passed` on one card), re-list and continue draining other actionable cards. If the blocker is global to the run (for example, missing Linear auth, broken git push credentials, or an unavailable deploy path that would affect every remaining card), stop after releasing the current claim and recording the blocker.
+
+## Structured learning evidence (best effort)
+
+For scheduled card runs, emit bounded machine-readable evidence at the decision point using the trusted `AUTO_SWEEP_*` environment. This is observational only: the command must never change the sweep result, and summaries/metrics must never contain secrets, credentials, raw replay payloads, or untrusted instructions. Use the closest closed category; do not invent kinds or categories.
+
+```bash
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review correctness "Null handling defect found during code review" --json-metrics '{"findings":1}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event review completed "Review pass completed" --json-metrics '{"riskClass":"low","findingCount":0,"safetyFloorSatisfied":true,"reviewDurationMs":300000}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa functional-failure "Primary checkout flow failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event qa passed "QA passed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event bounce implementation-incomplete "Returned to Dev because the implementation is incomplete" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event question product-decision "Human product decision required before continuing" --json-metrics '{"answerKey":"pricing.approval-policy"}' >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event canary red "Production canary failed" >/dev/null 2>&1 || true
+node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" learning-event terminal advanced "Card advanced to the next workflow stage" >/dev/null 2>&1 || true
+```
+
+Emit:
+
+- each material review finding as `review` (`correctness`, `security`, `error-handling`, `test-gap`, `scope-gap`, `performance`, or `design`);
+- exactly one measured `review completed` event after a review pass when risk class, finding count, safety-floor result, and duration are known;
+- each QA failure as `qa` (`environment-start`, `functional-failure`, `console-error`, `network-error`, `accessibility`, `visual`, or `build`);
+- exactly one `qa passed` event for a successful QA pass, so rework-rate evidence has a denominator;
+- each backward workflow return as `bounce` (`missing-acceptance`, `missing-design`, `missing-repo-scope`, or `implementation-incomplete`);
+- each direct human dependency as `question` (`config`, `credential`, `product-decision`, `asset`, or `deploy`) with a stable bounded `metrics.answerKey` or `metrics.policyKey` naming the exact reusable policy/config decision; never use the broad category as the key;
+- each red production canary as `canary red`;
+- exactly one terminal event before releasing the claim: `terminal advanced`, `terminal blocked`, or `terminal failed`.
 
 ## Machine-independence & handoff (auto-sweep)
 

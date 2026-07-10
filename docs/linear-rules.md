@@ -1,5 +1,13 @@
 # Linear board rules
 
+## Factory Learning Loop
+
+Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and never receives repository write tools or secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
+
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. Done cards are evaluated against their declared baseline and fixed window, producing exactly one of `verified-improvement`, `no-measurable-change`, `regression`, or `inconclusive-evidence`. Only no-change/regression plus fresh qualified evidence can create a linked next generation. Generation three is the cap; later qualifying evidence updates that Done card and adds `blocked:needs-user` for the manual unblock queue.
+
+Use `learning-status --json`, `learning-run --dry-run`, and the `doctor` learning block for read-only operation. The dry-run does not write Linear or advance state. Repo-local `learning.enabled` opts a workspace into observation even while delivery is paused; exactly one registry-pinned runner performs writes after delivery work drains. Missing provenance or route labels, incomplete pagination, partial GraphQL data, ambiguous ownership, and corrupt state all fail learning closed without failing ordinary sweeps.
+
 The sweeps assume this board shape. `scripts/linear.mjs setup-team` creates anything missing.
 
 ## Statuses (workflow states)

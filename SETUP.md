@@ -1,5 +1,11 @@
 # SETUP — bootstrap the board-sweeps workflow into a repo
 
+## Factory Learning Loop
+
+Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and never receives repository write tools or secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
+
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. After Done, a fixed evaluation window records the measurable outcome; only no-change/regression with fresh qualifying evidence can recur. Generation three is the cap, after which `blocked:needs-user` routes the Done card to manual review.
+
 **You are an AI coding agent (Claude Code or Codex).** The user pointed you at this kit to install the spec → dev → qa Linear board-sweep workflow into their **target repo**. Follow these steps in order. `KIT` = this repo's path; `TARGET` = the repo you're setting up (usually the current working directory).
 
 Do the work; don't just describe it. Prompt the user only for the inputs in Step 1.
@@ -191,6 +197,22 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    ```
    Source checkout dirtiness is advisory after this point; scheduled dispatch runs from managed clones populated from origin. Unpushed local commits are not visible to unattended sweeps.
 
+   **Optional Factory Learning.** Leave the template's repo-local `learning.enabled: false` for the default disabled behavior. To opt this workspace in, set it to `true` and choose any of the three lens `enabled` flags. Observation does not depend on the project's delivery `auto-sweep` label. Re-run `node "KIT/scripts/linear.mjs" setup-team "<Team>"` after upgrading so `factory:learning-generated` exists.
+
+   On exactly one learning host, edit `~/.config/linear-board-sweeps/registry.json` and merge this machine-local block; use the canonical path of a registered source anchor and never commit this registry:
+
+   ```json
+   "learning": {
+     "enabled": true,
+     "runner": true,
+     "coreSourceAnchor": "/canonical/registered/core-anchor",
+     "maxNewCardsPerRun": 6,
+     "runtime": null
+   }
+   ```
+
+   Keep `runner: false` on every other host. The core anchor receives findings whose ownership spans workspaces; proven local findings stay in their workspace. If the core workspace uses `repoRouting`, its anchor repo must be the target of exactly one `repoRouting.byLabel` label; without routing, the anchor must be the default first `repos` entry. Missing or ambiguous core ownership fails closed. Deterministic code owns confidence, routing, admission, mutation, and outcomes. Optional model synthesis runs in an isolated temporary directory with an allowlisted environment and cannot access Linear credentials or mutate repositories.
+
 4. **Activate the project** (adds the `auto-sweep` label via the API; creates the label if it doesn't exist yet):
    ```bash
    node "KIT/scripts/linear-watch.mjs" activate "ANCHOR"
@@ -202,7 +224,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" doctor
    node "KIT/scripts/linear-watch.mjs" doctor --json
    ```
-   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Optional macOS memory-pressure percentage is shown separately from free bytes. It exits non-zero for unhealthy capacity/runtime/tick or dirty managed state.
+   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Its learning block reports per-lens last success/due/sample/pending/error state, coverage gaps, active/due evaluations, and synthesis availability. A learning error is isolated from ordinary sweep health. Optional macOS memory-pressure percentage is shown separately from free bytes.
 
 6. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
    ```bash
@@ -210,6 +232,15 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    tail -n 40 ~/.local/state/linear-board-sweeps/*/*/$(date +%Y%m%d).log
    ```
    Expect the anchor's project to read active and real actionable counts. If it reads "paused", activation didn't take — re-check step 4. With `parallel.maxNonShipDispatches > 1`, dry-run logs every non-ship dispatch selected for the bounded batch. With `parallel.sameRepoCardLimits`, dry-run also logs the exact card slots it would claim and dispatch without writing claim labels. `parallel.maxSameRepoRefillDispatches` is visible in live `refill-trigger` / `refill-skip` logs after a child completes; dry-run cannot simulate that mid-batch completion. With `parallel.maxDrainPasses > 1`, dry-run can show repeated bounded pass logs without launching agents.
+
+   If Factory Learning is enabled, validate it separately:
+
+   ```bash
+   node "KIT/scripts/linear-watch.mjs" learning-status --json
+   node "KIT/scripts/linear-watch.mjs" learning-run --dry-run
+   ```
+
+   Both are read-only; the dry-run prints deterministic proposed creates, updates, and due evaluations with no Linear writes or cursor movement. A live attended `learning-run` requires this host's `learning.runner: true`. Generated cards land at the bottom of Spec without `sweep:manual-only`, must pass real QA and Signoff, and still require a human move to Ship. Disable repo-local `learning.enabled`, or set registry `learning.enabled`/`runner` false, as the kill switch.
 
 7. **Activate the schedule** (10-min timer) and confirm health:
    ```bash

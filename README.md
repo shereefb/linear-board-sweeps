@@ -1,5 +1,11 @@
 # linear-board-sweeps
 
+## Factory Learning Loop
+
+Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and receives neither repository write tools nor secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
+
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. After Done, the loop measures the declared acceptance metric over a fixed window and records verified improvement, no measurable change, regression, or inconclusive evidence. Only no-change/regression plus fresh qualifying evidence may recur; automatic recurrence stops after generation three for `blocked:needs-user` review.
+
 A portable kit that installs a **Linear-driven, cross-runtime (Claude Code + Codex) feature workflow** into any repo. Four autonomous "board sweeps" carry work across a Linear board, with a human gate before anything ships:
 
 ```
@@ -35,7 +41,7 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime scheduled sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec-sweep uses adaptive review depth, spec/dev/qa run materially gated review lenses, and ship-sweep is the only one that merges + deploys. |
 | `skills/unblock-sweep/SKILL.md` | Manual-only interactive workflow for resolving cards parked with blocking labels across registered anchors. It is copied to anchors but never scheduled. |
 | `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `retire-state`, `rename-states`, `repo-status`, `dependency-status`, `query`. |
-| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`, `doctor [--json]`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work, using the visible Linear column order — see [Triggering](#triggering-auto-sweep). |
+| `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: workspace registration/activation, runner pins, `learning-status`, `learning-run [--dry-run]`, `tick`, `health`, and `doctor`. Polls Linear cheaply and dispatches only actionable work — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
 | `templates/linear-sweep.json` | The per-repo config the skills read. Copied + filled into the target's `.claude/`. |
 | `templates/AGENTS.snippet.md` | The "Board sweeps" section appended to the target's `AGENTS.md` — how Codex finds the skills. |
@@ -63,6 +69,7 @@ Instead of running the sweeps by hand, the launcher (`scripts/linear-watch.mjs`)
 - **Multi-repo projects route by label.** Add `repoRouting.byLabel` when one Linear project contains cards owned by different repositories. Each value must exactly match a `config.repos` entry, and each scheduled card must carry exactly one mapped label. The launcher rechecks that route before claim/spawn, the child rechecks it before material work, and the selected repo is exported as `AUTO_SWEEP_REPO`/`AUTO_SWEEP_SOURCE_REPO`. `AUTO_SWEEP_ANCHOR` remains the managed workspace anchor that owns the single `.claude/linear-sweep.json`; routed sibling repos do not duplicate it. Missing, ambiguous, invalid, or changed ownership fails closed without material work; any launcher-owned claim is released automatically.
 - **Adaptive Spec review depth.** spec-sweep classifies each card from the actual code, draft spec, and predicted risk: mechanical Tier 0 work may skip engineering review, bounded Tier 1 work gets one targeted spec or implementation-plan pass, and material Tier 2 work gets both. After the plan exposes the concrete file map, task graph, tests, and failure modes, the tier may stay level or increase but never decrease. Material security and performance gates remain mandatory regardless of tier, while a domain label alone does not force an irrelevant heavyweight lens.
 - **Cheap when idle.** Every ~10 min the launcher makes a few Linear API calls and a fast-forward `git pull` — **zero LLM tokens** — and dispatches a heavyweight agent pass only when a queue holds genuinely actionable work.
+- **Factory Learning uses spare capacity.** Repo-local `learning.enabled` controls observation independently of the `auto-sweep` project label, so a paused delivery workspace can remain observable. The one host with registry `learning.runner: true` evaluates due reliability, quality/rework, and throughput/cost windows only after delivery draining. Deterministic code owns qualification, identity, routing, admission, outcomes, and Linear writes; optional synthesis receives only bounded sanitized findings.
 - **Board order is priority.** Within a status column, the next card is the top visible card in Linear (`Issue.sortOrder`), after blocked/live-claimed cards are filtered. Sweeps move completed or bounced cards to the bottom of the destination column via `node scripts/linear.mjs move-card-bottom <KEY-###> "<State>"`.
 - **Dependencies are relations, not labels.** A `blockedBy` relation is ready only when every visible blocker is in exact canonical `Done`; Canceled, Duplicate, Archived, and other terminal-looking states remain unresolved. The launcher checks relations during scan and claim confirmation, and every scheduled child runs `node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"` before its first material mutation. For an independently completable prerequisite, use the relation alone: never add `blocked:needs-user` merely because a `blockedBy` relation exists. That label remains for a direct human answer with no separate blocker issue and for its existing crash/bounce safety uses.
 - **Self-healing.** A crashed session's claim is auto-released via a heartbeat (not a raw timer). When a child exits successfully but leaves its card in the same workflow state, the launcher immediately releases only that child's owner-token claim so the work can resume instead of looking active until the stale timeout. Poison/oscillating cards escalate to `blocked:needs-user`, manual/dedicated work can be parked with `sweep:manual-only`, a holding-state reaper releases claims stranded in `Signoff`, scheduled tick failures create self-clearing `Todo` cards when Linear is reachable, and a PID-liveness lock keeps exactly one launcher tick supervising a bounded child-agent batch at a time.
@@ -90,6 +97,20 @@ node scripts/linear-watch.mjs doctor                     # inspect registry, man
 node scripts/linear-watch.mjs tick --dry-run             # validate live, spends no tokens
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.linear-board-sweeps.watch.plist  # turn on the 10-min timer
 ```
+
+Factory Learning is disabled in the repo template. To enable it, set `.claude/linear-sweep.json` `learning.enabled` to `true` (and select lenses), rerun `node scripts/linear.mjs setup-team "<Team>"` so the provenance label exists, then configure exactly one host's `~/.config/linear-board-sweeps/registry.json`:
+
+```json
+"learning": {
+  "enabled": true,
+  "runner": true,
+  "coreSourceAnchor": "/canonical/registered/core-anchor",
+  "maxNewCardsPerRun": 6,
+  "runtime": null
+}
+```
+
+`coreSourceAnchor` must be the canonical path of a registered workspace. If that workspace uses `repoRouting`, its anchor repo must be the target of exactly one `repoRouting.byLabel` label; without routing, the anchor must be the default first `repos` entry. Missing or ambiguous core ownership fails closed. Other hosts must keep `runner: false`. Verify with `node scripts/linear-watch.mjs learning-status --json`, preview exact decisions with `node scripts/linear-watch.mjs learning-run --dry-run`, and inspect the learning block in `doctor --json`. The dry-run performs no Linear writes and advances no learning cursor. Disable repo-local `learning.enabled`, or set registry `learning.enabled`/`runner` false, as the kill switch.
 
 `list` shows each anchor + managed path + `[auto-sweep: ON/off]` + this host's ship-runner state; `doctor` shows source-vs-managed paths, dirty source advisory status, managed blocking status, env presence, kit path, host/user, and ship-runner state; `health` reads `current-tick.json` while a tick is running, so a live PID with systemic current tick failures is unhealthy; `deactivate` pauses a project. Scheduled launcher failures that happen after project metadata and a usable API key are available are reconciled into deduplicated `Todo` cards marked with `[auto-sweep-tick-failure <fingerprint>]`; a later tick that checks the same scope cleanly comments recovery and moves the Todo to `Done`. Full design + rationale: [`docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md`](docs/superpowers/specs/2026-07-08-auto-sweep-launcher-design.md) and [`2026-07-08-gated-reviews-and-ship-split-design.md`](docs/superpowers/specs/2026-07-08-gated-reviews-and-ship-split-design.md). **Ship-runner:** production deploys run only on the one host with `ship-runner on`; qa-sweep no longer deploys, so it's safe to auto-run. `--dry-run` validates queue counting but not the merge/deploy path — watch the first real ship attended.
 

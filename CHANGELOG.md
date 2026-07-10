@@ -2,6 +2,26 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.5] - 2026-07-10
+
+### Added
+
+- Let an opted-in runner learn from factory operations on independent reliability, quality, and throughput cadences, using 15 deterministic detectors and bounded evidence instead of spending model tokens on idle passes.
+- Automatically create or update high- and medium-confidence improvement cards at the bottom of Spec, accumulate low-confidence evidence, cap each run at six new cards, and preserve Signoff plus the human-only move into Ship.
+- Track improvement outcomes through fixed post-Done evaluation windows, safe recurrence generations, durable write-ahead recovery, exact occurrence provenance, and a manual unblock path after the generation cap.
+- Expose learning health, coverage, pending writes, dry-run mutation plans, and an attended run command; optional synthesis runs without credentials, tools, network connectors, or write authority and can only annotate deterministic findings.
+
+### Changed
+
+- Emit bounded structured review, QA, bounce, question, canary, and terminal evidence from every canonical sweep skill, including stable policy keys for recurring human questions.
+- Route card-specific findings to their proven workspace and shared launcher remedies to one configured core repository, failing closed on missing credentials, incomplete evidence, or ambiguous repository ownership.
+
+### Fixed
+
+- Preserve due-lens isolation, exact workspace/repository outcome ownership, and deferred evidence from non-due lenses so one cadence cannot consume or erase another cadence's observations.
+- Reconcile create races, duplicate audits, generation caps, comments, labels, relations, and occurrence evidence with read-after-write confirmation before committing local state.
+- Make stale-claim, orphan cleanup, safety-invariant, and failed-recovery detectors reachable from confirmed launcher mutations, including route-less failure Todos in routed multi-repository workspaces.
+
 ## [1.2.0.4] - 2026-07-10
 
 ### Fixed

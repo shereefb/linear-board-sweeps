@@ -83,6 +83,13 @@ test("canonical Claude and Codex sweep copies match byte-for-byte", () => {
   }
 });
 
+test("canonical sweep skill headings contain no patch artifacts", () => {
+  for (const sweep of ["spec", "dev", "qa", "ship"]) {
+    const text = fs.readFileSync(new URL(`../skills/${sweep}-sweep/SKILL.md`, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /^\+## /m, sweep);
+  }
+});
+
 test("shared AGENTS rules distinguish relation blockers from human-only labels", () => {
   for (const file of ["../AGENTS.md", "../templates/AGENTS.snippet.md"]) {
     const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
@@ -151,5 +158,24 @@ test("migration docs limit the legacy relation-plus-label audit to visible prove
     assert.match(text, /bounded cycle detection/, file);
     assert.match(text, /cross-team[^\n]*token visibility/, file);
     assert.match(text, /not (?:an )?organization-wide guarantee|does not provide (?:an )?organization-wide guarantee/, file);
+  }
+});
+
+test("operator docs and templates describe the complete Factory Learning Loop", () => {
+  const template = JSON.parse(fs.readFileSync(new URL("../templates/linear-sweep.json", import.meta.url), "utf8"));
+  assert.deepEqual(template.learning, { enabled: false, lenses: { reliability: { enabled: true }, quality: { enabled: true }, throughput: { enabled: true } } });
+  const local = JSON.parse(fs.readFileSync(new URL("../.claude/linear-sweep.json", import.meta.url), "utf8"));
+  assert.equal(local.learning.enabled, true);
+  for (const file of ["../AGENTS.md", "../templates/AGENTS.snippet.md", "../README.md", "../SETUP.md", "../docs/linear-rules.md"]) {
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    for (const phrase of ["Factory Learning", "factory:learning-generated", "learning-status", "learning-run --dry-run", "reliability", "quality", "throughput", "human Ship"]) assert.match(text, new RegExp(phrase, "i"), `${file}: ${phrase}`);
+  }
+  const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  for (const phrase of ["registry.json", "coreSourceAnchor", "maxNewCardsPerRun", "setup-team", "kill switch", "verified improvement", "inconclusive evidence"]) {
+    assert.match(readme, new RegExp(phrase, "i"), `README: ${phrase}`);
+  }
+  const setup = fs.readFileSync(new URL("../SETUP.md", import.meta.url), "utf8");
+  for (const phrase of ["exactly one learning host", "runner: false", "no Linear writes or cursor movement", "isolated temporary directory", "blocked:needs-user"]) {
+    assert.match(setup, new RegExp(phrase, "i"), `SETUP: ${phrase}`);
   }
 });
