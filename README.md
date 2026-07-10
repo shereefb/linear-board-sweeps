@@ -31,9 +31,10 @@ From inside the target repo, tell your agent (Claude Code or Codex):
 | Path | What it is |
 |------|-----------|
 | `SETUP.md` | The agent-facing bootstrap procedure (what to prompt, where to put everything, exact commands). |
+| [`CHANGELOG.md`](CHANGELOG.md) | User-facing release history for the kit. |
 | `skills/{spec,dev,qa,ship}-sweep/SKILL.md` | The four cross-runtime scheduled sweep skills. Project-agnostic — they read `.claude/linear-sweep.json`. spec-sweep uses adaptive review depth, spec/dev/qa run materially gated review lenses, and ship-sweep is the only one that merges + deploys. |
 | `skills/unblock-sweep/SKILL.md` | Manual-only interactive workflow for resolving cards parked with blocking labels across registered anchors. It is copied to anchors but never scheduled. |
-| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `retire-state`, `rename-states`, `query`. |
+| `scripts/linear.mjs` | Zero-dependency Linear engine (Node 18+): `whoami`, `setup-team`, `ensure-project`, `create-card`, `move-card-bottom`, `retire-state`, `rename-states`, `dependency-status`, `query`. |
 | `scripts/linear-watch.mjs` | Zero-dependency auto-sweep launcher: `register`/`unregister`, `activate`/`deactivate` (toggle the project label), `ship-runner [on\|off]` (pin ship dispatch to this host), `list`, `tick [--dry-run]`, `health`, `doctor [--json]`. Polls Linear cheaply and dispatches a sweep only when a queue has actionable work, using the visible Linear column order — see [Triggering](#triggering-auto-sweep). |
 | `scripts/linear-watch.sh` + `scripts/install-watch.sh` + `templates/launchd/…watch.plist` | launchd wrapper, installer, and plist that run the launcher every 10 min on a Mac (mini). |
 | `templates/linear-sweep.json` | The per-repo config the skills read. Copied + filled into the target's `.claude/`. |
