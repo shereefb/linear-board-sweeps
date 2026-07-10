@@ -30,7 +30,7 @@ import {
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
@@ -4293,6 +4293,96 @@ test("classifyDispatchOutcome: exit 127, signal, interruption, and success remai
   assert.deepEqual(classifyDispatchOutcome({ ...base, type: "close", exitCode: 0 }), {
     kind: "success", code: null, exitCode: 0, signal: null, ...base,
   });
+});
+
+// Envelope: openai/codex bfe31598 exec_events.rs; message family: protocol/error.rs.
+const PERSONAL_LIMIT_ERROR = { type: "error", message: "You've hit your usage limit. Try again later." };
+const MODEL_LIMIT_FAILURE = { type: "turn.failed", error: { message: "You've hit your usage limit for codex_other. Switch to another model now, or try again later." } };
+const TPM_LIMIT = { type: "error", message: "Rate limit reached for gpt-5 on tokens per min. Please try again in 11s." };
+const WORKSPACE_CREDITS = { type: "error", message: "Your workspace has run out of credits." };
+
+test("Codex usage evidence: recognizes only source-pinned terminal error envelopes", () => {
+  assert.equal(isCodexUsageExhaustedEvent(PERSONAL_LIMIT_ERROR), true);
+  assert.equal(isCodexUsageExhaustedEvent(MODEL_LIMIT_FAILURE), true);
+
+  for (const value of [
+    { type: "agent.message", message: PERSONAL_LIMIT_ERROR.message },
+    { type: "item.completed", item: { message: PERSONAL_LIMIT_ERROR.message } },
+    { type: "error", message: "The service is overloaded. Try again later." },
+    { type: "error", message: "Context window exceeded." },
+    { type: "error", message: "Authentication required." },
+    { type: "error", message: "Quota exceeded." },
+    TPM_LIMIT,
+    WORKSPACE_CREDITS,
+    { type: "error", message: "Your workspace spending limit has been reached." },
+    { type: "error", message: "Your workspace credit balance is empty." },
+    { type: "turn.failed", error: { details: PERSONAL_LIMIT_ERROR.message } },
+    { type: "error" },
+    { type: "turn.failed" },
+    [],
+    null,
+    "You've hit your usage limit.",
+  ]) assert.equal(isCodexUsageExhaustedEvent(value), false);
+});
+
+test("Codex usage evidence: streams split stdout JSON and excludes log-only stderr", () => {
+  const collector = createCodexUsageEvidenceCollector();
+  const encoded = Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  collector.push(encoded.subarray(0, 17));
+  collector.push(encoded.subarray(17));
+  collector.finish();
+  assert.equal(collector.exhausted(), true);
+
+  const stdoutCollector = createCodexUsageEvidenceCollector();
+  const stderrLogOnly = Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  assert.ok(stderrLogOnly.length > 0);
+  stdoutCollector.finish();
+  assert.equal(stdoutCollector.exhausted(), false);
+});
+
+test("Codex usage evidence: fails closed on oversized, malformed, and bounded candidate streams", () => {
+  const oversizedPositive = { ...PERSONAL_LIMIT_ERROR, message: `${PERSONAL_LIMIT_ERROR.message}${"x".repeat(16 * 1024)}` };
+  const discarded = createCodexUsageEvidenceCollector();
+  discarded.push(Buffer.from(`${JSON.stringify(oversizedPositive)}\n`));
+  discarded.finish();
+  assert.equal(discarded.exhausted(), false);
+
+  const longLineThenPositive = createCodexUsageEvidenceCollector();
+  longLineThenPositive.push(Buffer.from(`${JSON.stringify(oversizedPositive)}\n${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  longLineThenPositive.finish();
+  assert.equal(longLineThenPositive.exhausted(), true);
+
+  const malformed = createCodexUsageEvidenceCollector();
+  malformed.push(Buffer.from([0x7b, 0x22, 0xff, 0x0a]));
+  malformed.push(Buffer.from("{not json}\n"));
+  malformed.finish();
+  assert.equal(malformed.exhausted(), false);
+
+  const candidateOverflow = createCodexUsageEvidenceCollector();
+  candidateOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  candidateOverflow.push(Buffer.from(`${Array.from({ length: 32 }, () => JSON.stringify({ type: "item.completed" })).join("\n")}\n`));
+  candidateOverflow.finish();
+  assert.equal(candidateOverflow.exhausted(), false);
+
+  const byteOverflow = createCodexUsageEvidenceCollector();
+  byteOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  byteOverflow.push(Buffer.from(`${Array.from({ length: 5 }, () => JSON.stringify({ type: "item.completed", payload: "x".repeat(14 * 1024) })).join("\n")}\n`));
+  byteOverflow.finish();
+  assert.equal(byteOverflow.exhausted(), false);
+  assert.equal("events" in byteOverflow, false);
+  assert.equal(Object.values(byteOverflow).some(Array.isArray), false);
+});
+
+test("Codex usage evidence: finish parses a bounded final stdout line", () => {
+  const bounded = createCodexUsageEvidenceCollector();
+  bounded.push(Buffer.from(JSON.stringify(PERSONAL_LIMIT_ERROR)));
+  bounded.finish();
+  assert.equal(bounded.exhausted(), true);
+
+  const oversized = createCodexUsageEvidenceCollector();
+  oversized.push(Buffer.from("x".repeat(16 * 1024 + 1)));
+  oversized.finish();
+  assert.equal(oversized.exhausted(), false);
 });
 test("dispatchAsync: child dependency outcome channel overrides a superficially successful runtime exit", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dependency-outcome-"));

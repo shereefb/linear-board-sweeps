@@ -21,6 +21,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
   bottomSortOrder,
@@ -5153,6 +5154,88 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
 }
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
+
+const CODEX_USAGE_LIMIT_PREFIXES = ["You've hit your usage limit.", "You've hit your usage limit for "];
+const CODEX_USAGE_MAX_LINE_BYTES = 16 * 1024;
+const CODEX_USAGE_MAX_CANDIDATES = 32;
+const CODEX_USAGE_MAX_CANDIDATE_BYTES = 64 * 1024;
+
+export function isCodexUsageExhaustedEvent(value) {
+  const message = value?.type === "error"
+    ? value.message
+    : value?.type === "turn.failed" ? value?.error?.message : null;
+  return typeof message === "string"
+    && CODEX_USAGE_LIMIT_PREFIXES.some((prefix) => message.startsWith(prefix));
+}
+
+export function createCodexUsageEvidenceCollector() {
+  const decoder = new StringDecoder("utf8");
+  let line = "";
+  let lineBytes = 0;
+  let discardingLine = false;
+  let candidateCount = 0;
+  let candidateBytes = 0;
+  let classificationDisabled = false;
+  let exhausted = false;
+  let finished = false;
+
+  const classifyLine = () => {
+    if (classificationDisabled || !line.length) return;
+    let value;
+    try { value = JSON.parse(line); } catch { return; }
+    candidateCount += 1;
+    candidateBytes += lineBytes;
+    if (candidateCount > CODEX_USAGE_MAX_CANDIDATES || candidateBytes > CODEX_USAGE_MAX_CANDIDATE_BYTES) {
+      classificationDisabled = true;
+      exhausted = false;
+      return;
+    }
+    if (isCodexUsageExhaustedEvent(value)) exhausted = true;
+  };
+
+  const resetLine = () => {
+    line = "";
+    lineBytes = 0;
+    discardingLine = false;
+  };
+
+  const appendDecoded = (text) => {
+    for (const character of text) {
+      if (character === "\n") {
+        if (!discardingLine) classifyLine();
+        resetLine();
+        continue;
+      }
+      if (discardingLine) continue;
+      const characterBytes = Buffer.byteLength(character);
+      if (lineBytes + characterBytes > CODEX_USAGE_MAX_LINE_BYTES) {
+        line = "";
+        lineBytes = 0;
+        discardingLine = true;
+        continue;
+      }
+      line += character;
+      lineBytes += characterBytes;
+    }
+  };
+
+  return {
+    push(chunk) {
+      if (finished || chunk == null) return;
+      appendDecoded(decoder.write(chunk));
+    },
+    finish() {
+      if (finished) return;
+      finished = true;
+      appendDecoded(decoder.end());
+      if (!discardingLine) classifyLine();
+      resetLine();
+    },
+    exhausted() {
+      return exhausted;
+    },
+  };
+}
 
 export function classifyDispatchOutcome(event = {}) {
   const base = {
