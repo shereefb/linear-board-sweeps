@@ -374,6 +374,102 @@ export function buildLearningEvidenceSnapshot({
   };
 }
 
+export function readLearningRunIndex(runsDir, {
+  from = null,
+  capturedThrough = new Date().toISOString(),
+  maxBytes = 5 * 1024 * 1024,
+  maxRecords = MAX_LEARNING_SNAPSHOT_RUNS,
+} = {}) {
+  const records = [];
+  const gaps = [];
+  let bytes = 0;
+  const files = (fs.existsSync(runsDir) ? fs.readdirSync(runsDir) : [])
+    .filter((name) => /^\d{8}\.jsonl$/.test(name))
+    .sort()
+    .slice(-LOGICAL_INDEX_RETENTION_DAYS);
+  outer: for (const name of files) {
+    const target = path.join(runsDir, name);
+    let text;
+    try {
+      const size = fs.statSync(target).size;
+      if (bytes + size > maxBytes) {
+        gaps.push({ source: target, reason: `run index bytes truncated at ${maxBytes}` });
+        break;
+      }
+      text = fs.readFileSync(target, "utf8");
+      bytes += size;
+    } catch {
+      gaps.push({ source: target, reason: "run index unreadable" });
+      continue;
+    }
+    for (const [index, line] of text.split("\n").entries()) {
+      if (!line) continue;
+      if (records.length >= maxRecords) {
+        gaps.push({ source: runsDir, reason: `run records truncated at ${maxRecords}` });
+        break outer;
+      }
+      try { records.push(JSON.parse(line)); }
+      catch { gaps.push({ source: target, reason: `malformed run index JSONL line ${index + 1}` }); }
+    }
+  }
+  const snapshot = buildLearningEvidenceSnapshot({ from, capturedThrough, runRecords: records, coverageGaps: gaps });
+  return { snapshot, filesRead: files.length, bytesRead: bytes };
+}
+
+const LOGICAL_INDEX_RETENTION_DAYS = 14;
+
+function elapsedMs(last, nowMs) {
+  const parsed = Date.parse(last || "");
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : Math.max(0, nowMs - parsed);
+}
+
+export function learningDueDecisions({ state = emptyLearningState(), snapshot = {}, workspaces = [], now = new Date().toISOString() } = {}) {
+  const nowMs = Date.parse(now);
+  if (Number.isNaN(nowMs)) throw new Error("learning due check requires an ISO now timestamp");
+  const enabled = Object.fromEntries(LEARNING_LENSES.map((lens) => [lens, workspaces.length === 0 || workspaces.some((workspace) => {
+    const learning = workspace.learning || workspace.config?.learning || {};
+    const lenses = learning.lenses || {};
+    const value = lenses[lens];
+    return learning.enabled !== false && (value === true || value?.enabled === true);
+  })]));
+  const events = snapshot.events || [];
+  const observations = snapshot.observations || [];
+  const runRecords = snapshot.runRecords || [];
+  const lensDecisions = LEARNING_LENSES.map((lens) => {
+    const lensState = state.lenses?.[lens] || emptyLensState();
+    if (!enabled[lens]) return { lens, due: false, reason: "disabled", sampleCount: 0 };
+    if (lensState.pending) return { lens, due: true, reason: "pending-window", sampleCount: Object.keys(lensState.pending.mutations || {}).length };
+    const since = Date.parse(lensState.lastSuccessfulCapturedThrough || "");
+    const afterCursor = (timestamp) => Number.isNaN(since) || Date.parse(timestamp || "") > since;
+    if (lens === "reliability") {
+      const evidence = [
+        ...events.filter((event) => afterCursor(event.occurredAt) && (event.kind === "canary" || (event.kind === "terminal" && event.category === "failed"))),
+        ...observations.filter((item) => afterCursor(item.occurredAt || item.at) && ["dispatch-failure", "stale-claim", "failure-recovery", "safety-invariant", "poison-card"].includes(item.signal)),
+      ];
+      const due = evidence.length > 0 && elapsedMs(lensState.lastSuccessfulCapturedThrough, nowMs) >= 24 * 3600000;
+      return { lens, due, reason: due ? "cadence-and-evidence" : evidence.length ? "cadence" : "no-new-evidence", sampleCount: evidence.length };
+    }
+    if (lens === "quality") {
+      const evidence = [
+        ...events.filter((event) => afterCursor(event.occurredAt) && (["review", "qa", "question", "bounce"].includes(event.kind) || event.kind === "terminal")),
+        ...observations.filter((item) => afterCursor(item.occurredAt || item.at) && ["review-finding", "qa-result", "spec-bounce", "human-question", "red-canary"].includes(item.signal)),
+      ];
+      const distinctCards = new Set(evidence.map((item) => item.cardId || item.identity?.issueIdentifier || item.issueIdentifier).filter(Boolean)).size;
+      const sampleCount = distinctCards || evidence.length;
+      const due = sampleCount >= 5 || (evidence.length > 0 && elapsedMs(lensState.lastSuccessfulCapturedThrough, nowMs) >= 7 * 86400000);
+      return { lens, due, reason: due ? sampleCount >= 5 ? "volume-threshold" : "cadence-and-evidence" : evidence.length ? "cadence" : "no-new-evidence", sampleCount };
+    }
+    const evidence = runRecords.filter((record) => afterCursor(record.endedAt));
+    const due = evidence.length >= 20 && elapsedMs(lensState.lastSuccessfulCapturedThrough, nowMs) >= 7 * 86400000;
+    return { lens, due, reason: due ? "sample-floor-and-cadence" : evidence.length ? "sample-or-cadence" : "no-new-evidence", sampleCount: evidence.length };
+  });
+  const evaluationDue = Object.entries(state.evaluations || {}).filter(([, evaluation]) => evaluation?.status === "active" && Date.parse(evaluation.windowEndsAt || evaluation.evaluateAfter || "") <= nowMs)
+    .map(([rootFingerprint]) => rootFingerprint);
+  const lenses = Object.fromEntries(lensDecisions.map((item) => [item.lens, item]));
+  const due = lensDecisions.some((item) => item.due) || evaluationDue.length > 0;
+  return { capturedThrough: snapshot.capturedThrough || now, lenses, evaluations: { due: evaluationDue }, due, anyDue: due };
+}
+
 const detectorDefinitions = [
   ["repeated-dispatch-failure", "reliability", "dispatch-failure", 2, "runId"],
   ["stale-claim-pattern", "reliability", "stale-claim", 2, "runId"],
@@ -420,7 +516,7 @@ function detectorQualifies(id, observations, config = {}) {
   if (id === "queue-delay-regression") {
     const byWindow = groupBy(observations.filter((item) => item.window), (item) => item.window);
     const windows = [...byWindow.keys()].sort().slice(-2);
-    return observations.length >= 20 && windows.length === 2 && windows.every((window) => {
+    return observations.length >= 20 && windows.length === 2 && consecutiveWindows(windows[0], windows[1]) && windows.every((window) => {
       const group = byWindow.get(window);
       const value = percentile(group.map((item) => Number(item.metrics?.waitMs)), 0.9);
       const baseline = percentile(group.map((item) => Number(item.metrics?.baselineP90Ms)), 0.9);
@@ -453,11 +549,23 @@ function detectorQualifies(id, observations, config = {}) {
     const relevant = observations.filter((item) => item.riskClass === "low" && item.safetyFloorSatisfied === true);
     const costly = relevant.filter((item) => item.findingCount === 0);
     const duration = percentile(costly.map((item) => Number(item.metrics?.reviewDurationMs)), 0.9);
-    const baseline = percentile(costly.map((item) => Number(item.metrics?.baselineReviewDurationMs ?? Number(thresholds.reviewCostFloorMs ?? 300_000) / 2)), 0.9);
+    const baseline = percentile(costly.map((item) => Number(item.metrics?.baselineReviewDurationMs)), 0.9);
     return observations.length >= 20 && costly.length / observations.length >= Number(thresholds.reviewOverprocessingRateFloor ?? 0.5)
       && duration >= Number(thresholds.reviewCostFloorMs ?? 300_000) && baseline > 0 && duration / baseline >= Number(thresholds.relativeRegression ?? 1.25);
   }
   return true;
+}
+
+function consecutiveWindows(left, right) {
+  const parse = (value) => {
+    const week = String(value).match(/^(\d{4})-W(\d{1,2})$/i);
+    if (week) return Number(week[1]) * 53 + Number(week[2]);
+    const trailing = String(value).match(/(\d+)$/);
+    return trailing ? Number(trailing[1]) : null;
+  };
+  const a = parse(left);
+  const b = parse(right);
+  return a !== null && b !== null && b - a === 1;
 }
 
 function percentile(values, quantile) {
@@ -517,11 +625,12 @@ function detectorWindowDays(detectorId) {
 }
 
 function detectorClusterKey(detector, item) {
-  if (detector.id === "stale-claim-pattern") return [item.stage, item.subsystem, item.fingerprint || item.rootCauseKey].join("|");
-  if (["repeated-review-finding", "spec-quality-failure", "recurring-human-question"].includes(detector.id)) return [item.category, item.rootCauseKey || item.fingerprint].join("|");
+  if (detector.id === "stale-claim-pattern") return [item.stage, item.subsystem].join("|");
+  if (["repeated-review-finding", "spec-quality-failure", "recurring-human-question"].includes(detector.id)) return item.category || "unknown-category";
   if (detector.id === "red-canary-pattern") return item.relatedKey || item.rootCauseKey || item.fingerprint || "unrelated";
   if (detector.id === "qa-rework-regression") return [item.sourceWorkspace, item.repoEntry, item.stage].join("|");
   if (detector.id === "stage-duration-regression" || detector.id === "review-overprocessing") return item.riskClass || "unknown-risk";
+  if (["queue-delay-regression", "nonproductive-run", "capacity-saturation"].includes(detector.id)) return [item.sourceWorkspace, item.stage].join("|");
   return item.fingerprint || item.rootCauseKey || item.reason || detector.signal;
 }
 
@@ -668,6 +777,12 @@ export function renderFindingCard(finding) {
   const marker = `[factory-learning root=${safe(finding.rootFingerprint, 128)} generation=${Math.max(0, Math.floor(Number(finding.generation)) || 0)}]`;
   const impact = safe(finding.impact);
   const references = (finding.evidenceReferences || []).slice(0, 100).map((value) => safe(value, 500));
+  const provenance = (finding.detectorProvenance || [`${finding.detectorId}/${finding.detectorVersion}`]).slice(0, 50).map((value) => safe(value, 200)).join(", ");
+  const mandatorySuffix = [
+    `## Detector provenance\n${provenance}`,
+    `## Measurement contracts\n${safe(stableJson(finding.measurementContracts || [{ detector: provenance, baseline: finding.baseline, acceptanceMetric: finding.acceptanceMetric, evaluationWindow: finding.evaluationWindow }]), 3_000)}`,
+    marker,
+  ].join("\n\n");
   const body = [
     `# Factory improvement: ${impact}`,
     "",
@@ -686,11 +801,10 @@ export function renderFindingCard(finding) {
     `## Baseline\n${safe(stableJson(finding.baseline), 2_000)}`,
     `## Evaluation window\n${safe(stableJson(finding.evaluationWindow), 2_000)}`,
     `## Exclusions\n${(finding.exclusions || []).slice(0, 50).map((value) => safe(value, 500)).join("\n")}`,
-    `## Detector provenance\n${(finding.detectorProvenance || [`${finding.detectorId}/${finding.detectorVersion}`]).slice(0, 50).map((value) => safe(value, 200)).join(", ")}`,
-    "",
-    marker,
   ].join("\n\n");
-  return sanitizeLearningText(body, 20_000);
+  const reserved = mandatorySuffix.length + 2;
+  const boundedBody = sanitizeLearningText(body, Math.max(0, 20_000 - reserved));
+  return `${boundedBody}\n\n${mandatorySuffix}`.slice(0, 20_000);
 }
 
 export function renderEvidenceDelta(finding, occurrenceIds = []) {
@@ -709,7 +823,7 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     return time > Date.parse(evaluation.completedAt || "") && time <= windowEndsAtMs;
   }).sort((a, b) => Date.parse(a.occurredAt || a.at) - Date.parse(b.occurredAt || b.at));
   const values = observations.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
-  let status = "inconclusive-evidence";
+  let status = windowReady ? "inconclusive-evidence" : "not-due";
   if (windowReady && coverageComplete && values.length) {
     const value = evaluation.aggregation === "p90" ? percentile(values, 0.9) : values.at(-1);
     const baseline = Number(evaluation.baseline);
@@ -730,7 +844,7 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
       else Object.assign(recurrence, { action: "create", generation: (evaluation.generation || 0) + 1 });
     }
   }
-  return { status, evaluatedAt: snapshot.capturedThrough, recurrence };
+  return { status, terminal: status !== "not-due", evaluatedAt: snapshot.capturedThrough, recurrence };
 }
 
 function clone(value) {

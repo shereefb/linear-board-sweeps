@@ -44,6 +44,8 @@ import {
   failureTodoTitle, failureTodoBody, failureTodoDecisions, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
+  buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
+  resolveRegisteredLearningWorkspaces, readLearningRunIndex, runPostDeliveryLearning,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -221,6 +223,27 @@ test("learning registry: legacy output gains disabled defaults and preserves unr
     runtime: null,
   });
   assert.deepEqual(normalized.customSetting, { keep: true });
+});
+test("registered learning workspaces are resolved before delivery activation and retain named gaps", () => {
+  const reads = [];
+  const result = resolveRegisteredLearningWorkspaces({ repos: ["/paused", "/active", "/broken"] }, {
+    configFn: (anchor) => {
+      reads.push(["config", anchor]);
+      if (anchor === "/broken") throw new Error("bad config");
+      return { projectId: anchor.slice(1), learning: { enabled: anchor === "/paused" } };
+    },
+    keyFn: (anchor) => {
+      reads.push(["key", anchor]);
+      return anchor === "/paused" ? null : "key";
+    },
+    canonicalFn: (anchor) => anchor,
+  });
+  assert.deepEqual(result.workspaces.map((item) => item.sourceAnchorPath), ["/paused"]);
+  assert.equal(result.workspaces[0].apiKey, null);
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/paused" && /LINEAR_API_KEY/.test(gap.reason)));
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/broken" && /bad config/.test(gap.reason)));
+  assert.deepEqual(reads.filter(([kind]) => kind === "config").map(([, anchor]) => anchor), ["/paused", "/active", "/broken"]);
+  assert.deepEqual(reads.filter(([kind]) => kind === "key").map(([, anchor]) => anchor), ["/paused", "/active"]);
 });
 test("capacity installation: persists ten without deleting existing registry settings", () => {
   const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/install-watch.sh"), "utf8");
@@ -1496,6 +1519,124 @@ test("admission priority: a lower-stage handoff never leapfrogs a higher stage",
     { stage: "dev", trigger: "handoff", issueIdentifier: "COD-1" },
     { stage: "qa", trigger: "refill", issueIdentifier: "COD-2" },
   ) > 0);
+});
+test("learning admission is explicitly lower than Spec and demand identity is registry-scoped", () => {
+  const stages = ["learning", "spec", "dev", "qa", "ship"].map((stage) => ({
+    stage,
+    trigger: stage === "learning" ? "learning-due" : "initial",
+    issueIdentifier: stage,
+  }));
+  assert.deepEqual(stages.sort(compareAdmissionDemand).map((item) => item.stage), ["ship", "qa", "dev", "spec", "learning"]);
+  const a = buildLearningDemand({ repos: ["/a"] }, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  const b = buildLearningDemand({ repos: ["/a", "/b"] }, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  assert.equal(a.issueIdentifier, b.issueIdentifier);
+  assert.deepEqual({ stage: a.stage, trigger: a.trigger }, { stage: "learning", trigger: "learning-due" });
+});
+
+test("capacity ledger accepts only the exact learning pair and enforces one live registry singleton", () => {
+  let stored = null;
+  let id = 0;
+  const ledger = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => `learning-${++id}`,
+  });
+  const demand = buildLearningDemand({}, { registryPath: "/state/registry.json", canonicalFn: (value) => value });
+  const first = ledger.reserve(demand);
+  assert.ok(first);
+  assert.equal(ledger.reserve(demand), null);
+  assert.throws(() => ledger.reserve({ ...demand, trigger: "initial" }), /invalid trigger|learning/i);
+  assert.throws(() => ledger.reserve({ ...demand, stage: "dev" }), /invalid trigger|learning/i);
+  first.release();
+  assert.ok(ledger.reserve(demand));
+});
+
+test("capacity restart keeps a live learning child and prunes a dead singleton", () => {
+  const entry = {
+    token: "learning-live", parentPid: 10, childPid: 20,
+    issueIdentifier: "factory-learning:registry", workspace: "/state/registry.json",
+    stage: "learning", trigger: "learning-due", reservedAt: "2026-07-10T00:00:00.000Z",
+  };
+  let stored = { version: 1, entries: [entry] };
+  const live = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: (pid) => pid === 20,
+  }).reconcile();
+  assert.deepEqual(live.entries, [entry]);
+  const dead = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => false,
+  }).reconcile();
+  assert.equal(dead.active, 0);
+});
+
+test("learning synthesis commands and child env deny capabilities for Codex and Claude", () => {
+  const common = {
+    tempDir: "/isolated/tmp", evidencePath: "/isolated/tmp/evidence.json",
+    schemaPath: "/isolated/tmp/schema.json", outputPath: "/isolated/tmp/output.json",
+  };
+  const codex = buildLearningSynthesisCommand({ ...common, runtime: "codex" });
+  assert.equal(codex.cwd, common.tempDir);
+  for (const pair of [["--cd", common.tempDir], ["--sandbox", "read-only"], ["--output-schema", common.schemaPath], ["--output-last-message", common.outputPath]]) {
+    const index = codex.args.indexOf(pair[0]);
+    assert.equal(codex.args[index + 1], pair[1]);
+  }
+  for (const flag of ["--ephemeral", "--ignore-user-config", "--skip-git-repo-check"]) assert.ok(codex.args.includes(flag), flag);
+  const claude = buildLearningSynthesisCommand({ ...common, runtime: "claude", emptyMcpPath: "/isolated/tmp/mcp.json" });
+  for (const flag of ["--safe-mode", "--bare", "--strict-mcp-config", "--no-session-persistence"]) assert.ok(claude.args.includes(flag), flag);
+  assert.equal(claude.args[claude.args.indexOf("--mcp-config") + 1], "/isolated/tmp/mcp.json");
+  assert.equal(claude.args[claude.args.indexOf("--tools") + 1], "");
+  assert.equal(claude.args[claude.args.indexOf("--json-schema") + 1], common.schemaPath);
+  const env = learningChildEnvironment({
+    PATH: "/bin", LANG: "en_US.UTF-8", LC_ALL: "C", SSL_CERT_FILE: "/certs.pem",
+    LINEAR_API_KEY: "secret", OPENAI_API_KEY: "secret", CUSTOM_TOKEN: "secret", REPO_VALUE: "secret",
+  }, { tempDir: common.tempDir });
+  assert.deepEqual(env, {
+    PATH: "/bin", LANG: "en_US.UTF-8", LC_ALL: "C", SSL_CERT_FILE: "/certs.pem",
+    HOME: common.tempDir, TMPDIR: common.tempDir,
+  });
+});
+
+test("bounded learning index reports malformed and truncated evidence", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "learning-read-index-"));
+  fs.writeFileSync(path.join(dir, "20260710.jsonl"), [
+    JSON.stringify({ cardRunId: "one", endedAt: "2026-07-10T10:00:00.000Z" }),
+    "malformed",
+    JSON.stringify({ cardRunId: "two", endedAt: "2026-07-10T11:00:00.000Z" }),
+  ].join("\n") + "\n");
+  const result = readLearningRunIndex(dir, { maxRecords: 1, maxFiles: 1, maxBytesPerFile: 10_000 });
+  assert.equal(result.runRecords.length, 1);
+  assert.ok(result.coverageGaps.some((gap) => /malformed/.test(gap.reason)));
+  assert.ok(result.coverageGaps.some((gap) => /record count/.test(gap.reason)));
+});
+
+test("post-delivery learning reserves directly without same-repo or observation seams and releases in finally", async () => {
+  let reserved = 0;
+  let released = 0;
+  const result = await runPostDeliveryLearning({
+    registry: { learning: { enabled: true, runner: true } },
+    dueDecisions: { due: true },
+    findings: [{ fingerprint: "known", confidence: "medium" }],
+    ledger: {
+      reserve: (demand) => {
+        reserved += 1;
+        assert.equal(demand.stage, "learning");
+        return { attachChildPid: () => true, release: () => { released += 1; } };
+      },
+    },
+    dispatchFn: async (_input, { onSpawn }) => {
+      onSpawn(123);
+      throw new Error("model unavailable");
+    },
+    deterministicFn: (findings, error) => ({ mode: "deterministic", findings, synthesisUnavailable: error.message }),
+  });
+  assert.equal(reserved, 1);
+  assert.equal(released, 1);
+  assert.equal(result.mode, "deterministic");
+  assert.match(result.synthesisUnavailable, /model unavailable/);
 });
 test("parallelLimit: defaults invalid and missing config to the bounded parallel default", () => {
   assert.equal(DEFAULT_MAX_NON_SHIP_DISPATCHES, 2);

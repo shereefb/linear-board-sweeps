@@ -16,10 +16,13 @@ import {
   buildLearningEvidenceSnapshot,
   aggregateLearningFindings,
   createLearningStateStore,
+  emptyLearningState,
   evaluateLearningOutcome,
+  learningDueDecisions,
   normalizeLearningRegistry,
   normalizeWorkspaceLearning,
   readLearningEvents,
+  readLearningRunIndex,
   rankQualifiedFindings,
   renderEvidenceDelta,
   renderFindingCard,
@@ -61,6 +64,71 @@ test("learning contracts expose stable stage, trigger, lenses, and taxonomy", ()
     canary: ["red"],
     terminal: ["advanced", "blocked", "failed"],
   });
+});
+
+test("learning due decisions preserve pending work and enforce independent cadences", () => {
+  const state = {
+    version: 1,
+    lenses: {
+      reliability: { lastSuccessfulCapturedThrough: "2026-07-09T12:00:00.000Z", pending: null },
+      quality: { lastSuccessfulCapturedThrough: "2026-07-04T12:00:00.000Z", pending: { capturedThrough: "2026-07-09T00:00:00.000Z" } },
+      throughput: { lastSuccessfulCapturedThrough: "2026-07-01T12:00:00.000Z", pending: null },
+    },
+    evaluations: {
+      due: { status: "active", evaluateAfter: "2026-07-10T11:00:00.000Z" },
+      later: { status: "active", evaluateAfter: "2026-07-11T11:00:00.000Z" },
+    },
+  };
+  const snapshot = {
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    events: [
+      { occurredAt: "2026-07-10T10:00:00.000Z", kind: "terminal", category: "failed" },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        occurredAt: `2026-07-10T10:0${index}:00.000Z`, kind: "bounce", category: "implementation-incomplete",
+      })),
+    ],
+    runRecords: Array.from({ length: 20 }, (_, index) => ({
+      endedAt: `2026-07-10T10:${String(index).padStart(2, "0")}:00.000Z`, cardRunId: `run-${index}`,
+    })),
+  };
+
+  const decisions = learningDueDecisions({ state, snapshot, now: "2026-07-10T12:00:00.000Z" });
+  assert.equal(decisions.lenses.reliability.due, true);
+  assert.equal(decisions.lenses.quality.due, true);
+  assert.equal(decisions.lenses.quality.reason, "pending-window");
+  assert.equal(decisions.lenses.throughput.due, true);
+  assert.deepEqual(decisions.evaluations.due, ["due"]);
+  assert.equal(decisions.due, true);
+});
+
+test("learning due decisions stay idle without new evidence and support quality volume override", () => {
+  const baseState = {
+    version: 1,
+    lenses: Object.fromEntries(LEARNING_LENSES.map((lens) => [lens, {
+      lastSuccessfulCapturedThrough: "2026-07-10T11:00:00.000Z", pending: null,
+    }])),
+    evaluations: {},
+  };
+  const idle = learningDueDecisions({
+    state: baseState,
+    snapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", events: [], runRecords: [] },
+    now: "2026-07-20T12:00:00.000Z",
+  });
+  assert.equal(idle.due, false);
+  const volume = learningDueDecisions({
+    state: baseState,
+    snapshot: {
+      capturedThrough: "2026-07-10T12:00:00.000Z",
+      events: Array.from({ length: 5 }, (_, index) => ({
+        occurredAt: `2026-07-10T11:0${index + 1}:00.000Z`, kind: "terminal", category: "blocked",
+      })),
+      runRecords: [],
+    },
+    now: "2026-07-10T12:00:00.000Z",
+  });
+  assert.equal(volume.lenses.quality.due, true);
+  assert.equal(volume.lenses.quality.reason, "volume-threshold");
+  assert.equal(volume.lenses.reliability.due, false);
 });
 
 test("learning events accept every closed taxonomy pair and reject every unknown", () => {
@@ -446,7 +514,7 @@ const DETECTOR_MATRIX = [
   ["stage-duration-regression", 20, (n) => repeat("stage-run", n, { riskClass: "medium", metrics: { durationMs: 200, baselineP90Ms: 100 } })],
   ["nonproductive-run", 20, (n) => repeat("productive-run", n, (i) => ({ success: true, productive: i >= 3 }))],
   ["capacity-saturation", 20, (n) => repeat("capacity-run", n, { deferred: true, metrics: { waitMs: 200, baselineP90Ms: 100 } })],
-  ["review-overprocessing", 20, (n) => repeat("review-run", n, { riskClass: "low", findingCount: 0, safetyFloorSatisfied: true, metrics: { reviewDurationMs: 200 } })],
+  ["review-overprocessing", 20, (n) => repeat("review-run", n, { riskClass: "low", findingCount: 0, safetyFloorSatisfied: true, metrics: { reviewDurationMs: 200, baselineReviewDurationMs: 100 } })],
 ];
 
 test("the declarative detector registry preserves all fifteen approved detectors and required contracts", () => {
@@ -701,7 +769,7 @@ test("outcome evaluation waits for and bounds the fixed evaluation window", () =
     { evidenceId: "inside", occurredAt: "2026-07-21T00:00:00.000Z", metrics: { repeatRate: 0.45 } },
     { evidenceId: "outside", occurredAt: "2026-07-30T00:00:00.000Z", metrics: { repeatRate: 0.1 } },
   ];
-  assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, preWindow).status, "inconclusive-evidence");
+  assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, preWindow).status, "not-due");
   assert.equal(evaluateLearningOutcome(OUTCOME_EVALUATION, afterWindow).status, "no-measurable-change");
 });
 
@@ -741,5 +809,54 @@ test("aggregation preserves every measurement and coverage contract and renderin
   const body = renderFindingCard({ ...merged, impact: `token=lin_api_${"x".repeat(100)} ${"z".repeat(30_000)}` });
   assert.ok(body.length <= 20_000);
   assert.doesNotMatch(body, /lin_api_|Structured evidence IDs are recorded above/);
-  for (const phrase of ["Evidence window", "Affected workspaces", "Confidence", "Severity", "Contributing lenses"]) assert.match(body, new RegExp(phrase));
+  for (const phrase of ["Evidence window", "Affected workspaces", "Confidence", "Severity", "Contributing lenses", "Measurement contracts", "[factory-learning root=root-1 generation=0]"]) assert.ok(body.includes(phrase), phrase);
+});
+
+test("detector semantic keys ignore irrelevant source fingerprints", () => {
+  const stale = repeat("stale-claim", 2, (i) => ({ stage: "dev", subsystem: "launcher", fingerprint: `host-${i}` }));
+  const review = repeat("review-finding", 3, (i) => ({ category: "correctness", fingerprint: `detail-${i}`, rootCauseKey: `detail-${i}` }));
+  const queue = repeat("queue-run", 20, (i) => ({ fingerprint: `run-${i}`, window: i < 10 ? "2026-W27" : "2026-W28", metrics: { waitMs: 200, baselineP90Ms: 100 } }));
+  assert.equal(runLearningDetectors(detectorSnapshot(stale), { ...detectorConfig, enabledDetectors: ["stale-claim-pattern"] }).length, 1);
+  assert.equal(runLearningDetectors(detectorSnapshot(review), { ...detectorConfig, enabledDetectors: ["repeated-review-finding"] }).length, 1);
+  assert.equal(runLearningDetectors(detectorSnapshot(queue), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 1);
+});
+
+test("queue delay requires adjacent windows and review overprocessing requires a measured baseline", () => {
+  const nonAdjacent = repeat("queue-run", 20, (i) => ({ window: i < 10 ? "2026-W01" : "2026-W10", metrics: { waitMs: 200, baselineP90Ms: 100 } }));
+  const noBaseline = repeat("review-run", 20, { riskClass: "low", findingCount: 0, safetyFloorSatisfied: true, metrics: { reviewDurationMs: 200 } });
+  assert.equal(runLearningDetectors(detectorSnapshot(nonAdjacent), { ...detectorConfig, enabledDetectors: ["queue-delay-regression"] }).length, 0);
+  assert.equal(runLearningDetectors(detectorSnapshot(noBaseline), { ...detectorConfig, enabledDetectors: ["review-overprocessing"] }).length, 0);
+});
+
+test("learning due decisions enforce cadence, sample floors, pending resumes, and evaluation deadlines", () => {
+  const state = emptyLearningState();
+  state.lenses.reliability.lastSuccessfulCapturedThrough = "2026-07-09T12:00:00.000Z";
+  state.lenses.quality.lastSuccessfulCapturedThrough = "2026-07-03T12:00:00.000Z";
+  state.lenses.throughput.lastSuccessfulCapturedThrough = "2026-07-03T12:00:00.000Z";
+  state.evaluations.root = { status: "active", windowEndsAt: "2026-07-10T11:00:00.000Z" };
+  const snapshot = {
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    events: [buildLearningEvent({ kind: "terminal", category: "failed", summary: "failed" }, TRUSTED_ENV, { now: () => "2026-07-10T11:00:00.000Z" })],
+    observations: repeat("review-finding", 5),
+    runRecords: Array.from({ length: 20 }, (_, i) => ({ cardRunId: `r${i}`, endedAt: "2026-07-10T11:00:00.000Z" })),
+  };
+  const due = learningDueDecisions({ state, snapshot, workspaces: [{ learning: { enabled: true, lenses: { reliability: true, quality: true, throughput: true } } }], now: "2026-07-10T12:00:00.000Z" });
+  assert.equal(due.anyDue, true);
+  assert.deepEqual(Object.values(due.lenses).filter((item) => item.due).map((item) => item.lens), ["reliability", "quality", "throughput"]);
+  assert.equal(due.evaluations.due.length, 1);
+
+  state.lenses.quality.pending = { capturedThrough: snapshot.capturedThrough, mutations: {} };
+  assert.equal(learningDueDecisions({ state, snapshot: { ...snapshot, observations: [] }, workspaces: [{ learning: { enabled: true, lenses: { quality: true } } }], now: "2026-07-10T12:00:00.000Z" }).lenses.quality.reason, "pending-window");
+});
+
+test("bounded learning run index reports malformed coverage and freezes the cutoff", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "learning-run-index-"));
+  fs.writeFileSync(path.join(dir, "20260710.jsonl"), [
+    JSON.stringify({ cardRunId: "before", issueIdentifier: "COD-1", sweep: "dev", sourceWorkspace: "/repo", endedAt: "2026-07-10T11:00:00.000Z", learningEvents: [] }),
+    JSON.stringify({ cardRunId: "after", issueIdentifier: "COD-2", sweep: "dev", sourceWorkspace: "/repo", endedAt: "2026-07-10T13:00:00.000Z", learningEvents: [] }),
+    "bad-json",
+  ].join("\n") + "\n");
+  const result = readLearningRunIndex(dir, { capturedThrough: "2026-07-10T12:00:00.000Z" });
+  assert.deepEqual(result.snapshot.runRecords.map((item) => item.cardRunId), ["before"]);
+  assert.equal(result.snapshot.coverage.complete, false);
 });
