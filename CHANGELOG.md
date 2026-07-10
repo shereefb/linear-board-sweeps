@@ -2,6 +2,13 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.3] - 2026-07-10
+
+### Changed
+
+- Allow Ship to run alongside every other stage while limiting Ship to one active child per registered source workspace; Ship no longer consumes the non-Ship candidate budget or globally blocks capacity admission.
+- Tune this registered host profile to ten non-Ship workspace/stage candidates, two QA cards per primary repo, and twenty same-repo refill dispatches while preserving the hard ten-child host ceiling.
+
 ## [1.2.0.2] - 2026-07-10
 
 ### Fixed

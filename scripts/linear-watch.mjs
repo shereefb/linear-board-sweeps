@@ -1148,7 +1148,8 @@ export function admissionDemandsForCandidates(candidates, {
         ...candidate,
         stage,
         trigger,
-        workspace: candidate.anchorPath,
+        workspace: candidate.sourceAnchorPath || candidate.anchorPath,
+        managedWorkspace: candidate.anchorPath,
         issueId: card.id,
         issueIdentifier: card.identifier,
         repoRoute: card.repoRoute,
@@ -1185,23 +1186,24 @@ function overlapsAny(paths, usedPaths) {
 
 export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT_MAX_NON_SHIP_DISPATCHES, rotationSeed = 0 } = {}) {
   const ranked = rankedDispatchCandidates(candidates);
-  const ship = ranked.find((c) => c.sweep === "ship");
-  if (ship) return [ship];
-
   let limit = Math.max(1, Math.floor(Number(maxNonShipDispatches)) || 1);
-  const rotated = rotateNonShipCandidates(ranked.filter((candidate) => candidate.sweep !== "ship"), rotationSeed);
+  const ordered = [
+    ...ranked.filter((candidate) => candidate.sweep === "ship"),
+    ...rotateNonShipCandidates(ranked, rotationSeed),
+  ];
   const picked = [];
   const pickedRepoSets = [];
   const pickedWorkspaceKeys = [];
   const seenWorkspaceStages = new Set();
-  for (const c of rotated) {
-    if (picked.length >= limit) break;
+  let nonShipPicked = 0;
+  for (const c of ordered) {
+    if (c.sweep !== "ship" && nonShipPicked >= limit) continue;
     const workspaceKey = path.resolve(c.sourceAnchorPath || c.anchorPath);
     const workspaceStageKey = `${workspaceKey}\0${c.sweep}`;
     if (seenWorkspaceStages.has(workspaceStageKey)) continue;
     seenWorkspaceStages.add(workspaceStageKey);
-    const candidateLimit = parallelLimit(c.config);
-    if (picked.length + 1 > Math.min(limit, candidateLimit)) continue;
+    const candidateLimit = c.sweep === "ship" ? null : parallelLimit(c.config);
+    if (candidateLimit !== null && nonShipPicked + 1 > Math.min(limit, candidateLimit)) continue;
     const repos = repoSet(c);
     const conflictsWithAnotherWorkspace = picked.some((_selected, index) => (
       pickedWorkspaceKeys[index] !== workspaceKey && overlapsAny(repos, pickedRepoSets[index])
@@ -1210,7 +1212,10 @@ export function selectDispatchBatch(candidates, { maxNonShipDispatches = DEFAULT
     picked.push(c);
     pickedRepoSets.push(repos);
     pickedWorkspaceKeys.push(workspaceKey);
-    limit = Math.min(limit, candidateLimit);
+    if (candidateLimit !== null) {
+      nonShipPicked += 1;
+      limit = Math.min(limit, candidateLimit);
+    }
   }
   return picked;
 }
@@ -1219,8 +1224,7 @@ export async function preflightAndSelectDispatchBatch(candidates, {
   preflightFn,
   selectOptions = {},
 } = {}) {
-  const shipCandidates = candidates.filter((candidate) => candidate.sweep === "ship");
-  const checked = await preflightFn(shipCandidates.length ? shipCandidates : candidates);
+  const checked = await preflightFn(candidates);
   return { ...checked, selected: selectDispatchBatch(checked.ready, selectOptions) };
 }
 
@@ -1774,10 +1778,24 @@ function capacityEntryError(entry) {
   if (entry.childPid !== null && (!Number.isInteger(entry.childPid) || entry.childPid <= 0)) return `entry ${entry.token} has invalid childPid`;
   if (typeof entry.issueIdentifier !== "string" || !entry.issueIdentifier) return `entry ${entry.token} has invalid issueIdentifier`;
   if (typeof entry.workspace !== "string" || !entry.workspace) return `entry ${entry.token} has invalid workspace`;
+  if (entry.managedWorkspace !== undefined && (typeof entry.managedWorkspace !== "string" || !entry.managedWorkspace)) return `entry ${entry.token} has invalid managedWorkspace`;
   if (!SWEEPS.includes(entry.stage)) return `entry ${entry.token} has invalid stage`;
   if (!["initial", "refill", "handoff"].includes(entry.trigger)) return `entry ${entry.token} has invalid trigger`;
   if (typeof entry.reservedAt !== "string" || Number.isNaN(Date.parse(entry.reservedAt))) return `entry ${entry.token} has invalid reservedAt`;
   return null;
+}
+
+function sameCapacityWorkspace(a = {}, b = {}) {
+  const keys = (value) => new Set([
+    value.workspace,
+    value.managedWorkspace,
+    value.sourceWorkspace,
+    value.sourceAnchorPath,
+    value.anchorPath,
+  ].filter((candidate) => typeof candidate === "string" && candidate).map((candidate) => path.resolve(candidate)));
+  const left = keys(a);
+  for (const candidate of keys(b)) if (left.has(candidate)) return true;
+  return false;
 }
 
 function capacityStaleError(entry, parentAlive, childAlive) {
@@ -1908,7 +1926,7 @@ export function createCapacityLedger({
     const state = reconcile();
     if (!state.healthy || state.active >= max) return null;
     const stage = demand.stage || demand.sweep;
-    if (stage === "ship" ? state.active > 0 : state.entries.some((entry) => entry.stage === "ship")) return null;
+    if (stage === "ship" && state.entries.some((entry) => entry.stage === "ship" && sameCapacityWorkspace(entry, demand))) return null;
     const existingTokens = new Set(state.entries.map((entry) => entry.token));
     let token = null;
     for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -1924,7 +1942,8 @@ export function createCapacityLedger({
       parentPid,
       childPid: null,
       issueIdentifier: demand.issueIdentifier || demand.topCard?.identifier,
-      workspace: demand.workspace || demand.anchorPath,
+      workspace: demand.workspace || demand.sourceAnchorPath || demand.anchorPath,
+      ...(demand.managedWorkspace || demand.anchorPath ? { managedWorkspace: demand.managedWorkspace || demand.anchorPath } : {}),
       stage,
       trigger: demand.trigger || "initial",
       reservedAt: now(),
@@ -2030,35 +2049,25 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
           }
           break;
         }
-        const shipIndex = pending.findIndex((item) => (item.demand.stage || item.demand.sweep) === "ship");
-        if (shipIndex >= 0 && state.active > 0) {
-          for (const item of pending) onCapacityDeferred?.(item.demand, state);
-          if (localActive === 0) {
-            for (const item of pending.splice(0)) {
-              byKey.delete(item.key);
-              item.resolve(null);
-            }
+        let admitted = false;
+        for (let index = 0; index < pending.length; index += 1) {
+          const item = pending[index];
+          const reservation = ledger.reserve(item.demand);
+          if (!reservation) continue;
+          pending.splice(index, 1);
+          settleRun(item, reservation);
+          admitted = true;
+          break;
+        }
+        if (admitted) continue;
+        for (const item of pending) onCapacityDeferred?.(item.demand, state);
+        if (localActive === 0) {
+          for (const item of pending.splice(0)) {
+            byKey.delete(item.key);
+            item.resolve(null);
           }
-          break;
         }
-        if (shipIndex < 0 && state.entries.some((entry) => entry.stage === "ship")) {
-          for (const item of pending) onCapacityDeferred?.(item.demand, state);
-          if (localActive === 0) {
-            for (const item of pending.splice(0)) {
-              byKey.delete(item.key);
-              item.resolve(null);
-            }
-          }
-          break;
-        }
-        const item = pending.splice(shipIndex >= 0 ? shipIndex : 0, 1)[0];
-        const reservation = ledger.reserve(item.demand);
-        if (!reservation) {
-          pending.unshift(item);
-          break;
-        }
-        settleRun(item, reservation);
-        if ((item.demand.stage || item.demand.sweep) === "ship") break;
+        break;
       }
     } finally {
       draining = false;

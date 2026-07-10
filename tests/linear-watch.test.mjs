@@ -476,7 +476,7 @@ test("preflightAndSelectDispatchBatch: missing higher-priority runtime does not 
   assert.deepEqual(result.selected.map((candidate) => candidate.sweep), ["dev"]);
   assert.deepEqual(result.failures.map((failure) => failure.runtime), ["claude"]);
 });
-test("preflightAndSelectDispatchBatch: unavailable Ship preserves the human gate and blocks healthy non-Ship work", async () => {
+test("preflightAndSelectDispatchBatch: unavailable Ship does not block healthy non-Ship work", async () => {
   const candidates = [
     { anchorPath: "/managed/ship", sweep: "ship", count: 1, config: { runtimes: { ship: { runtime: "claude" } } } },
     { anchorPath: "/managed/dev", sweep: "dev", count: 3, config: { runtimes: { dev: { runtime: "codex" } } } },
@@ -495,8 +495,8 @@ test("preflightAndSelectDispatchBatch: unavailable Ship preserves the human gate
   if (result.selected.length) claimCalls += 1;
 
   assert.deepEqual(result.failures.map((failure) => failure.pick.sweep), ["ship"]);
-  assert.deepEqual(result.selected, []);
-  assert.equal(claimCalls, 0);
+  assert.deepEqual(result.selected.map((candidate) => candidate.sweep), ["dev"]);
+  assert.equal(claimCalls, 1);
 });
 
 test("runtimeConfigForSweep: per-sweep runtimes override legacy runtime/models", () => {
@@ -956,10 +956,10 @@ test("capacity admission: eleven simultaneous demands never run more than ten", 
   await Promise.all(runs);
   assert.equal(stored.entries.length, 0);
 });
-test("capacity admission: queued Ship is exclusive and waits for active non-Ship work", async () => {
+test("capacity admission: Ship runs with other stages but only one Ship per workspace", async () => {
   let stored = null;
   const started = [];
-  const releases = [];
+  const releases = new Map();
   const ledger = createCapacityLedger({
     maxActiveChildren: 3,
     readJsonFn: () => stored,
@@ -971,23 +971,42 @@ test("capacity admission: queued Ship is exclusive and waits for active non-Ship
     ledger,
     executeDemand: async (demand) => {
       started.push(demand.issueIdentifier);
-      await new Promise((resolve) => releases.push(resolve));
+      await new Promise((resolve) => releases.set(demand.issueIdentifier, resolve));
     },
   });
-  const dev = admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: "COD-DEV", workspace: "/managed" }, { queue });
+  const dev = admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: "COD-DEV", workspace: "/source/a", managedWorkspace: "/managed/a" }, { queue });
+  const firstShip = admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-A1", workspace: "/source/a", managedWorkspace: "/managed/a" }, { queue });
+  const duplicateShip = admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-A2", workspace: "/source/a", managedWorkspace: "/managed/a" }, { queue });
+  const otherShip = admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-B", workspace: "/source/b", managedWorkspace: "/managed/b" }, { queue });
   await new Promise((resolve) => setImmediate(resolve));
-  const spec = admitDemand({ stage: "spec", trigger: "initial", issueIdentifier: "COD-SPEC", workspace: "/managed" }, { queue });
-  const ship = admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP", workspace: "/managed" }, { queue });
+  assert.deepEqual(started, ["COD-SHIP-A1", "COD-SHIP-B", "COD-DEV"]);
+  releases.get("COD-SHIP-A1")();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(started, ["COD-DEV"]);
-  releases.shift()();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(started, ["COD-DEV", "COD-SHIP"]);
-  releases.shift()();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(started, ["COD-DEV", "COD-SHIP", "COD-SPEC"]);
-  releases.shift()();
-  await Promise.all([dev, spec, ship]);
+  assert.deepEqual(started, ["COD-SHIP-A1", "COD-SHIP-B", "COD-DEV", "COD-SHIP-A2"]);
+  for (const identifier of ["COD-SHIP-B", "COD-DEV", "COD-SHIP-A2"]) releases.get(identifier)();
+  await Promise.all([dev, firstShip, duplicateShip, otherShip]);
+});
+test("capacity ledger: Ship reservation is scoped to source or managed workspace identity", () => {
+  let stored = null;
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 10,
+    parentPid: 100,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `token-${++n}`; })(),
+  });
+  assert.ok(ledger.reserve({ stage: "dev", trigger: "initial", issueIdentifier: "COD-DEV", workspace: "/source/a", managedWorkspace: "/managed/a" }));
+  assert.ok(ledger.reserve({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-A", workspace: "/source/a", managedWorkspace: "/managed/a" }));
+  assert.equal(ledger.reserve({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-A2", workspace: "/source/a", managedWorkspace: "/managed/a" }), null);
+  assert.ok(ledger.reserve({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-B", workspace: "/source/b", managedWorkspace: "/managed/b" }));
+
+  stored.entries = stored.entries.filter((entry) => entry.stage !== "ship");
+  stored.entries.push({
+    token: "legacy-ship", parentPid: 100, childPid: null, issueIdentifier: "COD-OLD",
+    workspace: "/managed/c", stage: "ship", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z",
+  });
+  assert.equal(ledger.reserve({ stage: "ship", trigger: "initial", issueIdentifier: "COD-SHIP-C", workspace: "/source/c", managedWorkspace: "/managed/c" }), null);
 });
 test("capacity admission: each completed child is handled before later siblings finish", async () => {
   const resolvers = new Map();
@@ -2664,6 +2683,7 @@ test("capacity refill admission: deferred mode returns unclaimed demands", async
 test("capacity initial admission: candidate expansion produces stable unclaimed demand records", () => {
   const demands = admissionDemandsForCandidates([{
     anchorPath: "/managed/repo",
+    sourceAnchorPath: "/source/repo",
     sweep: "qa",
     config: { parallel: { sameRepoCardLimits: { qa: 2 } } },
     cards: [
@@ -2676,6 +2696,7 @@ test("capacity initial admission: candidate expansion produces stable unclaimed 
     { stage: "qa", trigger: "initial", id: "COD-1", board: 20, rotation: 3 },
     { stage: "qa", trigger: "initial", id: "COD-2", board: 10, rotation: 3 },
   ]);
+  assert.ok(demands.every((demand) => demand.workspace === "/source/repo" && demand.managedWorkspace === "/managed/repo"));
 });
 test("capacity initial admission applies same-repo limits independently to routed siblings", () => {
   const config = {
@@ -3294,14 +3315,41 @@ test("selectDispatch: ship is dispatched before qa/dev/spec (most-downstream fir
   assert.equal(pick.sweep, "ship");
   assert.equal(SWEEP_ORDER[0], "ship");
 });
-test("selectDispatchBatch: ship suppresses all non-ship dispatch", () => {
+test("selectDispatchBatch: ship coexists with non-ship stages and does not consume their limit", () => {
   const batch = selectDispatchBatch([
     { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "dev", count: 5, oldestUpdatedAt: 1 },
+    { anchorPath: "/ws/a", config: { repos: ["a"] }, sweep: "ship", count: 1, oldestUpdatedAt: 999 },
     { anchorPath: "/ws/b", config: { repos: ["b"] }, sweep: "ship", count: 1, oldestUpdatedAt: 999 },
     { anchorPath: "/ws/c", config: { repos: ["c"] }, sweep: "qa", count: 5, oldestUpdatedAt: 1 },
-  ], { maxNonShipDispatches: 3 });
-  assert.equal(batch.length, 1);
-  assert.equal(batch[0].sweep, "ship");
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((candidate) => `${candidate.anchorPath}:${candidate.sweep}`), [
+    "/ws/a:ship",
+    "/ws/b:ship",
+    "/ws/c:qa",
+    "/ws/a:dev",
+  ]);
+});
+test("selectDispatchBatch: selects at most one Ship per registered source workspace", () => {
+  const batch = selectDispatchBatch([
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/a", config: { repos: ["a"] }, sweep: "ship", count: 1 },
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/a", config: { repos: ["a"] }, sweep: "ship", count: 1 },
+    { sourceAnchorPath: "/registered/b", anchorPath: "/managed/b", config: { repos: ["b"] }, sweep: "ship", count: 1 },
+  ], { maxNonShipDispatches: 1 });
+  assert.deepEqual(batch.map((candidate) => candidate.sourceAnchorPath), [
+    "/registered/a",
+    "/registered/b",
+  ]);
+});
+test("selectDispatchBatch: Ship preserves cross-workspace repository collision safety", () => {
+  const batch = selectDispatchBatch([
+    { sourceAnchorPath: "/registered/a", anchorPath: "/managed/a", managedRepoPaths: ["/managed/shared"], config: {}, sweep: "ship", count: 1 },
+    { sourceAnchorPath: "/registered/b", anchorPath: "/managed/b", managedRepoPaths: ["/managed/shared"], config: {}, sweep: "dev", count: 1 },
+    { sourceAnchorPath: "/registered/c", anchorPath: "/managed/c", managedRepoPaths: ["/managed/other"], config: {}, sweep: "spec", count: 1 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((candidate) => `${candidate.sourceAnchorPath}:${candidate.sweep}`), [
+    "/registered/a:ship",
+    "/registered/c:spec",
+  ]);
 });
 
 // ── foreign / orphaned-claim reaper ──────────────────────────────────────────
