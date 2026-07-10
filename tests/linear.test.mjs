@@ -442,7 +442,7 @@ function runDependencyStatusCli(inverseRelations, env = {}) {
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
   return spawnSync(process.execPath, ["--import", preload, linearCli, "dependency-status", "COD-9"], {
     encoding: "utf8",
-    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
+    env: { ...process.env, AUTO_SWEEP_ANCHOR: "", AUTO_SWEEP_OUTCOME_PATH: "", LINEAR_API_KEY: "key", ...env },
   });
 }
 
@@ -459,7 +459,7 @@ function runRepoStatusCli(labelNames, env = {}, { configDir, cwd } = {}) {
   return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", "SAF-207", "app:guide", "guide"], {
     cwd: cwd || dir,
     encoding: "utf8",
-    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
+    env: { ...process.env, AUTO_SWEEP_ANCHOR: "", AUTO_SWEEP_OUTCOME_PATH: "", LINEAR_API_KEY: "key", ...env },
   });
 }
 
