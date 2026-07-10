@@ -27,7 +27,7 @@ import {
   admissionDemandsForCandidates,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
-  DEFAULT_MAX_ACTIVE_CHILDREN,
+  DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -94,6 +94,8 @@ test("capacity registry: legacy registries default to exactly ten and configured
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 3.9 } }).capacity.maxActiveChildren, 3);
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 0 } }).capacity.maxActiveChildren, 1);
   assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: "invalid" } }).capacity.maxActiveChildren, 10);
+  assert.equal(MAX_ACTIVE_CHILDREN, 32);
+  assert.equal(normalizeRegistry({ capacity: { maxActiveChildren: 1_000_000 } }).capacity.maxActiveChildren, 32);
 });
 test("capacity installation: persists ten without deleting existing registry settings", () => {
   const source = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/install-watch.sh"), "utf8");
@@ -525,6 +527,47 @@ test("capacity ledger: malformed or unverifiable entries fail closed and consume
   assert.equal(unverifiable.reconcile().healthy, false);
   assert.equal(unverifiable.reserve({ stage: "qa", trigger: "initial", workspace: "/managed", issueIdentifier: "COD-2" }), null);
 });
+test("capacity ledger: duplicate tokens are malformed and release never removes corrupt entries", () => {
+  const entry = (issueIdentifier) => ({
+    token: "duplicate-token", parentPid: 10, childPid: null, issueIdentifier,
+    workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z",
+  });
+  const stored = { version: 1, entries: [entry("COD-1"), entry("COD-2")] };
+  let writes = 0;
+  const ledger = createCapacityLedger({
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: () => { writes += 1; },
+    isAlive: () => true,
+  });
+
+  const state = ledger.inspect();
+  assert.equal(state.healthy, false);
+  assert.match(state.errors.join("; "), /duplicate token/i);
+  assert.equal(ledger.release("duplicate-token"), false);
+  assert.equal(writes, 0);
+  assert.equal(stored.entries.length, 2);
+});
+test("capacity ledger: UUID collision retries without overwriting an existing reservation", () => {
+  let stored = { version: 1, entries: [{
+    token: "collision", parentPid: 10, childPid: null, issueIdentifier: "COD-1",
+    workspace: "/managed", stage: "dev", trigger: "initial", reservedAt: "2026-07-09T00:00:00.000Z",
+  }] };
+  const uuids = ["collision", "unique"];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1000,
+    parentPid: 11,
+    readJsonFn: () => structuredClone(stored),
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => uuids.shift(),
+  });
+
+  const reservation = ledger.reserve({ stage: "qa", trigger: "handoff", workspace: "/managed", issueIdentifier: "COD-2" });
+  assert.equal(ledger.maxActiveChildren, 32);
+  assert.equal(createCapacityLedger({ maxActiveChildren: null }).maxActiveChildren, 10);
+  assert.equal(reservation.token, "unique");
+  assert.deepEqual(stored.entries.map((entry) => entry.token), ["collision", "unique"]);
+});
 test("capacity admission: eleven simultaneous demands never run more than ten", async () => {
   let stored = null;
   let active = 0;
@@ -613,6 +656,37 @@ test("capacity admission: each completed child is handled before later siblings 
   assert.deepEqual(handled, ["COD-1"]);
   resolvers.get("COD-2")({ issueIdentifier: "COD-2" });
   assert.deepEqual((await run).map((result) => result.issueIdentifier), ["COD-1", "COD-2"]);
+});
+test("capacity admission: same-stage handoff discovered under the held token runs before queued initial work", async () => {
+  let stored = null;
+  const order = [];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `token-${++n}`; })(),
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (demand) => {
+      order.push(demand.issueIdentifier);
+      return { issueIdentifier: demand.issueIdentifier };
+    },
+    beforeRelease: async (_result, demand, admission) => {
+      if (demand.issueIdentifier === "A") admission.admitDemand({
+        stage: "dev", trigger: "handoff", boardOrder: 0, rotationRank: 0,
+        issueIdentifier: "H", workspace: "/managed",
+      });
+    },
+  });
+
+  await runAdmissionDemands([
+    { stage: "dev", trigger: "initial", boardOrder: 10, rotationRank: 0, issueIdentifier: "A", workspace: "/managed" },
+    { stage: "dev", trigger: "initial", boardOrder: 9, rotationRank: 0, issueIdentifier: "B", workspace: "/managed" },
+  ], { queue });
+  await queue.whenIdle();
+  assert.deepEqual(order, ["A", "H", "B"]);
 });
 
 // ── version compare ──────────────────────────────────────────────────────────
@@ -1884,6 +1958,44 @@ test("capacity ledger: dispatch attaches the live child PID immediately after sp
   assert.deepEqual(attached, [456]);
   child.emit("close", 0, null);
   assert.equal((await run).kind, "success");
+});
+test("capacity ledger: PID attachment failure terminates child and retains token until close", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-attach-failure-"));
+  let stored = null;
+  const child = new EventEmitter();
+  child.pid = 789;
+  child.killCalls = [];
+  child.kill = (signal) => { child.killCalls.push(signal); return true; };
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => "attach-token",
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (_demand, reservation) => dispatchAsync(anchorPath, "dev", {}, {
+      issueIdentifier: "COD-11", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+    }, {
+      spawnFn: () => child,
+      onSpawn: () => { throw new Error("ledger write failed"); },
+    }),
+  });
+
+  let settled = false;
+  const run = admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: "COD-11", workspace: "/managed" }, { queue })
+    .then((result) => { settled = true; return result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(child.killCalls, ["SIGTERM"]);
+  assert.equal(settled, false);
+  assert.equal(stored.entries.length, 1);
+
+  child.emit("close", null, "SIGTERM");
+  const result = await run;
+  assert.equal(result.kind, "spawn-error");
+  assert.equal(result.code, "CAPACITY_ATTACH_FAILED");
+  assert.deepEqual(stored, { version: 1, entries: [] });
 });
 
 test("SWEEP_CFG.ship exists and the derived lists include it", () => {

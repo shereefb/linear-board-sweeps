@@ -32,3 +32,31 @@ test("install-watch uses a managed clean kit clone for launchd runtime", () => {
   assert.equal(registry.kitPath, managedKit);
   assert.equal(registry.kitRemote, repoRoot);
 });
+
+test("install-watch clamps huge capacity to 32 and preserves existing settings", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watch-capacity-home-"));
+  const configDir = path.join(home, ".config", "linear-board-sweeps");
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(path.join(configDir, "registry.json"), JSON.stringify({
+    autoUpdate: false,
+    customSetting: "preserved",
+    capacity: { maxActiveChildren: 1_000_000, customCapacity: true },
+  }));
+  const result = spawnSync("zsh", [path.join(repoRoot, "scripts", "install-watch.sh")], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      LINEAR_SWEEP_RUNTIME_KIT: repoRoot,
+      LINEAR_SWEEP_KIT_REMOTE: repoRoot,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const registry = JSON.parse(fs.readFileSync(path.join(configDir, "registry.json"), "utf8"));
+  assert.equal(registry.capacity.maxActiveChildren, 32);
+  assert.equal(registry.capacity.customCapacity, true);
+  assert.equal(registry.customSetting, "preserved");
+  assert.equal(registry.autoUpdate, false);
+});

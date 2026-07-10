@@ -65,6 +65,7 @@ export const LOG_RETENTION_DAYS = 14;
 export const FAILURE_TODO_THROTTLE_MS = 24 * 3600000;
 export const DEFAULT_MAX_NON_SHIP_DISPATCHES = 2;
 export const DEFAULT_MAX_ACTIVE_CHILDREN = 10;
+export const MAX_ACTIVE_CHILDREN = 32;
 export const DEFAULT_MAX_DRAIN_PASSES = 5;
 export const MAX_DRAIN_PASSES = 5;
 export const DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES = 8;
@@ -140,7 +141,7 @@ export function normalizeRegistry(reg = {}, { now = () => new Date().toISOString
   out.capacity = {
     ...(out.capacity && typeof out.capacity === "object" ? out.capacity : {}),
     maxActiveChildren: Number.isFinite(configuredCapacity)
-      ? Math.max(1, Math.floor(configuredCapacity))
+      ? Math.min(MAX_ACTIVE_CHILDREN, Math.max(1, Math.floor(configuredCapacity)))
       : DEFAULT_MAX_ACTIVE_CHILDREN,
   };
   out.managedAnchors = { ...(out.managedAnchors || {}) };
@@ -1262,8 +1263,9 @@ export function createCapacityLedger({
   },
   writeJsonFn = atomicWriteJson,
 } = {}) {
-  const max = Number.isFinite(Number(maxActiveChildren))
-    ? Math.max(1, Math.floor(Number(maxActiveChildren)))
+  const configuredMax = maxActiveChildren === null || maxActiveChildren === "" ? Number.NaN : Number(maxActiveChildren);
+  const max = Number.isFinite(configuredMax)
+    ? Math.min(MAX_ACTIVE_CHILDREN, Math.max(1, Math.floor(configuredMax)))
     : DEFAULT_MAX_ACTIVE_CHILDREN;
   const released = new Set();
 
@@ -1280,6 +1282,12 @@ export function createCapacityLedger({
     }
     const entries = raw.entries.map((entry) => ({ ...entry }));
     const errors = entries.map(capacityEntryError).filter(Boolean);
+    const tokens = new Set();
+    for (const entry of entries) {
+      if (typeof entry.token !== "string" || !entry.token) continue;
+      if (tokens.has(entry.token)) errors.push(`duplicate token ${entry.token}`);
+      tokens.add(entry.token);
+    }
     if (checkLiveness && !errors.length) {
       for (const entry of entries) {
         for (const [kind, pid] of [["parent", entry.parentPid], ["child", entry.childPid]]) {
@@ -1355,7 +1363,16 @@ export function createCapacityLedger({
     if (!state.healthy || state.active >= max) return null;
     const stage = demand.stage || demand.sweep;
     if (stage === "ship" ? state.active > 0 : state.entries.some((entry) => entry.stage === "ship")) return null;
-    const token = randomUUID();
+    const existingTokens = new Set(state.entries.map((entry) => entry.token));
+    let token = null;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const candidate = randomUUID();
+      if (typeof candidate === "string" && candidate && !existingTokens.has(candidate)) {
+        token = candidate;
+        break;
+      }
+    }
+    if (!token) throw new Error("could not allocate a unique capacity token");
     const entry = {
       token,
       parentPid,
@@ -1380,7 +1397,7 @@ export function createCapacityLedger({
   return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
 }
 
-export function createAdmissionQueue({ ledger, executeDemand } = {}) {
+export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null } = {}) {
   if (!ledger || typeof ledger.reserve !== "function") throw new Error("capacity ledger is required");
   if (typeof executeDemand !== "function") throw new Error("executeDemand is required");
   const pending = [];
@@ -1388,6 +1405,7 @@ export function createAdmissionQueue({ ledger, executeDemand } = {}) {
   let localActive = 0;
   let drainScheduled = false;
   let draining = false;
+  const idleWaiters = [];
 
   const demandKey = (demand) => [demand.workspace || demand.anchorPath || "", demand.stage || demand.sweep || "", demand.issueIdentifier || demand.topCard?.identifier || ""].join("\0");
   const scheduleDrain = () => {
@@ -1398,11 +1416,17 @@ export function createAdmissionQueue({ ledger, executeDemand } = {}) {
       drainAdmissionQueue();
     });
   };
+  const notifyIdle = () => {
+    if (pending.length || localActive || drainScheduled || draining) return;
+    for (const resolve of idleWaiters.splice(0)) resolve();
+  };
   const settleRun = (item, reservation) => {
     localActive += 1;
     (async () => {
       try {
-        return await executeDemand(item.demand, reservation);
+        const result = await executeDemand(item.demand, reservation);
+        if (result && beforeRelease) await beforeRelease(result, item.demand, { admitDemand: enqueue });
+        return result;
       } finally {
         reservation.release();
       }
@@ -1410,6 +1434,7 @@ export function createAdmissionQueue({ ledger, executeDemand } = {}) {
       localActive -= 1;
       byKey.delete(item.key);
       scheduleDrain();
+      notifyIdle();
     });
   };
   const drainAdmissionQueue = () => {
@@ -1459,6 +1484,7 @@ export function createAdmissionQueue({ ledger, executeDemand } = {}) {
       }
     } finally {
       draining = false;
+      notifyIdle();
     }
   };
   const enqueue = (demand) => {
@@ -1477,6 +1503,10 @@ export function createAdmissionQueue({ ledger, executeDemand } = {}) {
   return {
     admitDemand: enqueue,
     drainAdmissionQueue,
+    whenIdle: () => {
+      if (!pending.length && !localActive && !drainScheduled && !draining) return Promise.resolve();
+      return new Promise((resolve) => idleWaiters.push(resolve));
+    },
     get pendingCount() { return pending.length; },
     get activeCount() { return localActive; },
   };
@@ -2788,10 +2818,34 @@ export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = 
     let child;
     try {
       child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
-      if (onSpawn && Number.isInteger(child?.pid) && child.pid > 0) onSpawn(child.pid, child);
     } catch (e) {
       finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
       return;
+    }
+    if (onSpawn) {
+      try {
+        if (!Number.isInteger(child?.pid) || child.pid <= 0) throw new Error("spawned child has no verifiable PID");
+        if (onSpawn(child.pid, child) === false) throw new Error("capacity ledger rejected child PID");
+      } catch (error) {
+        const attachError = new Error(`capacity PID attachment failed: ${error.message}`);
+        attachError.code = "CAPACITY_ATTACH_FAILED";
+        logFor(anchorPath, sweep, `FATAL ${attachError.message}; terminating child ${child?.pid || "unknown"}`);
+        child.on("error", (childError) => {
+          logFor(anchorPath, sweep, `child error while awaiting capacity-safe termination: ${childError.message}`);
+        });
+        child.once("close", () => finish(classifyDispatchOutcome({
+          type: "error",
+          error: attachError,
+          path: executable,
+          cwd,
+          cwdExists: fs.existsSync(cwd),
+          executableExists: fs.existsSync(executable),
+        })));
+        try { child.kill?.("SIGTERM"); } catch (killError) {
+          logFor(anchorPath, sweep, `could not terminate child after PID attachment failure: ${killError.message}`);
+        }
+        return;
+      }
     }
     child.on("error", (e) => {
       logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
@@ -2920,14 +2974,18 @@ async function tick({ dryRun = false } = {}) {
       }
       return active;
     };
-    const runHandoffTriggers = async (initialResult, firedHandoffs, handoffBudget, dispatchChildren) => {
-      let current = initialResult;
-      let remaining = maxHandoffTriggerHops(current.pick.config);
-      if (remaining <= 0) {
+    const runHandoffTriggers = async (current, firedHandoffs, handoffBudget) => {
+      const completedHops = current.pick.handoffHops || 0;
+      const maxHops = maxHandoffTriggerHops(current.pick.config);
+      if (maxHops <= 0) {
         logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: disabled`);
-        return;
+        return [];
       }
-      while (remaining > 0 && current?.success && current.pick?.issueIdentifier) {
+      if (completedHops >= maxHops) {
+        logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: hop-limit`);
+        return [];
+      }
+      if (current?.success && current.pick?.issueIdentifier) {
         const pick = current.pick;
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) return;
@@ -3009,6 +3067,7 @@ async function tick({ dryRun = false } = {}) {
           topCard: issue,
           topSortOrder: issue.sortOrder,
           cards: [issue],
+          handoffHops: completedHops + 1,
           triggeredBy: { issue: issue.identifier, sweep: pick.sweep },
         };
         const dirtyFailures = handoffDirtyCheckoutFailures(candidate, reg)
@@ -3045,15 +3104,11 @@ async function tick({ dryRun = false } = {}) {
         if (!downstream.length) {
           handoffBudget.remaining += 1;
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: capacity`);
-          return;
+          return [];
         }
-        const results = await dispatchChildren(downstream);
-        current = results.find((r) => r.issueIdentifier === issue.identifier) || results[0];
-        remaining -= 1;
+        return downstream;
       }
-      if (remaining <= 0 && current?.success && current.pick?.issueIdentifier) {
-        logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: hop-limit`);
-      }
+      return [];
     };
     const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
       localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
@@ -3123,6 +3178,7 @@ async function tick({ dryRun = false } = {}) {
       localFailures.push(failureEventFor("_", null, "capacity", "capacity-ledger", CAPACITY_LEDGER, initialCapacity.errors.join("; ")));
       writeCurrentTick();
     }
+    let completionDiscovery = async () => {};
     const admissionQueue = createAdmissionQueue({
       ledger: capacityLedger,
       executeDemand: async (demand, reservation) => {
@@ -3146,6 +3202,7 @@ async function tick({ dryRun = false } = {}) {
           activeSameRepo.decrement(demand);
         }
       },
+      beforeRelease: (result) => completionDiscovery(result),
     });
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
@@ -3380,14 +3437,13 @@ async function tick({ dryRun = false } = {}) {
       }
       const firedHandoffs = new Set();
       const handoffBudget = { remaining: maxNonShipDispatches };
-      let dispatchChildren;
       const handleDispatchResult = async (result) => {
-        await Promise.all([
-          runHandoffTriggers(result, firedHandoffs, handoffBudget, dispatchChildren),
+        const [handoffs, refill] = await Promise.all([
+          runHandoffTriggers(result, firedHandoffs, handoffBudget),
           (async () => {
             if (result.pick.runtimeLaneKey && runtimeCache.get(result.pick.runtimeLaneKey)?.ok === false) {
               logFor(result.pick.anchorPath, result.pick.sweep, `refill-skip ${result.pick.sweep}: runtime-disabled`);
-              return;
+              return { dispatches: [] };
             }
             const refill = await buildSameRepoRefillDispatches({
               result,
@@ -3414,12 +3470,21 @@ async function tick({ dryRun = false } = {}) {
                 }
               }
             }
-            if (refill.dispatches.length) await dispatchChildren(refill.dispatches);
+            return refill;
           })(),
         ]);
+        for (const demand of [...(handoffs || []), ...(refill?.dispatches || [])]) {
+          admitDemand(demand, { queue: admissionQueue }).catch((error) => {
+            recordLocalFailure(demand.anchorPath, demand.config, `${demand.sweep}:dispatch`, "admission", demand.issueIdentifier, error.message);
+          });
+        }
       };
+      completionDiscovery = handleDispatchResult;
+      let dispatchChildren;
       dispatchChildren = async (children) => {
-        return runAdmissionDemands(children, { queue: admissionQueue, onResult: handleDispatchResult });
+        const results = await runAdmissionDemands(children, { queue: admissionQueue });
+        await admissionQueue.whenIdle();
+        return results;
       };
       const results = await dispatchChildren(dispatches);
       return {

@@ -48,7 +48,7 @@ let registry = { autoUpdate: true, kitPath: null, kitRef: "main", kitRemote: nul
 if (fs.existsSync(registryPath)) registry = { ...registry, ...JSON.parse(fs.readFileSync(registryPath, "utf8")) };
 const rawCapacity = registry.capacity?.maxActiveChildren;
 const configuredCapacity = rawCapacity === null || rawCapacity === "" ? Number.NaN : Number(rawCapacity);
-registry = { ...registry, capacity: { ...(registry.capacity || {}), maxActiveChildren: Number.isFinite(configuredCapacity) ? Math.max(1, Math.floor(configuredCapacity)) : 10 } };
+registry = { ...registry, capacity: { ...(registry.capacity || {}), maxActiveChildren: Number.isFinite(configuredCapacity) ? Math.min(32, Math.max(1, Math.floor(configuredCapacity))) : 10 } };
 registry.kitPath = kitPath;
 registry.kitRemote = kitRemote || registry.kitRemote;
 fs.mkdirSync(configDir, { recursive: true });
