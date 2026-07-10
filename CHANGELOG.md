@@ -2,6 +2,21 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.6] - 2026-07-10
+
+### Added
+
+- Automatically route QA-passed bug fixes and explicitly eligible small features directly to Ship when the reviewed commit is still the current remote commit, while preserving the normal Signoff gate for every other card.
+
+### Changed
+
+- Let operators disable automatic QA-to-Ship routing globally or require Ship approval for every card; Factory Learning cards always retain the human Ship gate.
+- Bind Dev eligibility, QA evidence, and Ship admission to full Git commit SHAs, with a final remote recheck immediately before merge.
+
+### Fixed
+
+- Fail closed on malformed policy, stale commits, blockers, foreign claims, ownership changes, and unsupported QA destinations; successful terminal moves remove only the proven QA claim.
+
 ## [1.2.0.5] - 2026-07-10
 
 ### Added
