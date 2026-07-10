@@ -1,13 +1,13 @@
 ---
 name: qa-sweep
-description: Smoke-test the configured Linear project's "QA" cards as a real user, fix UX/UI bugs, attach screenshots + review notes, then move to "Signoff" for human sign-off. Never merges, never deploys — that's ship-sweep's job. Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "QA the QA cards", "run the QA sweep", or on a schedule.
+description: Smoke-test the configured Linear project's "QA" cards as a real user, fix UX/UI bugs, attach screenshots + review notes, then route each passing card to "Signoff" or commit-bound automatic "Ship". Never merges, never deploys — that's ship-sweep's job. Project-agnostic — reads .claude/linear-sweep.json. Use when asked to "QA the QA cards", "run the QA sweep", or on a schedule.
 ---
 
 # QA Sweep
 
-Act as a user: exercise each "QA" feature in a real dev environment, in as much detail as possible, confirm it works well, fix UX/UI bugs you find, then hand it to the human review gate by moving it to **"Signoff"** with screenshots + a written review on the card. A human reviews the "Signoff" column and moves approved cards to "Ship"; ship-sweep does the merge + deploy.
+Act as a user: exercise each "QA" feature in a real dev environment, in as much detail as possible, confirm it works well, fix UX/UI bugs you find, then attach screenshots + a written review and select the terminal handoff. Normal passing cards move to **"Signoff"** for human review; an unchanged, commit-bound fast-path candidate may move automatically to **"Ship"** after the same full QA. ship-sweep does the merge + deploy.
 
-**This sweep NEVER merges and NEVER deploys** (that's ship-sweep, gated behind the human "Ship" move). It is now symmetric with dev-sweep: it lands a green, smoke-tested feature at "Signoff" and stops. Because it no longer touches prod, it is safe to schedule as aggressively as the other sweeps.
+**This sweep NEVER merges and NEVER deploys.** It lands a green, smoke-tested feature at the selected holding queue and stops; ship-sweep remains the only production path. Because QA never touches prod, it is safe to schedule as aggressively as the other non-production sweeps.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. "Run the app" = your runtime's dev-server method (see §2.2).
 
@@ -52,15 +52,19 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 
 Proceed to §4 ONLY if: the smoke test passes, the build is green (`npm run build` / tests / lint as applicable), and no unresolved errors remain. **Otherwise do NOT pass it:** post your findings + screenshots to the card, add `qa:needs-changes`, remove `qa:in-progress`, leave the card in "QA", and move on. If the blocker needs the owner, use `blocked:needs-user` and comment what's needed.
 
-## 4. Land at "Signoff" (no merge, no deploy)
+## 4. Select the terminal handoff (no merge, no deploy)
 
 Only after §3 passes:
 1. **Attach the screenshots to the Linear card** (Linear file upload: `fileUpload` mutation → PUT the bytes to the returned signed URL with its headers → reference the asset URL as a markdown image in a comment / as an attachment).
 2. Post a **review write-up**: what you tested, what passed, bugs found + fixed (with commit refs), and any residual risk.
-3. Add **`qa:passed`** — this is ship-sweep's green signal and its pre-merge evidence.
-4. **Move the card to the bottom of "Signoff" and drop `qa:in-progress` in the same step** (or drop the claim immediately before the move). Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Signoff"`) so the status and bottom rank update together. "Signoff" is a holding state no sweep fetches, so a claim stranded there after a crash would be invisible to the per-sweep reaper — dropping it before the move avoids that. **Leave the branch pushed and unmerged; do NOT delete the worktree/branch/PR** — ship-sweep needs them.
+3. Add **`qa:passed`** — this is ship-sweep's green signal and its pre-merge evidence — then re-fetch the card so the handoff decision uses current state and labels.
+4. Fetch origin and resolve the branch's final full SHA from `origin/<PREFIX>-###`, never from the local worktree. Read the latest well-formed, issue-specific `[auto-sweep-fast-path <KEY> head=<full-git-sha>]` comment; a legacy marker without `head=` is not reviewed-SHA evidence. Compare the final origin branch SHA against that reviewed SHA.
+5. Evaluate `qaHandoffDecision` with the exact current facts: `config.fastPath.enabled !== false`, `config.requireShipApproval === false`, state `QA`, current labels including `fast-path:eligible` and `qa:passed`, the issue identifier, both full SHAs, and any live foreign `*:in-progress` claim. Unknown, unreadable, or malformed evidence fails closed to `Signoff`.
+6. **Eligible:** post `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` with the matching reviewed/final SHA evidence and policy facts, release `qa:in-progress`, and run `node scripts/linear.mjs move-card-bottom <PREFIX-###> "Ship"`. This is a queue transition only: do not invoke ship-sweep directly and do not add a launcher handoff.
+7. **SHA mismatch:** remove `fast-path:eligible` because it is stale, record the reviewed SHA and final origin SHA in the review write-up, release `qa:in-progress`, and run `node scripts/linear.mjs move-card-bottom <PREFIX-###> "Signoff"`.
+8. **Every other denial:** record the policy reason, release `qa:in-progress`, and move the passing card to the bottom of `Signoff` with the same helper. A policy denial is not a QA failure: keep `qa:passed` and do not add `qa:needs-changes`.
 
-A human reviews the "Signoff" column and moves approved cards to "Ship"; ship-sweep does the merge + deploy from there. qa-sweep's job ends at "Signoff".
+Immediately before the selected terminal move, re-fetch the card one final time. If a human or another run moved it out of `QA`, do not override; comment the completed QA evidence, release `qa:in-progress`, and stop. **Leave the branch pushed and unmerged; do not delete the worktree/branch/PR** — ship-sweep needs them. Normal cards continue through `QA` → `Signoff` → human approval → `Ship`; only an eligible unchanged fast path takes automatic `QA` → `Ship`, and `requireShipApproval: true` always preserves `Signoff`.
 
 ## Blocked / needs-user
 
@@ -85,12 +89,12 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 - **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `qa:in-progress`, post a comment `[auto-sweep-heartbeat <ISO8601 now>]`. A claim with no heartbeat past its stale threshold is treated as crashed and auto-released by the launcher — QA runs are long, so heartbeat diligently.
 - **Reconstruct the environment from the branch, not a local worktree.** `<PREFIX>-###` is deterministic from the card. In each relevant repo (`config.repos`): `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree exists from a prior run, `git reset --hard origin/<PREFIX>-###` before testing. This is how QA runs on a different machine than dev did.
 - **Push discipline (never force).** When you commit UX fixes, push the card's branch: `git fetch` → rebase onto `origin/<PREFIX>-###` → push; retry up to 2× on rejection; never force-push. **Do not touch `main`** — qa-sweep never merges. Leave the branch intact and unmerged for ship-sweep.
-- **Re-read before the terminal move.** Right before moving the card to "Signoff", re-fetch it. If a human moved it out of "QA", do NOT override — comment your findings, release `qa:in-progress`, and stop.
+- **Re-read before the selected terminal move.** Right before moving the card to "Signoff" or "Ship", re-fetch it. If a human moved it out of "QA", do NOT override — comment your findings, release `qa:in-progress`, and stop.
 - **Mark backward moves.** Sending a card back with `qa:needs-changes` is a normal QA outcome and does not need a bounce marker; but if you move it further back (to "Dev"/"Spec"), add `[auto-sweep-bounce QA→<to>]` so the launcher can park a card that oscillates.
 
 ## Guardrails
 
-- **Never merges, never deploys** — lands a green, smoke-tested feature at "Signoff" and stops. The human "Ship" move + ship-sweep own production. Now symmetric with dev-sweep; safe to auto-run.
+- **Never merges, never deploys** — lands a green, smoke-tested feature at the selected `Signoff` or `Ship` queue and stops. ship-sweep alone owns merge, deploy, and canary work; QA automatic routing does not launch it immediately.
 - Only pass a feature that passed a real smoke test with a green build. When in doubt, `qa:needs-changes` and stop.
 - QA evidence must match ship scope. A card cannot pass QA for a repo/deploy path that is not configured to ship it; split the card or require a multi-repo config/runbook first.
 - ≤2 cards/run; top-of-column order; claim/release via `qa:in-progress`; stay within `config.project`.

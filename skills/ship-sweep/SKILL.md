@@ -1,11 +1,11 @@
 ---
 name: ship-sweep
-description: Merge + deploy the configured Linear project's human-approved "Ship" cards to production, canary-verify, then move to "Done". The only sweep that touches prod. Project-agnostic — reads .claude/linear-sweep.json. Runs single-runner (one designated host). Use when asked to "ship the Ship cards", "run the ship sweep", or on a schedule.
+description: Merge + deploy the configured Linear project's human-approved or commit-bound auto-promoted "Ship" cards to production, canary-verify, then move to "Done". The only sweep that touches prod. Project-agnostic — reads .claude/linear-sweep.json. Runs single-runner (one designated host). Use when asked to "ship the Ship cards", "run the ship sweep", or on a schedule.
 ---
 
 # Ship Sweep
 
-Take cards a human has approved into **"Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. This is the **only** sweep that merges and deploys — every card it touches was either smoke-tested green by qa-sweep (`qa:passed`) or marked by dev-sweep as `fast-path:eligible`, and explicitly moved to "Ship" by a person. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change.
+Take cards in **"Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. Cards arrive either through human approval after `Signoff` or are automatically promoted by qa-sweep under the commit-bound fast-path policy. This is the **only sweep that merges and deploys**. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change. `requireShipApproval: true` remains a deliberate human act: QA keeps every passing card in `Signoff` until that approval path moves it to `Ship`.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. "Deploy" = `config.deploy`; "canary" = the `/canary` skill (or, on Codex, a post-deploy health check of the same URLs/endpoints).
 
@@ -105,7 +105,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 ## Guardrails
 
-- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and a human moved to "Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive enabled fast-path eligibility.
+- **Ships to production** — the highest-risk sweep. Only ever ship a card that reached `Ship` through human approval or commit-bound QA auto-promotion, is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and — if `requireShipApproval` — carries `ship:approved`. When in doubt, `blocked:needs-user` and stop; never deploy a card that did not satisfy the unchanged sanity gate.
 - Never treat a docs/spec merge in the anchor repo as proof that sibling app code shipped. If implementation/QA evidence is in another repo, that repo must be configured and shipped, or the card must be split/manual-shipped with explicit audit comments.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - One card at a time, but keep draining until the actionable "Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.
