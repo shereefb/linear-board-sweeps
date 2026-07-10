@@ -34,6 +34,15 @@
       "ship": 1
     }
   },
+  "$comment_learning": "Dogfood the Factory Learning Loop in this workspace. The registry runner remains machine-local; generated cards require normal QA, Signoff, and human Ship approval.",
+  "learning": {
+    "enabled": true,
+    "lenses": {
+      "reliability": { "enabled": true },
+      "quality": { "enabled": true },
+      "throughput": { "enabled": true }
+    }
+  },
   "$comment_reviewLenses": "Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens.",
   "reviewLenses": {
     "ui":       { "labels": ["frontend", "design", "ui"] },

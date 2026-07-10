@@ -43,6 +43,15 @@
       "ship": 1
     }
   },
+  "$comment_learning": "Factory Learning is disabled by default per workspace. When enabled, the single registry-pinned learning runner observes this workspace even if delivery auto-sweeps are paused. Reliability, quality/rework, and throughput/cost lenses use bounded structured evidence; medium/high findings create or update factory:learning-generated cards at the bottom of Spec. Generated cards always require QA -> Signoff and a human move to Ship.",
+  "learning": {
+    "enabled": false,
+    "lenses": {
+      "reliability": { "enabled": true },
+      "quality": { "enabled": true },
+      "throughput": { "enabled": true }
+    }
+  },
   "$comment_reviewLenses": "Optional. Card-type gating for review lenses: a card carrying any of a lens's labels fires that lens (design at spec+qa, devex at spec, security at spec+dev+ship, perf at dev/qa, research at spec). Omit the whole block to run only the always-on lenses (eng-review, code-review, /qa). setup-team creates these labels; sweeps auto-apply them to unlabelled cards (generate-if-missing).",
   "reviewLenses": {
     "ui":       { "labels": ["frontend", "design", "ui"] },

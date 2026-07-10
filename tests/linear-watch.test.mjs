@@ -46,8 +46,9 @@ import {
   rotateLearningEventFiles,
   buildLearningDemand, buildLearningSynthesisCommand, learningChildEnvironment,
   resolveRegisteredLearningWorkspaces, readLearningRunIndex, runPostDeliveryLearning,
-  fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations,
+  fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
+  buildLiveLearningDryRunPlan, learningRunExecutionDecision,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
@@ -1641,6 +1642,31 @@ test("post-delivery learning reserves directly without same-repo or observation 
   assert.match(result.synthesisUnavailable, /model unavailable/);
 });
 
+test("post-delivery learning skips optional synthesis when unconfigured and applies bounded annotations when enabled", async () => {
+  const base = {
+    registry: { learning: { enabled: true, runner: true } },
+    dueDecisions: { due: true },
+    findings: [{ rootFingerprint: "root-a", confidence: "high" }],
+    ledger: { reserve: () => ({ attachChildPid: () => true, release: () => {} }) },
+  };
+  let written;
+  const deterministic = await runPostDeliveryLearning({
+    ...base,
+    dispatchFn: null,
+    writerFn: async ({ findings }) => { written = findings; return { confirmed: 0 }; },
+  });
+  assert.equal(deterministic.mode, "deterministic");
+  assert.equal(written[0].synthesisAnnotation, undefined);
+
+  const synthesized = await runPostDeliveryLearning({
+    ...base,
+    dispatchFn: async () => ({ mode: "synthesized", available: true, annotations: [{ rootFingerprint: "root-a", summary: "Check the shared retry path." }] }),
+    writerFn: async ({ findings }) => { written = findings; return { confirmed: 0 }; },
+  });
+  assert.equal(synthesized.mode, "synthesized");
+  assert.equal(written[0].synthesisAnnotation, "Check the shared retry path.");
+});
+
 test("learning issue comments paginate past 100 and fail closed on cursor cycles or partial data", async () => {
   const pages = [
     { comments: { nodes: Array.from({ length: 100 }, (_, index) => ({ id: `c${index}`, body: "ordinary" })), pageInfo: { hasNextPage: true, endCursor: "next" } } },
@@ -1689,6 +1715,252 @@ test("learning issue discovery paginates, scans stable markers, and rejects inco
   assert.equal(result[0].rootFingerprint, "root-a");
   assert.equal(result[0].generation, 0);
   assert.deepEqual(result[0].occurrenceIds, []);
+});
+
+test("learning issue discovery restores deterministic evaluation metadata and confirmed outcomes", async () => {
+  const description = [
+    "## Acceptance metric", JSON.stringify({ name: "failureRate", direction: "decrease", target: 0.2 }),
+    "## Baseline", JSON.stringify({ value: 0.8, unit: "ratio" }),
+    "## Evaluation window", JSON.stringify({ durationDays: 7 }),
+    "[factory-learning root=root-a generation=0]",
+  ].join("\n\n");
+  const result = await fetchLearningIssues("key", { teamKey: "COD", projectId: "project-1" }, {
+    gqlFn: async (query) => query.includes("comments(first:100")
+      ? { issue: { comments: { nodes: [{ id: "outcome", body: "[factory-learning outcome root=root-a generation=0 status=verified-improvement]", createdAt: "2026-07-09T00:00:00.000Z" }], pageInfo: { hasNextPage: false, endCursor: null } } } }
+      : { issues: { nodes: [{ id: "one", identifier: "COD-1", description, completedAt: "2026-07-01T00:00:00.000Z", state: { name: "Done" }, labels: { nodes: [{ id: "prov", name: "factory:learning-generated" }] } }], pageInfo: { hasNextPage: false, endCursor: null } } },
+  });
+  assert.deepEqual(result[0].evaluationMetadata, {
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+    baseline: { value: 0.8, unit: "ratio" },
+    evaluationWindow: { durationDays: 7 },
+  });
+  assert.equal(result[0].completedAt, "2026-07-01T00:00:00.000Z");
+  assert.deepEqual(result[0].outcome, { status: "verified-improvement", evaluatedAt: "2026-07-09T00:00:00.000Z" });
+  assert.equal(result[0].outcomeStatus, "verified-improvement");
+});
+
+test("learning evaluations persist active windows and confirm exactly one terminal outcome after timeout", async () => {
+  const issue = {
+    id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
+    rootFingerprint: "root-a", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["e1"], comments: [],
+    evaluationMetadata: {
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+      baseline: { value: 0.8, unit: "ratio" },
+      evaluationWindow: { durationDays: 7 },
+    },
+  };
+  const firstState = new Map();
+  const firstStore = { setEvaluation: (id, value) => { firstState.set(id, structuredClone(value)); return value; } };
+  const early = await executeLearningEvaluations({
+    issues: [issue], stateStore: firstStore,
+    snapshot: { capturedThrough: "2026-07-05T00:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, { fetchIssuesFn: async () => [issue], addCommentFn: async () => assert.fail("not due must not comment") });
+  assert.equal(early.active, 1);
+  assert.equal(firstState.get("root-a:0").status, "active");
+  assert.equal(firstState.get("root-a:0").windowEndsAt, "2026-07-08T00:00:00.000Z");
+
+  let commentAttempts = 0;
+  const dueSnapshot = {
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    observations: [{ at: "2026-07-07T12:00:00.000Z", metrics: { failureRate: 0.1 } }],
+    qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+  };
+  const due = await executeLearningEvaluations({ issues: [issue], stateStore: firstStore, snapshot: dueSnapshot }, {
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      commentAttempts += 1;
+      const status = body.match(/status=([^\]]+)/)[1];
+      issue.comments.push({ body, createdAt: dueSnapshot.capturedThrough });
+      issue.outcome = { status, evaluatedAt: dueSnapshot.capturedThrough };
+      issue.outcomeStatus = status;
+      throw new Error("comment timeout after success");
+    },
+  });
+  assert.equal(due.confirmed, 1);
+  assert.equal(commentAttempts, 1);
+  assert.equal(firstState.get("root-a:0").status, "verified-improvement");
+
+  const restored = new Map();
+  const restoredResult = await executeLearningEvaluations({
+    issues: [issue], stateStore: { setEvaluation: (id, value) => { restored.set(id, structuredClone(value)); return value; } }, snapshot: dueSnapshot,
+  }, { fetchIssuesFn: async () => [issue], addCommentFn: async () => assert.fail("confirmed outcome must not duplicate") });
+  assert.equal(restoredResult.restored, 1);
+  assert.equal(restored.get("root-a:0").status, "verified-improvement");
+  assert.equal(commentAttempts, 1);
+});
+
+test("production learning cycle evaluates generated Done cards even when no detector finding remains", async () => {
+  const issue = {
+    id: "done", identifier: "COD-1", stateName: "Done", labelNames: ["factory:learning-generated"],
+    rootFingerprint: "fixed-root", generation: 0, completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: ["old"], comments: [],
+    evaluationMetadata: {
+      acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+      baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
+    },
+  };
+  const evaluations = new Map();
+  const stateStore = {
+    setEvaluation: (id, value) => { evaluations.set(id, structuredClone(value)); return value; },
+    stageWindow: () => assert.fail("no finding means no mutation WAL"),
+    confirmMutation: () => assert.fail("no finding means no mutation confirmation"),
+    commitLens: () => assert.fail("no finding means no lens commit"),
+  };
+  let comments = 0;
+  const result = await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } },
+    stateStore,
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    snapshot: {
+      capturedThrough: "2026-07-09T00:00:00.000Z",
+      observations: [{ at: "2026-07-07T00:00:00.000Z", metrics: { failureRate: 0.1 } }],
+      qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+    },
+  }, {
+    fetchIssuesFn: async () => [issue],
+    addCommentFn: async (_issueId, body) => {
+      comments += 1;
+      issue.comments.push({ body, createdAt: "2026-07-09T00:00:00.000Z" });
+      issue.outcomeStatus = "verified-improvement";
+      issue.outcome = { status: "verified-improvement", evaluatedAt: "2026-07-09T00:00:00.000Z" };
+    },
+  });
+  assert.equal(result.evaluations.confirmed, 1);
+  assert.equal(result.mutations, 0);
+  assert.equal(comments, 1);
+  assert.equal(evaluations.get("fixed-root:0").status, "verified-improvement");
+});
+
+test("production learning cycle advances a due zero-mutation lens watermark", async () => {
+  const calls = [];
+  const stateStore = {
+    setEvaluation: () => assert.fail("no generated Done issue to evaluate"),
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.length, window.capturedThrough]),
+    confirmMutation: () => assert.fail("zero mutations have nothing to confirm"),
+    commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  const result = await executeLearningCycleWrites({
+    findings: [],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    snapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+    dueDecisions: { lenses: { quality: { due: true } } },
+  }, { fetchIssuesFn: async () => [] });
+  assert.equal(result.mutations, 0);
+  assert.deepEqual(calls, [
+    ["stage", "quality", 0, "2026-07-10T12:00:00.000Z"],
+    ["commit", "quality"],
+  ]);
+});
+
+test("cross-lens learning mutation uses one Linear write and every lens WAL", async () => {
+  const calls = [];
+  const live = [];
+  const stateStore = {
+    setEvaluation: () => assert.fail("no generated Done issue to evaluate"),
+    stageWindow: (lens, window) => calls.push(["stage", lens, window.mutations.map((mutation) => mutation.mutationId)]),
+    confirmMutation: (lens, mutationId) => calls.push(["confirm", lens, mutationId]),
+    commitLens: (lens) => { calls.push(["commit", lens]); return true; },
+  };
+  let creates = 0;
+  const result = await executeLearningCycleWrites({
+    findings: [learningFindingForWatcher({ lenses: ["quality", "reliability"] })],
+    workspaces: [{ sourceAnchorPath: "/source/app", apiKey: "key", config: { teamKey: "COD", projectId: "project-1" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, stateStore,
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    snapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, {
+    fetchIssuesFn: async () => live,
+    loadLabelsFn: async () => ({ "factory:learning-generated": "prov" }),
+    loadTeamFn: async () => ({ teamId: "team", stateIds: { Spec: "spec" } }),
+    fetchSpecCardsFn: async () => live,
+    createIssueFn: async (input) => {
+      creates += 1;
+      const marker = input.description.match(/\[factory-learning root=([^\s\]]+) generation=(\d+)\]/);
+      const created = { id: "created", identifier: "COD-2", stateName: "Spec", sortOrder: input.sortOrder, rootFingerprint: marker[1], generation: Number(marker[2]), occurrenceIds: [], labelNames: ["factory:learning-generated"] };
+      live.push(created);
+      return created;
+    },
+  });
+  assert.equal(creates, 1);
+  assert.equal(result.confirmed, 1);
+  assert.deepEqual(calls.filter(([kind]) => kind === "stage").map(([, lens, ids]) => [lens, ids.length]), [["quality", 1], ["reliability", 1]]);
+  assert.deepEqual(calls.filter(([kind]) => kind === "confirm").map(([, lens]) => lens), ["quality", "reliability"]);
+  assert.deepEqual(calls.filter(([kind]) => kind === "commit").map(([, lens]) => lens), ["quality", "reliability"]);
+});
+
+test("live learning dry-run plans exact updates, creates, recurrences, caps, and evaluations without writes", async () => {
+  const workspace = {
+    sourceAnchorPath: "/source/app", apiKey: "key",
+    config: { teamKey: "COD", projectId: "project-1", repoRouting: { byLabel: { "app:main": "app" } } },
+  };
+  const metadata = {
+    acceptanceMetric: { name: "failureRate", direction: "decrease", target: 0.2 },
+    baseline: { value: 0.8 }, evaluationWindow: { durationDays: 7 },
+  };
+  const done = (rootFingerprint, generation, outcomeStatus = null) => ({
+    id: `${rootFingerprint}-${generation}`, identifier: `COD-${generation}`, stateName: "Done",
+    labelNames: ["factory:learning-generated"], rootFingerprint, generation,
+    completedAt: "2026-07-01T00:00:00.000Z", occurrenceIds: [`old-${rootFingerprint}`], comments: [],
+    evaluationMetadata: metadata,
+    ...(outcomeStatus ? { outcomeStatus, outcome: { status: outcomeStatus, evaluatedAt: "2026-07-09T00:00:00.000Z" } } : {}),
+  });
+  const live = [
+    { id: "active", identifier: "COD-10", stateName: "Dev", rootFingerprint: "active-root", generation: 0, occurrenceIds: ["old-active"], labelNames: ["factory:learning-generated"] },
+    done("recur-root", 0),
+    done("verified-root", 0, "verified-improvement"),
+    done("cap-root", 3, "regression"),
+  ];
+  const finding = (rootFingerprint, occurrenceIds) => learningFindingForWatcher({ rootFingerprint, occurrenceIds, sourceWorkspaces: [workspace.sourceAnchorPath] });
+  const snapshot = {
+    capturedThrough: "2026-07-09T00:00:00.000Z",
+    observations: [{ at: "2026-07-07T00:00:00.000Z", metrics: { failureRate: 0.7 } }],
+    coverage: { complete: true, gaps: [] },
+  };
+  const result = await buildLiveLearningDryRunPlan({
+    findings: [
+      finding("active-root", ["old-active", "new-active"]),
+      finding("create-root", ["new-create"]),
+      finding("recur-root", ["old-recur-root", "new-recur"]),
+      finding("verified-root", ["old-verified-root", "new-verified"]),
+      finding("cap-root", ["old-cap-root", "new-cap"]),
+    ],
+    workspaces: [workspace, { sourceAnchorPath: "/missing", apiKey: null, config: { teamKey: "COD", projectId: "missing-project" } }],
+    registry: { learning: { maxNewCardsPerRun: 6 } }, snapshot,
+  }, { fetchIssuesFn: async (destination) => destination.sourceAnchorPath === workspace.sourceAnchorPath ? live : [] });
+
+  assert.deepEqual(result.mutations.map((mutation) => [mutation.action, mutation.rootFingerprint, mutation.generation]), [
+    ["append-evidence", "active-root", 0],
+    ["block-generation-cap", "cap-root", 3],
+    ["create", "create-root", 0],
+    ["create", "recur-root", 1],
+  ]);
+  assert.ok(result.deferred.some((item) => item.finding?.rootFingerprint === "verified-root" && item.reason === "evaluation-not-recurrence-eligible"));
+  assert.deepEqual(result.evaluations.map((evaluation) => [evaluation.rootFingerprint, evaluation.status, evaluation.action]), [
+    ["cap-root", "regression", "restore"],
+    ["recur-root", "no-measurable-change", "append-outcome"],
+    ["verified-root", "verified-improvement", "restore"],
+  ]);
+  assert.ok(result.coverageGaps.some((gap) => gap.source === "/missing" && /credential/.test(gap.reason)));
+});
+
+test("live learning dry-run reports route gaps and manual runs override cadence only when attended", async () => {
+  const workspace = {
+    sourceAnchorPath: "/source/app", apiKey: "key",
+    config: { teamKey: "COD", projectId: "project-1", repoRouting: { byLabel: { "app:main": "app" } } },
+  };
+  const result = await buildLiveLearningDryRunPlan({
+    findings: [learningFindingForWatcher({ repoEntry: "unknown", sourceWorkspaces: [workspace.sourceAnchorPath] })],
+    workspaces: [workspace], registry: { learning: { maxNewCardsPerRun: 6 } },
+    snapshot: { capturedThrough: "2026-07-10T00:00:00.000Z", observations: [], coverage: { complete: true, gaps: [] } },
+  }, { fetchIssuesFn: async () => [] });
+  assert.ok(result.coverageGaps.some((gap) => /route/.test(gap.reason)));
+  assert.equal(learningRunExecutionDecision({ dryRun: true, automatic: false, due: false }), "dry-run");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: true, due: false }), "idle");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: false, due: false }), "run");
+  assert.equal(learningRunExecutionDecision({ dryRun: false, automatic: true, due: true }), "run");
 });
 
 test("learning writer fails closed without provenance and confirms retry-safe create at bottom of Spec", async () => {
@@ -1831,7 +2103,7 @@ test("production learning cycle stages one WAL and globally caps creates across 
 test("production learning cycle routes same-project findings to their exact source workspace", async () => {
   const finding = learningFindingForWatcher({ sourceWorkspaces: ["/z-source"] });
   const visited = [];
-  await executeLearningCycleWrites({
+  const result = await executeLearningCycleWrites({
     findings: [finding],
     registry: { learning: { maxNewCardsPerRun: 0 } },
     workspaces: [
@@ -1842,7 +2114,8 @@ test("production learning cycle routes same-project findings to their exact sour
   }, {
     fetchIssuesFn: async (destination) => { visited.push(destination.sourceAnchorPath); return []; },
   });
-  assert.deepEqual(visited, ["/z-source"]);
+  assert.deepEqual(visited, ["/a-source", "/z-source"], "evaluation discovery scans every registered learning workspace");
+  assert.deepEqual(result.plannedDestinations, ["/z-source"]);
 });
 
 test("generation cap appends fresh evidence and one blocker audit while preserving Done", async () => {
@@ -4478,6 +4751,90 @@ test("doctor telemetry: malformed observations surface as a metrics gap without 
   assert.equal(report.ok, true);
   assert.deepEqual(report.metricsUnavailable, ["observation schema is malformed"]);
   assert.match(formatDoctorReport(report), /metrics unavailable: observation schema is malformed/);
+});
+test("doctor learning diagnostics expose due lenses, WAL, evaluations, coverage, and synthesis independently", () => {
+  const now = "2026-07-10T12:00:00.000Z";
+  const state = {
+    version: 1,
+    lenses: {
+      reliability: { lastSuccessfulCapturedThrough: "2026-07-09T00:00:00.000Z", pending: null, error: "detector timeout" },
+      quality: { lastSuccessfulCapturedThrough: "2026-07-08T00:00:00.000Z", pending: { mutations: { a: {}, b: {} } } },
+      throughput: { lastSuccessfulCapturedThrough: "2026-07-01T00:00:00.000Z", pending: null },
+    },
+    evaluations: {
+      due: { status: "active", evaluateAfter: "2026-07-10T11:00:00.000Z" },
+      later: { status: "active", evaluateAfter: "2026-07-11T11:00:00.000Z" },
+      done: { status: "verified-improvement", evaluateAfter: "2026-07-01T00:00:00.000Z" },
+    },
+  };
+  const snapshot = {
+    capturedThrough: now,
+    events: [{ occurredAt: "2026-07-10T10:00:00.000Z", kind: "terminal", category: "failed" }],
+    observations: [],
+    runRecords: Array.from({ length: 20 }, (_, index) => ({ endedAt: `2026-07-10T10:${String(index).padStart(2, "0")}:00.000Z` })),
+    coverage: { complete: false, gaps: [{ source: "runs", reason: "one malformed line" }] },
+  };
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, learning: { enabled: true, runner: true } },
+    capacityState: { healthy: true, active: 1, max: 10, errors: [], entries: [{ stage: "learning", trigger: "learning-due" }] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: state,
+    learningSnapshot: snapshot,
+    learningWorkspaces: [{ learning: { enabled: true, lenses: { reliability: true, quality: true, throughput: true } } }],
+    learningSynthesisState: { runtime: "codex", available: false, reason: "runtime missing" },
+    now: Date.parse(now),
+  });
+
+  assert.equal(report.ok, true, "learning red must not flip ordinary doctor health");
+  assert.deepEqual({ enabled: report.learning.enabled, runner: report.learning.runner, active: report.learning.active, healthy: report.learning.healthy }, {
+    enabled: true, runner: true, active: true, healthy: false,
+  });
+  assert.deepEqual(report.learning.lenses.reliability, {
+    lastSuccess: "2026-07-09T00:00:00.000Z", due: true, reason: "cadence-and-evidence", sampleCount: 1, pending: 0, error: "detector timeout",
+  });
+  assert.equal(report.learning.lenses.quality.pending, 2);
+  assert.equal(report.learning.lenses.quality.due, true);
+  assert.equal(report.learning.lenses.throughput.sampleCount, 20);
+  assert.deepEqual(report.learning.evaluations, { active: 2, due: 1, dueRoots: ["due"] });
+  assert.deepEqual(report.learning.coverage.gaps, [{ source: "runs", reason: "one malformed line" }]);
+  assert.deepEqual(report.learning.synthesis, { runtime: "codex", available: false, reason: "runtime missing" });
+
+  const human = formatDoctorReport(report);
+  assert.match(human, /learning: enabled, runner, active, RED/);
+  assert.match(human, /reliability: due=yes last=2026-07-09T00:00:00.000Z samples=1 pending=0 error=detector timeout/);
+  assert.match(human, /quality: due=yes .*pending=2/);
+  assert.match(human, /evaluations: active=2 due=1/);
+  assert.match(human, /coverage gap: runs: one malformed line/);
+  assert.match(human, /synthesis: codex unavailable \(runtime missing\)/);
+});
+
+test("doctor learning diagnostics default disabled without affecting ordinary health", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [], entries: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: { version: 1, lenses: {}, evaluations: {} },
+    learningSnapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", events: [], observations: [], runRecords: [], coverage: { complete: true, gaps: [] } },
+    learningWorkspaces: [],
+    learningSynthesisState: { runtime: null, available: null, reason: "disabled" },
+  });
+  assert.equal(report.ok, true);
+  assert.equal(report.learning.enabled, false);
+  assert.equal(report.learning.healthy, true);
+  assert.match(formatDoctorReport(report), /learning: disabled, non-runner, idle, OK/);
+});
+
+test("doctor reports optional synthesis as not configured without making learning red", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, learning: { enabled: true, runner: true, runtime: null } },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [], entries: [] },
+    observationState: { healthy: true, entries: [], errors: [] },
+    learningState: { version: 1, lenses: {}, evaluations: {} },
+    learningSnapshot: { capturedThrough: "2026-07-10T12:00:00.000Z", events: [], observations: [], runRecords: [], coverage: { complete: true, gaps: [] } },
+    learningWorkspaces: [],
+  });
+  assert.deepEqual(report.learning.synthesis, { runtime: null, available: null, reason: "not-configured" });
+  assert.equal(report.learning.healthy, true);
 });
 test("doctor preserves exact dependency-cycle evidence after the tick completes", () => {
   const lastTick = {

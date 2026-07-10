@@ -93,13 +93,13 @@ test("learning mutation planner creates, updates active cards, and preserves Sig
 });
 
 test("learning mutation planner handles Done recurrence, duplicates, cap, and six-create budget", () => {
-  const done = [{ id: "done-0", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"] }];
+  const done = [{ id: "done-0", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0, occurrenceIds: ["e1"], outcomeStatus: "no-measurable-change" }];
   const recurrence = planLearningMutations([learningFinding()], done, {});
   assert.equal(recurrence.mutations.find((item) => item.action === "create")?.generation, 1);
   assert.equal(recurrence.mutations.find((item) => item.action === "create")?.relatedIssueId, "done-0");
 
   const capped = planLearningMutations([learningFinding({ generation: 3 })], [{
-    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"],
+    id: "done-3", identifier: "COD-3", stateName: "Done", rootFingerprint: "root-a", generation: 3, occurrenceIds: ["e1"], outcomeStatus: "regression",
   }], {});
   assert.equal(capped.mutations.some((item) => item.action === "create"), false);
   assert.equal(capped.mutations.find((item) => item.action === "block-generation-cap")?.issueId, "done-3");
@@ -116,6 +116,20 @@ test("learning mutation planner handles Done recurrence, duplicates, cap, and si
   })), [], { maxNewCardsPerRun: 6 });
   assert.equal(many.mutations.filter((item) => item.action === "create").length, 6);
   assert.equal(many.deferred.length, 2);
+});
+
+test("learning mutation planner gates recurrence on a confirmed terminal outcome", () => {
+  for (const [outcomeStatus, creates] of [
+    [null, false], ["active", false], ["verified-improvement", false], ["inconclusive-evidence", false],
+    ["no-measurable-change", true], ["regression", true],
+  ]) {
+    const result = planLearningMutations([learningFinding()], [{
+      id: "done", identifier: "COD-1", stateName: "Done", rootFingerprint: "root-a", generation: 0,
+      occurrenceIds: ["e1"], outcomeStatus,
+    }], {});
+    assert.equal(result.mutations.some((mutation) => mutation.action === "create"), creates, String(outcomeStatus));
+    if (!creates) assert.ok(result.deferred.some((item) => item.reason === "evaluation-not-recurrence-eligible"), String(outcomeStatus));
+  }
 });
 
 test("learning mutation planner never budgets updates and emits no duplicate occurrence", () => {
@@ -449,6 +463,19 @@ test("learning state advances a lens watermark only after every mutation is conf
   assert.equal(store.snapshot().lenses.reliability.pending, null);
 });
 
+test("learning state persists active and terminal evaluations atomically", () => {
+  const { store, stored } = memoryLearningStore();
+  const active = {
+    status: "active", rootFingerprint: "root-a", generation: 0, issueId: "issue-a",
+    completedAt: "2026-07-01T00:00:00.000Z", windowEndsAt: "2026-07-08T00:00:00.000Z",
+  };
+  assert.deepEqual(store.setEvaluation("root-a:0", active), active);
+  assert.deepEqual(stored().evaluations["root-a:0"], active);
+  const terminal = { ...active, status: "verified-improvement", evaluatedAt: "2026-07-08T00:00:00.000Z" };
+  assert.deepEqual(store.setEvaluation("root-a:0", terminal), terminal);
+  assert.deepEqual(stored().evaluations["root-a:0"], terminal);
+});
+
 test("learning state validates lens and mutation identities before writing", () => {
   const { store, writes } = memoryLearningStore();
   assert.throws(() => store.stageWindow("unknown", { capturedThrough: "2026-07-10T00:00:00.000Z", mutations: [] }), /unknown learning lens/);
@@ -723,6 +750,7 @@ test("ranking admits unlimited updates, caps new creates at six, and defers low 
   const low = aggregateFixture({ rootFingerprint: "low", confidence: "low" });
   const noRoute = aggregateFixture({ rootFingerprint: "no-route", actionable: false });
   const result = rankQualifiedFindings([...creates.reverse(), low, ...updates, noRoute], 6);
+  assert.equal(result.qualified.length, creates.length + updates.length);
   assert.equal(result.admitted.filter((item) => item.existingCardId).length, 8);
   assert.equal(result.admitted.filter((item) => !item.existingCardId).length, 6);
   assert.equal(result.deferred.length, 4);
@@ -738,6 +766,7 @@ test("deterministic finding rendering includes the complete audit and measuremen
   assert.equal(body, renderFindingCard(structuredClone(finding)));
   assert.match(renderEvidenceDelta(finding, ["o3", "o2"]), /o3/);
   assert.doesNotMatch(renderEvidenceDelta(finding, ["o3", "o2"]), /o2\b.*o2\b/);
+  assert.match(renderFindingCard({ ...finding, synthesisAnnotation: "Check shared retry ownership." }), /Non-authoritative synthesis annotation[\s\S]*Check shared retry ownership/);
 });
 
 function outcomeSnapshot(value, { complete = true, qualifyingFinding = null } = {}) {

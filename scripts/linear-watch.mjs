@@ -38,6 +38,7 @@ import {
   canonicalAnchorIdentity,
   createLearningStateStore,
   emptyLearningState,
+  evaluateLearningOutcome,
   LEARNING_STAGE,
   LEARNING_TRIGGER,
   learningDueDecisions,
@@ -983,13 +984,22 @@ export async function runPostDeliveryLearning({
   if (!reservation) return { mode: "deferred", findings };
   try {
     let synthesis;
-    try {
-      synthesis = await dispatchFn({ demand, findings }, { onSpawn: (pid) => reservation.attachChildPid(pid) });
-    } catch (error) {
-      synthesis = deterministicFn(findings, error);
+    if (!findings.length || typeof dispatchFn !== "function") {
+      synthesis = deterministicFn(findings, null);
+    } else {
+      try {
+        synthesis = await dispatchFn({ demand, findings }, { onSpawn: (pid) => reservation.attachChildPid(pid) });
+      } catch (error) {
+        synthesis = deterministicFn(findings, error);
+      }
     }
     if (!writerFn) return synthesis;
-    const writes = await writerFn({ findings, synthesis, demand });
+    const annotations = new Map((synthesis?.annotations || []).map((annotation) => [annotation.rootFingerprint, annotation.summary]));
+    const annotatedFindings = findings.map((finding) => {
+      const annotation = annotations.get(finding.rootFingerprint);
+      return annotation ? { ...finding, synthesisAnnotation: String(annotation).slice(0, 1_000) } : finding;
+    });
+    const writes = await writerFn({ findings: annotatedFindings, synthesis, demand });
     return { ...synthesis, writes };
   } catch (error) {
     throw error;
@@ -2583,6 +2593,7 @@ function unwrapGraphQlData(result, context) {
 
 const LEARNING_PROVENANCE_LABEL = "factory:learning-generated";
 const LEARNING_MARKER_RE = /\[factory-learning root=([^\s\]]+) generation=(\d+)\]/g;
+const LEARNING_OUTCOME_RE = /\[factory-learning outcome root=([^\s\]]+) generation=(\d+) status=(verified-improvement|no-measurable-change|regression|inconclusive-evidence)\]/g;
 
 function learningMarkers(text) {
   const out = [];
@@ -2602,6 +2613,35 @@ function learningOccurrenceIds(text) {
     for (const id of match[1].split(",").map((item) => item.trim()).filter(Boolean)) ids.add(id);
   }
   return [...ids].sort();
+}
+
+function learningJsonSection(text, heading) {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = String(text || "").match(new RegExp(`## ${escaped}\\s*\\n([^\\n]+)`));
+  if (!match) return null;
+  try {
+    const value = JSON.parse(match[1]);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function learningEvaluationMetadata(description) {
+  const acceptanceMetric = learningJsonSection(description, "Acceptance metric");
+  const baseline = learningJsonSection(description, "Baseline");
+  const evaluationWindow = learningJsonSection(description, "Evaluation window");
+  return acceptanceMetric && baseline && evaluationWindow ? { acceptanceMetric, baseline, evaluationWindow } : null;
+}
+
+function learningOutcomeForText(text, rootFingerprint, generation, comments = []) {
+  const outcomes = [];
+  for (const match of String(text || "").matchAll(LEARNING_OUTCOME_RE)) {
+    if (match[1] !== rootFingerprint || Number(match[2]) !== Number(generation)) continue;
+    const comment = comments.find((item) => String(item.body || "").includes(match[0]));
+    outcomes.push({ status: match[3], evaluatedAt: comment?.createdAt || null });
+  }
+  return outcomes.at(-1) || null;
 }
 
 export async function fetchLearningIssueComments(apiKey, issueId, { gqlFn = gql } = {}) {
@@ -2661,7 +2701,7 @@ export async function fetchLearningIssues(apiKey, { teamKey, projectId } = {}, {
   let cursor = null;
   while (true) {
     const result = await gqlFn(
-      `query($cursor:String,$teamKey:String!,$projectId:ID!){ issues(first:100, after:$cursor, filter:{ team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$projectId } } }){ pageInfo{ hasNextPage endCursor } nodes{ id identifier title description sortOrder updatedAt state{ name } labels{ nodes{ id name } } } } }`,
+      `query($cursor:String,$teamKey:String!,$projectId:ID!){ issues(first:100, after:$cursor, filter:{ team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$projectId } } }){ pageInfo{ hasNextPage endCursor } nodes{ id identifier title description sortOrder updatedAt completedAt state{ name } labels{ nodes{ id name } } } } }`,
       { cursor, teamKey, projectId },
       apiKey,
     );
@@ -2684,6 +2724,7 @@ export async function fetchLearningIssues(apiKey, { teamKey, projectId } = {}, {
     const markers = learningMarkers(text);
     if (!markers.length) continue;
     const marker = [...markers].sort((a, b) => b.generation - a.generation || a.rootFingerprint.localeCompare(b.rootFingerprint))[0];
+    const outcome = learningOutcomeForText(text, marker.rootFingerprint, marker.generation, comments);
     issues.push({
       id: node.id,
       identifier: node.identifier,
@@ -2691,6 +2732,7 @@ export async function fetchLearningIssues(apiKey, { teamKey, projectId } = {}, {
       description: node.description || "",
       sortOrder: node.sortOrder,
       updatedAt: node.updatedAt,
+      completedAt: node.completedAt || null,
       stateName: node.state?.name || null,
       labelNames: (node.labels?.nodes || []).map((label) => label.name),
       labelIds: Object.fromEntries((node.labels?.nodes || []).map((label) => [label.name, label.id])),
@@ -2698,9 +2740,99 @@ export async function fetchLearningIssues(apiKey, { teamKey, projectId } = {}, {
       rootFingerprint: marker.rootFingerprint,
       generation: marker.generation,
       occurrenceIds: learningOccurrenceIds(text),
+      evaluationMetadata: learningEvaluationMetadata(node.description || ""),
+      outcome,
+      outcomeStatus: outcome?.status || null,
     });
   }
   return issues;
+}
+
+function buildLearningEvaluation(issue) {
+  const metadata = issue?.evaluationMetadata;
+  const completedAt = issue?.completedAt || issue?.updatedAt;
+  const durationDays = Number(metadata?.evaluationWindow?.durationDays);
+  const baseline = Number(metadata?.baseline?.value);
+  const metric = String(metadata?.acceptanceMetric?.name || "").trim();
+  const expectedDirection = metadata?.acceptanceMetric?.direction;
+  if (issue?.stateName !== "Done" || !issue.labelNames?.includes(LEARNING_PROVENANCE_LABEL)
+    || !issue.rootFingerprint || Number.isNaN(Date.parse(completedAt || ""))
+    || !Number.isFinite(durationDays) || durationDays <= 0 || !Number.isFinite(baseline)
+    || !metric || !["increase", "decrease"].includes(expectedDirection)) return null;
+  const target = Number(metadata.acceptanceMetric.target);
+  return {
+    status: "active",
+    rootFingerprint: issue.rootFingerprint,
+    generation: Number(issue.generation || 0),
+    issueId: issue.id,
+    completedAt,
+    windowEndsAt: new Date(Date.parse(completedAt) + durationDays * 86400000).toISOString(),
+    metric,
+    aggregation: metadata.acceptanceMetric.aggregation || "latest",
+    baseline,
+    expectedDirection,
+    minimumChange: Number.isFinite(target) ? Math.abs(target - baseline) : 0,
+    priorEvidenceIds: [...new Set(issue.occurrenceIds || [])].sort(),
+  };
+}
+
+export async function executeLearningEvaluations({
+  issues = [],
+  stateStore,
+  snapshot = {},
+  apiKey = null,
+} = {}, {
+  fetchIssuesFn = async () => issues,
+  addCommentFn,
+} = {}) {
+  if (typeof addCommentFn !== "function") addCommentFn = (issueId, body) => addComment(apiKey, issueId, body);
+  let active = 0;
+  let confirmed = 0;
+  let restored = 0;
+  const errors = [];
+  for (const issue of issues) {
+    const evaluationId = `${issue.rootFingerprint}:${Number(issue.generation || 0)}`;
+    const contract = buildLearningEvaluation(issue);
+    if (!contract) {
+      if (issue?.stateName === "Done" && issue?.labelNames?.includes(LEARNING_PROVENANCE_LABEL)) {
+        errors.push({ issueId: issue.id, reason: "generated Done card has invalid evaluation metadata" });
+      }
+      continue;
+    }
+    if (!stateStore?.setEvaluation) throw new Error("learning evaluation state store is required");
+    if (issue.outcome?.status) {
+      stateStore.setEvaluation(evaluationId, {
+        ...contract,
+        status: issue.outcome.status,
+        evaluatedAt: issue.outcome.evaluatedAt || null,
+      });
+      restored += 1;
+      continue;
+    }
+    stateStore.setEvaluation(evaluationId, contract);
+    const outcome = evaluateLearningOutcome(contract, snapshot);
+    if (!outcome.terminal) {
+      active += 1;
+      continue;
+    }
+    const marker = `[factory-learning outcome root=${contract.rootFingerprint} generation=${contract.generation} status=${outcome.status}]`;
+    let writeError = null;
+    try { await addCommentFn(issue.id, `${marker}\nOutcome evaluated from the fixed post-Done measurement window.`); }
+    catch (error) { writeError = error; }
+    const refreshed = await fetchIssuesFn();
+    const confirmedIssue = refreshed.find((candidate) => candidate.id === issue.id);
+    if (!confirmedIssue?.outcome || confirmedIssue.outcome.status !== outcome.status) {
+      if (writeError) throw writeError;
+      throw new Error(`learning outcome ${evaluationId} was not confirmed`);
+    }
+    stateStore.setEvaluation(evaluationId, {
+      ...contract,
+      status: outcome.status,
+      evaluatedAt: confirmedIssue.outcome.evaluatedAt || outcome.evaluatedAt,
+    });
+    confirmed += 1;
+  }
+  return { active, confirmed, restored, errors };
 }
 
 async function fetchLearningSpecCards(apiKey, teamKey, projectId, { gqlFn = gql } = {}) {
@@ -2868,16 +3000,126 @@ function openLearningStateStore(statePath = LEARNING_STATE_PATH) {
   });
 }
 
+export function learningRunExecutionDecision({ dryRun = false, automatic = false, due = false } = {}) {
+  if (dryRun) return "dry-run";
+  if (automatic && !due) return "idle";
+  return "run";
+}
+
+export async function buildLiveLearningDryRunPlan({
+  findings = [],
+  workspaces = [],
+  registry = {},
+  snapshot = {},
+} = {}, {
+  fetchIssuesFn = (workspace) => fetchLearningIssues(workspace.apiKey, {
+    teamKey: workspace.config.teamKey,
+    projectId: workspace.config.projectId,
+  }),
+} = {}) {
+  const coverageGaps = [...(snapshot?.coverage?.gaps || [])];
+  const destinations = new Map();
+  for (const workspace of workspaces) {
+    if (!workspace?.config?.projectId) {
+      coverageGaps.push({ source: workspace?.sourceAnchorPath || "unknown", reason: "learning destination project is missing" });
+      continue;
+    }
+    if (!workspace.apiKey) {
+      coverageGaps.push({ source: workspace.sourceAnchorPath, reason: "learning destination credential is missing" });
+      continue;
+    }
+    destinations.set(`${workspace.sourceAnchorPath}\0${workspace.config.projectId}`, { workspace, findings: [], issues: [] });
+  }
+  const deferred = [];
+  for (const finding of findings) {
+    const candidates = workspaces.filter((workspace) => workspace.config?.projectId === finding.projectId && workspace.apiKey);
+    const sourceScoped = candidates.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
+    const workspace = (sourceScoped.length ? sourceScoped : candidates).sort((a, b) => a.sourceAnchorPath.localeCompare(b.sourceAnchorPath))[0];
+    if (!workspace) {
+      const reason = "destination-workspace-or-credential-missing";
+      deferred.push({ finding, reason });
+      coverageGaps.push({ source: finding.projectId || finding.rootFingerprint, reason });
+      continue;
+    }
+    destinations.get(`${workspace.sourceAnchorPath}\0${workspace.config.projectId}`).findings.push(finding);
+  }
+
+  const evaluations = [];
+  for (const entry of [...destinations.values()].sort((a, b) => a.workspace.sourceAnchorPath.localeCompare(b.workspace.sourceAnchorPath))) {
+    try { entry.issues = await fetchIssuesFn(entry.workspace); }
+    catch (error) {
+      coverageGaps.push({ source: entry.workspace.sourceAnchorPath, reason: `learning issue scan failed: ${sanitizeFailureMessage(error?.message || error)}` });
+      entry.unreadable = true;
+      continue;
+    }
+    entry.issues = entry.issues.map((issue) => {
+      const contract = buildLearningEvaluation(issue);
+      if (!contract) {
+        if (issue.stateName === "Done" && issue.labelNames?.includes(LEARNING_PROVENANCE_LABEL)) {
+          coverageGaps.push({ source: issue.identifier || issue.id, reason: "generated Done card has invalid evaluation metadata" });
+        }
+        return issue;
+      }
+      if (issue.outcome?.status) {
+        evaluations.push({ rootFingerprint: issue.rootFingerprint, generation: issue.generation, status: issue.outcome.status, action: "restore", issueId: issue.id });
+        return issue;
+      }
+      const outcome = evaluateLearningOutcome(contract, snapshot);
+      evaluations.push({
+        rootFingerprint: issue.rootFingerprint,
+        generation: issue.generation,
+        status: outcome.status === "not-due" ? "active" : outcome.status,
+        action: outcome.terminal ? "append-outcome" : "active",
+        issueId: issue.id,
+        windowEndsAt: contract.windowEndsAt,
+      });
+      return outcome.terminal ? { ...issue, outcomeStatus: outcome.status, outcome: { status: outcome.status, evaluatedAt: outcome.evaluatedAt } } : issue;
+    });
+  }
+
+  const mutations = [];
+  let remainingCreates = Math.min(6, Math.max(0, Math.floor(Number(registry.learning?.maxNewCardsPerRun ?? 6)) || 0));
+  for (const entry of [...destinations.values()].sort((a, b) => a.workspace.sourceAnchorPath.localeCompare(b.workspace.sourceAnchorPath))) {
+    if (entry.unreadable) {
+      deferred.push(...entry.findings.map((finding) => ({ finding, reason: "destination-issues-unreadable" })));
+      continue;
+    }
+    const planned = planLearningMutations(entry.findings, entry.issues, {
+      ...entry.workspace.config,
+      maxNewCardsPerRun: remainingCreates,
+    });
+    mutations.push(...planned.mutations);
+    deferred.push(...planned.deferred);
+    remainingCreates -= planned.mutations.filter((mutation) => mutation.action === "create").length;
+  }
+  for (const item of deferred) {
+    if (/route/.test(item.reason || "")) coverageGaps.push({ source: item.finding?.rootFingerprint || "unknown", reason: item.reason });
+  }
+  return {
+    mutations,
+    deferred,
+    evaluations: evaluations.sort((a, b) => a.rootFingerprint.localeCompare(b.rootFingerprint) || a.generation - b.generation),
+    coverageGaps: [...new Map(coverageGaps.map((gap) => [`${gap.source}\0${gap.reason}`, gap])).values()],
+  };
+}
+
 export async function executeLearningCycleWrites({
   findings = [],
   workspaces = [],
   registry = {},
   stateStore = null,
   capturedThrough = new Date().toISOString(),
+  snapshot = { capturedThrough, observations: [], coverage: { complete: true, gaps: [] } },
+  dueDecisions = null,
   from = null,
 } = {}, deps = {}) {
   const destinations = new Map();
   const deferred = [];
+  for (const workspace of workspaces) {
+    if (!workspace?.apiKey || !workspace.config?.projectId) continue;
+    const key = `${workspace.sourceAnchorPath}\0${workspace.config.projectId}`;
+    destinations.set(key, { destination: workspace, findings: [] });
+  }
   for (const finding of findings) {
     const candidates = workspaces.filter((workspace) => workspace.config?.projectId === finding.projectId);
     const sourceScoped = candidates.filter((workspace) => (finding.sourceWorkspaces || []).includes(workspace.sourceAnchorPath));
@@ -2892,61 +3134,86 @@ export async function executeLearningCycleWrites({
     destinations.get(key).findings.push(finding);
   }
 
+  const store = stateStore || openLearningStateStore();
   const prepared = [];
+  const evaluationSummary = { active: 0, confirmed: 0, restored: 0, errors: [] };
   let remainingCreates = Math.min(6, Math.max(0, Math.floor(Number(registry.learning?.maxNewCardsPerRun ?? 6)) || 0));
   for (const { destination, findings: destinationFindings } of [...destinations.values()].sort((a, b) => a.destination.sourceAnchorPath.localeCompare(b.destination.sourceAnchorPath))) {
     const fetchIssuesFn = deps.fetchIssuesFn
       ? () => deps.fetchIssuesFn(destination)
       : () => fetchLearningIssues(destination.apiKey, { teamKey: destination.config.teamKey, projectId: destination.config.projectId });
-    const liveIssues = await fetchIssuesFn();
+    let liveIssues = await fetchIssuesFn();
+    const evaluationResult = await executeLearningEvaluations({
+      issues: liveIssues,
+      stateStore: store,
+      snapshot,
+      apiKey: destination.apiKey,
+    }, {
+      fetchIssuesFn,
+      ...(deps.addCommentFn ? { addCommentFn: deps.addCommentFn } : {}),
+    });
+    evaluationSummary.active += evaluationResult.active;
+    evaluationSummary.confirmed += evaluationResult.confirmed;
+    evaluationSummary.restored += evaluationResult.restored;
+    evaluationSummary.errors.push(...evaluationResult.errors);
+    if (evaluationResult.confirmed) liveIssues = await fetchIssuesFn();
     const planned = planLearningMutations(destinationFindings, liveIssues, {
       ...destination.config,
       maxNewCardsPerRun: remainingCreates,
     });
     remainingCreates -= planned.mutations.filter((mutation) => mutation.action === "create").length;
     deferred.push(...planned.deferred);
-    prepared.push({ destination, mutations: planned.mutations, fetchIssuesFn });
+    prepared.push({ destination, mutations: planned.mutations, fetchIssuesFn, findingCount: destinationFindings.length });
   }
   const mutations = prepared.flatMap((entry) => entry.mutations);
-  const store = stateStore || openLearningStateStore();
   const byLens = new Map();
   for (const mutation of mutations) {
-    const lens = mutation.finding?.lenses?.[0] || "reliability";
-    mutation.lens = lens;
-    if (!byLens.has(lens)) byLens.set(lens, []);
-    byLens.get(lens).push(mutation);
+    const lenses = [...new Set(mutation.finding?.lenses?.length ? mutation.finding.lenses : ["reliability"])];
+    mutation.lenses = lenses;
+    for (const lens of lenses) {
+      if (!byLens.has(lens)) byLens.set(lens, []);
+      byLens.get(lens).push(mutation);
+    }
+  }
+  for (const [lens, decision] of Object.entries(dueDecisions?.lenses || {})) {
+    if (decision?.due && !byLens.has(lens)) byLens.set(lens, []);
   }
   for (const [lens, lensMutations] of byLens) {
     store.stageWindow(lens, { from, capturedThrough, mutations: lensMutations });
   }
   let confirmed = 0;
   for (const entry of prepared) {
-    for (const [lens, lensMutations] of [...byLens]) {
-      const destinationIds = new Set(entry.mutations.map((mutation) => mutation.mutationId));
-      const selected = lensMutations.filter((mutation) => destinationIds.has(mutation.mutationId));
-      if (!selected.length) continue;
-      const destination = entry.destination;
-      const result = await executeLearningMutations({
-        mutations: selected,
-        lens,
-        capturedThrough,
-        from,
-        stateStore: store,
-        walManagedExternally: true,
-        apiKey: destination.apiKey,
-        teamKey: destination.config.teamKey,
-        projectId: destination.config.projectId,
-      }, {
-        ...deps,
-        fetchIssuesFn: entry.fetchIssuesFn,
-      });
-      confirmed += result.confirmed;
+    if (!entry.mutations.length) continue;
+    const destination = entry.destination;
+    const result = await executeLearningMutations({
+      mutations: entry.mutations,
+      capturedThrough,
+      from,
+      stateStore: null,
+      walManagedExternally: true,
+      apiKey: destination.apiKey,
+      teamKey: destination.config.teamKey,
+      projectId: destination.config.projectId,
+    }, {
+      ...deps,
+      fetchIssuesFn: entry.fetchIssuesFn,
+    });
+    confirmed += result.confirmed;
+    for (const mutation of entry.mutations) {
+      for (const lens of mutation.lenses) store.confirmMutation(lens, mutation.mutationId);
     }
   }
   for (const lens of byLens.keys()) {
     if (!store.commitLens(lens)) throw new Error(`learning WAL for ${lens} did not fully confirm`);
   }
-  return { mutations: mutations.length, confirmed, deferred };
+  return {
+    mutations: mutations.length,
+    confirmed,
+    deferred,
+    evaluations: evaluationSummary,
+    plannedDestinations: prepared.filter((entry) => entry.findingCount > 0)
+      .map((entry) => entry.destination.sourceAnchorPath),
+  };
 }
 
 function normalizeCardFields(node) {
@@ -3531,6 +3798,12 @@ export function doctorReport({
   observationPath = OBSERVATIONS,
   resolveRuntimeFn = resolveRuntimeExecutable,
   runtimeEnvBySource = null,
+  learningState = null,
+  learningSnapshot = null,
+  learningWorkspaces = null,
+  learningSynthesisState = null,
+  learningStatePath = LEARNING_STATE_PATH,
+  learningRunsDir = LEARNING_RUNS_DIR,
   isAlive = isAlivePid,
   now = Date.now(),
 } = {}) {
@@ -3590,6 +3863,76 @@ export function doctorReport({
     ...(telemetry.metricsUnavailable || []),
     ...(observations.healthy === false ? observations.errors || ["observations unavailable"] : []),
   ])];
+
+  const learningNow = new Date(now).toISOString();
+  const learningStateResult = learningState
+    ? { state: learningState, coverageGaps: [] }
+    : readLearningStateSafe(learningStatePath);
+  let workspaceResult;
+  if (learningWorkspaces) workspaceResult = { workspaces: learningWorkspaces, coverageGaps: [] };
+  else {
+    try { workspaceResult = resolveRegisteredLearningWorkspaces(reg); }
+    catch (error) { workspaceResult = { workspaces: [], coverageGaps: [{ source: registryPath, reason: `learning workspace resolution failed: ${sanitizeFailureMessage(error?.message || error)}` }] }; }
+  }
+  let snapshot = learningSnapshot;
+  let indexGaps = [];
+  if (!snapshot) {
+    const indexed = readLearningRunIndex(learningRunsDir, { capturedThrough: learningNow });
+    snapshot = indexed.snapshot;
+    indexGaps = indexed.coverageGaps || [];
+  }
+  const due = learningDueDecisions({
+    state: learningStateResult.state,
+    snapshot,
+    workspaces: workspaceResult.workspaces,
+    now: learningNow,
+  });
+  const coverageGaps = [...new Map([
+    ...(snapshot?.coverage?.gaps || []),
+    ...indexGaps,
+    ...(workspaceResult.coverageGaps || []),
+    ...(learningStateResult.coverageGaps || []),
+  ].map((gap) => [`${gap.source}\0${gap.reason}`, gap])).values()];
+  const evaluations = Object.entries(learningStateResult.state?.evaluations || {});
+  const activeEvaluations = evaluations.filter(([, evaluation]) => evaluation?.status === "active");
+  let synthesis = learningSynthesisState;
+  if (!synthesis) {
+    if (!reg.learning.enabled) synthesis = { runtime: null, available: null, reason: "disabled" };
+    else if (!reg.learning.runtime) synthesis = { runtime: null, available: null, reason: "not-configured" };
+    else {
+      const runtime = reg.learning.runtime.runtime || "codex";
+      const resolution = resolveRuntimeFn(runtime, process.env);
+      synthesis = {
+        runtime,
+        available: resolution?.ok === true,
+        reason: resolution?.ok ? null : (resolution?.code || "runtime missing"),
+      };
+    }
+  }
+  const lensReports = Object.fromEntries(["reliability", "quality", "throughput"].map((lens) => {
+    const state = learningStateResult.state?.lenses?.[lens] || {};
+    const decision = due.lenses?.[lens] || { due: false, reason: "disabled", sampleCount: 0 };
+    const pending = Object.keys(state.pending?.mutations || {}).length;
+    return [lens, {
+      lastSuccess: state.lastSuccessfulCapturedThrough || null,
+      due: decision.due === true,
+      reason: decision.reason,
+      sampleCount: decision.sampleCount || 0,
+      pending,
+      error: state.error ? sanitizeFailureMessage(state.error) : null,
+    }];
+  }));
+  const lensErrors = Object.values(lensReports).filter((lens) => lens.error).length;
+  report.learning = {
+    enabled: reg.learning.enabled === true,
+    runner: reg.learning.runner === true,
+    active: (report.capacity.entries || []).some((entry) => entry.stage === LEARNING_STAGE && entry.trigger === LEARNING_TRIGGER),
+    healthy: reg.learning.enabled !== true || (coverageGaps.length === 0 && lensErrors === 0 && synthesis.available !== false),
+    lenses: lensReports,
+    coverage: { complete: coverageGaps.length === 0, gaps: coverageGaps },
+    evaluations: { active: activeEvaluations.length, due: due.evaluations?.due?.length || 0, dueRoots: due.evaluations?.due || [] },
+    synthesis,
+  };
 
   for (const sourceAnchorPath of reg.repos || []) {
     const record = workspaceRecordForSourceAnchor(sourceAnchorPath, reg);
@@ -3665,6 +4008,18 @@ export function formatDoctorReport(report) {
     lines.push(`capacity deferred=${report.deferred.capacity}`);
   }
   for (const gap of report.metricsUnavailable || []) lines.push(`metrics unavailable: ${gap}`);
+  if (report.learning) {
+    lines.push(`learning: ${report.learning.enabled ? "enabled" : "disabled"}, ${report.learning.runner ? "runner" : "non-runner"}, ${report.learning.active ? "active" : "idle"}, ${report.learning.healthy ? "OK" : "RED"}`);
+    for (const lensName of ["reliability", "quality", "throughput"]) {
+      const lens = report.learning.lenses?.[lensName];
+      if (!lens) continue;
+      lines.push(`  ${lensName}: due=${lens.due ? "yes" : "no"} last=${lens.lastSuccess || "never"} samples=${lens.sampleCount} pending=${lens.pending}${lens.error ? ` error=${lens.error}` : ""}`);
+    }
+    lines.push(`  evaluations: active=${report.learning.evaluations?.active || 0} due=${report.learning.evaluations?.due || 0}`);
+    for (const gap of report.learning.coverage?.gaps || []) lines.push(`  coverage gap: ${gap.source}: ${gap.reason}`);
+    const synthesis = report.learning.synthesis || {};
+    lines.push(`  synthesis: ${synthesis.runtime || "disabled"} ${synthesis.available === true ? "available" : synthesis.available === false ? `unavailable${synthesis.reason ? ` (${synthesis.reason})` : ""}` : synthesis.reason || "disabled"}`);
+  }
   if (report.kit.dirty) lines.push(`  kit dirty: ${report.kit.dirty.message.replace(/\n/g, "\n  ")}`);
   for (const anchor of report.anchors) {
     lines.push("");
@@ -5315,12 +5670,16 @@ async function tick({ dryRun = false } = {}) {
           dueDecisions: preview.due,
           findings: preview.qualified,
           ledger: capacityLedger,
-          dispatchFn: (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: reg.learning?.runtime || {} }, { onSpawn }),
+          dispatchFn: reg.learning?.runtime
+            ? (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: reg.learning.runtime }, { onSpawn })
+            : null,
           writerFn: ({ findings }) => executeLearningCycleWrites({
             findings,
             workspaces: learningResolved.workspaces,
             registry: reg,
             capturedThrough: learningNow,
+            snapshot,
+            dueDecisions: preview.due,
           }),
         });
         log(`learning ${learningResult.mode}`);
@@ -5559,26 +5918,37 @@ async function cmdLearningRun(args = []) {
   const stateResult = readLearningStateSafe();
   const snapshot = buildLearningEvidenceSnapshot({ capturedThrough: now, runRecords: indexed.runRecords, events: indexed.events, observations: indexed.observations, coverageGaps: [...indexed.coverageGaps, ...resolved.coverageGaps, ...stateResult.coverageGaps] });
   const preview = buildLearningCyclePreview({ registry, workspaces: resolved.workspaces, state: stateResult.state, snapshot, now });
-  if (dryRun) {
-    console.log(JSON.stringify({ mode: "dry-run", due: preview.due, admitted: preview.admitted, deferred: preview.deferred, rendered: preview.rendered }, null, 2));
+  const execution = learningRunExecutionDecision({ dryRun, automatic, due: preview.due.due });
+  if (execution === "dry-run") {
+    const livePlan = await buildLiveLearningDryRunPlan({
+      findings: preview.qualified,
+      workspaces: resolved.workspaces,
+      registry,
+      snapshot,
+    });
+    console.log(JSON.stringify({ mode: "dry-run", due: preview.due, ...livePlan }, null, 2));
     return;
   }
-  if (automatic && !preview.due.due) {
+  if (execution === "idle") {
     console.log(JSON.stringify({ mode: "idle", due: preview.due }, null, 2));
     return;
   }
   const ledger = createCapacityLedger({ maxActiveChildren: registry.capacity?.maxActiveChildren });
   const result = await runPostDeliveryLearning({
     registry,
-    dueDecisions: preview.due,
+    dueDecisions: automatic ? preview.due : { ...preview.due, due: true, anyDue: true, forced: true },
     findings: preview.qualified,
     ledger,
-    dispatchFn: (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: registry.learning?.runtime || {} }, { onSpawn }),
+    dispatchFn: registry.learning?.runtime
+      ? (input, { onSpawn }) => dispatchLearningAsync({ findings: input.findings, runtimeConfig: registry.learning.runtime }, { onSpawn })
+      : null,
     writerFn: ({ findings }) => executeLearningCycleWrites({
       findings,
       workspaces: resolved.workspaces,
       registry,
       capturedThrough: now,
+      snapshot,
+      dueDecisions: preview.due,
     }),
   });
   console.log(JSON.stringify({ ...result, due: preview.due }, null, 2));

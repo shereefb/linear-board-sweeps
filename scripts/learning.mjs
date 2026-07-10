@@ -782,7 +782,7 @@ export function rankQualifiedFindings(findings = [], maxNewCards = MAX_NEW_LEARN
   const createLimit = Math.min(MAX_NEW_LEARNING_CARDS_PER_RUN, Math.max(0, Math.floor(Number(maxNewCards)) || 0));
   const admittedCreates = creates.slice(0, createLimit);
   const admittedSet = new Set([...updates, ...admittedCreates]);
-  return { admitted: [...updates, ...admittedCreates], deferred: findings.filter((item) => !admittedSet.has(item)) };
+  return { qualified, admitted: [...updates, ...admittedCreates], deferred: findings.filter((item) => !admittedSet.has(item)) };
 }
 
 function stableJson(value) {
@@ -815,6 +815,7 @@ export function renderFindingCard(finding) {
     `## Contributing lenses\n${(finding.lenses || []).slice(0, 10).map((value) => safe(value, 50)).join(", ")}`,
     `## Coverage\n${finding.coverage?.complete ? "complete" : `partial: ${(finding.coverage?.gaps || []).slice(0, 100).map((gap) => `${safe(gap.source, 300)}: ${safe(gap.reason, 500)}`).join("; ")}`}`,
     `## Root-cause hypothesis\n${safe(finding.rootCauseHypothesis, 2_000)}`,
+    ...(finding.synthesisAnnotation ? [`## Non-authoritative synthesis annotation\n${safe(finding.synthesisAnnotation, 1_000)}`] : []),
     `## Desired outcome\n${safe(finding.desiredOutcome, 2_000)}`,
     `## Acceptance metric\n${safe(stableJson(finding.acceptanceMetric), 2_000)}`,
     `## Baseline\n${safe(stableJson(finding.baseline), 2_000)}`,
@@ -905,6 +906,10 @@ export function planLearningMutations(findings = [], liveIssues = [], config = {
         continue;
       }
       const generation = Number(primary.generation || 0);
+      if (primary.stateName === "Done" && !["no-measurable-change", "regression"].includes(primary.outcomeStatus)) {
+        deferred.push({ finding, reason: "evaluation-not-recurrence-eligible", generation, outcomeStatus: primary.outcomeStatus || null });
+        continue;
+      }
       if (primary.stateName === "Done" && generation >= 3) {
         mutations.push({
           mutationId: learningMutationId("block-generation-cap", rootFingerprint, generation, fresh.join(",")),
@@ -1101,6 +1106,16 @@ export function createLearningStateStore({
   return {
     snapshot() {
       return clone(state);
+    },
+
+    setEvaluation(evaluationId, evaluation) {
+      const id = String(evaluationId || "").trim();
+      if (!id) throw new Error("learning evaluationId is required");
+      if (!evaluation || typeof evaluation !== "object" || !evaluation.status) throw new Error("learning evaluation is invalid");
+      const candidate = clone(state);
+      candidate.evaluations[id] = clone(evaluation);
+      persistCandidate(candidate);
+      return clone(candidate.evaluations[id]);
     },
 
     stageWindow(lens, { from = null, capturedThrough, mutations = [] } = {}) {
