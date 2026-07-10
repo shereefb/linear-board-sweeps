@@ -13,7 +13,11 @@ Four Linear board sweeps drive features from idea → shipped on the **<TEAM>** 
 - For any task involving writing, reviewing, debugging, refactoring, or otherwise changing code, invoke the installed Andrej Karpathy skill (`andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin) before starting that work.
 - If the skill is unavailable in the current session, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 
-**Config:** all four read `.claude/linear-sweep.json` at the repo root for the team/project/prefix and repo-specific paths — nothing is hardcoded. Team `<TEAM>` (key `<KEY>`), project `<PROJECT>`, issue prefix `<KEY>-###`. Deploy path: <DEPLOY>. Optional `reviewLenses` gate card-type review lenses; optional `requireShipApproval` hardens the ship gate. `parallel.maxNonShipDispatches` counts workspace/sweep candidates; `parallel.sameRepoCardLimits` counts same-repo per-card child slots inside a selected non-ship candidate. Ship remains serial.
+## Delegation preference
+
+- By default, delegate independent, bounded research, implementation, verification, or review work to subagents when parallel execution is safe and useful. Keep shared-state edits coordinated by the primary agent, and do not delegate when the work is too small or tightly sequential for delegation to help.
+
+**Config:** all four read `.claude/linear-sweep.json` at the repo root for the team/project/prefix and repo-specific paths — nothing is hardcoded. Team `<TEAM>` (key `<KEY>`), project `<PROJECT>`, issue prefix `<KEY>-###`. Deploy path: <DEPLOY>. Optional `repoRouting.byLabel` selects one primary repo per card and fails closed unless exactly one mapped label is live; scheduled children recheck that route before material work. Optional `reviewLenses` gate card-type review lenses; optional `requireShipApproval` hardens the ship gate. `parallel.maxNonShipDispatches` counts workspace/sweep candidates; `parallel.sameRepoCardLimits` counts per-primary-repo child slots inside a selected non-ship candidate. Ship remains serial.
 
 **Repo scope:** default to one deployable repo per card. If a feature spans sibling repos, split it into per-repo implementation cards under a parent/product card, or make this workspace explicitly multi-repo: every touched repo must be in `config.repos`, and `config.deploy` must describe every production target and canary. Do not let an unconfigured sibling-repo branch reach this repo's Ship path.
 

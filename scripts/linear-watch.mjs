@@ -198,6 +198,104 @@ export function resolveWorkspaceRepos(anchorPath, config, { mode = "source", wor
   });
 }
 
+export function workspaceRepoPairs(sourceAnchorPath, config, workspaceRecord) {
+  const entries = Array.isArray(config?.repos) && config.repos.length
+    ? config.repos
+    : [path.basename(sourceAnchorPath)];
+  const sourceRepos = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "source" });
+  const managedRepos = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord });
+  return entries.map((repoEntry, index) => ({
+    repoEntry,
+    sourceRepoPath: sourceRepos[index].path,
+    managedRepoPath: managedRepos[index].path,
+  }));
+}
+
+function repoRoutingConfigured(config) {
+  return Object.prototype.hasOwnProperty.call(config || {}, "repoRouting");
+}
+
+export function resolveCardRepoRoute({ config = {}, card = {}, repoPairs = [] } = {}) {
+  const entries = Array.isArray(config.repos) && config.repos.length
+    ? config.repos
+    : repoPairs.map((pair) => pair.repoEntry);
+  const identifier = card.identifier || card.id || "unknown issue";
+  if (!repoRoutingConfigured(config)) {
+    const first = repoPairs[0];
+    return first
+      ? { ok: true, label: null, ...first }
+      : { ok: false, code: "missing-repo", message: `${identifier} has no configured repository` };
+  }
+  if (new Set(entries).size !== entries.length) {
+    return { ok: false, code: "duplicate-repo-entry", message: `${identifier} cannot route because config.repos contains duplicate entries` };
+  }
+  const byLabel = config.repoRouting?.byLabel;
+  if (!byLabel || typeof byLabel !== "object" || Array.isArray(byLabel) || Object.keys(byLabel).length === 0) {
+    return { ok: false, code: "invalid-routing-config", message: `${identifier} cannot route because repoRouting.byLabel is empty or invalid` };
+  }
+  const labels = new Set(card.labelNames || []);
+  const matches = Object.entries(byLabel).filter(([label]) => labels.has(label));
+  if (matches.length === 0) {
+    return { ok: false, code: "missing-route-label", message: `${identifier} has no label mapped by repoRouting.byLabel; expected exactly one of: ${Object.keys(byLabel).sort().join(", ")}` };
+  }
+  if (matches.length !== 1) {
+    return { ok: false, code: "ambiguous-route-label", message: `${identifier} has multiple repository route labels: ${matches.map(([label]) => label).sort().join(", ")}` };
+  }
+  const [label, repoEntry] = matches[0];
+  if (!entries.includes(repoEntry)) {
+    return { ok: false, code: "invalid-route-target", message: `${identifier} route ${label} targets unconfigured repo entry ${repoEntry}` };
+  }
+  const pair = repoPairs.find((candidate) => candidate.repoEntry === repoEntry);
+  if (!pair) {
+    return { ok: false, code: "missing-repo", message: `${identifier} route ${label} has no resolved repository pair for ${repoEntry}` };
+  }
+  return { ok: true, label, ...pair };
+}
+
+export function sameCardRepoRoute(a, b) {
+  if (!a?.ok || !b?.ok) return false;
+  return a.label === b.label
+    && a.repoEntry === b.repoEntry
+    && path.resolve(a.sourceRepoPath) === path.resolve(b.sourceRepoPath)
+    && path.resolve(a.managedRepoPath) === path.resolve(b.managedRepoPath);
+}
+
+export function routeCardsByRepo(cards, config, repoPairs, { managedRepoPath = null } = {}) {
+  if (!repoRoutingConfigured(config) && (!repoPairs || repoPairs.length === 0)) {
+    return { cards: [...(cards || [])], deferred: [], failures: [] };
+  }
+  const routed = [];
+  const deferred = [];
+  const failures = [];
+  for (const card of cards || []) {
+    const repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
+    if (!repoRoute.ok) {
+      failures.push({ identifier: card.identifier || card.id || "unknown", ...repoRoute });
+      continue;
+    }
+    const routedCard = { ...card, repoRoute };
+    if (managedRepoPath && path.resolve(repoRoute.managedRepoPath) !== path.resolve(managedRepoPath)) {
+      deferred.push(routedCard);
+    } else {
+      routed.push(routedCard);
+    }
+  }
+  return { cards: routed, deferred, failures };
+}
+
+export function handoffRepoRoutingDecision(pick, issue, repoPairs = []) {
+  const repoRoute = resolveCardRepoRoute({ config: pick.config, card: issue, repoPairs });
+  if (repoRoutingConfigured(pick.config) && !sameCardRepoRoute(pick.repoRoute, repoRoute)) {
+    return {
+      ok: false,
+      code: repoRoute.code || "route-changed",
+      message: repoRoute.message || `${pick.issueIdentifier} repository route changed before handoff`,
+      repoRoute,
+    };
+  }
+  return { ok: true, card: { ...issue, repoRoute: repoRoute.ok ? repoRoute : pick.repoRoute }, repoRoute };
+}
+
 export function materializeManagedWorkspacePlan({
   sourceAnchorPath,
   config,
@@ -897,8 +995,8 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function cardWorktreePath(anchorPath, config, issueIdentifier) {
-  const repo = resolveRepos(anchorPath, config)[0]?.path || anchorPath;
+export function cardWorktreePath(anchorPath, config, issueIdentifier, repoRoute = null) {
+  const repo = repoRoute?.managedRepoPath || resolveRepos(anchorPath, config)[0]?.path || anchorPath;
   return worktreePath(repo, issueIdentifier);
 }
 
@@ -909,7 +1007,7 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
   const tmpDir = path.join(CACHE_DIR, parentRunId, childRunKey, "tmp");
   const portBase = SAME_REPO_PORT_BASE + childIndex * 10;
   return {
-    worktreePath: cardWorktreePath(anchorPath, config, issueIdentifier),
+    worktreePath: cardWorktreePath(anchorPath, config, issueIdentifier, slot.repoRoute),
     logDir,
     tmpDir,
     portBase,
@@ -925,6 +1023,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
   const paths = cardRunPaths(pick.anchorPath, pick.config, pick.sweep, {
     identifier: pick.issueIdentifier,
     slotIndex: pick.slotIndex || 0,
+    repoRoute: pick.repoRoute,
   }, parentRunId, childIndex);
   return {
     ...pick,
@@ -935,6 +1034,10 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0) {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
       AUTO_SWEEP_SOURCE_ANCHOR: pick.sourceAnchorPath || pick.anchorPath,
+      ...(pick.repoRoute?.managedRepoPath ? { AUTO_SWEEP_REPO: pick.repoRoute.managedRepoPath } : {}),
+      ...(pick.repoRoute?.sourceRepoPath ? { AUTO_SWEEP_SOURCE_REPO: pick.repoRoute.sourceRepoPath } : {}),
+      ...(pick.repoRoute?.label ? { AUTO_SWEEP_REPO_LABEL: pick.repoRoute.label } : {}),
+      ...(pick.repoRoute?.repoEntry ? { AUTO_SWEEP_REPO_ENTRY: pick.repoRoute.repoEntry } : {}),
       AUTO_SWEEP_SLOT_INDEX: String(pick.slotIndex || 0),
       AUTO_SWEEP_WORKTREE: paths.worktreePath,
       AUTO_SWEEP_LOG_DIR: paths.logDir,
@@ -970,7 +1073,7 @@ export function createSameRepoActiveCounts() {
   const counts = new Map();
   const adjust = (pick, delta) => {
     if (!pick?.anchorPath || !pick?.sweep || !pick?.issueIdentifier || pick.sweep === "ship") return 0;
-    const key = sameRepoActiveKey(pick.anchorPath, pick.sweep);
+    const key = sameRepoActiveKey(pick.repoRoute?.managedRepoPath || pick.anchorPath, pick.sweep);
     const next = Math.max(0, (counts.get(key) || 0) + delta);
     if (next) counts.set(key, next);
     else counts.delete(key);
@@ -979,6 +1082,14 @@ export function createSameRepoActiveCounts() {
   return {
     increment(pick) {
       return adjust(pick, 1);
+    },
+    tryAcquire(pick, limit) {
+      if (pick?.sweep === "ship") return true;
+      const repoPath = pick?.repoRoute?.managedRepoPath || pick?.anchorPath;
+      const boundedLimit = Math.max(0, Math.floor(Number(limit)) || 0);
+      if (!pick?.issueIdentifier || !repoPath || !pick?.sweep || this.get(repoPath, pick.sweep) >= boundedLimit) return false;
+      adjust(pick, 1);
+      return true;
     },
     decrement(pick) {
       return adjust(pick, -1);
@@ -1001,6 +1112,26 @@ export function sameRepoAvailableSlots({ cards = [], cfg, anchorPath, sweep, act
   return Math.max(0, Math.floor(Number(limit)) - Math.max(parentActive, boardActiveClaims));
 }
 
+export function selectCandidateCardsForAdmission(candidate, { now = Date.now() } = {}) {
+  const stage = candidate.sweep;
+  if (stage === "ship") return [candidate.topCard || candidate.cards?.[0]].filter(Boolean);
+  const limit = candidate.slotLimit ?? sameRepoCardLimit(candidate.config || {}, stage);
+  const cards = candidate.cards || [];
+  if (!repoRoutingConfigured(candidate.config)) {
+    return selectCardSlots(cards, SWEEP_CFG[stage], stage, limit, now).map((slot) => slot.card);
+  }
+  const groups = new Map();
+  for (const card of cards) {
+    if (!card.repoRoute?.ok || !card.repoRoute.managedRepoPath) continue;
+    const key = card.repoRoute.managedRepoPath;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(card);
+  }
+  return sortByBoardPosition([...groups.values()].flatMap((group) => (
+    selectCardSlots(group, SWEEP_CFG[stage], stage, limit, now).map((slot) => slot.card)
+  )));
+}
+
 export function admissionDemandsForCandidates(candidates, {
   trigger = "initial",
   now = Date.now(),
@@ -1010,22 +1141,16 @@ export function admissionDemandsForCandidates(candidates, {
   for (const candidate of candidates || []) {
     const stage = candidate.sweep;
     const rotationRank = rotationRanks.get(candidate.anchorPath) ?? candidate.rotationRank ?? 0;
-    const cards = stage === "ship"
-      ? [candidate.topCard || candidate.cards?.[0]].filter(Boolean)
-      : selectCardSlots(
-        candidate.cards || [],
-        SWEEP_CFG[stage],
-        stage,
-        candidate.slotLimit ?? sameRepoCardLimit(candidate.config || {}, stage),
-        now,
-      ).map((slot) => slot.card);
+    const cards = selectCandidateCardsForAdmission(candidate, { now });
     for (const card of cards) {
       demands.push({
         ...candidate,
         stage,
         trigger,
         workspace: candidate.anchorPath,
+        issueId: card.id,
         issueIdentifier: card.identifier,
+        repoRoute: card.repoRoute,
         boardOrder: boardOrderValue(card),
         rotationRank,
         topCard: card,
@@ -1040,7 +1165,8 @@ export function admissionDemandsForCandidates(candidates, {
 }
 
 function repoSet(candidate) {
-  return new Set(resolveRepos(candidate.anchorPath, candidate.config).map((r) => path.resolve(r.path)));
+  const managed = candidate.managedRepoPaths || [];
+  return new Set((managed.length ? managed : resolveRepos(candidate.anchorPath, candidate.config).map((repo) => repo.path)).map((repoPath) => path.resolve(repoPath)));
 }
 
 function pathsOverlap(a, b) {
@@ -1126,11 +1252,15 @@ export function dryRunDispatchMessages(batch) {
       body: `[dry-run] WOULD dispatch ${runtimeSummary(runtimeConfigForSweep(pick.config || {}, pick.sweep))} (${pick.count} actionable${pick.topCard?.identifier ? `; top ${pick.topCard.identifier}` : ""}; sameRepoLimit=${limit})`,
     });
     if (pick.cards) {
-      for (const slot of selectCardSlots(pick.cards, SWEEP_CFG[pick.sweep], pick.sweep, limit, Date.now())) {
+      const repoSlots = new Map();
+      for (const card of selectCandidateCardsForAdmission(pick)) {
+        const repoKey = card.repoRoute?.managedRepoPath || pick.anchorPath;
+        const slotIndex = repoSlots.get(repoKey) || 0;
+        repoSlots.set(repoKey, slotIndex + 1);
         out.push({
           anchorPath: pick.anchorPath,
           sweep: pick.sweep,
-          body: `[dry-run] slot ${slot.slotIndex + 1}/${limit} ${pick.sweep} ${slot.identifier} sortOrder=${slot.sortOrder}`,
+          body: `[dry-run] slot ${slotIndex + 1}/${limit} ${pick.sweep} ${card.identifier} sortOrder=${card.sortOrder}${card.repoRoute?.repoEntry ? ` repo=${card.repoRoute.repoEntry}` : ""}`,
         });
       }
     }
@@ -2886,16 +3016,18 @@ async function executeBounce(apiKey, card, labelMap) {
   await addComment(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
 }
 
-export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now }, {
+export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now, repoPairs = [] }, {
   applyLabelEditFn = applyLabelEdit,
   addCommentFn = addComment,
   sleepFn = sleep,
   fetchCardFn = fetchCard,
   fetchClaimCardFn = fetchClaimCard,
+  onRouteFailure = () => {},
 } = {}) {
   const cfg = SWEEP_CFG[sweep];
   const claimId = labelMap[cfg.claim];
   if (!claimId) throw new Error(`missing team label ${cfg.claim}`);
+  const routingConfigured = repoRoutingConfigured(config);
   const claimed = [];
   const candidates = sortByBoardPosition(actionableCards(cards, cfg, now));
   for (const card of candidates) {
@@ -2904,12 +3036,36 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
     const owner = ownerToken({ parentRunId, issueIdentifier: card.identifier, slotIndex });
     let claimApplied = false;
     try {
-      await applyLabelEditFn(apiKey, card, { add: { [cfg.claim]: claimId } });
+      let claimTarget = card;
+      if (routingConfigured) {
+        let freshBeforeClaim;
+        try {
+          freshBeforeClaim = await fetchClaimCardFn(apiKey, card.id);
+        } catch (error) {
+          const failure = { ok: false, code: "route-read-failed", message: `could not re-read ${card.identifier} repository route before claim: ${error.message}` };
+          onRouteFailure(card, failure);
+          logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${failure.message}`);
+          continue;
+        }
+        const freshRoute = resolveCardRepoRoute({ config, card: freshBeforeClaim, repoPairs });
+        if (!sameCardRepoRoute(card.repoRoute, freshRoute)) {
+          onRouteFailure(card, freshRoute);
+          logFor(anchorPath, sweep, `claim-skip ${card.identifier}: repository route changed before claim (${freshRoute.message || freshRoute.label || "unknown"})`);
+          continue;
+        }
+        claimTarget = freshBeforeClaim;
+      }
+      await applyLabelEditFn(apiKey, claimTarget, { add: { [cfg.claim]: claimId } });
       claimApplied = true;
       await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Claimed for same-repo parallel ${sweep} slot ${slotIndex + 1}/${limit}.`);
       await sleepFn(CLAIM_CONFIRM_DELAY_MS);
       const fresh = await fetchCardFn(apiKey, card.id);
-      if (!claimConfirmed(fresh, cfg, owner, cfg.states)) {
+      const freshRoute = routingConfigured
+        ? resolveCardRepoRoute({ config, card: fresh, repoPairs })
+        : card.repoRoute;
+      if (!claimConfirmed(fresh, cfg, owner, cfg.states)
+        || (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute))) {
+        if (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute)) onRouteFailure(card, freshRoute);
         if (hasLabel(fresh, cfg.claim) && latestHeartbeatOwner(fresh, cfg.claim) === owner) {
           await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
         }
@@ -2918,6 +3074,7 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       }
       claimed.push({
         ...fresh,
+        repoRoute: routingConfigured ? freshRoute : card.repoRoute,
         card: fresh,
         id: fresh.id,
         identifier: fresh.identifier,
@@ -2975,11 +3132,32 @@ export async function expandDispatchBatch(batch, {
   childIndexAllocator = createChildIndexAllocator(),
   claimCardSlotsFn = claimCardSlots,
   labelMap: providedLabelMap = null,
+  fetchRouteCardFn = fetchClaimCard,
+  onRouteFailure = () => {},
 } = {}) {
   const expanded = [];
   for (const pick of batch) {
     if (pick.sweep === "ship") {
-      expanded.push(withCardDispatchEnv(pick, parentRunId, childIndexAllocator.next()));
+      let routedPick = pick;
+      if (!dryRun && repoRoutingConfigured(pick.config)) {
+        const active = activeByAnchor.get(pick.anchorPath);
+        try {
+          const fresh = await fetchRouteCardFn(active?.apiKey, pick.issueId || pick.issueIdentifier);
+          const freshRoute = resolveCardRepoRoute({ config: pick.config, card: fresh, repoPairs: active?.repoPairs || pick.repoPairs || [] });
+          if (!sameCardRepoRoute(pick.repoRoute, freshRoute)) {
+            onRouteFailure(pick, freshRoute);
+            logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: route changed before Ship spawn (${freshRoute.message || freshRoute.label || "unknown"})`);
+            continue;
+          }
+          routedPick = { ...pick, topCard: { ...fresh, repoRoute: freshRoute }, repoRoute: freshRoute };
+        } catch (error) {
+          const failure = { ok: false, code: "route-read-failed", message: `could not re-read ${pick.issueIdentifier} repository route: ${error.message}` };
+          onRouteFailure(pick, failure);
+          logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: ${failure.message}`);
+          continue;
+        }
+      }
+      expanded.push(withCardDispatchEnv(routedPick, parentRunId, childIndexAllocator.next()));
       continue;
     }
     const rawSlotLimit = pick.slotLimit;
@@ -2992,7 +3170,11 @@ export async function expandDispatchBatch(batch, {
       continue;
     }
     if (dryRun) {
-      slots = selectCardSlots(pick.cards || [], SWEEP_CFG[pick.sweep], pick.sweep, limit, now);
+      slots = selectCandidateCardsForAdmission({ ...pick, slotLimit: limit }, { now }).map((card, slotIndex) => ({
+        ...card,
+        card,
+        slotIndex,
+      }));
     } else {
       const active = activeByAnchor.get(pick.anchorPath);
       if (!active) continue;
@@ -3008,15 +3190,17 @@ export async function expandDispatchBatch(batch, {
         limit,
         labelMap,
         now,
-      });
+        repoPairs: active.repoPairs || pick.repoPairs || [],
+      }, { onRouteFailure: (card, failure) => onRouteFailure({ ...pick, issueIdentifier: card.identifier }, failure) });
     }
-    logFor(pick.anchorPath, pick.sweep, `same-repo slots ${slots.length}/${limit} selected under workspace candidate (${pick.count} actionable)`);
+    logFor(pick.anchorPath, pick.sweep, `same-repo slots ${slots.length} selected (per-primary-repo limit ${limit}) under workspace candidate (${pick.count} actionable)`);
     for (const slot of slots) {
       expanded.push(withCardDispatchEnv({
         anchorPath: pick.anchorPath,
         sourceAnchorPath: pick.sourceAnchorPath,
         managedRepoPaths: pick.managedRepoPaths,
         config: pick.config,
+        repoPairs: pick.repoPairs,
         sweep: pick.sweep,
         count: 1,
         topCard: slot.card,
@@ -3024,6 +3208,7 @@ export async function expandDispatchBatch(batch, {
         issueIdentifier: slot.identifier,
         slotIndex: slot.slotIndex,
         ownerToken: slot.ownerToken,
+        repoRoute: slot.repoRoute,
         parentRunId,
         triggeredBy: pick.triggeredBy,
         trigger: pick.trigger,
@@ -3101,10 +3286,15 @@ export async function buildSameRepoRefillDispatches({
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: fetch ${e.message}`);
     return empty("fetch");
   }
+  const routed = routeCardsByRepo(cards, pick.config, active.repoPairs || pick.repoPairs || [], {
+    managedRepoPath: pick.repoRoute?.managedRepoPath || null,
+  });
+  for (const failure of routed.failures) logFn(pick.anchorPath, sweep, `refill-skip ${failure.identifier}: ${failure.message}`);
+  cards = routed.cards;
   const availableByCapacity = sameRepoAvailableSlots({
     cards,
     cfg: SWEEP_CFG[sweep],
-    anchorPath: pick.anchorPath,
+    anchorPath: pick.repoRoute?.managedRepoPath || pick.anchorPath,
     sweep,
     activeSameRepo,
     limit,
@@ -3125,6 +3315,7 @@ export async function buildSameRepoRefillDispatches({
     anchorPath: pick.anchorPath,
     sourceAnchorPath: pick.sourceAnchorPath,
     managedRepoPaths: pick.managedRepoPaths,
+    repoPairs: active.repoPairs || pick.repoPairs,
     config: pick.config,
     sweep,
     count: actionable.length,
@@ -3340,12 +3531,26 @@ export function classifyDispatchOutcome(event = {}) {
   return { kind: "exit", ...base };
 }
 
-function dependencyOutcomeForPick(pick = {}) {
+function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {
     const value = JSON.parse(fs.readFileSync(pick.outcomePath, "utf8"));
-    if (value?.version !== 1 || value?.kind !== "dependency-deferred") return null;
+    if (value?.version !== 1 || !["dependency-deferred", "repo-routing-deferred"].includes(value?.kind)) return null;
     if (value.issueIdentifier && value.issueIdentifier !== pick.issueIdentifier) return null;
+    if (value.kind === "repo-routing-deferred") {
+      const routeExitCode = Number(value.routeExitCode);
+      if (![2, 3].includes(routeExitCode)) return null;
+      return {
+        kind: "repo-routing-deferred",
+        code: routeExitCode === 3 ? "REPO_ROUTE_CHANGED" : "REPO_ROUTE_UNREADABLE",
+        exitCode: 0,
+        signal: null,
+        path: pick.runtimeExecutable || null,
+        cwd: pick.anchorPath || null,
+        routeExitCode,
+        routing: value.routing || null,
+      };
+    }
     const dependencyExitCode = Number(value.dependencyExitCode);
     if (![2, 3].includes(dependencyExitCode)) return null;
     return {
@@ -3540,7 +3745,7 @@ export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = 
     });
     child.on("close", (exitCode, childSignal) => finish(signal?.aborted
       ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
-      : (dependencyOutcomeForPick(pick) || classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }))));
+      : (childDeferredOutcomeForPick(pick) || classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }))));
   });
 }
 
@@ -3649,11 +3854,21 @@ async function tick({ dryRun = false } = {}) {
       }) : runtime;
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
       const dependencyDeferred = result.kind === "dependency-deferred";
-      const releaseClaim = startFailure || result.kind === "interrupted" || dependencyDeferred;
+      const routingDeferred = result.kind === "repo-routing-deferred";
+      const releaseClaim = startFailure || result.kind === "interrupted" || dependencyDeferred || routingDeferred;
       const detail = result.signal || result.code || result.exitCode;
-      const failures = (result.kind === "success" || dependencyDeferred) ? [] : [
-        failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
-      ];
+      const failures = routingDeferred
+        ? [failureEventFor(
+          pick.anchorPath,
+          pick.config,
+          `${pick.sweep}:routing`,
+          "repo-routing",
+          pick.issueIdentifier,
+          `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
+        )]
+        : (result.kind === "success" || dependencyDeferred) ? [] : [
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
+        ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
         const key = pick.runtimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
@@ -3673,9 +3888,13 @@ async function tick({ dryRun = false } = {}) {
       }
       if (releaseClaim && pick.issueIdentifier) {
         try {
-          const releaseReason = dependencyDeferred ? "dependency preflight deferred material work" : `dispatcher via ${runtime} could not start`;
+          const releaseReason = dependencyDeferred
+            ? "dependency preflight deferred material work"
+            : routingDeferred
+              ? "repository preflight deferred material work"
+              : `dispatcher via ${runtime} could not start`;
           const released = await releaseOwnedDispatchClaim(active.apiKey, pick, releaseReason);
-          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after ${dependencyDeferred ? "dependency deferral" : "dispatch-start failure"} ${pick.issueIdentifier}`);
+          if (released) logFor(pick.anchorPath, pick.sweep, `released pre-claim after ${dependencyDeferred ? "dependency deferral" : routingDeferred ? "repository deferral" : "dispatch-start failure"} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `pre-claim release failed ${pick.issueIdentifier}: ${e.message}`);
           recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", stableTarget, e.message);
@@ -3739,6 +3958,16 @@ async function tick({ dryRun = false } = {}) {
           else logFor(pick.anchorPath, pick.sweep, `handoff-skip ${issue.identifier}: not-forward state=${issue.stateName}`);
           return;
         }
+        const handoffRouting = handoffRepoRoutingDecision(pick, issue, active.repoPairs || pick.repoPairs || []);
+        if (!handoffRouting.ok) {
+          const routingScope = `${nextSweep}:routing`;
+          const event = failureEventFor(pick.anchorPath, pick.config, routingScope, "repo-routing", pick.issueIdentifier, handoffRouting.message);
+          active.failures.push(event);
+          logFor(pick.anchorPath, nextSweep, `handoff-skip ${pick.issueIdentifier}: ${event.message}`);
+          try { await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set(), active.envValues, { dryRun: false }); } catch (error) { recordLocalFailure(pick.anchorPath, pick.config, routingScope, "failure-todo", pick.issueIdentifier, error.message); }
+          return;
+        }
+        issue = handoffRouting.card;
         const key = handoffTriggerKey(issue.identifier, pick.sweep, nextSweep);
         if (firedHandoffs.has(key)) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: duplicate ${key}`);
@@ -3775,11 +4004,14 @@ async function tick({ dryRun = false } = {}) {
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${issue.identifier}: fetch ${e.message}`);
           return;
         }
+        targetCards = routeCardsByRepo(targetCards, pick.config, active.repoPairs || pick.repoPairs || [], {
+          managedRepoPath: issue.repoRoute?.managedRepoPath || null,
+        }).cards;
         const targetLimit = sameRepoCardLimit(pick.config, nextSweep);
         const availableSlots = sameRepoAvailableSlots({
           cards: targetCards,
           cfg: nextCfg,
-          anchorPath: pick.anchorPath,
+          anchorPath: issue.repoRoute?.managedRepoPath || pick.anchorPath,
           sweep: nextSweep,
           activeSameRepo,
           limit: targetLimit,
@@ -3794,6 +4026,7 @@ async function tick({ dryRun = false } = {}) {
           anchorPath: pick.anchorPath,
           sourceAnchorPath: pick.sourceAnchorPath,
           managedRepoPaths: pick.managedRepoPaths,
+          repoPairs: active.repoPairs || pick.repoPairs,
           config: pick.config,
           sweep: nextSweep,
           count: 1,
@@ -3944,21 +4177,43 @@ async function tick({ dryRun = false } = {}) {
         capacityDeferredKeys.delete(observationKey(demand));
       },
       executeDemand: async (demand, reservation) => {
-        activeSameRepo.increment(demand);
+        const sameRepoAcquired = activeSameRepo.tryAcquire(demand, sameRepoCardLimit(demand.config, demand.sweep));
+        if (!sameRepoAcquired) {
+          logFor(demand.anchorPath, demand.sweep, `admission-skip ${demand.issueIdentifier}: primary repo slot no longer available`);
+          return null;
+        }
         try {
           const observation = observationStore.get(demand);
           if (observation) demand.telemetry = { ...(demand.telemetry || {}), ...observation };
           demand.resourceSampler = resourceSampler;
           demand.dependencyDeferredCount = dependencyDeferredKeys.size;
           demand.dependencyDeferredIssues = [...dependencyDeferredIssues.values()].slice(0, MAX_DEPENDENCY_DEFERRED_ISSUES);
+          const routeFailures = [];
           const [pick] = await expandDispatchBatch([demand], {
             dryRun: false,
             parentRunId,
             activeByAnchor,
             now: Date.now(),
             childIndexAllocator,
+            onRouteFailure: (failedPick, failure) => routeFailures.push(failureEventFor(
+              failedPick.anchorPath,
+              failedPick.config,
+              `${failedPick.sweep}:routing`,
+              "repo-routing",
+              failedPick.issueIdentifier,
+              failure.message || `${failedPick.issueIdentifier} repository route changed during admission`,
+            )),
           });
-          if (!pick) return null;
+          if (!pick) {
+            const active = activeByAnchor.get(demand.anchorPath);
+            if (active && routeFailures.length) {
+              active.failures.push(...routeFailures);
+              localFailures.push(...routeFailures);
+              await reconcileFailureTodos(active.apiKey, demand.config, demand.anchorPath, routeFailures, new Set(), active.envValues, { dryRun: false });
+              writeCurrentTick();
+            }
+            return null;
+          }
           pick.telemetry = { ...(pick.telemetry || {}), claimAt: new Date().toISOString() };
           const [result] = await dispatchBatch([pick], {
             signal: dispatchAbortContext?.signal,
@@ -4026,9 +4281,10 @@ async function tick({ dryRun = false } = {}) {
         writeRegistry(reg);
       }
       const managedAnchorPath = setupResult.record.managedAnchorPath;
-      const managedRepoPaths = resolveWorkspaceRepos(sourceAnchorPath, config, { mode: "managed", workspaceRecord: setupResult.record }).map((r) => r.path);
+      const repoPairs = workspaceRepoPairs(sourceAnchorPath, config, setupResult.record);
+      const managedRepoPaths = repoPairs.map((repo) => repo.managedRepoPath);
       const recoveredTargets = cleanManagedCheckoutTargets({ anchorPath: managedAnchorPath, managedRepoPaths }, reg);
-      const active = { anchorPath: managedAnchorPath, sourceAnchorPath, managedRepoPaths, workspaceRecord: setupResult.record, config, apiKey, envValues, failures: [], checkedScopes: new Set(), recoveredTargets };
+      const active = { anchorPath: managedAnchorPath, sourceAnchorPath, managedRepoPaths, repoPairs, workspaceRecord: setupResult.record, config, apiKey, envValues, failures: [], checkedScopes: new Set(), recoveredTargets };
       active.checkedScopes.add("activation");
       active.checkedScopes.add("setup");
       anchors.push(active);
@@ -4141,7 +4397,14 @@ async function tick({ dryRun = false } = {}) {
             logFor(anchorPath, sweep, "0 actionable; dependency admission unavailable");
             continue;
           }
-          const actionable = sortByBoardPosition(actionableCards(cards, cfg, now));
+          const stageActionable = sortByBoardPosition(actionableCards(cards, cfg, now));
+          const routed = routeCardsByRepo(stageActionable, config, active.repoPairs);
+          active.checkedScopes.add(`${sweep}:routing`);
+          for (const failure of routed.failures) {
+            recordFailure(`${sweep}:routing`, "repo-routing", failure.identifier, failure.message);
+            logFor(anchorPath, sweep, `repo-routing-skip ${failure.identifier}: ${failure.message}`);
+          }
+          const actionable = routed.cards;
           const actionableIds = new Set(actionable.map((card) => card.identifier));
           const scopeKey = JSON.stringify([active.sourceAnchorPath, sweep]);
           for (const key of [...dependencyDeferredKeys]) {
@@ -4185,7 +4448,7 @@ async function tick({ dryRun = false } = {}) {
             if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
             continue;
           }
-          if (actionable.length > 0) candidates.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
+          if (actionable.length > 0) candidates.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
         }
 
         // Holding/legacy-state reaper: release claims stranded in states no sweep fetches

@@ -22,6 +22,7 @@ test("Codex AGENTS instructions include the Karpathy coding guardrail", () => {
     assert.match(text, /before starting that work/, file);
     assert.match(text, /If the skill is unavailable/, file);
     assert.match(text, /apply its core checks manually/, file);
+    assert.match(text, /By default, delegate independent, bounded/, file);
     assert.match(text, /sweep:manual-only/, file);
   }
 });
@@ -32,7 +33,11 @@ test("scheduled sweep instructions require the dependency preflight and relation
       const file = `${root}/${sweep}-sweep/SKILL.md`;
       const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
 
+      assert.match(text, /repo-status "\$AUTO_SWEEP_ISSUE" "\$AUTO_SWEEP_REPO_LABEL" "\$AUTO_SWEEP_REPO_ENTRY"/, file);
+      assert.doesNotMatch(text.match(/[^\n]*repo-status[^\n]*/)?.[0] || "", /\\"/, `${file}: repo-status command must not contain literal quote escapes`);
       assert.match(text, /node "\$AUTO_SWEEP_KIT_PATH\/scripts\/linear\.mjs" dependency-status "\$AUTO_SWEEP_ISSUE"/, file);
+      assert.ok(text.indexOf("repo-status") < text.indexOf("dependency-status"), `${file}: repository preflight must precede dependency preflight`);
+      assert.match(text, /Never add `blocked:needs-user` for this machine-checkable routing failure/, file);
       assert.match(text, /exact(?: canonical)? `Done`/, file);
       assert.match(text, /never add `blocked:needs-user` merely because a `blockedBy` relation exists/, file);
       assert.match(text, /Exit `3`[^\n]*blocker identifiers\/states[^\n]*remove only[^\n]*owned claim[^\n]*stop without material work/, file);
