@@ -307,9 +307,15 @@ export function buildLearningEvidenceSnapshot({
     return true;
   };
   for (const event of Array.isArray(events) ? events : []) if (!addEvent(event)) break;
+  if (inspectedEvents >= eventInspectionLimit && selectedRawRuns.some((record) => Array.isArray(record.learningEvents) && record.learningEvents.length > 0)) {
+    pushGap("events", `event inspection truncated at ${eventInspectionLimit}`);
+  }
   for (const record of selectedRawRuns) {
     for (const event of Array.isArray(record.learningEvents) ? record.learningEvents : []) if (!addEvent(event)) break;
-    if (inspectedEvents >= eventInspectionLimit) break;
+    if (inspectedEvents >= eventInspectionLimit) {
+      pushGap("events", `event inspection truncated at ${eventInspectionLimit}`);
+      break;
+    }
   }
   const selectedObservations = [];
   const observationInspectionLimit = Math.max(4, bounded.observations * 4);

@@ -206,6 +206,27 @@ test("learning evidence snapshots bound malformed-input scanning and generated g
   assert.ok(snapshot.coverage.gaps.some((gap) => /inspection truncated/.test(gap.reason)));
 });
 
+test("learning evidence snapshots report exact-limit omissions across embedded event sources", () => {
+  const future = Array.from({ length: 4 }, (_, index) => buildLearningEvent({ kind: "terminal", category: "advanced", summary: `future ${index}` }, TRUSTED_ENV, {
+    now: () => `2026-07-11T00:0${index}:00.000Z`,
+  }));
+  const embedded = buildLearningEvent({ kind: "terminal", category: "failed", summary: "embedded" }, TRUSTED_ENV, {
+    now: () => "2026-07-10T11:59:00.000Z",
+  });
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: "2026-07-10T12:00:00.000Z",
+    events: future,
+    runRecords: [
+      { cardRunId: "r1", endedAt: "2026-07-10T11:58:00.000Z", learningEvents: [] },
+      { cardRunId: "r2", endedAt: "2026-07-10T11:59:00.000Z", learningEvents: [embedded] },
+    ],
+    limits: { events: 1 },
+  });
+  assert.equal(snapshot.events.length, 0);
+  assert.equal(snapshot.coverage.complete, false);
+  assert.ok(snapshot.coverage.gaps.some((gap) => /event inspection truncated/.test(gap.reason)));
+});
+
 test("learning config defaults disabled and clamps the create budget", () => {
   assert.deepEqual(normalizeWorkspaceLearning({}), {
     enabled: false,
