@@ -15,6 +15,11 @@ Take cards a human has approved into **"Ship"** and land them: merge to `main`, 
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials in `config.credentialsNote`.
 - **Coding guardrail.** Before merge-review debugging or any code change/refactor needed during shipping, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
 - **Single-runner check.** ship-sweep dispatch is pinned to one host (`shipRunner` in the launcher registry) so two machines can't merge + deploy the same card. If you were started by the launcher, it already gated this. If you're unsure you're the designated runner and another may be too, stop and say so — a double prod deploy is worse than a delayed one.
+- **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
+  ```bash
+  node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
+  ```
+  Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`ship:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`ship:in-progress`), and stop. Never infer readiness from partial output.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `ship:in-progress`, `blocked:needs-user`, `sweep:manual-only`.
 - **Repo/deploy scope is part of the ship gate.** Default expectation: one card ships one deployable repo. A multi-repo card may ship only when every touched repo is listed in `config.repos`, every implementation branch/PR is present, and `config.deploy` describes each production target and canary expectation. If QA/dev evidence points to an unconfigured sibling repo, do not merge the configured repo as a partial product ship; comment the mismatch and require a split card, a per-repo ship, or an updated multi-repo config/runbook.
 
@@ -56,7 +61,7 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 
 ## 5. Deploy
 
-1. **Deploy to production** via `config.deploy`. If a deploy step is manual/unavailable in this environment (e.g. `hs project upload`, a Vercel env var, a Supabase migration to apply), **create a `Todo` card** for the human deploy step rather than leaving it ambiguous — then treat the deploy as pending, not done.
+1. **Deploy to production** via `config.deploy`. If a deploy step is manual/unavailable in this environment (e.g. `hs project upload`, a Vercel env var, a Supabase migration to apply), use the retry-safe prerequisite workflow below to create or reuse a `Todo` card for the human deploy step rather than leaving it ambiguous; treat the deploy as pending, release `ship:in-progress`, and stop.
 2. **On a completed deploy, post `[auto-sweep-deployed <ISO8601 now>]` as a comment BEFORE touching status.** This is the idempotency marker §2 reads on resume — write it the moment the deploy lands, so a crash before §7 doesn't cause a re-deploy.
 
 ## 6. Canary + docs
@@ -69,9 +74,21 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 - **Canary green:** move the card to the **bottom of "Done"** with a comment: which deploy path ran, the canary result, and the merge commit(s). Remove `ship:in-progress`. Prefer the repo helper (`node scripts/linear.mjs move-card-bottom <PREFIX-###> "Done"`) so the status and bottom rank update together.
 - **Canary red (the change is already live):** **move the card to the bottom of "Done", add `blocked:needs-user`, and post a red comment** with the canary findings. Do **NOT** attempt an autonomous rollback (high-risk and deploy-target-specific — flag the human) and do **NOT** leave the card in "Ship" (it IS deployed; leaving it there invites a re-ship). "Done + blocked:needs-user" means *shipped, please verify.* Remove `ship:in-progress`.
 
+### Retry-safe prerequisite blockers
+
+When a prerequisite can be completed as its own issue, use only a `blockedBy` relation from the dependent to that blocker. Follow this exact mini-workflow so retries converge:
+
+1. **Search for the stable audit marker** `[auto-sweep-dependency <dependent> blocked-by <blocker>]` and for an existing matching or orphaned blocker before creating anything.
+2. **Create or reuse the blocker issue**; never create a duplicate when a matching issue already exists.
+3. **Create the `blockedBy` relation only if it is absent.**
+4. **Add the audit comment only if the stable marker is absent.**
+5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `ship:in-progress` claim.
+
+A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:needs-user`). Preserve the existing label gates for a failing sanity check, security finding, ambiguous decision, or red canary; those are human-review states, not mirrored dependency labels.
+
 ## Blocked / needs-user
 
-If you can't finish without the owner (a failing sanity gate, a security block, a manual deploy step you can't perform, ambiguous intended behavior): comment the specifics, add `blocked:needs-user`, remove `ship:in-progress`, and leave the card where it is (Ship if not yet merged; Done if already deployed). Ask once; resume when they reply.
+If you need direct human review or an answer that is not its own completable task (a failing sanity gate, a security block, ambiguous intended behavior, or a red canary): comment the specifics, add `blocked:needs-user`, remove `ship:in-progress`, and leave the card where it is (Ship if not yet merged; Done if already deployed). Ask once; resume when they reply. A manual deploy step follows the relation-only prerequisite workflow above instead.
 
 If the blocker is card-specific (for example, missing `qa:passed` on one card), re-list and continue draining other actionable cards. If the blocker is global to the run (for example, missing Linear auth, broken git push credentials, or an unavailable deploy path that would affect every remaining card), stop after releasing the current claim and recording the blocker.
 

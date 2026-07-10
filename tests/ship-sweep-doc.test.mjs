@@ -18,6 +18,17 @@ test("ship-sweep drains Ship one card at a time until empty", () => {
   }
 });
 
+test("ship-sweep checks dependencies before its merge and deploy gates", () => {
+  for (const path of skillPaths) {
+    const body = fs.readFileSync(path, "utf8");
+    const preflight = body.indexOf("dependency-status");
+    const sanityGate = body.indexOf("Sanity gate (fresh path only)");
+    assert.ok(preflight >= 0 && preflight < sanityGate, `${path}: dependency preflight must precede the ship sanity gate`);
+    assert.match(body, /Exit `3`[^\n]*remove only[^\n]*`ship:in-progress`[^\n]*stop without material work/);
+    assert.match(body, /never add `blocked:needs-user` merely because a `blockedBy` relation exists/);
+  }
+});
+
 test("SETUP unattended activation guidance points production caution at ship-sweep", () => {
   const body = fs.readFileSync("SETUP.md", "utf8");
   const caution = body.match(/\*\*Scheduling caution[^]*?(?=\n\n\*\*If this is NOT the always-on machine)/)?.[0] || "";

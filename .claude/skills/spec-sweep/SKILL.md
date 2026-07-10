@@ -18,12 +18,17 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 - **Load repo config.** Read `.claude/linear-sweep.json` from the repo root. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.
 - **Require `LINEAR_API_KEY`.** Load it from the environment or the repo's gitignored `.env` (`set -a && . ./.env && set +a`). If unset, exit immediately with a clear one-line error — do not attempt to recover a key from transcripts. Confirm git push credentials and any other credentials named in `config.credentialsNote` if a card needs live data.
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
+- **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
+  ```bash
+  node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
+  ```
+  Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`spec:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`spec:in-progress`), and stop. Never infer readiness from partial output.
 - **Repo ownership gate.** Decide which configured repo(s) the card truly needs before writing the plan. Default to one deployable repo per card. If the outcome needs sibling repos with separate ship/deploy paths, either write a parent/product spec plus explicit per-repo child cards, or proceed as a true multi-repo card only when every repo is listed in `config.repos` and `config.deploy` names the production path for each. Never plan implementation in a repo that is not in `config.repos`; ask/block or create/split the appropriate card instead.
 - Ensure these labels exist in the team; create any that are missing: `blocked:open-questions`, `spec:in-progress`, `sweep:manual-only`.
 
 ## 1. Select cards (top-of-column order, bounded)
 
-**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other Spec card. Treat an existing fresh `spec:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths. In same-repo parallel mode, draft only this card's docs before landing. If this child performs its own fetch/merge/push/card move, first acquire a repo-local landing lock such as `mkdir "$(git -C "$AUTO_SWEEP_WORKTREE" rev-parse --git-common-dir)/auto-sweep-spec-landing.lock"` and release it on exit; hold that lock only for the serialized landing section.
+**Single-card auto-sweep mode.** If `AUTO_SWEEP_ISSUE` is set (or the unattended prompt names a single issue key), process only that issue and ignore every other Spec card. Treat an existing fresh `spec:in-progress` claim plus an `[auto-sweep-heartbeat ... owner=...]` comment as the launcher's pre-claim for this child, not as a competing run. Use `AUTO_SWEEP_WORKTREE`, `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` when present instead of inventing local paths. Store screenshots, generated evidence, browser profiles, and scratch files under those env paths, never in repo roots. In same-repo parallel mode, draft only this card's docs before landing. If this child performs its own fetch/merge/push/card move, first acquire a repo-local landing lock such as `mkdir "$(git -C "$AUTO_SWEEP_WORKTREE" rev-parse --git-common-dir)/auto-sweep-spec-landing.lock"` and release it on exit; hold that lock only for the serialized landing section.
 
 List "Spec" cards **in `config.project`**, top-to-bottom as they appear in the Linear column, and for each decide:
 
@@ -73,6 +78,18 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 ## 4. Blocked on questions
 
 When the spec genuinely can't be finished without answers only the owner can give: post them as a **single numbered comment** on the card, add `blocked:open-questions`, remove `spec:in-progress`, and **leave it in "Spec"** (do not move to Dev). A later run resumes it once the owner replies (see §1). Ask each question once — never re-post.
+
+### Retry-safe prerequisite blockers
+
+When a prerequisite can be completed as its own issue, use only a `blockedBy` relation from the dependent to that blocker. Follow this exact mini-workflow so retries converge:
+
+1. **Search for the stable audit marker** `[auto-sweep-dependency <dependent> blocked-by <blocker>]` and for an existing matching or orphaned blocker before creating anything.
+2. **Create or reuse the blocker issue**; never create a duplicate when a matching issue already exists.
+3. **Create the `blockedBy` relation only if it is absent.**
+4. **Add the audit comment only if the stable marker is absent.**
+5. **Re-read the relation**; once it exists, stop material work and remove only the dependent's owned `spec:in-progress` claim.
+
+A separately completable blocker is relation-only: never add `blocked:needs-user` merely because a `blockedBy` relation exists. The launcher resumes the dependent only after every blocker reaches exact canonical `Done`. A direct human answer without its own issue retains the existing human-block label path (`blocked:open-questions`).
 
 ## Machine-independence & handoff (auto-sweep)
 

@@ -5,7 +5,7 @@
   "project": "<Linear project name, e.g. My App>",
   "projectId": "<project uuid — get it from: node scripts/linear.mjs ensure-project \"<team>\" \"<project>\">",
   "issuePrefix": "<team key used in card ids, e.g. COD>",
-  "$comment_repos": "Repo scope is ship scope. Default to one deployable repo per card. For true multi-repo cards, list every sibling repo the sweeps may touch and make deploy/canary instructions cover every production target; otherwise split work into per-repo cards.",
+  "$comment_repos": "Repo scope is ship scope. Default to one deployable repo per card. For true multi-repo cards, list every sibling repo the sweeps may touch and make deploy/canary instructions cover every production target; otherwise split work into per-repo cards. Scheduled dispatch clones these repos into a managed workspace under ~/.local/share/linear-board-sweeps/workspaces/<anchor>/; source checkout dirtiness is advisory but unpushed local commits are invisible to sweeps.",
   "repos": ["<repo folder name(s) the sweeps may touch>"],
   "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
@@ -22,7 +22,8 @@
     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
   },
-  "$comment_parallel": "Optional. maxNonShipDispatches defaults to 2, counts selected workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts active child slots inside each selected non-ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps same-repo child slots backfilled after successful child completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; ship-sweep always stays serial and is never handoff-triggered.",
+  "$comment_parallel": "Optional repo-local demand limits beneath the host ceiling. maxNonShipDispatches defaults to 2, counts selected workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. sameRepoCardLimits defaults to spec/dev=4, qa/ship=1 and counts active child slots inside each selected non-ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps same-repo child slots backfilled after successful child completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; ship-sweep always stays serial and is never handoff-triggered.",
+  "$comment_host_capacity": "The launcher registry, not this repo-local file, owns host-wide capacity.maxActiveChildren (default 10, clamp 1..32). It caps initial, refill, and handoff top-level scheduled children across all registered anchors and launcher restarts. Reviewer subagents inside a scheduled child are not counted; parallel settings below only shape demand beneath that ceiling.",
   "parallel": {
     "maxNonShipDispatches": 2,
     "maxDrainPasses": 5,
@@ -62,5 +63,6 @@
     "schema": null
   },
   "deploy": "<how this project reaches production for every repo in config.repos — e.g. 'web: Vercel auto-deploys on push to main; api: run ...; manual DB migration Todo required before deploy'>",
-  "credentialsNote": "<where app + tooling secrets live — e.g. '.env.local for app secrets; Linear key in gitignored .env'>"
+  "$comment_artifacts": "Scheduled sweeps receive AUTO_SWEEP_LOG_DIR, AUTO_SWEEP_TMPDIR, AUTO_SWEEP_SCREENSHOT_DIR, and AUTO_SWEEP_BROWSER_PROFILE_DIR under state/cache paths. Evidence and scratch artifacts should use those paths rather than repo roots.",
+  "credentialsNote": "<where app + tooling secrets live — e.g. '.env.local for app secrets; Linear key in gitignored .env copied to managed clones with mode 0600'>"
 }
