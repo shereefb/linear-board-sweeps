@@ -13,6 +13,7 @@ import path from "node:path";
 //   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
 //   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
 //   node linear.mjs dependency-status "<Issue>"             # JSON; exits 0 ready, 3 blocked, 2 unreadable
+//   node linear.mjs repo-status "<Issue>" "<Label>" "<Repo>" # JSON; exits 0 ready, 3 changed, 2 unreadable
 //   node linear.mjs query '{ viewer { name } }'            # raw GraphQL
 //
 export const WORKFLOW_STATE_RENAMES = [
@@ -55,6 +56,28 @@ export function dependencyEligibility(blockers, complete = true) {
   if (!complete) return { eligible: false, reason: "incomplete-relations", unresolved: blockers || [] };
   const unresolved = (blockers || []).filter((blocker) => blocker.stateName !== WORKFLOW_STATES.done);
   return { eligible: unresolved.length === 0, reason: unresolved.length ? "blocked" : "ready", unresolved };
+}
+
+export function repoRouteEligibility(labelNames, byLabel, expectedLabel, expectedRepoEntry) {
+  if (!byLabel || typeof byLabel !== "object" || Array.isArray(byLabel) || Object.keys(byLabel).length === 0) {
+    throw new Error("repoRouting.byLabel is empty or invalid");
+  }
+  if (!expectedLabel || !expectedRepoEntry) throw new Error("expected route label and repo entry are required");
+  if (byLabel[expectedLabel] !== expectedRepoEntry) {
+    throw new Error(`expected route ${expectedLabel} -> ${expectedRepoEntry} is not present in repoRouting.byLabel`);
+  }
+  const labels = new Set(labelNames || []);
+  const matches = Object.entries(byLabel)
+    .filter(([label]) => labels.has(label))
+    .map(([label, repoEntry]) => ({ label, repoEntry }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  if (matches.length === 0) return { eligible: false, reason: "missing-route-label", matches };
+  if (matches.length > 1) return { eligible: false, reason: "ambiguous-route-label", matches };
+  const [match] = matches;
+  if (match.label !== expectedLabel || match.repoEntry !== expectedRepoEntry) {
+    return { eligible: false, reason: "route-changed", matches };
+  }
+  return { eligible: true, reason: "ready", matches };
 }
 
 // The canonical board definition the sweeps depend on:
@@ -204,6 +227,30 @@ export async function fetchIssueDependencies(apiKey, issueId, { gqlFn = gql } = 
     if (!pageInfo.endCursor || seenCursors.has(pageInfo.endCursor)) return { issue, blockers, complete: false };
     seenCursors.add(pageInfo.endCursor);
     cursor = pageInfo.endCursor;
+  }
+}
+
+export async function fetchIssueLabels(apiKey, issueId, { gqlFn = gql } = {}) {
+  if (!issueId) throw new Error("usage: repo-status <issueId> <expectedLabel> <expectedRepoEntry>");
+  const d = await gqlFn(
+    `query($issueId:String!){ issue(id:$issueId){ identifier labels{ nodes{ name } } } }`,
+    { issueId },
+    apiKey,
+  );
+  if (!d?.issue || !Array.isArray(d.issue.labels?.nodes)) throw new Error(`Issue "${issueId}" not found or labels unreadable.`);
+  return { issue: d.issue.identifier || issueId, labelNames: d.issue.labels.nodes.map((label) => label.name) };
+}
+
+function writeAutoSweepOutcome(value) {
+  const outcomePath = process.env.AUTO_SWEEP_OUTCOME_PATH;
+  if (!outcomePath) return false;
+  fs.mkdirSync(path.dirname(outcomePath), { recursive: true });
+  try {
+    fs.writeFileSync(outcomePath, JSON.stringify(value), { flag: "wx" });
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
   }
 }
 
@@ -471,6 +518,44 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     "retire-state": () => retireState(args[0], args[1], args[2]),
     "rename-states": () => renameWorkflowStates(args[0]),
+    "repo-status": async () => {
+      const [issueId, expectedLabel, expectedRepoEntry] = args;
+      try {
+        const configPath = path.join(process.cwd(), ".claude", "linear-sweep.json");
+        const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        const result = await fetchIssueLabels(KEY, issueId);
+        const eligibility = repoRouteEligibility(result.labelNames, config.repoRouting?.byLabel, expectedLabel, expectedRepoEntry);
+        const routing = {
+          reason: eligibility.reason,
+          expectedLabel,
+          expectedRepoEntry,
+          matches: eligibility.matches,
+        };
+        console.log(JSON.stringify({ issue: result.issue, eligible: eligibility.eligible, ...routing }));
+        process.exitCode = eligibility.eligible ? 0 : 3;
+        if (process.exitCode !== 0) {
+          writeAutoSweepOutcome({
+            version: 1,
+            kind: "repo-routing-deferred",
+            issueIdentifier: result.issue,
+            routeExitCode: process.exitCode,
+            routing,
+          });
+        }
+      } catch (error) {
+        console.error(String(error.message || error));
+        process.exitCode = 2;
+        if (process.env.AUTO_SWEEP_OUTCOME_PATH) {
+          writeAutoSweepOutcome({
+            version: 1,
+            kind: "repo-routing-deferred",
+            issueIdentifier: issueId,
+            routeExitCode: 2,
+            routing: { reason: "unreadable", expectedLabel, expectedRepoEntry, matches: [] },
+          });
+        }
+      }
+    },
     "dependency-status": async () => {
       try {
         const result = await fetchIssueDependencies(KEY, args[0]);
@@ -482,12 +567,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
           blockers: eligibility.unresolved.map(({ identifier, stateName }) => ({ identifier, stateName })),
         }));
         process.exitCode = eligibility.eligible ? 0 : eligibility.reason === "blocked" ? 3 : 2;
-        if (process.exitCode === 0 && process.env.AUTO_SWEEP_OUTCOME_PATH) {
-          fs.rmSync(process.env.AUTO_SWEEP_OUTCOME_PATH, { force: true });
-        }
-        if (process.exitCode !== 0 && process.env.AUTO_SWEEP_OUTCOME_PATH) {
-          fs.mkdirSync(path.dirname(process.env.AUTO_SWEEP_OUTCOME_PATH), { recursive: true });
-          fs.writeFileSync(process.env.AUTO_SWEEP_OUTCOME_PATH, JSON.stringify({
+        if (process.exitCode !== 0) {
+          writeAutoSweepOutcome({
             version: 1,
             kind: "dependency-deferred",
             issueIdentifier: result.issue,
@@ -496,27 +577,26 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
               reason: eligibility.reason,
               blockers: eligibility.unresolved.map(({ identifier, stateName }) => ({ identifier, stateName })),
             },
-          }));
+          });
         }
       } catch (error) {
         console.error(String(error.message || error));
         process.exitCode = 2;
         if (process.env.AUTO_SWEEP_OUTCOME_PATH) {
-          fs.mkdirSync(path.dirname(process.env.AUTO_SWEEP_OUTCOME_PATH), { recursive: true });
-          fs.writeFileSync(process.env.AUTO_SWEEP_OUTCOME_PATH, JSON.stringify({
+          writeAutoSweepOutcome({
             version: 1,
             kind: "dependency-deferred",
             issueIdentifier: args[0],
             dependencyExitCode: 2,
             dependency: { reason: "unreadable", blockers: [] },
-          }));
+          });
         }
       }
     },
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | dependency-status <Issue> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

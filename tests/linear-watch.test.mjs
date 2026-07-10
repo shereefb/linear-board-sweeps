@@ -10,9 +10,9 @@ import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
-  resolveRepos, resolveWorkspaceRepos, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
+  resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
-  recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures,
+  recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures, handoffRepoRoutingDecision,
   dirtyCheckoutEvent, doctorReport, formatDoctorReport,
   worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
@@ -25,7 +25,7 @@ import {
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
@@ -60,6 +60,114 @@ test("resolveRepos: absolute and ./ entries are used as-is", () => {
 });
 test("resolveRepos: empty repos defaults to the anchor itself", () => {
   assert.deepEqual(resolveRepos("/ws/anchor", {}).map((r) => r.path), ["/ws/anchor"]);
+});
+test("workspaceRepoPairs: pairs source and stable-slug managed repos by config index", () => {
+  const sourceAnchorPath = "/source/safetaper-coach";
+  const workspaceRecord = {
+    sourceAnchorPath,
+    managedWorkspaceRoot: "/managed/ws",
+    managedAnchorPath: "/managed/ws/safetaper-coach",
+    repoMap: {
+      "/source/safetaper-coach": { managedPath: "/managed/ws/safetaper-coach" },
+      "/source/safetaper-guide": { managedPath: "/managed/ws/source-safetaper-guide-a1b2" },
+    },
+  };
+  assert.deepEqual(workspaceRepoPairs(sourceAnchorPath, {
+    repos: ["safetaper-coach", "safetaper-guide"],
+  }, workspaceRecord), [
+    {
+      repoEntry: "safetaper-coach",
+      sourceRepoPath: "/source/safetaper-coach",
+      managedRepoPath: "/managed/ws/safetaper-coach",
+    },
+    {
+      repoEntry: "safetaper-guide",
+      sourceRepoPath: "/source/safetaper-guide",
+      managedRepoPath: "/managed/ws/source-safetaper-guide-a1b2",
+    },
+  ]);
+});
+test("resolveCardRepoRoute: preserves first-repo behavior without routing config", () => {
+  const pairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  assert.deepEqual(resolveCardRepoRoute({
+    config: { repos: ["coach", "guide"] },
+    card: { identifier: "SAF-1", labelNames: ["app:guide"] },
+    repoPairs: pairs,
+  }), { ok: true, label: null, ...pairs[0] });
+});
+test("resolveCardRepoRoute: maps each configured app label to its exact repo entry", () => {
+  const entries = ["safetaper-coach", "safetaper-guide", "safetaper-admin", "safetaper-client-portal", "safetaper-slack"];
+  const byLabel = {
+    "app:coach": entries[0],
+    "app:guide": entries[1],
+    "app:admin": entries[2],
+    "app:portal": entries[3],
+    "app:slack": entries[4],
+  };
+  const pairs = entries.map((repoEntry) => ({ repoEntry, sourceRepoPath: `/source/${repoEntry}`, managedRepoPath: `/managed/${repoEntry}` }));
+  for (const [label, repoEntry] of Object.entries(byLabel)) {
+    assert.deepEqual(resolveCardRepoRoute({
+      config: { repos: entries, repoRouting: { byLabel } },
+      card: { identifier: "SAF-1", labelNames: [label] },
+      repoPairs: pairs,
+    }), { ok: true, label, ...pairs.find((pair) => pair.repoEntry === repoEntry) });
+  }
+});
+test("resolveCardRepoRoute: fails closed for missing, ambiguous, invalid, and duplicate routes", () => {
+  const pairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const base = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  assert.equal(resolveCardRepoRoute({ config: base, card: { identifier: "SAF-1", labelNames: [] }, repoPairs: pairs }).code, "missing-route-label");
+  assert.equal(resolveCardRepoRoute({ config: base, card: { identifier: "SAF-1", labelNames: ["app:coach", "app:guide"] }, repoPairs: pairs }).code, "ambiguous-route-label");
+  assert.equal(resolveCardRepoRoute({
+    config: { ...base, repoRouting: { byLabel: { "app:guide": "unknown" } } },
+    card: { identifier: "SAF-1", labelNames: ["app:guide"] }, repoPairs: pairs,
+  }).code, "invalid-route-target");
+  assert.equal(resolveCardRepoRoute({
+    config: { repos: ["coach", "coach"], repoRouting: { byLabel: { "app:coach": "coach" } } },
+    card: { identifier: "SAF-1", labelNames: ["app:coach"] }, repoPairs: [pairs[0], pairs[0]],
+  }).code, "duplicate-repo-entry");
+  assert.equal(resolveCardRepoRoute({
+    config: { repos: ["coach"], repoRouting: { byLabel: { "app:one": "coach", "app:two": "coach" } } },
+    card: { identifier: "SAF-1", labelNames: ["app:one", "app:two"] }, repoPairs: [pairs[0]],
+  }).code, "ambiguous-route-label");
+  for (const repoRouting of [null, false]) {
+    assert.equal(resolveCardRepoRoute({
+      config: { repos: ["coach"], repoRouting },
+      card: { identifier: "SAF-1", labelNames: ["app:coach"] },
+      repoPairs: [pairs[0]],
+    }).code, "invalid-routing-config");
+  }
+  assert.equal(resolveCardRepoRoute({ config: {}, card: { identifier: "SAF-1", labelNames: [] }, repoPairs: [] }).code, "missing-repo");
+  assert.equal(resolveCardRepoRoute({
+    config: { repos: ["coach"], repoRouting: { byLabel: {} } },
+    card: { identifier: "SAF-1", labelNames: ["app:coach"] }, repoPairs: [pairs[0]],
+  }).code, "invalid-routing-config");
+  assert.equal(resolveCardRepoRoute({
+    config: { repos: ["coach"], repoRouting: { byLabel: { "app:coach": "coach" } } },
+    card: { identifier: "SAF-1", labelNames: ["app:coach"] }, repoPairs: [],
+  }).code, "missing-repo");
+});
+test("routeCardsByRepo: separates invalid routes and can limit refill to one primary repo", () => {
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  const result = routeCardsByRepo([
+    { identifier: "SAF-1", labelNames: ["app:coach"] },
+    { identifier: "SAF-2", labelNames: ["app:guide"] },
+    { identifier: "SAF-3", labelNames: [] },
+  ], config, repoPairs, { managedRepoPath: "/managed/guide" });
+  assert.deepEqual(result.cards.map((card) => card.identifier), ["SAF-2"]);
+  assert.deepEqual(result.deferred.map((card) => card.identifier), ["SAF-1"]);
+  assert.deepEqual(result.failures.map((failure) => [failure.identifier, failure.code]), [["SAF-3", "missing-route-label"]]);
+  assert.equal(result.cards[0].repoRoute.managedRepoPath, "/managed/guide");
 });
 test("normalizeRegistry: preserves source anchors and adds managed anchor metadata", () => {
   const normalized = normalizeRegistry({
@@ -1490,6 +1598,21 @@ test("handoffDirtyCheckoutFailures: handoff candidates use managed dirty-check f
   assert.equal(failures[0].stableTarget, "managed-repo:/managed/app/worker");
   assert.match(failures[0].message, /README\.md/);
 });
+test("handoffRepoRoutingDecision: preserves a stable route and fails closed when the app label changes", () => {
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const repoRoute = resolveCardRepoRoute({ config, card: { identifier: "SAF-1", labelNames: ["app:guide"] }, repoPairs });
+  const pick = { issueIdentifier: "SAF-1", config, repoRoute };
+  const stable = handoffRepoRoutingDecision(pick, { id: "id", identifier: "SAF-1", labelNames: ["app:guide"] }, repoPairs);
+  assert.equal(stable.ok, true);
+  assert.equal(stable.card.repoRoute.managedRepoPath, "/managed/guide");
+  const changed = handoffRepoRoutingDecision(pick, { id: "id", identifier: "SAF-1", labelNames: ["app:coach"] }, repoPairs);
+  assert.equal(changed.ok, false);
+  assert.match(changed.message, /changed before handoff/);
+});
 test("selectCardSlots: chooses top actionable cards and assigns stable slot indexes", () => {
   const cards = [
     { id: "blocked", identifier: "COD-1", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["blocked:needs-user"], comments: [] },
@@ -1835,6 +1958,32 @@ test("card dispatch env prefers the original source anchor for managed workspace
   }, "run-id");
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/source/repo");
 });
+test("card dispatch env uses the routed managed sibling for worktrees and exports both repo paths", () => {
+  const repoRoute = {
+    ok: true,
+    label: "app:guide",
+    repoEntry: "safetaper-guide",
+    sourceRepoPath: "/source/safetaper-guide",
+    managedRepoPath: "/managed/ws/source-safetaper-guide-a1b2",
+  };
+  assert.equal(
+    cardWorktreePath("/managed/ws/safetaper-coach", { repos: ["safetaper-coach", "safetaper-guide"] }, "SAF-207", repoRoute),
+    "/managed/ws/source-safetaper-guide-a1b2/.worktrees/SAF-207",
+  );
+  const pick = withCardDispatchEnv({
+    anchorPath: "/managed/ws/safetaper-coach",
+    sourceAnchorPath: "/source/safetaper-coach",
+    config: { repos: ["safetaper-coach", "safetaper-guide"] },
+    sweep: "dev",
+    issueIdentifier: "SAF-207",
+    repoRoute,
+  }, "run-id");
+  assert.equal(pick.worktreePath, "/managed/ws/source-safetaper-guide-a1b2/.worktrees/SAF-207");
+  assert.equal(pick.childEnv.AUTO_SWEEP_REPO, repoRoute.managedRepoPath);
+  assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_REPO, repoRoute.sourceRepoPath);
+  assert.equal(pick.childEnv.AUTO_SWEEP_REPO_LABEL, "app:guide");
+  assert.equal(pick.childEnv.AUTO_SWEEP_REPO_ENTRY, "safetaper-guide");
+});
 test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
   const [pick] = await expandDispatchBatch([{
@@ -1864,6 +2013,216 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
   const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
+});
+test("expandDispatchBatch: Ship route-label races fail before child expansion", async () => {
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const repoRoute = resolveCardRepoRoute({ config, card: { identifier: "SAF-9", labelNames: ["app:guide"] }, repoPairs });
+  const failures = [];
+  const children = await expandDispatchBatch([{
+    anchorPath: "/managed/coach",
+    sourceAnchorPath: "/source/coach",
+    config,
+    repoPairs,
+    sweep: "ship",
+    issueId: "issue-id",
+    issueIdentifier: "SAF-9",
+    repoRoute,
+    topCard: { id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"], repoRoute },
+  }], {
+    dryRun: false,
+    parentRunId: "run-id",
+    activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
+    now: NOW,
+    fetchRouteCardFn: async () => ({ id: "issue-id", identifier: "SAF-9", labelNames: ["app:coach"] }),
+    onRouteFailure: (_pick, failure) => failures.push(failure),
+  });
+  assert.deepEqual(children, []);
+  assert.equal(failures.length, 1);
+});
+test("expandDispatchBatch: a stable Ship route expands the routed production worktree", async () => {
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const fresh = { id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"] };
+  const repoRoute = resolveCardRepoRoute({ config, card: fresh, repoPairs });
+  const [child] = await expandDispatchBatch([{
+    anchorPath: "/managed/coach",
+    sourceAnchorPath: "/source/coach",
+    config,
+    repoPairs,
+    sweep: "ship",
+    issueId: fresh.id,
+    issueIdentifier: fresh.identifier,
+    repoRoute,
+    topCard: { ...fresh, repoRoute },
+  }], {
+    dryRun: false,
+    parentRunId: "run-id",
+    activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
+    now: NOW,
+    fetchRouteCardFn: async () => fresh,
+  });
+  assert.equal(child.worktreePath, "/managed/guide/.worktrees/SAF-9");
+  assert.equal(child.childEnv.AUTO_SWEEP_REPO, "/managed/guide");
+  assert.equal(child.childEnv.AUTO_SWEEP_SOURCE_REPO, "/source/guide");
+});
+test("expandDispatchBatch: a failed Ship route read creates no child and reports the failure", async () => {
+  const config = { repos: ["guide"], repoRouting: { byLabel: { "app:guide": "guide" } } };
+  const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
+  const card = { id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"] };
+  const repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
+  const failures = [];
+  const children = await expandDispatchBatch([{
+    anchorPath: "/managed/guide", config, repoPairs, sweep: "ship", issueId: card.id, issueIdentifier: card.identifier, repoRoute, topCard: { ...card, repoRoute },
+  }], {
+    dryRun: false,
+    parentRunId: "run-id",
+    activeByAnchor: new Map([["/managed/guide", { apiKey: "key", repoPairs }]]),
+    now: NOW,
+    fetchRouteCardFn: async () => { throw new Error("Linear unavailable"); },
+    onRouteFailure: (_pick, failure) => failures.push(failure),
+  });
+  assert.deepEqual(children, []);
+  assert.match(failures[0].message, /could not re-read SAF-9 repository route/);
+});
+
+test("claimCardSlots: a fresh route-label race fails before applying the claim", async () => {
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const config = {
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+  };
+  const guideRoute = resolveCardRepoRoute({
+    config,
+    card: { identifier: "SAF-207", labelNames: ["app:guide"] },
+    repoPairs,
+  });
+  let claimEdits = 0;
+  const claimed = await claimCardSlots("key", "/managed/coach", config, "dev", [dependencyReadyCard({
+    id: "issue-id",
+    identifier: "SAF-207",
+    stateName: "Dev",
+    labelNames: ["app:guide"],
+    comments: [],
+    updatedAt: minsAgo(1),
+    sortOrder: 1,
+    repoRoute: guideRoute,
+  })], {
+    parentRunId: "run-id",
+    limit: 1,
+    labelMap: { "dev:in-progress": "claim-id" },
+    now: NOW,
+    repoPairs,
+  }, {
+    applyLabelEditFn: async () => { claimEdits += 1; },
+    fetchClaimCardFn: async () => dependencyReadyCard({
+      id: "issue-id",
+      identifier: "SAF-207",
+      stateName: "Dev",
+      labelNames: ["app:coach"],
+      comments: [],
+    }),
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(claimEdits, 0);
+});
+test("claimCardSlots: a failed fresh route read reports a routing failure without claiming", async () => {
+  const config = { repos: ["guide"], repoRouting: { byLabel: { "app:guide": "guide" } } };
+  const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "SAF-207", stateName: "Dev", labelNames: ["app:guide"], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
+  const failures = [];
+  let claimEdits = 0;
+  const claimed = await claimCardSlots("key", "/managed/guide", config, "dev", [card], {
+    parentRunId: "run-id",
+    limit: 1,
+    labelMap: { "dev:in-progress": "claim-id" },
+    now: NOW,
+    repoPairs,
+  }, {
+    fetchClaimCardFn: async () => { throw new Error("Linear unavailable"); },
+    applyLabelEditFn: async () => { claimEdits += 1; },
+    onRouteFailure: (_card, failure) => failures.push(failure),
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(claimEdits, 0);
+  assert.match(failures[0].message, /could not re-read SAF-207 repository route/);
+});
+test("claimCardSlots: a post-claim route race removes only this attempt's owned claim", async () => {
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
+  const card = dependencyReadyCard({
+    id: "issue-id",
+    identifier: "SAF-207",
+    stateName: "Dev",
+    labelNames: ["app:guide"],
+    comments: [],
+    updatedAt: minsAgo(1),
+    sortOrder: 1,
+  });
+  card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
+  const edits = [];
+  let heartbeatBody = "";
+  const claimed = await claimCardSlots("key", "/managed/coach", config, "dev", [card], {
+    parentRunId: "run-id",
+    limit: 1,
+    labelMap: { "dev:in-progress": "claim-id" },
+    now: NOW,
+    repoPairs,
+  }, {
+    fetchClaimCardFn: async () => ({ ...card }),
+    applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
+    addCommentFn: async (_key, _id, body) => { heartbeatBody = body; },
+    sleepFn: async () => {},
+    fetchCardFn: async () => dependencyReadyCard({
+      ...card,
+      labelNames: ["app:coach", "dev:in-progress"],
+      comments: [{ body: heartbeatBody, createdAt: new Date(NOW).toISOString() }],
+    }),
+  });
+  assert.deepEqual(claimed, []);
+  assert.deepEqual(edits, [
+    { add: { "dev:in-progress": "claim-id" } },
+    { remove: ["dev:in-progress"] },
+  ]);
+});
+test("claimCardSlots: a stable routed claim returns the confirmed primary repo", async () => {
+  const config = { repos: ["guide"], repoRouting: { byLabel: { "app:guide": "guide" } } };
+  const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "SAF-207", stateName: "Dev", labelNames: ["app:guide"], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
+  let heartbeatBody = "";
+  const claimed = await claimCardSlots("key", "/managed/guide", config, "dev", [card], {
+    parentRunId: "run-id",
+    limit: 1,
+    labelMap: { "dev:in-progress": "claim-id" },
+    now: NOW,
+    repoPairs,
+  }, {
+    fetchClaimCardFn: async () => ({ ...card }),
+    applyLabelEditFn: async () => {},
+    addCommentFn: async (_key, _id, body) => { heartbeatBody = body; },
+    sleepFn: async () => {},
+    fetchCardFn: async () => dependencyReadyCard({
+      ...card,
+      labelNames: ["app:guide", "dev:in-progress"],
+      comments: [{ body: heartbeatBody, createdAt: new Date(NOW).toISOString() }],
+    }),
+  });
+  assert.equal(claimed.length, 1);
+  assert.equal(claimed[0].repoRoute.managedRepoPath, "/managed/guide");
 });
 
 test("claimCardSlots: confirmation exceptions clean up only the claim owned by this attempt", async () => {
@@ -2038,6 +2397,25 @@ test("same-repo active counts: successful child completion frees exactly one slo
   assert.equal(active.get("/ws/repo", "dev"), 1);
   assert.equal(active.available("/ws/repo", "dev", 4), 3);
 });
+test("same-repo active counts isolate sibling primary repositories in one workspace", () => {
+  const active = createSameRepoActiveCounts();
+  active.increment({
+    anchorPath: "/managed/coach",
+    repoRoute: { managedRepoPath: "/managed/guide" },
+    sweep: "dev",
+    issueIdentifier: "SAF-1",
+  });
+  assert.equal(active.get("/managed/guide", "dev"), 1);
+  assert.equal(active.get("/managed/coach", "dev"), 0);
+});
+test("same-repo active counts atomically reserve routed follow-up slots", () => {
+  const active = createSameRepoActiveCounts();
+  const pick = (identifier) => ({ anchorPath: "/managed/coach", repoRoute: { managedRepoPath: "/managed/guide" }, sweep: "qa", issueIdentifier: identifier });
+  assert.equal(active.tryAcquire(pick("SAF-1"), 1), true);
+  assert.equal(active.tryAcquire(pick("SAF-2"), 1), false);
+  active.decrement(pick("SAF-1"));
+  assert.equal(active.tryAcquire(pick("SAF-2"), 1), true);
+});
 test("sameRepoAvailableSlots: live board claims and parent reservations share the same capacity", () => {
   const active = createSameRepoActiveCounts();
   active.increment({ anchorPath: "/ws/repo", sweep: "qa", issueIdentifier: "COD-1" });
@@ -2104,6 +2482,45 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
   assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_APP_PORT, "47040");
   assert.equal(refillBudget.remaining, 7);
   assert.match(logs.find((line) => line.includes("refill-trigger")), /COD-4: dev 1\/4/);
+});
+test("buildSameRepoRefillDispatches: refill stays on the completed card's primary repo", async () => {
+  const config = {
+    teamKey: "SAF",
+    projectId: "project-1",
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+    parallel: { sameRepoCardLimits: { dev: 1 } },
+  };
+  const repoPairs = [
+    { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
+    { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+  ];
+  const guideRoute = resolveCardRepoRoute({ config, card: { identifier: "SAF-1", labelNames: ["app:guide"] }, repoPairs });
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "SAF-1",
+      pick: { anchorPath: "/managed/coach", sweep: "dev", issueIdentifier: "SAF-1", config, repoPairs, repoRoute: guideRoute },
+    },
+    activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget: { remaining: 2 },
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    deferClaim: true,
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-1"]),
+      checkoutDispatchBlockers: () => [],
+      fetchCards: async () => [
+        dependencyReadyCard({ id: "coach", identifier: "SAF-2", sortOrder: 99, updatedAt: minsAgo(1), labelNames: ["app:coach"], comments: [] }),
+        dependencyReadyCard({ id: "guide", identifier: "SAF-3", sortOrder: 1, updatedAt: minsAgo(1), labelNames: ["app:guide"], comments: [] }),
+      ],
+      logFor: () => {},
+    },
+  });
+  assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-3"]);
+  assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
 });
 test("buildSameRepoRefillDispatches: budget, capacity, failed child, and ship suppress refill", async () => {
   const base = {
@@ -2259,6 +2676,28 @@ test("capacity initial admission: candidate expansion produces stable unclaimed 
     { stage: "qa", trigger: "initial", id: "COD-2", board: 10, rotation: 3 },
   ]);
 });
+test("capacity initial admission applies same-repo limits independently to routed siblings", () => {
+  const config = {
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+    parallel: { sameRepoCardLimits: { qa: 1 } },
+  };
+  const route = (repoEntry) => ({ ok: true, label: `app:${repoEntry}`, repoEntry, sourceRepoPath: `/source/${repoEntry}`, managedRepoPath: `/managed/${repoEntry}` });
+  const cards = [
+    dependencyReadyCard({ id: "coach-1", identifier: "SAF-1", sortOrder: 30, updatedAt: minsAgo(1), labelNames: ["app:coach"], comments: [], repoRoute: route("coach") }),
+    dependencyReadyCard({ id: "coach-2", identifier: "SAF-2", sortOrder: 20, updatedAt: minsAgo(1), labelNames: ["app:coach"], comments: [], repoRoute: route("coach") }),
+    dependencyReadyCard({ id: "guide-1", identifier: "SAF-3", sortOrder: 10, updatedAt: minsAgo(1), labelNames: ["app:guide"], comments: [], repoRoute: route("guide") }),
+  ];
+  const demands = admissionDemandsForCandidates([{
+    anchorPath: "/managed/coach",
+    config,
+    sweep: "qa",
+    count: cards.length,
+    topCard: cards[0],
+    cards,
+  }], { now: NOW });
+  assert.deepEqual(demands.map((demand) => demand.issueIdentifier), ["SAF-1", "SAF-3"]);
+});
 test("buildSameRepoRefillDispatches: dirty checks include managed sibling paths from the completed child", async () => {
   const seen = [];
   const result = await buildSameRepoRefillDispatches({
@@ -2364,6 +2803,13 @@ test("selectDispatchBatch: dedupes nested repo path overlap", () => {
   ], { maxNonShipDispatches: 3 });
   assert.deepEqual(batch.map((c) => c.anchorPath), ["/ws/a", "/ws/c"]);
 });
+test("selectDispatchBatch: overlap detection uses actual stable-slug managed repo paths", () => {
+  const batch = selectDispatchBatch([
+    { anchorPath: "/managed/a", managedRepoPaths: ["/managed/a", "/managed/sibling-guide-a1b2"], config: { repos: ["a", "guide"] }, sweep: "dev", count: 1 },
+    { anchorPath: "/managed/b", managedRepoPaths: ["/managed/sibling-guide-a1b2"], config: { repos: ["b"] }, sweep: "spec", count: 1 },
+  ], { maxNonShipDispatches: 2 });
+  assert.deepEqual(batch.map((candidate) => candidate.anchorPath), ["/managed/a"]);
+});
 test("dryRunDispatchMessages: reports every selected dispatch", () => {
   const messages = dryRunDispatchMessages([
     { anchorPath: "/ws/a", sweep: "dev", count: 2, config: { runtimes: { dev: { runtime: "codex", model: "gpt-5.5", effort: "high" } } } },
@@ -2393,6 +2839,46 @@ test("dryRunDispatchMessages: reports expanded same-repo card slots when cards a
     "[dry-run] slot 1/2 dev COD-8 sortOrder=5",
     "[dry-run] slot 2/2 dev COD-7 sortOrder=1",
   ]);
+});
+test("dryRunDispatchMessages: names each card's routed primary repo", () => {
+  const messages = dryRunDispatchMessages([{
+    anchorPath: "/managed/coach",
+    sweep: "dev",
+    count: 1,
+    config: { parallel: { sameRepoCardLimits: { dev: 1 } } },
+    cards: [dependencyReadyCard({
+      id: "guide",
+      identifier: "SAF-207",
+      sortOrder: 1,
+      updatedAt: minsAgo(1),
+      labelNames: ["app:guide"],
+      comments: [],
+      repoRoute: { ok: true, label: "app:guide", repoEntry: "safetaper-guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
+    })],
+  }]);
+  assert.match(messages[1].body, /repo=safetaper-guide/);
+});
+test("dry-run and child expansion apply limits independently to routed sibling repos", async () => {
+  const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } }, parallel: { sameRepoCardLimits: { qa: 1 } } };
+  const card = (repoEntry, identifier, sortOrder) => dependencyReadyCard({
+    id: identifier,
+    identifier,
+    sortOrder,
+    updatedAt: minsAgo(1),
+    labelNames: [`app:${repoEntry}`],
+    comments: [],
+    repoRoute: { ok: true, label: `app:${repoEntry}`, repoEntry, sourceRepoPath: `/source/${repoEntry}`, managedRepoPath: `/managed/${repoEntry}` },
+  });
+  const candidate = {
+    anchorPath: "/managed/coach",
+    config,
+    sweep: "qa",
+    count: 2,
+    cards: [card("coach", "SAF-1", 2), card("guide", "SAF-2", 1)],
+  };
+  assert.deepEqual(dryRunDispatchMessages([candidate]).slice(1).map((message) => message.body.match(/repo=([^ ]+)/)?.[1]), ["coach", "guide"]);
+  const children = await expandDispatchBatch([candidate], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW });
+  assert.deepEqual(children.map((child) => child.issueIdentifier), ["SAF-1", "SAF-2"]);
 });
 test("dispatchBatch: dispatches every selected child and returns structured results", async () => {
   const calls = [];
@@ -2496,6 +2982,30 @@ test("dispatchAsync: child dependency outcome channel overrides a superficially 
   assert.equal(outcome.dependencyExitCode, 3);
   const recordName = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(logDir, recordName), "utf8")).outcome.kind, "dependency-deferred");
+});
+test("dispatchAsync: child repository outcome prevents a superficially successful handoff", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-route-outcome-"));
+  const logDir = path.join(anchorPath, "logs");
+  const outcomePath = path.join(anchorPath, "route-outcome.json");
+  const child = new EventEmitter();
+  child.pid = 503;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "SAF-207", issueId: "issue-207", ownerToken: "owner-207",
+    logDir, outcomePath, runtimeExecutable: "/resolved/codex",
+    childEnv: { AUTO_SWEEP_OUTCOME_PATH: outcomePath },
+  }, { spawnFn: () => child });
+  fs.writeFileSync(outcomePath, JSON.stringify({
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "SAF-207",
+    routeExitCode: 3,
+    routing: { reason: "route-changed", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [{ label: "app:coach", repoEntry: "coach" }] },
+  }));
+  child.emit("close", 0, null);
+  const outcome = await run;
+  assert.equal(outcome.kind, "repo-routing-deferred");
+  assert.equal(outcome.code, "REPO_ROUTE_CHANGED");
+  assert.equal(outcome.routing.reason, "route-changed");
 });
 test("runtimeDisabledByOutcome: only executable disappearance disables a runtime lane", () => {
   const base = { path: "/resolved/codex", cwd: "/workspace" };
@@ -3109,6 +3619,14 @@ test("failureTodoDecisions: only closes recovered Todos for checked scopes", () 
 
   const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["dev"]), NOW);
   assert.equal(checked[0].action, "close");
+});
+test("failureTodoDecisions: repository routing failures dedupe and self-close on the matching stage scope", () => {
+  const event = failureEvent({ scope: "qa:routing", kind: "repo-routing", stableTarget: "SAF-200", message: "SAF-200 expected exactly one of app:admin" });
+  const fp = failureFingerprint(event);
+  assert.deepEqual(failureTodoDecisions([event, event], [], new Set(["qa:routing"]), NOW).map((decision) => decision.action), ["create"]);
+  const todo = existingFailureTodo(fp, { scope: "qa:routing", description: failureTodoBody(event, fp) });
+  assert.deepEqual(failureTodoDecisions([], [todo], new Set(["dev:routing"]), NOW), []);
+  assert.equal(failureTodoDecisions([], [todo], new Set(["qa:routing"]), NOW)[0].action, "close");
 });
 test("failureTodoDecisions: dispatch failures recover only after dispatch succeeds", () => {
   const event = failureEvent({ scope: "dev:dispatch" });

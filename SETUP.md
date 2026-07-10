@@ -83,7 +83,7 @@ Claude Code discovers these natively. (For Codex, Step 8 wires them via AGENTS.m
 
 ## Step 7 — Write the repo config
 
-Copy `KIT/templates/linear-sweep.json` to `TARGET/.claude/linear-sweep.json` and fill every `<placeholder>` from Steps 1 + 5 (teamName, teamKey, project, projectId, issuePrefix, repos, deploy, canonicalDocs, credentialsNote). This file is what makes the skills project-agnostic.
+Copy `KIT/templates/linear-sweep.json` to `TARGET/.claude/linear-sweep.json` and fill every `<placeholder>` from Steps 1 + 5 (teamName, teamKey, project, projectId, issuePrefix, repos, deploy, canonicalDocs, credentialsNote). For a project whose cards have different primary repos, copy `$example_repoRouting` to `repoRouting`, replace its label/repo pairs, and ensure each value exactly matches one `repos` entry. Remove the example block for a single-repo project. This file is what makes the skills project-agnostic.
 
 If `TARGET/.gitignore` has a broad `.claude/*` ignore, make sure `!.claude/skills/` and `!.claude/linear-sweep.json` are present (the gitignore snippet includes them) so the skills + config are tracked.
 
@@ -236,7 +236,7 @@ Before restarting launchd, run `doctor`, `doctor --json`, and `tick --dry-run` f
 
 Perform a one-time dry-run audit for each project returned by `list`: in Linear, filter for `blocked:needs-user`, then report only cards that also have a current visible `blockedBy` relation. Require attended confirmation and direct provenance in issue history/comments that the label merely mirrored that still-current relation and that no later human request reused the label before removing it. Preserve ambiguous labels. This audit is limited to current visible relations: bounded cycle detection and cross-team token visibility mean it is not an organization-wide guarantee. Do not infer an invisible relation, reconstruct a removed relation, or bulk-delete labels.
 
-**Managed workspace notes.** Scheduled sweeps clone/fetch/ff-only every configured repo in `config.repos` into one managed workspace root. `.env` is copied only when it exists in the source repo and is gitignored there, then written in the managed clone with mode `0600`. Screenshots, logs, browser profiles, and temporary files should use the launcher-provided `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` paths under state/cache directories, not repo roots.
+**Managed workspace notes.** Scheduled sweeps clone/fetch/ff-only every configured repo in `config.repos` into one managed workspace root. Label routing pairs source and managed clones by config index; scheduled children receive the selected primary clone as `AUTO_SWEEP_REPO`, its source as `AUTO_SWEEP_SOURCE_REPO`, and a worktree below it as `AUTO_SWEEP_WORKTREE`. `.env` is copied only when it exists in the source repo and is gitignored there, then written in the managed clone with mode `0600`. Screenshots, logs, browser profiles, and temporary files should use the launcher-provided `AUTO_SWEEP_LOG_DIR`, `AUTO_SWEEP_TMPDIR`, `AUTO_SWEEP_SCREENSHOT_DIR`, and `AUTO_SWEEP_BROWSER_PROFILE_DIR` paths under state/cache directories, not repo roots.
 
 **Scheduling caution — decide before activating.** `qa-sweep` never merges or deploys, but it can fix UX bugs and push review branches. `ship-sweep` is the only production merge/deploy path and only runs from the human-gated `Ship` column. Pin ship dispatch to one host with `node "KIT/scripts/linear-watch.mjs" ship-runner on` before relying on scheduled shipping.
 

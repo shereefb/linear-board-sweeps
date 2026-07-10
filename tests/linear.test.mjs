@@ -12,6 +12,7 @@ import {
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
+  repoRouteEligibility, fetchIssueLabels,
 } from "../scripts/linear.mjs";
 
 test("dependency eligibility releases only exact Done blockers", () => {
@@ -39,6 +40,31 @@ test("dependency normalization fails closed when a blocks relation has no issue"
     () => normalizeBlockingRelations({ pageInfo: { hasNextPage: false }, nodes: [{ id: "r", type: "blocks", issue: null }] }),
     /blocking relation r has no readable issue/,
   );
+});
+
+test("repo route eligibility requires one live mapped label matching the expected label and repo", () => {
+  const byLabel = { "app:coach": "coach", "app:guide": "guide" };
+  assert.deepEqual(repoRouteEligibility(["app:guide", "frontend"], byLabel, "app:guide", "guide"), {
+    eligible: true,
+    reason: "ready",
+    matches: [{ label: "app:guide", repoEntry: "guide" }],
+  });
+  assert.equal(repoRouteEligibility([], byLabel, "app:guide", "guide").reason, "missing-route-label");
+  assert.equal(repoRouteEligibility(["app:coach", "app:guide"], byLabel, "app:guide", "guide").reason, "ambiguous-route-label");
+  assert.equal(repoRouteEligibility(["app:coach"], byLabel, "app:guide", "guide").reason, "route-changed");
+  assert.throws(() => repoRouteEligibility(["app:guide"], null, "app:guide", "guide"), /repoRouting.byLabel/);
+});
+
+test("fetchIssueLabels returns the canonical identifier and exact live label names", async () => {
+  const calls = [];
+  const result = await fetchIssueLabels("key", "SAF-207", {
+    gqlFn: async (query, variables, apiKey) => {
+      calls.push({ query, variables, apiKey });
+      return { issue: { identifier: "SAF-207", labels: { nodes: [{ name: "app:guide" }, { name: "frontend" }] } } };
+    },
+  });
+  assert.deepEqual(result, { issue: "SAF-207", labelNames: ["app:guide", "frontend"] });
+  assert.equal(calls[0].apiKey, "key");
 });
 
 test("fetchIssueDependencies paginates inverse blocking relations to completion", async () => {
@@ -111,6 +137,53 @@ function runDependencyStatusCli(inverseRelations, env = {}) {
     env: { ...process.env, LINEAR_API_KEY: "key", ...env },
   });
 }
+
+function runRepoStatusCli(labelNames, env = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-status-"));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "linear-sweep.json"), JSON.stringify({
+    repos: ["coach", "guide"],
+    repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
+  }));
+  const response = { data: { issue: { identifier: "SAF-207", labels: { nodes: labelNames.map((name) => ({ name })) } } } };
+  const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
+  const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", "SAF-207", "app:guide", "guide"], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
+  });
+}
+
+test("repo-status CLI fails closed on a live label race and writes a parent outcome", () => {
+  const ready = runRepoStatusCli(["app:guide"]);
+  assert.equal(ready.status, 0, ready.stderr);
+  assert.equal(JSON.parse(ready.stdout).eligible, true);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-route-outcome-"));
+  const outcomePath = path.join(dir, "outcome.json");
+  const changed = runRepoStatusCli(["app:coach"], { AUTO_SWEEP_OUTCOME_PATH: outcomePath });
+  assert.equal(changed.status, 3, changed.stderr);
+  assert.equal(JSON.parse(changed.stdout).reason, "route-changed");
+  assert.deepEqual(JSON.parse(fs.readFileSync(outcomePath, "utf8")), {
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "SAF-207",
+    routeExitCode: 3,
+    routing: { reason: "route-changed", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [{ label: "app:coach", repoEntry: "coach" }] },
+  });
+});
+test("child preflights preserve the first deferred outcome if a later check mistakenly continues", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-first-outcome-"));
+  const outcomePath = path.join(dir, "outcome.json");
+  const changed = runRepoStatusCli(["app:coach"], { AUTO_SWEEP_OUTCOME_PATH: outcomePath });
+  assert.equal(changed.status, 3, changed.stderr);
+  const readyDependency = runDependencyStatusCli({ pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }, {
+    AUTO_SWEEP_OUTCOME_PATH: outcomePath,
+  });
+  assert.equal(readyDependency.status, 0, readyDependency.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(outcomePath, "utf8")).kind, "repo-routing-deferred");
+});
 
 test("dependency-status CLI emits blocker JSON and maps readiness to exit status", () => {
   const blocked = runDependencyStatusCli({

@@ -16,12 +16,14 @@ Build features from "Dev" cards, one worktree per feature, with subagents/parall
 - **Load repo config.** Read `.claude/linear-sweep.json` (see spec-sweep §0 for fields). Missing file → exit with a one-line error.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
 - **Coding guardrail.** Before writing, reviewing, debugging, refactoring, or otherwise changing code, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
+- **Child repository preflight (mandatory when routed).** In scheduled single-card mode, when `AUTO_SWEEP_REPO_LABEL` is set, run `node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" repo-status "$AUTO_SWEEP_ISSUE" "$AUTO_SWEEP_REPO_LABEL" "$AUTO_SWEEP_REPO_ENTRY"` immediately after startup and before the dependency check, claim, worktree mutation, merge, deploy, or any other material work. **Exit `0`:** continue. **Exit `3`:** the live app label is missing, ambiguous, or changed; comment the returned route evidence, remove only this sweep's owned claim if present, and stop. **Exit `2`:** routing is unreadable or misconfigured; report it, remove only this sweep's owned claim if present, and stop. Never add `blocked:needs-user` for this machine-checkable routing failure; the launcher's self-clearing routing Todo owns the retry signal.
 - **Child dependency preflight (mandatory).** In scheduled single-card mode, after startup and before the first material mutation, run:
   ```bash
   node "$AUTO_SWEEP_KIT_PATH/scripts/linear.mjs" dependency-status "$AUTO_SWEEP_ISSUE"
   ```
   Only the exact canonical `Done` state releases a blocker; Canceled, Duplicate, Archived, and every other state remain blocked. Handle the command by exit status: **Exit `0`:** continue. **Exit `3`:** comment the visible blocker identifiers/states, remove only this sweep's owned claim (`dev:in-progress`), and stop without material work. **Exit `2`:** report unreadable dependency data, remove only this sweep's owned claim (`dev:in-progress`), and stop. Never infer readiness from partial output.
 - Team = `config.teamName` (`config.teamKey`); operate only within `config.project`. Repos: `config.repos`. Ensure labels exist; create if missing: `dev:in-progress`, `blocked:needs-user`, `sweep:manual-only`.
+- **Scheduled primary repo:** when `AUTO_SWEEP_REPO` is set, it is the launcher's label-routed managed repository for this card; `AUTO_SWEEP_SOURCE_REPO` is its source checkout. Treat that repo as primary and put the card worktree at `AUTO_SWEEP_WORKTREE`. Other entries in `config.repos` remain available only for plan-approved multi-repo scope; never switch primary ownership implicitly.
 
 ## 1. Select cards (top-of-column order, bounded, claimed)
 
