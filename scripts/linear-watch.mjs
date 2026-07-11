@@ -6329,7 +6329,7 @@ export async function reconcileDispatchProgress(apiKey, result, runtime, {
   resumeStore = null,
 } = {}) {
   if (result?.kind !== "success" || !result?.pick?.issueId) {
-    return { success: Boolean(result?.success), progress: null, claimResult: null, failure: null };
+    return { success: Boolean(result?.success), terminal: false, progress: null, claimResult: null, failure: null };
   }
   const pick = result.pick;
   let card;
@@ -6338,6 +6338,7 @@ export async function reconcileDispatchProgress(apiKey, result, runtime, {
   } catch (error) {
     return {
       success: false,
+      terminal: false,
       progress: { kind: "complete-read-failed", valid: false, ownsOpenClaim: false, reason: error.message },
       claimResult: null,
       failure: error,
@@ -6351,7 +6352,7 @@ export async function reconcileDispatchProgress(apiKey, result, runtime, {
   const progress = classifyPostDispatchProgress(result, card, {
     resumeRecord: storedResume ? { kind: "resume", record: storedResume } : null,
   });
-  if (progress.valid) return { success: true, progress, claimResult: null, failure: null };
+  if (progress.valid) return { success: true, terminal: progress.kind !== "resume-needed", progress, claimResult: null, failure: null };
 
   let claimResult = null;
   let failure = null;
@@ -6368,7 +6369,18 @@ export async function reconcileDispatchProgress(apiKey, result, runtime, {
       claimResult = { attempted: true, released: false };
     }
   }
-  return { success: false, progress, claimResult, failure };
+  return { success: false, terminal: false, progress, claimResult, failure };
+}
+
+export function applyDispatchProgressReconciliation(result, reconciliation) {
+  result.progress = reconciliation.progress;
+  result.claimResult = reconciliation.claimResult;
+  result.accepted = reconciliation.success;
+  if (reconciliation.success && reconciliation.terminal) return result;
+  result.success = false;
+  result.kind = reconciliation.progress?.kind || "successful-no-op";
+  if (!reconciliation.success) result.code = "SUCCESSFUL_NO_OP";
+  return result;
 }
 
 function childDeferredOutcomeForPick(pick = {}) {
@@ -6957,12 +6969,8 @@ async function tick({ dryRun = false } = {}) {
       const dispatchScope = result.dispatchScope;
       if (result.kind === "success" && pick.issueIdentifier) {
         const reconciliation = await reconcileDispatchProgress(active.apiKey, result, runtime, { resumeStore });
-        result.progress = reconciliation.progress;
-        result.claimResult = reconciliation.claimResult;
+        applyDispatchProgressReconciliation(result, reconciliation);
         if (!reconciliation.success) {
-          result.success = false;
-          result.kind = reconciliation.progress?.kind || "successful-no-op";
-          result.code = "SUCCESSFUL_NO_OP";
           logFor(pick.anchorPath, pick.sweep, `dispatch progress rejected ${pick.issueIdentifier}: ${reconciliation.progress?.reason || "post-run reconciliation failed"}`);
           if (reconciliation.failure) {
             recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", pick.issueIdentifier, reconciliation.failure.message);
@@ -7025,7 +7033,7 @@ async function tick({ dryRun = false } = {}) {
         });
         logFor(pick.anchorPath, pick.sweep, `${pick.issueIdentifier} capacity deferred (${capacityKind}); retry eligible ${nextEligibleAt}`);
       }
-      const failures = (capacityKind || finalUsageExhausted) ? [] : routingDeferred
+      const failures = (capacityKind || finalUsageExhausted || result.kind === "resume-needed") ? [] : routingDeferred
         ? [failureEventFor(
           pick.anchorPath,
           pick.config,

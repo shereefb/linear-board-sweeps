@@ -32,7 +32,7 @@ import {
   retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, reconcileDispatchProgress, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, reconcileDispatchProgress, applyDispatchProgressReconciliation, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
   fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards, fetchCompleteMigrationCard, claimMigrationStatusReport, resetClaimMigration,
@@ -1754,6 +1754,47 @@ test("capacity admission: same-stage handoff discovered under the held token run
   ], { queue });
   await queue.whenIdle();
   assert.deepEqual(order, ["A", "H", "B"]);
+});
+
+test("capacity admission: resume-needed completion cannot handoff or refill before release", async () => {
+  let stored = null;
+  const discoveries = [];
+  let releases = 0;
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    parentPid: 100,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: () => "resume-token",
+  });
+  const pick = {
+    sweep: "ship", issueId: "issue", issueIdentifier: "COD-179", ownerToken: "owner", claimDeclarationId: "decl",
+    anchorPath: "/managed", sourceAnchorPath: "/source",
+  };
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async () => {
+      const result = { ...postDispatchResult(), success: true, pick };
+      const reconciliation = await reconcileDispatchProgress("key", result, "codex", {
+        fetchClaimCardFn: async () => ({ ...postDispatchCard(), id: "issue", identifier: "COD-179" }),
+        releaseFailedDispatchClaimFn: async () => { releases += 1; return true; },
+        resumeStore: { get: () => ({ sweep: "ship", ownerToken: "owner", claimDeclarationId: "decl" }) },
+      });
+      applyDispatchProgressReconciliation(result, reconciliation);
+      return result;
+    },
+    beforeRelease: async (result) => {
+      if (result.success) discoveries.push("handoff", "refill");
+    },
+  });
+
+  const result = await admitDemand({ stage: "ship", trigger: "initial", issueIdentifier: "COD-179", workspace: "/source" }, { queue });
+  assert.equal(result.kind, "resume-needed");
+  assert.equal(result.success, false);
+  assert.equal(result.progress.valid, true);
+  assert.deepEqual(discoveries, []);
+  assert.equal(releases, 0);
 });
 
 // ── version compare ──────────────────────────────────────────────────────────
