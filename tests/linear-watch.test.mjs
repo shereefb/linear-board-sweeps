@@ -65,6 +65,7 @@ import {
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
   recordSuccessfulNoOpTelemetry,
+  recordChildLivenessTelemetry, MAX_RECENT_TERMINAL_CHILDREN,
 } from "../scripts/linear-watch.mjs";
 
 const postDispatchResult = (sweep = "ship", kind = "success") => ({
@@ -7375,6 +7376,68 @@ test("finalizeTickState: writes versioned last-tick before removing current-tick
   assert.deepEqual(JSON.parse(fs.readFileSync(lastTickPath, "utf8")), completed);
   assert.deepEqual(fs.readdirSync(dir), ["last-tick"]);
   assert.deepEqual(order, ["write:last-tick", "remove:current-tick.json"]);
+});
+
+test("child liveness telemetry retains only secret-free lifecycle summaries", () => {
+  const child = {
+    issueIdentifier: "COD-179",
+    sweep: "dev",
+    sourceAnchorPath: "/workspace/source",
+    ownerToken: "owner-secret",
+    claimDeclarationId: "declaration-secret",
+    comments: [{ body: "secret comment" }],
+    prompt: "secret prompt",
+    childEnv: { LINEAR_API_KEY: "secret-key" },
+  };
+  let telemetry = recordChildLivenessTelemetry({}, child, "start", "2026-07-11T12:00:00.000Z");
+  telemetry = recordChildLivenessTelemetry(telemetry, child, "liveness", "2026-07-11T12:00:01.000Z");
+  telemetry = recordChildLivenessTelemetry(telemetry, child, "terminal", "2026-07-11T12:00:02.000Z", "timeout-forced");
+
+  assert.deepEqual(telemetry.children, [{
+    issue: "COD-179",
+    sweep: "dev",
+    workspace: "/workspace/source",
+    startedAt: "2026-07-11T12:00:00.000Z",
+    lastLivenessAt: "2026-07-11T12:00:02.000Z",
+    state: "terminal",
+    outcomeKind: "timeout-forced",
+  }]);
+  assert.deepEqual(Object.keys(telemetry.children[0]).sort(), [
+    "issue", "lastLivenessAt", "outcomeKind", "startedAt", "state", "sweep", "workspace",
+  ]);
+  assert.doesNotMatch(JSON.stringify(telemetry.children), /owner-secret|declaration-secret|secret comment|secret prompt|secret-key/);
+});
+
+test("child liveness telemetry keeps active children and caps recent terminal summaries", () => {
+  let telemetry = {};
+  for (let index = 0; index < MAX_RECENT_TERMINAL_CHILDREN + 2; index += 1) {
+    const child = { issueIdentifier: `COD-${index}`, sweep: "qa", anchorPath: `/workspace/${index}` };
+    telemetry = recordChildLivenessTelemetry(telemetry, child, "start", `2026-07-11T12:00:${String(index).padStart(2, "0")}.000Z`);
+    telemetry = recordChildLivenessTelemetry(telemetry, child, "terminal", `2026-07-11T12:01:${String(index).padStart(2, "0")}.000Z`, "advanced");
+  }
+  telemetry = recordChildLivenessTelemetry(telemetry, {
+    issueIdentifier: "COD-active", sweep: "ship", anchorPath: "/workspace/active",
+  }, "start", "2026-07-11T12:02:00.000Z");
+
+  assert.equal(telemetry.children.filter((child) => child.state === "terminal").length, MAX_RECENT_TERMINAL_CHILDREN);
+  assert.equal(telemetry.children.filter((child) => child.state === "active").length, 1);
+  assert.deepEqual(telemetry.children.filter((child) => child.state === "terminal").map((child) => child.issue),
+    Array.from({ length: MAX_RECENT_TERMINAL_CHILDREN }, (_, index) => `COD-${index + 2}`));
+});
+
+test("child liveness telemetry persists from current tick into last tick", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-child-telemetry-"));
+  const currentPath = path.join(dir, "current-tick.json");
+  const lastTickPath = path.join(dir, "last-tick");
+  const telemetry = recordChildLivenessTelemetry({}, {
+    issueIdentifier: "COD-179", sweep: "dev", anchorPath: "/workspace",
+  }, "start", "2026-07-11T12:00:00.000Z");
+  const state = { version: 1, status: "running", pid: 42, at: "2026-07-11T12:00:00.000Z", failures: [], telemetry };
+  atomicWriteJson(currentPath, state);
+  assert.deepEqual(JSON.parse(fs.readFileSync(currentPath, "utf8")).telemetry, telemetry);
+
+  finalizeTickState(state, { currentPath, lastTickPath, now: () => "2026-07-11T12:03:00.000Z" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(lastTickPath, "utf8")).telemetry, telemetry);
 });
 test("finalizeTickState: failed last-tick write preserves a red current-tick", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-failure-"));

@@ -133,6 +133,7 @@ export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
 export const RESUME_PROTECTION_MAX_AGE_MS = 24 * 3600000;
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
+export const MAX_RECENT_TERMINAL_CHILDREN = 5;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
@@ -2138,6 +2139,38 @@ export function atomicWriteJson(filePath, value) {
     try { fs.rmSync(tempPath, { force: true }); } catch { /* ignore cleanup failure */ }
     throw error;
   }
+}
+
+export function recordChildLivenessTelemetry(telemetry = {}, pick = {}, event, at = new Date().toISOString(), outcomeKind = null) {
+  const identity = {
+    issue: pick.issueIdentifier,
+    sweep: pick.sweep,
+    workspace: pick.sourceAnchorPath || pick.anchorPath,
+  };
+  if (!identity.issue || !identity.sweep || !identity.workspace) return telemetry;
+  const matches = (child) => child.issue === identity.issue && child.sweep === identity.sweep && child.workspace === identity.workspace;
+  const children = Array.isArray(telemetry.children) ? telemetry.children : [];
+  const existing = children.find(matches);
+  let next;
+  if (event === "start") {
+    next = { ...identity, startedAt: at, lastLivenessAt: at, state: "active", outcomeKind: null };
+  } else if (event === "liveness" && existing?.state === "active") {
+    next = { ...existing, lastLivenessAt: at };
+  } else if (event === "terminal") {
+    next = {
+      ...identity,
+      startedAt: existing?.startedAt || at,
+      lastLivenessAt: at,
+      state: "terminal",
+      outcomeKind,
+    };
+  } else {
+    return telemetry;
+  }
+  const updated = [...children.filter((child) => !matches(child)), next];
+  const active = updated.filter((child) => child.state === "active");
+  const terminal = updated.filter((child) => child.state === "terminal").slice(-MAX_RECENT_TERMINAL_CHILDREN);
+  return { ...telemetry, children: [...active, ...terminal] };
 }
 
 function observationIdentity(value = {}) {
@@ -7381,6 +7414,13 @@ async function tick({ dryRun = false } = {}) {
       };
       atomicWriteJson(CURRENT_TICK, tickState);
     };
+    const recordChildTelemetry = (pick, event, outcomeKind = null) => {
+      tickState = {
+        ...tickState,
+        telemetry: recordChildLivenessTelemetry(tickState.telemetry, pick, event, new Date().toISOString(), outcomeKind),
+      };
+      writeCurrentTick();
+    };
     const preflightCandidatesForTick = async (candidates) => {
       const cooldownReady = [];
       for (const pick of candidates || []) {
@@ -7529,11 +7569,22 @@ async function tick({ dryRun = false } = {}) {
             return null;
           }
           pick.telemetry = { ...(pick.telemetry || {}), claimAt: new Date().toISOString() };
+          recordChildTelemetry(pick, "start");
           const [result] = await dispatchBatch([pick], {
             signal: dispatchAbortContext?.signal,
-            dispatchOptions: { onSpawn: (pid) => reservation.attachChildPid(pid) },
+            dispatchOptions: {
+              onSpawn: (pid) => {
+                const attached = reservation.attachChildPid(pid);
+                if (attached !== false) recordChildTelemetry(pick, "liveness");
+                return attached;
+              },
+            },
           });
+          if (result.kind === "timeout-graceful" || result.kind === "timeout-forced") {
+            recordChildTelemetry(pick, "terminal", result.kind);
+          }
           await reconcileDispatchResult(result);
+          recordChildTelemetry(pick, "terminal", result.progress?.kind || result.kind);
           return result;
         } finally {
           activeSameRepo.decrement(demand);
