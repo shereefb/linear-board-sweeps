@@ -54,6 +54,8 @@ import {
 import {
   claimCloseMarker,
   claimDeclarationMarker,
+  claimHeartbeatMarker,
+  claimResetMarker,
   parseClaimMarker,
   resolveClaimOwnership,
 } from "./claim-ownership.mjs";
@@ -121,7 +123,7 @@ const LEARNING_STATE_PATH = path.join(STATE_DIR, "learning-state.json");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
-export const RESUME_STATE_VERSION = 1;
+export const RESUME_STATE_VERSION = 2;
 export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
@@ -634,9 +636,24 @@ export function isNewerVersion(kitMarker, installedMarker) {
   return kitMarker !== installedMarker;
 }
 
-// Heartbeat age in minutes: newest [auto-sweep-heartbeat <ISO>] comment, else
-// fall back to the card's updatedAt (the claim label bumped it).
-export function heartbeatAgeMin(card, now) {
+// Claim liveness age in minutes. Declared epochs use their matching heartbeat or
+// declaration time; closed epochs use the boundary; legacy labels retain the
+// pre-protocol heartbeat/updatedAt fallback.
+export function heartbeatAgeMin(card, now, claim = null) {
+  if (claim && card?.commentsComplete === true) {
+    const ownership = resolveCardClaim(card, claim);
+    if (ownership.status === "owned") return (now - Date.parse(ownership.livenessAt)) / 60000;
+    if (ownership.status === "ambiguous") return Number.NEGATIVE_INFINITY;
+    if (ownership.status === "legacy-unowned") {
+      const boundaries = (card.comments || []).flatMap((comment) => {
+        const marker = parseClaimMarker(comment);
+        return (marker?.type === "close" || marker?.type === "reset") && marker.claim === claim
+          ? [Date.parse(marker.createdAt)] : [];
+      });
+      if (boundaries.length) return (now - Math.max(...boundaries)) / 60000;
+    }
+    if (ownership.status !== "legacy-unowned") return Number.POSITIVE_INFINITY;
+  }
   const beats = (card.comments || [])
     .map((c) => {
       const i = (c.body || "").indexOf(HEARTBEAT_TAG);
@@ -664,7 +681,7 @@ function liveClaimLabel(card, now, releasedIds = new Set()) {
     if (!hasLabel(card, claim)) return false;
     const owner = SWEEPS.find((s) => SWEEP_CFG[s].claim === claim);
     const staleMin = owner ? SWEEP_CFG[owner].staleMin : MAX_STALE_MIN;
-    return heartbeatAgeMin(card, now) <= staleMin;
+    return heartbeatAgeMin(card, now, claim) <= staleMin;
   }) || null;
 }
 
@@ -674,17 +691,21 @@ export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } =
   const out = [];
   for (const card of cards) {
     if (!hasLabel(card, cfg.claim)) continue;
-    if (heartbeatAgeMin(card, now) <= cfg.staleMin) continue; // fresh/alive
+    const ownership = resolveCardClaim(card, cfg.claim);
+    if (ownership.status === "ambiguous" || ownership.status === "unclaimed" || ownership.status === "closed" || ownership.status === "orphan-declaration") continue;
+    if (heartbeatAgeMin(card, now, cfg.claim) <= cfg.staleMin) continue; // fresh/alive
     const preserved = protectedClaim(card);
-    if (preserved) {
+    const target = ownership.status === "owned" ? ownership.declarationId : "legacy";
+    if (preserved && ownership.status === "owned"
+        && preserved.ownerToken === ownership.ownerToken && preserved.claimDeclarationId === ownership.declarationId) {
       out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim, ownerToken: preserved.ownerToken, claimDeclarationId: preserved.claimDeclarationId });
       continue;
     }
     const priorReaps = countMarkers(card, REAPER_TAG, now);
     if (priorReaps + 1 >= CRASH_ESCALATE_AFTER) {
-      out.push({ id: card.id, identifier: card.identifier, action: "escalate-crash", releaseClaim: cfg.claim, count: priorReaps + 1 });
+      out.push({ id: card.id, identifier: card.identifier, action: "escalate-crash", releaseClaim: cfg.claim, target, staleMin: cfg.staleMin, count: priorReaps + 1 });
     } else {
-      out.push({ id: card.id, identifier: card.identifier, action: "reap", releaseClaim: cfg.claim });
+      out.push({ id: card.id, identifier: card.identifier, action: "reap", releaseClaim: cfg.claim, target, staleMin: cfg.staleMin });
     }
   }
   return out;
@@ -703,9 +724,13 @@ export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } =
 export function foreignClaimReleases(cards, now, ownClaim = null, claims = ALL_CLAIMS, staleMin = MAX_STALE_MIN) {
   const out = [];
   for (const card of cards) {
-    if (heartbeatAgeMin(card, now) <= staleMin) continue; // a live run may be mid-transition
-    const releaseClaims = claims.filter((c) => c !== ownClaim && hasLabel(card, c));
-    if (releaseClaims.length) out.push({ id: card.id, identifier: card.identifier, action: "reap-orphan", releaseClaims });
+    const releases = claims.filter((claim) => claim !== ownClaim && hasLabel(card, claim)).flatMap((claim) => {
+      const ownership = resolveCardClaim(card, claim);
+      if (ownership.status === "ambiguous" || ownership.status === "unclaimed" || ownership.status === "closed" || ownership.status === "orphan-declaration") return [];
+      if (heartbeatAgeMin(card, now, claim) <= staleMin) return [];
+      return [{ claim, target: ownership.status === "owned" ? ownership.declarationId : "legacy", staleMin }];
+    });
+    if (releases.length) out.push({ id: card.id, identifier: card.identifier, action: "reap-orphan", releaseClaims: releases.map(({ claim }) => claim), releases });
   }
   return out;
 }
@@ -1390,6 +1415,45 @@ export function claimConfirmed(card, cfg, ownership, expectedStates = []) {
   return resolved.status === "owned"
     && resolved.ownerToken === ownership?.ownerToken
     && resolved.declarationId === ownership?.declarationId;
+}
+
+function exactClaimOwner(card, claim, identity) {
+  const ownership = resolveCardClaim(card, claim);
+  return ownership.status === "owned" && ownership.ownerToken === identity?.ownerToken
+    && ownership.declarationId === identity?.claimDeclarationId;
+}
+
+function exactBoundaryVisible(card, claim, { type, target }, excludedCommentIds = new Set()) {
+  if (card?.commentsComplete !== true) return false;
+  return (card.comments || []).some((comment) => {
+    if (excludedCommentIds.has(comment.id)) return false;
+    const marker = parseClaimMarker(comment);
+    if (type === "close") return marker?.type === "close" && marker.claim === claim && marker.declarationId === target;
+    return marker?.type === "reset" && marker.claim === claim && marker.target === target;
+  });
+}
+
+export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
+  fetchClaimCardFn = fetchClaimCard,
+  addCommentFn = addComment,
+  applyLabelEditFn = applyLabelEdit,
+  expectedStates = [],
+} = {}) {
+  if (!card?.id || !cfg?.claim || !identity?.ownerToken || !identity?.claimDeclarationId) return false;
+  const before = await fetchClaimCardFn(apiKey, card.id);
+  if (expectedStates.length && !expectedStates.includes(before.stateName)) return false;
+  if (!exactClaimOwner(before, cfg.claim, identity)) return false;
+  const beforeCommentIds = new Set((before.comments || []).map((comment) => comment.id));
+  await addCommentFn(apiKey, card.id, claimCloseMarker({ claim: cfg.claim, declarationId: identity.claimDeclarationId, reason }));
+  const closed = await fetchClaimCardFn(apiKey, card.id);
+  const ownership = resolveCardClaim(closed, cfg.claim);
+  if (!exactBoundaryVisible(closed, cfg.claim, { type: "close", target: identity.claimDeclarationId }, beforeCommentIds)) {
+    throw new Error("claim close unverified");
+  }
+  if (ownership.status === "owned") return false;
+  if (ownership.status !== "legacy-unowned" && ownership.status !== "closed") throw new Error("claim close unverified");
+  if (hasLabel(closed, cfg.claim)) await applyLabelEditFn(apiKey, closed, { remove: [cfg.claim] });
+  return true;
 }
 
 function sleep(ms) {
@@ -2106,7 +2170,7 @@ function validResumeRecord(value) {
   return Boolean(value && typeof value === "object" && typeof value.sourceWorkspace === "string" && value.sourceWorkspace
     && typeof value.sweep === "string" && value.sweep && typeof value.issueIdentifier === "string" && value.issueIdentifier
     && typeof value.ownerToken === "string" && value.ownerToken && typeof value.worktreePath === "string" && value.worktreePath
-    && (value.claimDeclarationId === undefined || (typeof value.claimDeclarationId === "string" && value.claimDeclarationId))
+    && typeof value.claimDeclarationId === "string" && value.claimDeclarationId
     && typeof value.branch === "string" && value.branch && typeof value.repoEntry === "string" && value.repoEntry
     && typeof value.reason === "string" && value.reason && Number.isFinite(Date.parse(value.nextEligibleAt || ""))
     && Number.isInteger(value.attempts) && value.attempts >= 0);
@@ -2130,7 +2194,8 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
   const get = (pick) => { const state = read(); return state.healthy ? state.entries[resumeKey(pick)] || null : null; };
   const upsert = (record) => {
     if (!validResumeRecord(record)) return null;
-    const state = read(); if (!state.healthy) return null;
+    const current = read();
+    const state = current.healthy ? current : { healthy: true, entries: {} };
     const key = resumeKey(record); const timestamp = new Date(now()).toISOString();
     state.entries[key] = { ...state.entries[key], ...record, createdAt: state.entries[key]?.createdAt || record.createdAt || timestamp, updatedAt: timestamp };
     persist(state); return structuredClone(state.entries[key]);
@@ -2138,7 +2203,7 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
   const clear = (pick) => {
     const state = read(); const key = resumeKey(pick); const entry = state.entries[key];
     if (!state.healthy || !entry || !pick.ownerToken || entry.ownerToken !== pick.ownerToken) return false;
-    if (entry.claimDeclarationId && entry.claimDeclarationId !== pick.claimDeclarationId) return false;
+    if (!pick.claimDeclarationId || entry.claimDeclarationId !== pick.claimDeclarationId) return false;
     delete state.entries[key]; persist(state); return true;
   };
   const due = (pick) => { const entry = get(pick); return entry && Date.parse(entry.nextEligibleAt) <= now() ? entry : null; };
@@ -2148,11 +2213,9 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
     const scoped = card?.sourceWorkspace || card?.sourceAnchorPath || card?.anchorPath;
     const entry = state.healthy ? Object.values(state.entries).find((candidate) => candidate.sweep === sweep && candidate.issueIdentifier === card?.identifier && (!scoped || candidate.sourceWorkspace === scoped)) : null;
     if (!entry || !cfg || !hasLabel(card, cfg.claim)) return null;
-    if (entry.claimDeclarationId) {
-      const ownership = resolveCardClaim(card, cfg.claim);
-      if (ownership.status !== "owned" || ownership.ownerToken !== entry.ownerToken
-          || ownership.declarationId !== entry.claimDeclarationId) return null;
-    } else if (latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
+    const ownership = resolveCardClaim(card, cfg.claim);
+    if (ownership.status !== "owned" || ownership.ownerToken !== entry.ownerToken
+        || ownership.declarationId !== entry.claimDeclarationId) return null;
     return entry;
   };
   return { resumePath, read, get, upsert, clear, due, protectedClaim };
@@ -4403,16 +4466,40 @@ async function applyLabelEdit(apiKey, card, { remove = [], add = {} }) {
   await setIssueLabels(apiKey, card.id, Object.values(card.labelIds));
 }
 
-// Execute a reap/escalate decision: drop the claim label (+ optionally add
-// blocked:needs-user) and post the audit comment.
-async function executeReap(apiKey, card, decision, labelMap, sweep) {
+export async function resetStaleClaimBoundary(apiKey, card, claim, target, staleMin, now, {
+  fetchClaimCardFn = fetchClaimCard,
+  addCommentFn = addComment,
+} = {}) {
+  const before = await fetchClaimCardFn(apiKey, card.id);
+  const ownership = resolveCardClaim(before, claim);
+  const exact = target === "legacy"
+    ? ownership.status === "legacy-unowned"
+    : ownership.status === "owned" && ownership.declarationId === target;
+  if (!exact || !Number.isFinite(staleMin) || heartbeatAgeMin(before, now, claim) <= staleMin) return null;
+  const beforeCommentIds = new Set((before.comments || []).map((comment) => comment.id));
+  const reason = target === "legacy" ? "legacy" : "orphan-declaration";
+  await addCommentFn(apiKey, card.id, claimResetMarker({ claim, target, reason }));
+  const reset = await fetchClaimCardFn(apiKey, card.id);
+  if (!exactBoundaryVisible(reset, claim, { type: "reset", target }, beforeCommentIds)) throw new Error("claim reset unverified");
+  const after = resolveCardClaim(reset, claim);
+  if (after.status === "owned") return null;
+  if (after.status !== "legacy-unowned" && after.status !== "closed") throw new Error("claim reset unverified");
+  return reset;
+}
+
+// Execute a reap/escalate decision: reset the exact stale epoch, then drop the
+// claim label (+ optionally add blocked:needs-user) and post the audit comment.
+async function executeReap(apiKey, card, decision, labelMap, sweep, now = Date.now()) {
+  const reset = await resetStaleClaimBoundary(apiKey, card, decision.releaseClaim, decision.target, decision.staleMin, now);
+  if (!reset) return false;
   if (decision.action === "escalate-crash" && labelMap["blocked:needs-user"]) {
-    await applyLabelEdit(apiKey, card, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
+    await applyLabelEdit(apiKey, reset, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
     await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` and set **blocked:needs-user** — the ${sweep} sweep has stranded this card ${decision.count}× (the runtime likely keeps dying on it). Needs a human before it retries.`);
   } else {
-    await applyLabelEdit(apiKey, card, { remove: [decision.releaseClaim] });
+    await applyLabelEdit(apiKey, reset, { remove: [decision.releaseClaim] });
     await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
   }
+  return true;
 }
 
 export async function recordConfirmedReapEvidence({ apiKey, sourceAnchorPath, config, repoPairs, card, decision, sweep }, {
@@ -4808,10 +4895,16 @@ export function formatDoctorReport(report) {
 // Release orphaned/foreign claims (all of a card's, in one write) — no escalation;
 // the card advanced and the owning sweep just crashed before dropping its claim.
 // Uses ORPHAN_TAG (not REAPER_TAG) so it does not inflate the crash-escalation count.
-async function executeOrphanReap(apiKey, card, decision) {
-  await applyLabelEdit(apiKey, card, { remove: decision.releaseClaims });
+async function executeOrphanReap(apiKey, card, decision, now = Date.now()) {
+  let reset = card;
+  for (const release of decision.releases || []) {
+    reset = await resetStaleClaimBoundary(apiKey, reset, release.claim, release.target, release.staleMin, now);
+    if (!reset) return false;
+  }
+  await applyLabelEdit(apiKey, reset, { remove: decision.releaseClaims });
   const list = decision.releaseClaims.map((c) => `\`${c}\``).join(", ");
   await addComment(apiKey, card.id, `${ORPHAN_TAG} Auto-released orphaned claim(s) ${list} — stale heartbeat in a state their owning sweep does not run; the prior run likely crashed after advancing the card but before dropping its claim.`);
+  return true;
 }
 
 export async function recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath, config, repoPairs, card, decision, sweep = "launcher" }, {
@@ -5010,16 +5103,19 @@ export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
   fetchClaimCardFn = fetchClaimCard,
   applyLabelEditFn = applyLabelEdit,
   addCommentFn = addComment,
+  addAuditCommentFn = addCommentFn,
   expectedStates = [],
 } = {}) {
   const cfg = SWEEP_CFG[pick.sweep];
-  if (!cfg || !pick.issueId || !pick.ownerToken) return false;
-  const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
-  if (expectedStates.length && !expectedStates.includes(fresh.stateName)) return false;
-  if (!hasLabel(fresh, cfg.claim)) return false;
-  if (latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
-  await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
-  await addCommentFn(apiKey, fresh.id, `${ORPHAN_TAG} Released launcher-owned \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Eligible for retry/backfill.`);
+  if (!cfg || !pick.issueId || !pick.ownerToken || !pick.claimDeclarationId) return false;
+  const released = await closeOwnedClaim(apiKey, { id: pick.issueId }, cfg, pick, "released", {
+    fetchClaimCardFn,
+    applyLabelEditFn,
+    addCommentFn,
+    expectedStates,
+  });
+  if (!released) return false;
+  await addAuditCommentFn(apiKey, pick.issueId, `${ORPHAN_TAG} Released launcher-owned \`${cfg.claim}\` for ${pick.issueIdentifier} — ${reason}. Eligible for retry/backfill.`);
   return true;
 }
 
@@ -5081,8 +5177,9 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
         attempts: 0,
       });
       if (!record) return { attempted: true, released: false, reasonKind: "resume-store-unavailable" };
-      const marker = `${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}] Preserved local worktree for ${pick.issueIdentifier}; ${record.reason}. Resume eligible ${eligible}.`;
-      const prior = (fresh.comments || []).find((comment) => (comment.body || "").includes(`${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}]`));
+      const markerPrefix = `${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim} declaration=${pick.claimDeclarationId}]`;
+      const marker = `${markerPrefix} Preserved local worktree for ${pick.issueIdentifier}; ${record.reason}. Resume eligible ${eligible}.`;
+      const prior = (fresh.comments || []).find((comment) => (comment.body || "").includes(markerPrefix));
       if (prior?.id) await updateCommentFn(apiKey, prior.id, marker);
       else if (!prior) await addCommentFn(apiKey, fresh.id, marker);
       return { attempted: true, released: false, reasonKind: "resume-needed", record };
@@ -6497,11 +6594,12 @@ async function tick({ dryRun = false } = {}) {
           });
           const protectedReaps = reapActions.filter((decision) => decision.action === "protect-resume");
           const reaps = reapActions.filter((decision) => decision.action !== "protect-resume");
+          const appliedReaps = dryRun ? reaps : [];
           if (!dryRun) {
             for (const decision of protectedReaps) {
               const card = cards.find((candidate) => candidate.id === decision.id);
               try {
-                await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=${decision.ownerToken} claim=${cfg.claim}] Preserved resume-needed worktree remains protected on this host.`);
+                await addComment(apiKey, card.id, claimHeartbeatMarker({ claim: cfg.claim, declarationId: decision.claimDeclarationId, at: new Date(now).toISOString() }));
                 logFor(anchorPath, sweep, `protect-resume ${decision.identifier}`);
               } catch (error) { recordFailure(sweep, "resume-heartbeat", decision.identifier, error.message); }
             }
@@ -6516,7 +6614,9 @@ async function tick({ dryRun = false } = {}) {
             if (labelMap) {
               for (const d of reaps) { try {
                 const card = cards.find((c) => c.id === d.id);
-                await executeReap(apiKey, card, d, labelMap, sweep);
+                const released = await executeReap(apiKey, card, d, labelMap, sweep, now);
+                if (!released) continue;
+                appliedReaps.push(d);
                 await recordConfirmedReapEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep });
                 logFor(anchorPath, sweep, `${d.action} ${d.identifier}`);
               } catch (e) { logFor(anchorPath, sweep, `reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "reap", d.identifier, e.message); } }
@@ -6527,7 +6627,7 @@ async function tick({ dryRun = false } = {}) {
           }
           // Reflect the decisions in memory so the count is correct: a reaped card
           // becomes actionable, an escalated (crash or bounce) card is now blocked.
-          applyDecisionsInMemory(cards, reaps, bounces);
+          applyDecisionsInMemory(cards, appliedReaps, bounces);
           // Release FOREIGN stale claims stranded in this sweep's states — a sweep's
           // own reaper handles only its cfg.claim, so e.g. a ship:in-progress dragged
           // into "QA" would otherwise leak forever. Reuses the fetched cards
@@ -6536,7 +6636,8 @@ async function tick({ dryRun = false } = {}) {
           if (!dryRun && foreign.length) {
             for (const d of foreign) { try {
               const card = cards.find((c) => c.id === d.id);
-              await executeOrphanReap(apiKey, card, d);
+              const released = await executeOrphanReap(apiKey, card, d, now);
+              if (!released) continue;
               await recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep });
               logFor(anchorPath, sweep, `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`);
             } catch (e) { logFor(anchorPath, sweep, `orphan reap error ${d.identifier}: ${e.message}`); recordFailure(sweep, "orphan-reap", d.identifier, e.message); } }
@@ -6566,15 +6667,13 @@ async function tick({ dryRun = false } = {}) {
             // machine-local proof: matching live claim plus a dirty deterministic
             // worktree. Never attempt cleanup or release in this discovery path.
             if (!resumeStore.get(resumePickKey) && sweep === "dev" && hasLabel(card, cfg.claim)) {
-              const owner = latestHeartbeatOwner(card, cfg.claim);
               const ownership = resolveCardClaim(card, cfg.claim);
-              const claimDeclarationId = ownership.status === "owned" && ownership.ownerToken === owner
-                ? ownership.declarationId : undefined;
-              const worktreePath = cardWorktreePath(anchorPath, config, card.identifier);
+              const routedRecovery = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+              const worktreePath = routedRecovery && cardWorktreePath(anchorPath, config, card.identifier, routedRecovery.repoRoute);
               const dirty = dirtyCheckoutEvent({ sweep, worktreePath, issueIdentifier: card.identifier }, { role: "worktree", path: worktreePath });
-              if (owner && dirty?.kind === "dirty-checkout") resumeStore.upsert({
-                ...resumePickKey, issueId: card.id, ownerToken: owner, claimDeclarationId, worktreePath, branch: card.identifier,
-                repoEntry: ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(now).toISOString(), attempts: 0,
+              if (ownership.status === "owned" && dirty?.kind === "dirty-checkout") resumeStore.upsert({
+                ...resumePickKey, issueId: card.id, ownerToken: ownership.ownerToken, claimDeclarationId: ownership.declarationId, worktreePath, branch: card.identifier,
+                repoEntry: routedRecovery.repoRoute?.repoEntry || ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(now).toISOString(), attempts: 0,
               });
             }
             const record = resumeStore.due(resumePickKey);
@@ -6650,7 +6749,8 @@ async function tick({ dryRun = false } = {}) {
           if (!dryRun) {
             for (const d of orphans) { try {
               const card = held.find((c) => c.id === d.id);
-              await executeOrphanReap(apiKey, card, d);
+              const released = await executeOrphanReap(apiKey, card, d, now);
+              if (!released) continue;
               await recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath: active.sourceAnchorPath, config, repoPairs: active.repoPairs, card, decision: d, sweep: "holding" });
               logFor(anchorPath, "_", `reap-orphan ${d.releaseClaims.join(",")} ${d.identifier}`);
             } catch (e) { logFor(anchorPath, "_", `orphan reap error ${d.identifier}: ${e.message}`); recordFailure("holding", "orphan-reap", d.identifier, e.message); } }

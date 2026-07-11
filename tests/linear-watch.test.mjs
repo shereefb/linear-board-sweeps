@@ -10,7 +10,7 @@ import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
-import { claimCloseMarker, claimDeclarationMarker } from "../scripts/claim-ownership.mjs";
+import { claimCloseMarker, claimDeclarationMarker, claimHeartbeatMarker, claimResetMarker, resolveClaimOwnership } from "../scripts/claim-ownership.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -57,7 +57,7 @@ import {
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
-  createResumeStore, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
+  createResumeStore, successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim, RESUME_STATE_VERSION,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
 
@@ -166,11 +166,30 @@ test("resume store: persists only a valid exact record and protects its matching
   assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner-210" }), false);
   assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner-210", claimDeclarationId: "decl-210" }), true);
   const legacy = store.upsert({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-211", issueId: "id-211", ownerToken: "legacy-owner", worktreePath: "/managed/.worktrees/SAF-211", branch: "SAF-211", repoEntry: ".", reason: "legacy dirty", nextEligibleAt: new Date(now).toISOString(), attempts: 0 });
-  assert.equal(legacy.claimDeclarationId, undefined);
-  assert.equal(store.protectedClaim({ identifier: "SAF-211", labelNames: ["dev:in-progress"], comments: [
-    { body: `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=legacy-owner claim=dev:in-progress]`, createdAt: new Date(now).toISOString() },
-  ] }, SWEEP_CFG.dev, now).ownerToken, "legacy-owner");
+  assert.equal(legacy, null);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("resume store: v2 requires declaration identity and v1 fails closed", () => {
+  assert.equal(RESUME_STATE_VERSION, 2);
+  const base = { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "COD-169", issueId: "id", ownerToken: "owner", worktreePath: "/managed/.worktrees/COD-169", branch: "COD-169", repoEntry: ".", reason: "dirty", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  const v1 = createResumeStore({ readJsonFn: () => ({ version: 1, entries: { legacy: { ...base, claimDeclarationId: "decl" } } }) });
+  assert.deepEqual(v1.read(), { healthy: false, entries: {} });
+  const missingDeclaration = createResumeStore({ readJsonFn: () => ({ version: 2, entries: { bad: base } }) });
+  assert.deepEqual(missingDeclaration.read(), { healthy: false, entries: {} });
+});
+
+test("resume store: exact v2 rediscovery can replace an unreadable v1 store", () => {
+  let persisted = null;
+  const record = { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "COD-169", issueId: "id", ownerToken: "owner", claimDeclarationId: "decl", worktreePath: "/managed/.worktrees/COD-169", branch: "COD-169", repoEntry: ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  const store = createResumeStore({
+    readJsonFn: () => persisted || { version: 1, entries: { legacy: { ...record, claimDeclarationId: undefined } } },
+    writeJsonFn: (_path, value) => { persisted = value; },
+    now: () => NOW,
+  });
+  assert.equal(store.get(record), null);
+  assert.equal(store.upsert(record).claimDeclarationId, "decl");
+  assert.equal(persisted.version, 2);
 });
 
 test("same-state recovery: dirty and unpushed work preserves the claim, only clean pushed work releases", () => {
@@ -1426,6 +1445,36 @@ test("heartbeatAgeMin: falls back to updatedAt when no heartbeat present", () =>
   const card = { updatedAt: minsAgo(45), comments: [{ body: "just a normal comment", createdAt: minsAgo(10) }] };
   assert.ok(Math.abs(heartbeatAgeMin(card, NOW) - 45) < 0.5);
 });
+
+test("heartbeatAgeMin: declared claim falls back to declaration time and ignores a delayed old heartbeat", () => {
+  const card = {
+    updatedAt: minsAgo(1),
+    labelNames: ["dev:in-progress"],
+    commentsComplete: true,
+    comments: [
+      { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "old", declarationId: "old-decl" }), createdAt: minsAgo(300) },
+      { id: "c2", body: claimCloseMarker({ claim: "dev:in-progress", declarationId: "old-decl", reason: "released" }), createdAt: minsAgo(250) },
+      { id: "c3", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "new", declarationId: "new-decl" }), createdAt: minsAgo(45) },
+      { id: "c4", body: claimHeartbeatMarker({ claim: "dev:in-progress", declarationId: "old-decl", at: minsAgo(1) }), createdAt: minsAgo(1) },
+    ],
+  };
+  assert.ok(Math.abs(heartbeatAgeMin(card, NOW, "dev:in-progress") - 45) < 0.5);
+});
+test("heartbeatAgeMin: stranded closed label ages from its boundary and ignores delayed old heartbeat", () => {
+  const card = { updatedAt: minsAgo(1), labelNames: ["qa:in-progress"], commentsComplete: true, comments: [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) },
+    { id: "c2", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "released" }), createdAt: minsAgo(200) },
+    { id: "c3", body: claimHeartbeatMarker({ claim: "qa:in-progress", declarationId: "decl", at: minsAgo(1) }), createdAt: minsAgo(1) },
+  ] };
+  assert.ok(Math.abs(heartbeatAgeMin(card, NOW, "qa:in-progress") - 200) < 0.5);
+});
+test("heartbeatAgeMin: ambiguous declared history fails closed as live", () => {
+  const card = dependencyReadyCard({ id: "bad", stateName: "Dev", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
+    { id: "c1", body: "[auto-sweep-claim v1 claim=dev:in-progress broken]", createdAt: minsAgo(300) },
+  ] });
+  assert.equal(heartbeatAgeMin(card, NOW, "dev:in-progress"), Number.NEGATIVE_INFINITY);
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
+});
 test("countMarkers: only counts markers inside the rolling window", () => {
   const card = { comments: [
     { body: REAPER_TAG, createdAt: hoursAgo(1) },
@@ -1439,16 +1488,30 @@ test("countMarkers: only counts markers inside the rolling window", () => {
 const claimed = (over, extra = {}) => ({
   id: "i1", identifier: "COD-1", updatedAt: minsAgo(over ? 200 : 2),
   labelNames: ["dev:in-progress", ...(extra.labels || [])],
+  commentsComplete: true,
   comments: extra.comments || [],
 });
 test("reapDecisions: fresh heartbeat is not reaped", () => {
-  const card = { id: "i", identifier: "COD-1", updatedAt: minsAgo(2), labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(2)}]`, createdAt: minsAgo(2) }] };
+  const card = { id: "i", identifier: "COD-1", updatedAt: minsAgo(2), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(2)}]`, createdAt: minsAgo(2) }] };
   assert.deepEqual(reapDecisions([card], SWEEP_CFG.dev, NOW), []);
 });
 test("reapDecisions: stale claim with no prior reaps is reaped", () => {
   const d = reapDecisions([claimed(true)], SWEEP_CFG.dev, NOW);
   assert.equal(d.length, 1);
   assert.equal(d[0].action, "reap");
+});
+
+test("reapDecisions: targets the exact stale declaration and resume protection must match it", () => {
+  const card = {
+    id: "declared", identifier: "COD-169", updatedAt: minsAgo(1), labelNames: ["dev:in-progress"], commentsComplete: true,
+    comments: [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) }],
+  };
+  assert.deepEqual(reapDecisions([card], SWEEP_CFG.dev, NOW, {
+    protectedClaim: () => ({ ownerToken: "owner", claimDeclarationId: "other" }),
+  })[0].target, "decl");
+  assert.equal(reapDecisions([card], SWEEP_CFG.dev, NOW, {
+    protectedClaim: () => ({ ownerToken: "owner", claimDeclarationId: "decl" }),
+  })[0].action, "protect-resume");
 });
 test("reapDecisions: escalates to blocked after the 3rd reap within window", () => {
   const card = claimed(true, { comments: [
@@ -1637,8 +1700,8 @@ test("bounded dependency cycles: an acyclic active-queue chain has no anomaly", 
 });
 test("applyDecisionsInMemory: a reaped card becomes actionable; an escalated card does NOT", () => {
   // Two stale-claim cards: one plain reap, one hitting the 3rd reap (escalate-crash).
-  const reapCard = dependencyReadyCard({ id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
-  const escCard = dependencyReadyCard({ id: "e", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [
+  const reapCard = dependencyReadyCard({ id: "r", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [] });
+  const escCard = dependencyReadyCard({ id: "e", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
     { body: REAPER_TAG, createdAt: hoursAgo(2) }, { body: REAPER_TAG, createdAt: hoursAgo(4) } ] });
   const cards = [reapCard, escCard];
   const reaps = reapDecisions(cards, SWEEP_CFG.dev, NOW);
@@ -3505,15 +3568,6 @@ test("claimCardSlots: declaration precedes label and exact declaration reaches t
   assert.deepEqual(calls, ["declaration", "label", "winner-read", "compatibility-heartbeat", "final-read"]);
   assert.equal(claimed[0].claimDeclarationId, "decl-winner");
   assert.equal(latestHeartbeatOwner(claimed[0].card, "dev:in-progress"), claimed[0].ownerToken);
-  const releaseEdits = [];
-  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", {
-    sweep: "dev", issueId: card.id, issueIdentifier: card.identifier, ownerToken: claimed[0].ownerToken,
-  }, "staged compatibility", {
-    fetchClaimCardFn: async () => claimed[0].card,
-    applyLabelEditFn: async (_key, _fresh, edit) => releaseEdits.push(edit),
-    addCommentFn: async () => {},
-  }), true);
-  assert.deepEqual(releaseEdits, [{ remove: ["dev:in-progress"] }]);
 });
 test("claimCardSlots: only the first declaration wins and a loser never removes the shared label", async () => {
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
@@ -3796,39 +3850,143 @@ test("claimCardSlots: another declaration owner is preserved after an acquisitio
 test("releaseOwnedDispatchClaim: dependency deferral removes only the matching owned claim", async () => {
   assert.equal(typeof watchModule.releaseOwnedDispatchClaim, "function");
   const edits = [];
-  const fresh = {
+  const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner-91", declarationId: "decl-91" }), createdAt: claimIso(1) }];
+  const fresh = () => ({
     id: "issue-91", identifier: "COD-91", labelNames: ["dev:in-progress"],
-    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-91 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
-  };
+    commentsComplete: true, comments: [...comments],
+  });
   const released = await watchModule.releaseOwnedDispatchClaim("key", {
-    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "owner-91",
+    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "owner-91", claimDeclarationId: "decl-91",
   }, "dependency preflight deferred material work", {
-    fetchClaimCardFn: async () => fresh,
+    fetchClaimCardFn: async () => fresh(),
     applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
-    addCommentFn: async () => {},
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "c2", body, createdAt: claimIso(2) }),
   });
   assert.equal(released, true);
   assert.deepEqual(edits, [{ remove: ["dev:in-progress"] }]);
 
   assert.equal(await watchModule.releaseOwnedDispatchClaim("key", {
-    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "other-owner",
-  }, "dependency deferred", { fetchClaimCardFn: async () => fresh }), false);
+    sweep: "dev", issueId: "issue-91", issueIdentifier: "COD-91", ownerToken: "other-owner", claimDeclarationId: "other-decl",
+  }, "dependency deferred", { fetchClaimCardFn: async () => fresh() }), false);
+});
+
+test("releaseOwnedDispatchClaim: closes and verifies the exact epoch before removing the label", async () => {
+  const calls = [];
+  const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: claimIso(1) }];
+  const card = () => ({ id: "issue", identifier: "COD-169", stateName: "Dev", labelNames: ["dev:in-progress"], labelIds: { "dev:in-progress": "label" }, commentsComplete: true, comments: [...comments] });
+  const released = await watchModule.releaseOwnedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue", issueIdentifier: "COD-169", ownerToken: "owner", claimDeclarationId: "decl",
+  }, "dependency preflight deferred material work", {
+    fetchClaimCardFn: async () => { calls.push("fetch"); return card(); },
+    addCommentFn: async (_key, _id, body) => { calls.push("comment-close"); comments.push({ id: "c2", body, createdAt: claimIso(2) }); },
+    applyLabelEditFn: async () => calls.push("label-remove"),
+    addAuditCommentFn: async () => calls.push("comment-audit"),
+  });
+  assert.equal(released, true);
+  assert.deepEqual(calls, ["fetch", "comment-close", "fetch", "label-remove", "comment-audit"]);
+});
+
+test("releaseOwnedDispatchClaim: a stale child cannot release a newer declaration", async () => {
+  let removals = 0;
+  const fresh = {
+    id: "issue", identifier: "COD-169", stateName: "Dev", labelNames: ["dev:in-progress"], commentsComplete: true,
+    comments: [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "new", declarationId: "new-decl" }), createdAt: claimIso(1) }],
+  };
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue", issueIdentifier: "COD-169", ownerToken: "old", claimDeclarationId: "old-decl",
+  }, "late", { fetchClaimCardFn: async () => fresh, applyLabelEditFn: async () => { removals += 1; } }), false);
+  assert.equal(removals, 0);
+});
+
+test("closeOwnedClaim: close write and verification failures never mutate the label", async () => {
+  const identity = { ownerToken: "owner", claimDeclarationId: "decl" };
+  const cfg = SWEEP_CFG.dev;
+  const active = { id: "issue", labelNames: [cfg.claim], commentsComplete: true, comments: [
+    { id: "c1", body: claimDeclarationMarker({ claim: cfg.claim, ownerToken: "owner", declarationId: "decl" }), createdAt: claimIso(1) },
+  ] };
+  let edits = 0;
+  await assert.rejects(closeOwnedClaim("key", active, cfg, identity, "failed", {
+    fetchClaimCardFn: async () => active,
+    addCommentFn: async () => { throw new Error("close unavailable"); },
+    applyLabelEditFn: async () => { edits += 1; },
+  }), /close unavailable/);
+  await assert.rejects(closeOwnedClaim("key", active, cfg, identity, "failed", {
+    fetchClaimCardFn: async () => active,
+    addCommentFn: async () => {},
+    applyLabelEditFn: async () => { edits += 1; },
+  }), /close unverified/);
+  assert.equal(edits, 0);
+});
+
+test("administrative reset: exact stale declaration is reset and verified before mutation may continue", async () => {
+  assert.equal(typeof watchModule.resetStaleClaimBoundary, "function");
+  const calls = [];
+  const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) }];
+  const card = () => ({ id: "issue", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [...comments] });
+  const reset = await watchModule.resetStaleClaimBoundary("key", card(), "dev:in-progress", "decl", 45, NOW, {
+    fetchClaimCardFn: async () => { calls.push("fetch"); return card(); },
+    addCommentFn: async (_key, _id, body) => { calls.push("comment-reset"); comments.push({ id: "c2", body, createdAt: minsAgo(1) }); },
+  });
+  calls.push("mutation-ready");
+  assert.ok(reset);
+  assert.deepEqual(calls, ["fetch", "comment-reset", "fetch", "mutation-ready"]);
+});
+
+test("administrative reset: refreshed, newer, duplicate, and unverified targets fail closed", async () => {
+  const old = { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "old", declarationId: "old-decl" }), createdAt: minsAgo(300) };
+  const freshBeat = { id: "c2", body: claimHeartbeatMarker({ claim: "dev:in-progress", declarationId: "old-decl", at: minsAgo(1) }), createdAt: minsAgo(1) };
+  let writes = 0;
+  assert.equal(await watchModule.resetStaleClaimBoundary("key", { id: "issue" }, "dev:in-progress", "old-decl", 45, NOW, {
+    fetchClaimCardFn: async () => ({ id: "issue", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [old, freshBeat] }),
+    addCommentFn: async () => { writes += 1; },
+  }), null);
+  const newer = { id: "c3", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "new", declarationId: "new-decl" }), createdAt: minsAgo(100) };
+  const resetOld = { id: "c2", body: claimResetMarker({ claim: "dev:in-progress", target: "old-decl", reason: "orphan-declaration" }), createdAt: minsAgo(200) };
+  assert.equal(await watchModule.resetStaleClaimBoundary("key", { id: "issue" }, "dev:in-progress", "old-decl", 45, NOW, {
+    fetchClaimCardFn: async () => ({ id: "issue", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [old, resetOld, newer] }),
+    addCommentFn: async () => { writes += 1; },
+  }), null);
+  await assert.rejects(watchModule.resetStaleClaimBoundary("key", { id: "issue" }, "dev:in-progress", "old-decl", 45, NOW, {
+    fetchClaimCardFn: async () => ({ id: "issue", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [old] }),
+    addCommentFn: async () => { writes += 1; },
+  }), /reset unverified/);
+  const priorLegacyReset = { id: "c0", body: claimResetMarker({ claim: "dev:in-progress", target: "legacy", reason: "legacy" }), createdAt: minsAgo(300) };
+  await assert.rejects(watchModule.resetStaleClaimBoundary("key", { id: "issue" }, "dev:in-progress", "legacy", 45, NOW, {
+    fetchClaimCardFn: async () => ({ id: "issue", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [priorLegacyReset] }),
+    addCommentFn: async () => { writes += 1; },
+  }), /reset unverified/);
+  assert.equal(writes, 2);
+});
+
+test("administrative reset: a stranded label after an exact close is cleaned through a verified legacy boundary", async () => {
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) },
+    { id: "c2", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "released" }), createdAt: minsAgo(250) },
+  ];
+  const card = () => ({ id: "issue", updatedAt: minsAgo(240), labelNames: ["qa:in-progress"], commentsComplete: true, comments: [...comments] });
+  const reset = await watchModule.resetStaleClaimBoundary("key", card(), "qa:in-progress", "legacy", 120, NOW, {
+    fetchClaimCardFn: async () => card(),
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "c3", body, createdAt: minsAgo(1) }),
+  });
+  assert.ok(reset);
+  assert.equal(resolveClaimOwnership({ comments: reset.comments, complete: true, claim: "qa:in-progress", labelPresent: true }).status, "legacy-unowned");
 });
 test("releaseOwnedDispatchClaim: successful completion only releases a claim while the card remains in the completed sweep", async () => {
   const edits = [];
+  const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner-141", declarationId: "decl-141" }), createdAt: claimIso(1) }];
   const base = {
     id: "issue-141",
     identifier: "COD-141",
     labelNames: ["dev:in-progress"],
-    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-141 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    commentsComplete: true, comments,
   };
-  const pick = { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" };
+  const pick = { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141", claimDeclarationId: "decl-141" };
 
   assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child stopped in Dev", {
     expectedStates: ["Dev"],
-    fetchClaimCardFn: async () => ({ ...base, stateName: "Dev" }),
+    fetchClaimCardFn: async () => ({ ...base, comments: [...comments], stateName: "Dev" }),
     applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
-    addCommentFn: async () => {},
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "c2", body, createdAt: claimIso(2) }),
   }), true);
   assert.deepEqual(edits, [{ remove: ["dev:in-progress"] }]);
 
@@ -3838,6 +3996,19 @@ test("releaseOwnedDispatchClaim: successful completion only releases a claim whi
     applyLabelEditFn: async () => { throw new Error("advanced claims must be left to the child/holding-state cleanup"); },
     addCommentFn: async () => {},
   }), false);
+});
+test("releaseOwnedDispatchClaim: same-state release rechecks state with the ownership proof", async () => {
+  const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: claimIso(1) }];
+  let reads = 0;
+  const pick = { sweep: "dev", issueId: "issue", issueIdentifier: "COD-169", ownerToken: "owner", claimDeclarationId: "decl" };
+  assert.equal(await watchModule.releaseOwnedDispatchClaim("key", pick, "successful child", {
+    expectedStates: ["Dev"],
+    fetchClaimCardFn: async () => { reads += 1; return { id: "issue", stateName: "Dev", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [...comments] }; },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "c2", body, createdAt: claimIso(2) }),
+    addAuditCommentFn: async () => {},
+    applyLabelEditFn: async () => {},
+  }), true);
+  assert.equal(reads, 2);
 });
 test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
   assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
@@ -4922,8 +5093,9 @@ test("selectDispatchBatch: Ship preserves cross-workspace repository collision s
 
 // ── foreign / orphaned-claim reaper ──────────────────────────────────────────
 test("foreignClaimReleases: releases a stale orphaned claim; a fresh heartbeat is spared", () => {
-  const stale = { id: "s", identifier: "COD-7", updatedAt: minsAgo(300), labelNames: ["qa:in-progress"], comments: [] };
+  const stale = { id: "s", identifier: "COD-7", updatedAt: minsAgo(300), labelNames: ["qa:in-progress"], commentsComplete: true, comments: [] };
   const fresh = { id: "f", identifier: "COD-8", updatedAt: minsAgo(1), labelNames: ["qa:in-progress"],
+    commentsComplete: true,
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)}]`, createdAt: minsAgo(1) }] };
   const d = foreignClaimReleases([stale, fresh], NOW);
   assert.equal(d.length, 1);
@@ -4934,18 +5106,18 @@ test("foreignClaimReleases: releases a stale orphaned claim; a fresh heartbeat i
 test("foreignClaimReleases: batches TWO stale claims on one card into a single decision (no clobber)", () => {
   // The bug the batching fixes: releasing per-claim with full-set overwrites
   // re-added an earlier removal. One decision → one write → both cleared.
-  const card = { id: "m", identifier: "COD-10", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], comments: [] };
+  const card = { id: "m", identifier: "COD-10", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], commentsComplete: true, comments: [] };
   const d = foreignClaimReleases([card], NOW);
   assert.equal(d.length, 1);
   assert.deepEqual([...d[0].releaseClaims].sort(), ["qa:in-progress", "ship:in-progress"]);
 });
 test("foreignClaimReleases: excludes ownClaim so the sweep's own reaper (with escalation) handles it", () => {
-  const card = { id: "o", identifier: "COD-11", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], comments: [] };
+  const card = { id: "o", identifier: "COD-11", updatedAt: minsAgo(300), labelNames: ["qa:in-progress", "ship:in-progress"], commentsComplete: true, comments: [] };
   const d = foreignClaimReleases([card], NOW, "qa:in-progress"); // processing the qa sweep's QA cards
   assert.deepEqual(d[0].releaseClaims, ["ship:in-progress"]); // only the foreign ship claim, not qa's own
 });
 test("foreignClaimReleases: an unclaimed card is ignored; holding-state constants sane", () => {
-  const card = { id: "u", identifier: "COD-9", updatedAt: minsAgo(300), labelNames: [], comments: [] };
+  const card = { id: "u", identifier: "COD-9", updatedAt: minsAgo(300), labelNames: [], commentsComplete: true, comments: [] };
   assert.deepEqual(foreignClaimReleases([card], NOW), []);
   assert.deepEqual(HOLDING_STATES, ["Signoff"]); // the state qa lands in but no sweep fetches
   assert.deepEqual(LEGACY_CLEANUP_STATES, ["In Progress"]); // retired dev state still gets orphan cleanup
@@ -4953,10 +5125,19 @@ test("foreignClaimReleases: an unclaimed card is ignored; holding-state constant
   assert.equal(MAX_STALE_MIN, 120);
 });
 test("foreignClaimReleases: stale dev claim in legacy In Progress is released by cleanup pass", () => {
-  const card = { id: "legacy", identifier: "COD-99", state: { name: "In Progress" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] };
+  const card = { id: "legacy", identifier: "COD-99", state: { name: "In Progress" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [] };
   const d = foreignClaimReleases([card], NOW);
   assert.equal(d.length, 1);
   assert.deepEqual(d[0].releaseClaims, ["dev:in-progress"]);
+});
+
+test("foreignClaimReleases: a stale stranded label after an exact close is cleanup-ready", () => {
+  const card = { id: "closed", identifier: "COD-169", updatedAt: minsAgo(1), labelNames: ["qa:in-progress"], commentsComplete: true, comments: [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) },
+    { id: "c2", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "released" }), createdAt: minsAgo(200) },
+  ] };
+  const [decision] = foreignClaimReleases([card], NOW);
+  assert.deepEqual(decision.releases, [{ claim: "qa:in-progress", target: "legacy", staleMin: 120 }]);
 });
 
 // ── env parsing ──────────────────────────────────────────────────────────────
