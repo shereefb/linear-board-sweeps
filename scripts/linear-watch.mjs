@@ -1436,6 +1436,25 @@ function exactBoundaryVisible(card, claim, { type, target }, excludedCommentIds 
   });
 }
 
+function exactClaimBoundaryAuthority(card, claim, {
+  type,
+  target,
+  boundaryCommentId,
+  reason = null,
+} = {}) {
+  if (card?.commentsComplete !== true || !boundaryCommentId) return false;
+  const ownership = resolveCardClaim(card, claim);
+  if (ownership.status !== (hasLabel(card, claim) ? "legacy-unowned" : "closed")
+      || ownership.boundaryCommentId !== boundaryCommentId) return false;
+  const boundary = (card.comments || []).find((comment) => comment.id === boundaryCommentId);
+  const marker = parseClaimMarker(boundary);
+  if (type === "close") {
+    return marker?.type === "close" && marker.claim === claim
+      && marker.declarationId === target && (!reason || marker.reason === reason);
+  }
+  return marker?.type === "reset" && marker.claim === claim && marker.target === target;
+}
+
 export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
   fetchClaimCardFn = fetchClaimCard,
   addCommentFn = addComment,
@@ -1456,10 +1475,12 @@ export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
   if (ownership.status === "owned") return false;
   if (ownership.status !== "legacy-unowned" && ownership.status !== "closed") throw new Error("claim close unverified");
   const final = await fetchClaimCardFn(apiKey, card.id);
-  const finalOwnership = resolveCardClaim(final, cfg.claim);
-  if (finalOwnership.status === "owned") return false;
-  if ((finalOwnership.status !== "legacy-unowned" && finalOwnership.status !== "closed")
-      || finalOwnership.boundaryCommentId !== ownership.boundaryCommentId) return false;
+  if (!exactClaimBoundaryAuthority(final, cfg.claim, {
+    type: "close",
+    target: identity.claimDeclarationId,
+    boundaryCommentId: ownership.boundaryCommentId,
+    reason,
+  })) return false;
   if (hasLabel(final, cfg.claim)) await applyLabelEditFn(apiKey, final, { remove: [cfg.claim] });
   return true;
 }
@@ -4696,15 +4717,21 @@ export async function executeReap(apiKey, card, decision, labelMap, sweep, now =
     addCommentFn,
   });
   if (!reset) return false;
+  const final = await fetchClaimCardFn(apiKey, card.id);
+  if (!exactClaimBoundaryAuthority(final, decision.releaseClaim, {
+    type: "reset",
+    target: decision.target,
+    boundaryCommentId: reset.claimResetProof?.boundaryCommentId,
+  })) return false;
   if (decision.action === "escalate-crash" && labelMap["blocked:needs-user"]) {
-    await applyLabelEditFn(apiKey, reset, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
-    card.labelIds = { ...reset.labelIds };
-    card.labelNames = [...reset.labelNames];
+    await applyLabelEditFn(apiKey, final, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
+    card.labelIds = { ...final.labelIds };
+    card.labelNames = [...final.labelNames];
     await addAuditCommentFn(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` and set **blocked:needs-user** — the ${sweep} sweep has stranded this card ${decision.count}× (the runtime likely keeps dying on it). Needs a human before it retries.`);
   } else {
-    await applyLabelEditFn(apiKey, reset, { remove: [decision.releaseClaim] });
-    card.labelIds = { ...reset.labelIds };
-    card.labelNames = [...reset.labelNames];
+    await applyLabelEditFn(apiKey, final, { remove: [decision.releaseClaim] });
+    card.labelIds = { ...final.labelIds };
+    card.labelNames = [...final.labelNames];
     await addAuditCommentFn(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
   }
   return true;
@@ -5231,18 +5258,25 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       await addCommentFn(apiKey, card.id, claimCloseMarker({ claim: cfg.claim, declarationId, reason: "failed" }));
       const closed = await fetchCardFn(apiKey, card.id);
       const closedOwnership = resolveCardClaim(closed, cfg.claim);
-      const exactClose = closed.commentsComplete === true && (closed.comments || []).some((comment) => {
+      const closeBoundary = closed.commentsComplete === true && (closed.comments || []).find((comment) => {
         const marker = parseClaimMarker(comment);
         return marker?.type === "close" && marker.claim === cfg.claim
           && marker.declarationId === declarationId && marker.reason === "failed";
       });
-      const closedExactly = exactClose && (hasLabel(closed, cfg.claim)
+      const closedExactly = closeBoundary && (hasLabel(closed, cfg.claim)
         ? closedOwnership.status === "legacy-unowned"
         : closedOwnership.status === "closed");
-      if (exactClose && closedOwnership.status === "owned"
+      if (closeBoundary && closedOwnership.status === "owned"
           && (closedOwnership.ownerToken !== owner || closedOwnership.declarationId !== declarationId)) return false;
       if (!closedExactly) throw safetyError(card, `claim close was not authoritative (${closedOwnership.status}/${closedOwnership.reason})`);
-      if (hasLabel(closed, cfg.claim)) await applyLabelEditFn(apiKey, closed, { remove: [cfg.claim] });
+      const final = await fetchCardFn(apiKey, card.id);
+      if (!exactClaimBoundaryAuthority(final, cfg.claim, {
+        type: "close",
+        target: declarationId,
+        boundaryCommentId: closeBoundary.id,
+        reason: "failed",
+      })) return false;
+      if (hasLabel(final, cfg.claim)) await applyLabelEditFn(apiKey, final, { remove: [cfg.claim] });
       return true;
     };
     try {

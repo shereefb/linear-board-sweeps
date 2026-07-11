@@ -3896,7 +3896,6 @@ test("claimCardSlots: only the first declaration wins and a loser never removes 
   }, {
     declarationTokenFn: () => "decl-loser",
     fetchClaimCardFn: async () => completeUnclaimedCard(card),
-    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async (_key, _id, body) => {
       if (body.startsWith("[auto-sweep-claim ")) ourDeclaration = body;
       else compatibilityHeartbeats += 1;
@@ -4004,6 +4003,30 @@ test("claimCardSlots: a post-claim route race closes then removes only this atte
     { remove: ["dev:in-progress"] },
   ]);
 });
+test("claimCardSlots: a delayed claimant after close verification preserves the shared label", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const comments = [];
+  let reads = 0;
+  let removals = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "our-decl",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
+    sleepFn: async () => {},
+    fetchCardFn: async () => {
+      reads += 1;
+      if (reads === 1) return dependencyReadyCard({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"], commentsComplete: true, comments: [...comments] });
+      if (reads === 3) comments.push({ id: "contender", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: claimIso(3) });
+      return dependencyReadyCard({ ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [...comments] });
+    },
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(reads, 3);
+  assert.equal(removals, 0);
+});
 test("claimCardSlots: a stable routed claim returns the confirmed primary repo", async () => {
   const config = { repos: ["guide"], repoRouting: { byLabel: { "app:guide": "guide" } } };
   const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
@@ -4068,7 +4091,7 @@ test("claimCardSlots: label-write failure closes its orphan declaration without 
     fetchCardFn: async () => { reads += 1; return { ...card, commentsComplete: true, comments: [...comments] }; },
   });
   assert.deepEqual(claimed, []);
-  assert.equal(reads, 2);
+  assert.equal(reads, 3);
   assert.equal(removals, 0);
   assert.equal(comments.at(-1).body, claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-89", reason: "failed" }));
 });
@@ -4292,6 +4315,36 @@ test("executeReap: synchronizes the scheduler card before a same-tick bounce ful
   ]);
   assert.deepEqual(original.labelIds, { feature: "feature-label", "blocked:needs-user": "blocked-label" });
   assert.deepEqual(original.labelNames, ["feature", "blocked:needs-user"]);
+});
+test("executeReap: a delayed claimant after reset verification denies the whole label mutation", async () => {
+  const claim = "dev:in-progress";
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim, ownerToken: "old-owner", declarationId: "old-decl" }), createdAt: minsAgo(300) },
+  ];
+  const card = dependencyReadyCard({
+    id: "issue", identifier: "COD-169", stateName: "Dev", updatedAt: minsAgo(300),
+    labelIds: { [claim]: "claim-label" }, labelNames: [claim], commentsComplete: true, comments: [...comments],
+  });
+  let reads = 0;
+  let edits = 0;
+  let audits = 0;
+  const snapshot = () => ({ ...card, labelIds: { [claim]: "claim-label" }, labelNames: [claim], commentsComplete: true, comments: [...comments] });
+  const released = await watchModule.executeReap("key", card, {
+    action: "reap", releaseClaim: claim, target: "old-decl", staleMin: 45,
+  }, { [claim]: "claim-label" }, "dev", NOW, {
+    fetchClaimCardFn: async () => {
+      reads += 1;
+      if (reads === 3) comments.push({ id: "contender", body: claimDeclarationMarker({ claim, ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: minsAgo(0) });
+      return snapshot();
+    },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "reset", body, createdAt: minsAgo(1) }),
+    applyLabelEditFn: async () => { edits += 1; },
+    addAuditCommentFn: async () => { audits += 1; },
+  });
+  assert.equal(released, false);
+  assert.equal(reads, 3);
+  assert.equal(edits, 0);
+  assert.equal(audits, 0);
 });
 test("releaseOwnedDispatchClaim: successful completion only releases a claim while the card remains in the completed sweep", async () => {
   const edits = [];
@@ -4655,6 +4708,46 @@ test("buildSameRepoRefillDispatches: completed Ship immediately offers the next 
   assert.equal(result.dispatches[0].trigger, "refill");
   assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
   assert.equal(refillBudget.remaining, 2);
+});
+test("buildSameRepoRefillDispatches: Ship refill claims then atomically exports both identities", async () => {
+  const refillBudget = { remaining: 1 };
+  const card = dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", stateName: "Ship", sortOrder: 50, updatedAt: minsAgo(1), labelNames: [] });
+  let claimCalls = 0;
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "SAF-200",
+      pick: {
+        anchorPath: "/managed/safe",
+        sourceAnchorPath: "/source/safe",
+        sweep: "ship",
+        issueIdentifier: "SAF-200",
+        config: { teamKey: "SAF", projectId: "project-safe", repos: ["repo"] },
+      },
+    },
+    activeByAnchor: new Map([["/managed/safe", { apiKey: "lin", repoPairs: [] }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget,
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-safe"]),
+      checkoutDispatchBlockers: () => [],
+      fetchCards: async () => [card],
+      teamLabelMap: async () => ({ "ship:in-progress": "ship-label" }),
+      claimCardSlots: async (_key, _anchor, _config, sweep, cards) => {
+        claimCalls += 1;
+        assert.equal(sweep, "ship");
+        return [{ ...cards[0], card: cards[0], sweep, slotIndex: 0, ownerToken: "ship-owner", claimDeclarationId: "ship-decl" }];
+      },
+      logFor: () => {},
+    },
+  });
+  assert.equal(claimCalls, 1);
+  assert.equal(result.dispatches.length, 1);
+  assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
+  assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_CLAIM_DECLARATION, "ship-decl");
 });
 test("buildSameRepoRefillDispatches: live board claims count against refill capacity", async () => {
   const activeSameRepo = createSameRepoActiveCounts();

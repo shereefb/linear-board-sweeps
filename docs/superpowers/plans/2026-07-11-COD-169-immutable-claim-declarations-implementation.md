@@ -541,7 +541,7 @@ git add <reviewed-files> docs/superpowers/plans/2026-07-11-COD-169-immutable-cla
 git commit -m "fix(COD-169): close claim lifecycle review gaps"
 ```
 
-Verification evidence (2026-07-11): four syntax checks passed; the final focused suite passed 485/485 and the final full suite passed 591/591. All six canonical skill mirrors matched byte-for-byte. The removed latest-heartbeat helper audit returned no matches, and every owner-token lifecycle surface carried declaration identity. Independent concurrency review found and the fix wave closed three gaps: Ship claim acquisition, close-to-mutation reentry, and unlabeled orphan recovery. Re-review approved the fixes with no remaining actionable finding. The live migration diagnostic remained intentionally non-ready with five legacy-unowned labels and no orphan or ambiguous histories; rollout stays blocked until attended migration cleanup.
+Verification evidence (2026-07-11): all four syntax checks passed; the final focused suite passed 488/488 and the actual full glob suite passed 594/594. All six canonical skill mirrors matched byte-for-byte. Two additional delayed-claim races were reproduced RED and fixed GREEN: acquisition-failure cleanup and the own reset/reaper path now final-complete-reread and prove the same exact authoritative boundary before label mutation. A direct Ship-refill regression covers demand through `claimCardSlots` into paired child environment identity. Independent concurrency re-review approved the amended diff with no remaining actionable finding. The live migration diagnostic remained intentionally non-ready with five legacy-unowned labels and no orphan or ambiguous histories; rollout stays blocked until attended migration cleanup.
 
 - [ ] **Step 6: Update COD-169**
 
