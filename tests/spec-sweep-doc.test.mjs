@@ -49,3 +49,31 @@ test("operator docs explain adaptive spec review depth", () => {
   assert.match(read("README.md"), /adaptive review depth/i);
   assert.match(read("docs/linear-rules.md"), /Tier 0[^]*Tier 1[^]*Tier 2/i);
 });
+
+test("scope closure is risk-proportional and precedes review selection", () => {
+  const body = read(canonicalPath);
+  const brainstormAt = body.indexOf("Brainstorm the spec");
+  const scopeAt = body.indexOf("Scope closure: scope-closure/v1");
+  const classifyAt = body.indexOf("Classify review depth");
+  assert.ok(brainstormAt >= 0 && brainstormAt < scopeAt && scopeAt < classifyAt);
+  assert.match(body, /required \| not required[^]*concrete[^]*Tier 0/i);
+  assert.match(body, /S1\.\.Sn[^]*Surface and evidence[^]*Required outcome[^]*Owning repo\/module[^]*Closure proof/i);
+  assert.match(body, /do not add ceremonial[^]*inapplicable/i);
+});
+
+test("scope closure traces both directions and composes with correctness", () => {
+  const body = read(canonicalPath);
+  assert.match(body, /run scope closure first[^]*correctness applicability/i);
+  assert.match(body, /S[^]*row[^]*reference[^]*C[^]*IDs[^]*rather than duplicate/i);
+  assert.match(body, /every[^]*S[^]*row[^]*implementing task[^]*proof/i);
+  assert.match(body, /every planned task[^]*map[^]*S[^]*row/i);
+  assert.match(body, /plan task[^]*new surface[^]*add[^]*S[^]*row[^]*reassess/i);
+});
+
+test("scope closure preserves evidence and fails the terminal gate closed", () => {
+  const body = read(canonicalPath);
+  assert.match(body, /pre-review-self-check[^]*review\/scope-gap|review\/scope-gap[^]*pre-review-self-check/i);
+  assert.match(body, /never[^]*(suppress|recategorize)[^]*scope-gap/i);
+  assert.match(body, /procedural[^]*independent reviewer/i);
+  assert.match(body, /terminal review gate[^]*(absent|unmapped|contradictory|unresolved)/i);
+});

@@ -2,7 +2,7 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
-## [1.2.0.6] - 2026-07-10
+## [1.2.0.8] - 2026-07-11
 
 ### Changed
 
@@ -13,6 +13,31 @@ All notable changes to the linear board sweeps kit are documented here.
 
 - Invalidate stale proof after affected-path QA changes and share one fail-closed legacy boundary with other versioned contracts in either landing order.
 - Bump the marker so installed anchors receive all three sweep skill updates.
+## [1.2.0.7] - 2026-07-10
+
+### Changed
+
+- Require material Spec cards to carry an auditable `scope-closure/v1` inventory whose stable surface IDs map into implementation tasks, proofs, rollout evidence, and owners before handoff.
+- Compose scope closure with correctness and adaptive review depth without adding a review pass or weakening safety gates.
+
+### Fixed
+
+- Preserve material self-check omissions as `review/scope-gap` evidence, and prove the VERSION-triggered updater installs the changed canonical skill bytes.
+
+## [1.2.0.6] - 2026-07-10
+
+### Added
+
+- Automatically route QA-passed bug fixes and explicitly eligible small features directly to Ship when the reviewed commit is still the current remote commit, while preserving the normal Signoff gate for every other card.
+
+### Changed
+
+- Let operators disable automatic QA-to-Ship routing globally or require Ship approval for every card; Factory Learning cards always retain the human Ship gate.
+- Bind Dev eligibility, QA evidence, and Ship admission to full Git commit SHAs, with a final remote recheck immediately before merge.
+
+### Fixed
+
+- Fail closed on malformed policy, stale commits, blockers, foreign claims, ownership changes, and unsupported QA destinations; successful terminal moves remove only the proven QA claim.
 
 ## [1.2.0.5] - 2026-07-10
 

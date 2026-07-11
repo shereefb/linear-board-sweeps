@@ -12,13 +12,266 @@ import {
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
-  repoRouteEligibility, fetchIssueLabels,
+  repoRouteEligibility, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
+  guardedTerminalMoveInput, latestClaimHeartbeat, moveCardBottomIfCurrent,
 } from "../scripts/linear.mjs";
+
+const QA_HANDOFF_BASE = Object.freeze({
+  fastPathEnabled: true,
+  requireShipApproval: false,
+  stateName: "QA",
+  labelNames: ["fast-path:eligible", "qa:passed", "qa:in-progress"],
+  issueIdentifier: "COD-142",
+  reviewedHead: "a".repeat(40),
+  finalHead: "a".repeat(40),
+  hasForeignClaim: false,
+});
+
+test("QA handoff sends an eligible fast path to Ship", () => {
+  assert.deepEqual(qaHandoffDecision(QA_HANDOFF_BASE), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+const QA_HANDOFF_DENIALS = [
+  [{ fastPathEnabled: false }, "fast-path-disabled"],
+  [{ requireShipApproval: true }, "ship-approval-required"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "qa:in-progress", "factory:learning-generated"] }, "factory-learning-requires-signoff"],
+  [{ stateName: "Signoff" }, "not-in-qa"],
+  [{ labelNames: ["qa:passed"] }, "missing-fast-path-label"],
+  [{ labelNames: ["fast-path:eligible"] }, "missing-qa-pass"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "blocked:open-questions"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "blocked:needs-user"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "qa:needs-changes"] }, "blocked"],
+  [{ labelNames: ["fast-path:eligible", "qa:passed", "sweep:manual-only"] }, "blocked"],
+  [{ hasForeignClaim: true }, "foreign-claim"],
+  [{ reviewedHead: null }, "missing-reviewed-head"],
+  [{ reviewedHead: "abc123" }, "invalid-reviewed-head"],
+  [{ finalHead: null }, "missing-final-head"],
+  [{ finalHead: "abc123" }, "invalid-final-head"],
+  [{ finalHead: "b".repeat(40) }, "head-mismatch"],
+];
+
+for (const [override, reason] of QA_HANDOFF_DENIALS) {
+  test(`QA handoff denies with ${reason}`, () => {
+    assert.deepEqual(qaHandoffDecision({ ...QA_HANDOFF_BASE, ...override }), {
+      destination: "Signoff",
+      eligible: false,
+      reason,
+    });
+  });
+}
+
+const QA_HANDOFF_INVALID_CONFIG = [
+  [{ fastPathEnabled: "false" }, "invalid-fast-path-enabled"],
+  [{ fastPathEnabled: null }, "invalid-fast-path-enabled"],
+  [{ fastPathEnabled: 0 }, "invalid-fast-path-enabled"],
+  [{ requireShipApproval: "true" }, "invalid-ship-approval"],
+  [{ requireShipApproval: null }, "invalid-ship-approval"],
+  [{ requireShipApproval: 0 }, "invalid-ship-approval"],
+];
+
+for (const [override, reason] of QA_HANDOFF_INVALID_CONFIG) {
+  test(`QA handoff fails closed with ${reason} for ${JSON.stringify(override)}`, () => {
+    assert.deepEqual(qaHandoffDecision({ ...QA_HANDOFF_BASE, ...override }), {
+      destination: "Signoff",
+      eligible: false,
+      reason,
+    });
+  });
+}
+
+test("QA handoff defaults fast path on and ship approval off", () => {
+  const { fastPathEnabled: _fastPathEnabled, requireShipApproval: _requireShipApproval, ...input } = QA_HANDOFF_BASE;
+  assert.deepEqual(qaHandoffDecision(input), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+  assert.deepEqual(qaHandoffDecision({
+    ...input,
+    fastPathEnabled: undefined,
+    requireShipApproval: undefined,
+  }), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+test("QA handoff compares full Git SHAs case-insensitively", () => {
+  assert.deepEqual(qaHandoffDecision({
+    ...QA_HANDOFF_BASE,
+    reviewedHead: "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+    finalHead: "abcdef0123456789abcdef0123456789abcdef01",
+  }), {
+    destination: "Ship",
+    eligible: true,
+    reason: "eligible",
+  });
+});
+
+test("QA handoff fails closed for malformed or missing input", () => {
+  for (const input of [undefined, null, "invalid", [], { labelNames: "fast-path:eligible" }]) {
+    const decision = qaHandoffDecision(input);
+    assert.equal(decision.destination, "Signoff");
+    assert.equal(decision.eligible, false);
+  }
+});
+
+test("QA handoff does not mutate the input or labels", () => {
+  const labelNames = Object.freeze([...QA_HANDOFF_BASE.labelNames]);
+  const input = Object.freeze({ ...QA_HANDOFF_BASE, labelNames });
+  const before = structuredClone(input);
+  qaHandoffDecision(input);
+  assert.deepEqual(input, before);
+});
+
+const GUARDED_MOVE_BASE = Object.freeze({
+  stateName: "QA",
+  expectedState: "QA",
+  destinationState: "Ship",
+  labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress"],
+  ownedClaim: "qa:in-progress",
+  ownerToken: "owner-142",
+  heartbeatOwner: "owner-142",
+  heartbeatMalformed: false,
+});
+
+test("guarded terminal move allows only a current source card with its owned claim", () => {
+  assert.deepEqual(guardedTerminalMoveDecision(GUARDED_MOVE_BASE), { eligible: true, reason: "ready" });
+});
+
+for (const [override, reason] of [
+  [{ destinationState: "Done" }, "invalid-destination"],
+  [{ destinationState: "Dev" }, "invalid-destination"],
+  [{ destinationState: "Unexpected" }, "invalid-destination"],
+  [{ expectedState: "Dev", stateName: "Dev", ownedClaim: "dev:in-progress", destinationState: "QA" }, "invalid-destination"],
+  [{ stateName: "Signoff" }, "source-state-changed"],
+  [{ labelNames: ["qa:passed"] }, "owned-claim-missing"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "blocked:needs-user"] }, "blocking-label"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "sweep:manual-only"] }, "blocking-label"],
+  [{ labelNames: ["qa:passed", "qa:in-progress", "dev:in-progress"] }, "foreign-claim"],
+  [{ ownedClaim: "fast-path:eligible" }, "invalid-owned-claim"],
+  [{ ownerToken: "" }, "missing-owner-token"],
+  [{ heartbeatOwner: null }, "missing-owner-heartbeat"],
+  [{ heartbeatOwner: "newer-owner" }, "owner-mismatch"],
+  [{ heartbeatOwner: null, heartbeatMalformed: true }, "malformed-heartbeat"],
+  [{ labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress", "factory:learning-generated"] }, "factory-learning-requires-signoff"],
+]) {
+  test(`guarded terminal move denies ${reason}`, () => {
+    assert.deepEqual(guardedTerminalMoveDecision({ ...GUARDED_MOVE_BASE, ...override }), { eligible: false, reason });
+  });
+}
+
+test("guarded terminal move allows a generated learning card to move from QA to Signoff", () => {
+  assert.deepEqual(guardedTerminalMoveDecision({
+    ...GUARDED_MOVE_BASE,
+    destinationState: "Signoff",
+    labelNames: [...GUARDED_MOVE_BASE.labelNames, "factory:learning-generated"],
+  }), { eligible: true, reason: "ready" });
+});
+
+test("latestClaimHeartbeat selects the newest exact-claim owner", () => {
+  assert.deepEqual(latestClaimHeartbeat([
+    { body: "[auto-sweep-heartbeat 2026-07-10T10:00:00.000Z owner=older claim=qa:in-progress]", createdAt: "2026-07-10T10:00:00.000Z" },
+    { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress] still working", createdAt: "2026-07-10T10:05:00.000Z" },
+    { body: "[auto-sweep-heartbeat 2026-07-10T10:06:00.000Z owner=dev-owner claim=dev:in-progress]", createdAt: "2026-07-10T10:06:00.000Z" },
+  ], "qa:in-progress"), { owner: "owner-142", malformed: false });
+});
+
+test("latestClaimHeartbeat fails ownership closed for a newer malformed exact-claim comment", () => {
+  assert.deepEqual(latestClaimHeartbeat([
+    { body: "[auto-sweep-heartbeat 2026-07-10T10:00:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:00:00.000Z" },
+    { body: "[auto-sweep-heartbeat malformed claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+  ], "qa:in-progress"), { owner: null, malformed: true });
+  assert.throws(() => latestClaimHeartbeat([], "qa:in-progress", { complete: false }), /comments incomplete/);
+});
+
+test("guarded terminal move input removes only the owned claim", () => {
+  assert.deepEqual(guardedTerminalMoveInput(
+    "ship-state",
+    [{ sortOrder: 7 }, { sortOrder: -3 }],
+    "claim-id",
+  ), {
+    stateId: "ship-state",
+    sortOrder: -4,
+    removedLabelIds: ["claim-id"],
+  });
+});
+
+test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUpdate", async () => {
+  const calls = [];
+  const gqlFn = async (query, variables) => {
+    calls.push({ query, variables });
+    if (query.includes("issue(id:$id)") && !query.includes("comments(first:250)")) return { issue: {
+      id: "issue-142", identifier: "COD-142", project: { id: "project" },
+      team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
+    } };
+    if (query.includes("comments(first:250)")) return { issue: {
+      id: "issue-142", identifier: "COD-142", state: { name: "QA" },
+      labels: { pageInfo: { hasNextPage: false }, nodes: [
+        { id: "passed", name: "qa:passed" }, { id: "claim", name: "qa:in-progress" }, { id: "product", name: "frontend" },
+      ] },
+      comments: { pageInfo: { hasNextPage: false }, nodes: [
+        { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+      ] },
+    } };
+    if (query.includes("issues(first:100")) return {
+      issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ id: "other", sortOrder: -8 }] },
+    };
+    if (query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: {
+      identifier: "COD-142", state: { name: "Ship" }, sortOrder: -9, url: "https://linear/COD-142",
+    } } };
+    throw new Error(`unexpected query: ${query}`);
+  };
+
+  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
+  assert.equal(result.moved, true);
+  const destinationIndex = calls.findIndex((call) => call.query.includes("issues(first:100"));
+  const guardIndex = calls.findIndex((call) => call.query.includes("comments(first:250)"));
+  assert.ok(destinationIndex >= 0 && guardIndex > destinationIndex, "destination pagination must precede the final guard read");
+  assert.deepEqual(calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{
+    id: "issue-142",
+    input: { stateId: "ship-state", sortOrder: -9, removedLabelIds: ["claim"] },
+  }]);
+  assert.equal(Object.hasOwn(calls.find((call) => call.query.includes("issueUpdate")).variables.input, "labelIds"), false);
+});
+
+for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["dev:in-progress", "foreign-claim"]]) {
+  test(`moveCardBottomIfCurrent denies late ${lateLabel} from the final read without mutation`, async () => {
+    const calls = [];
+    const gqlFn = async (query) => {
+      calls.push(query);
+      if (query.includes("issue(id:$id)") && !query.includes("comments(first:250)")) return { issue: {
+        id: "issue-142", identifier: "COD-142", project: { id: "project" },
+        team: { states: { nodes: [{ id: "ship-state", name: "Ship" }] } },
+      } };
+      if (query.includes("issues(first:100")) return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+      if (query.includes("comments(first:250)")) return { issue: {
+        id: "issue-142", identifier: "COD-142", state: { name: "QA" },
+        labels: { pageInfo: { hasNextPage: false }, nodes: [
+          { id: "claim", name: "qa:in-progress" }, { id: "late", name: lateLabel },
+        ] },
+        comments: { pageInfo: { hasNextPage: false }, nodes: [
+          { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+        ] },
+      } };
+      throw new Error(`unexpected query: ${query}`);
+    };
+    assert.deepEqual(
+      await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} }),
+      { moved: false, issue: "COD-142", reason },
+    );
+    assert.equal(calls.some((query) => query.includes("issueUpdate")), false);
+  });
+}
 
 test("required setup taxonomy includes the exact learning provenance label", () => {
   assert.equal(REQUIRED_LABELS.filter((label) => label.name === "factory:learning-generated").length, 1);
 });
-
 test("dependency eligibility releases only exact Done blockers", () => {
   assert.equal(WORKFLOW_STATES.done, "Done");
   const connection = {
@@ -132,13 +385,64 @@ test("fetchIssueDependencies rejects query failures instead of returning an empt
 });
 
 const linearCli = fileURLToPath(new URL("../scripts/linear.mjs", import.meta.url));
+function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in-progress"], ownerToken = "owner-142", heartbeatOwner = "owner-142", unreadable = false, commentsComplete = true } = {}) {
+  const metadataIssue = unreadable ? null : {
+    id: "issue-142", identifier: "COD-142", project: { id: "project" },
+    team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
+  };
+  const finalIssue = unreadable ? null : {
+    id: "issue-142", identifier: "COD-142", state: { name: stateName },
+    labels: { pageInfo: { hasNextPage: false }, nodes: labelNames.map((name, index) => ({ id: `label-${index}`, name })) },
+    comments: { pageInfo: { hasNextPage: !commentsComplete }, nodes: [
+      { body: `[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=${heartbeatOwner} claim=qa:in-progress]`, createdAt: "2026-07-10T10:05:00.000Z" },
+    ] },
+  };
+  const preloadSource = `globalThis.fetch = async (_url, options) => {
+    const { query } = JSON.parse(options.body);
+    let data;
+    if (query.includes("comments(first:250)")) data = { issue: ${JSON.stringify(finalIssue)} };
+    else if (query.includes("issue(id:$id)")) data = { issue: ${JSON.stringify(metadataIssue)} };
+    else if (query.includes("issues(first:100")) data = { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    else if (query.includes("issueUpdate")) data = { issueUpdate: { success: true, issue: { identifier: "COD-142", state: { name: "Ship" }, sortOrder: 0, url: "https://linear/COD-142" } } };
+    else throw new Error("unexpected query: " + query);
+    return { json: async () => ({ data }) };
+  };`;
+  const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "move-card-bottom-if-current", "COD-142", "QA", "Ship", "qa:in-progress", ownerToken], {
+    encoding: "utf8",
+    env: { ...process.env, LINEAR_API_KEY: "key" },
+  });
+}
+
+test("move-card-bottom-if-current CLI maps moved, denied, and unreadable outcomes to 0/3/2", () => {
+  const moved = runGuardedMoveCli();
+  assert.equal(moved.status, 0, moved.stderr);
+  assert.equal(JSON.parse(moved.stdout).moved, true);
+
+  const denied = runGuardedMoveCli({ stateName: "Signoff" });
+  assert.equal(denied.status, 3, denied.stderr);
+  assert.deepEqual(JSON.parse(denied.stdout), { moved: false, issue: "COD-142", reason: "source-state-changed" });
+
+  const newerOwner = runGuardedMoveCli({ heartbeatOwner: "newer-owner" });
+  assert.equal(newerOwner.status, 3, newerOwner.stderr);
+  assert.equal(JSON.parse(newerOwner.stdout).reason, "owner-mismatch");
+
+  const unreadable = runGuardedMoveCli({ unreadable: true });
+  assert.equal(unreadable.status, 2);
+  assert.match(unreadable.stderr, /not found.*unreadable/i);
+
+  const incomplete = runGuardedMoveCli({ commentsComplete: false });
+  assert.equal(incomplete.status, 2);
+  assert.match(incomplete.stderr, /comments incomplete/i);
+});
+
 function runDependencyStatusCli(inverseRelations, env = {}) {
   const response = { data: { issue: { identifier: "COD-9", inverseRelations } } };
   const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
   return spawnSync(process.execPath, ["--import", preload, linearCli, "dependency-status", "COD-9"], {
     encoding: "utf8",
-    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
+    env: { ...process.env, AUTO_SWEEP_ANCHOR: "", AUTO_SWEEP_OUTCOME_PATH: "", LINEAR_API_KEY: "key", ...env },
   });
 }
 
@@ -155,7 +459,7 @@ function runRepoStatusCli(labelNames, env = {}, { configDir, cwd } = {}) {
   return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", "SAF-207", "app:guide", "guide"], {
     cwd: cwd || dir,
     encoding: "utf8",
-    env: { ...process.env, LINEAR_API_KEY: "key", ...env },
+    env: { ...process.env, AUTO_SWEEP_ANCHOR: "", AUTO_SWEEP_OUTCOME_PATH: "", LINEAR_API_KEY: "key", ...env },
   });
 }
 
