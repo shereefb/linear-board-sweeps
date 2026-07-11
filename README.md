@@ -10,7 +10,7 @@ Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human
 
 **Planned (COD-157):** material acceptance behaviors and risks will carry a versioned verification contract from Spec through executable Plan proofs, Dev execution, and ID-linked QA evidence. Independent reviewers will continue emitting every material `review/test-gap` finding so Factory Learning measures prevention honestly without weakening review, QA, Signoff, or the human Ship gate.
 
-**Planned (COD-158):** materially performance-sensitive specs will carry a versioned performance contract whose stable budget IDs remain traceable through implementation tasks, benchmark evidence, and QA. Applicability follows the actual performance surface rather than labels alone, and the contract preserves engineering review, code review, QA, Signoff, and the human Ship gate.
+**COD-158:** materially performance-sensitive specs carry a versioned performance contract whose stable budget IDs remain traceable through implementation tasks, kind-specific commit-bound proof, and QA. Applicability follows the actual performance surface rather than labels alone; stale proof after an affected-path QA change is invalidated, while engineering review, code review, QA, Signoff, and the human Ship gate remain intact.
 
 **Planned (COD-160):** material specs will carry a reviewer-mediated `scope-closure/v1` inventory whose stable surface IDs map to implementation tasks, proofs, rollout evidence, and owners before handoff. Material omissions found during self-check or formal review will remain structured `review/scope-gap` evidence so earlier discovery cannot game the learning metric.
 
