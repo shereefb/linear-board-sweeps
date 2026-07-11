@@ -5,6 +5,10 @@ description: Smoke-test the configured Linear project's "QA" cards as a real use
 
 # QA Sweep
 
+### Direct manual handoff
+
+When `MANUAL_SWEEP_STAGE=qa`, process only the named expected-state card after route, dependency, and foreign-claim validation. Claim/heartbeat/release only that card and write/reuse `[manual-sweep-handoff qa <id>]`; scheduled selection still skips manual-only cards.
+
 Act as a user: exercise each "QA" feature in a real dev environment, in as much detail as possible, confirm it works well, fix UX/UI bugs you find, then attach screenshots + a written review and select the terminal handoff. Normal passing cards move to **"Signoff"** for human review; an unchanged, commit-bound fast-path candidate may move automatically to **"Ship"** after the same full QA. ship-sweep does the merge + deploy.
 
 **This sweep NEVER merges and NEVER deploys.** It lands a green, smoke-tested feature at the selected holding queue and stops; ship-sweep remains the only production path. Because QA never touches prod, it is safe to schedule as aggressively as the other non-production sweeps.
@@ -115,7 +119,7 @@ Emit:
 Every card must be resumable on any machine — this run, the auto-sweep launcher, and any other machine coordinate ONLY through origin. Follow these whether a human or the launcher started you.
 
 - **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `qa:in-progress`, post `[auto-sweep-heartbeat <ISO8601 now> owner=<token> claim=qa:in-progress]` using the same `AUTO_SWEEP_OWNER_TOKEN`. A missing or changed latest owner means this run no longer owns the claim: stop and never remove it. A claim with no heartbeat past its stale threshold is treated as crashed and auto-released by the launcher — QA runs are long, so heartbeat diligently.
-- **Reconstruct the environment from the branch, not a local worktree.** `<PREFIX>-###` is deterministic from the card. In each relevant repo (`config.repos`): `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree exists from a prior run, `git reset --hard origin/<PREFIX>-###` before testing. This is how QA runs on a different machine than dev did.
+- **Reconstruct only clean environments from the branch.** `<PREFIX>-###` is deterministic from the card. In each relevant repo (`config.repos`): `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`. A dirty local card worktree is preserved, not reset or discarded; QA must not use reset, checkout, restore, clean, stash, auto-commit, or broad worktree removal as recovery.
 - **Push discipline (never force).** When you commit UX fixes, push the card's branch: `git fetch` → rebase onto `origin/<PREFIX>-###` → push; retry up to 2× on rejection; never force-push. **Do not touch `main`** — qa-sweep never merges. Leave the branch intact and unmerged for ship-sweep.
 - **Guard the selected terminal move.** Right before moving the card to "Signoff" or "Ship", re-fetch it and origin, rerun the full handoff policy, then use `move-card-bottom-if-current`. If live facts deny, do NOT override and do not separately release the claim.
 - **Mark backward moves.** Sending a card back with `qa:needs-changes` is a normal QA outcome and does not need a bounce marker; but if you move it further back (to "Dev"/"Spec"), add `[auto-sweep-bounce QA→<to>]` so the launcher can park a card that oscillates.

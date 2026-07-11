@@ -5,6 +5,10 @@ description: Merge + deploy the configured Linear project's human-approved or co
 
 # Ship Sweep
 
+### Direct manual handoff
+
+Only a matching `MANUAL_SWEEP_STAGE=ship` invocation may process a manual-only card. It must validate the named issue, expected `Signoff` state, route, dependencies, and all foreign claims; write/reuse `[manual-sweep-handoff ship <id>]`; move to Ship; re-read; then continue. Require the current human `[manual-sweep-ship-approval ...]`, request label, `fast-path:eligible`, `qa:passed`, and `ship:approved` when configured. Scheduled runs accept only a human-approved Ship card or a commit-bound card auto-promoted by qa-sweep.
+
 Take cards in **"Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. Cards arrive either through human approval after `Signoff` or are automatically promoted by qa-sweep under the commit-bound fast-path policy. This is the **only sweep that merges and deploys**. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change. `requireShipApproval: true` remains a deliberate human act: QA keeps every passing card in `Signoff` until that approval path moves it to `Ship`.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. "Deploy" = `config.deploy`; "canary" = the `/canary` skill (or, on Codex, a post-deploy health check of the same URLs/endpoints).

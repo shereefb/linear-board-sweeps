@@ -13,6 +13,10 @@ Build features from "Dev" cards, one worktree per feature, with subagents/parall
 
 ## 0. Preflight (fail fast)
 
+### Direct manual handoff
+
+When `MANUAL_SWEEP_STAGE=dev`, process only `MANUAL_SWEEP_ISSUE` when its state equals `MANUAL_SWEEP_EXPECTED_STATE`; validate route, dependencies, and no foreign claim before claiming it, write/reuse `[manual-sweep-handoff dev <id>]`, heartbeat, and release only that claim. This is the sole exception to the normal `sweep:manual-only` skip and never applies to scheduled runs. For `manual-sweep:fast-track-requested`, preserve every eligibility gate but bypass only size and allowed-label checks; factory-learning, disabled fast path, material risk, failed checks/reviews/lenses deny and remove stale eligibility.
+
 - **Load workspace config.** In scheduled mode, read `$AUTO_SWEEP_ANCHOR/.claude/linear-sweep.json`; otherwise read `.claude/linear-sweep.json` from the current repo root (see spec-sweep §0 for fields). The routed primary repo may be a sibling and is not required to carry a duplicate config. Missing file → exit with a one-line error.
 - **Require `LINEAR_API_KEY`** (env or the repo's gitignored `.env`); confirm git push credentials and any credentials named in `config.credentialsNote`.
 - **Coding guardrail.** Before writing, reviewing, debugging, refactoring, or otherwise changing code, invoke `andrej-karpathy-skill` from the `andrej-karpathy-skills` plugin. If the skill is unavailable, apply its core checks manually: think before coding, keep the change simple, make surgical edits, and verify the goal before calling the work complete.
@@ -106,7 +110,7 @@ Every card must be resumable on any machine — this run, the auto-sweep launche
 - **Origin holds everything at rest.** Before you change a card's status OR leave it blocked, ensure all its artifacts are committed and pushed in **every repo you touched** (`config.repos`). Uncommitted work in a local worktree is allowed only while you are actively building.
 - **Checkpoint WIP.** Commit + push the branch at natural checkpoints (after the build first goes green, before code review), not only at the end, so a crash strands as little as possible.
 - **Push discipline (never force).** For every push: `git fetch` → rebase your commits onto the updated remote ref → push; on a non-fast-forward rejection retry up to 2×; if it still fails, comment what happened on the card and stop. Never force-push.
-- **Worktrees are disposable; the branch is the truth.** `<PREFIX>-###` is deterministic from the card id. Picking up a card, in each relevant repo: `git fetch`; if `origin/<PREFIX>-###` exists and no local worktree does, rebuild it at `<repo>/.worktrees/<PREFIX>-###`; if a local worktree already exists (a prior crashed run, possibly dirty), `git reset --hard origin/<PREFIX>-###` before working. Prune worktrees whose remote branch is gone (`git worktree prune`).
+- **Preserve worktrees with local WIP.** `<PREFIX>-###` is deterministic from the card id. A clean worktree may be rebuilt from `origin/<PREFIX>-###`; a dirty existing card worktree is preserved exactly as found. Never reset, checkout, restore, clean, stash, auto-commit, prune, or remove it. The launcher retains its matching claim and resumes the same worktree only through its exact local resume record.
 - **Re-read before the terminal move.** Right before moving the card to "QA", re-fetch it. If a human (or another run) moved it out of "Dev", do NOT override — comment what you built + the branch name, release `dev:in-progress`, and stop.
 - **Mark backward bounces.** When you send a card back to "Spec", add a comment `[auto-sweep-bounce Dev→Spec]`. Two backward bounces within 48h and the launcher parks the card with `blocked:needs-user` — so bounce only on a real spec-quality gate, and say exactly what's missing.
 
