@@ -5457,7 +5457,12 @@ export function appendLauncherEvidenceRun(input, {
   return record;
 }
 
-function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
+function writeRunRecord({
+  pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt,
+  resolvedRuntimeExecutable = pick.runtimeExecutable,
+  fallbackUsed = false,
+  attempts = null,
+}) {
   if (!pick.issueIdentifier || !pick.logDir) return;
   let metrics = {};
   try {
@@ -5499,7 +5504,7 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     claimAt: telemetry.claimAt,
     dispatchAt: startedAt,
     queueWaitMs: telemetry.queueWaitMs,
-    resolvedRuntimeExecutable: pick.runtimeExecutable,
+    resolvedRuntimeExecutable,
     capacitySlot: telemetry.capacitySlot,
     capacityHighWater: Math.max(telemetry.capacityHighWater || 0, metrics.capacityHighWater || 0) || undefined,
     loadAverage1m: metrics.loadAverage1m,
@@ -5515,6 +5520,7 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     exitCode: outcome?.exitCode ?? null,
     startedAt,
     endedAt,
+    ...(fallbackUsed ? { fallbackUsed: true, attempts: (attempts || []).slice(0, 2) } : {}),
   };
   fs.mkdirSync(pick.logDir, { recursive: true });
   const f = path.join(pick.logDir, `run-records-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.jsonl`);
@@ -5536,98 +5542,197 @@ function dispatchEnvironment(anchorPath, pick = {}) {
   };
 }
 
-function dispatch(anchorPath, sweep, config, pick = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const executable = pick.runtimeExecutable || cmd;
-  const env = dispatchEnvironment(anchorPath, pick);
-  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
-  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
-  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
-  const r = spawnSync(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
-  fs.closeSync(fd);
-  const outcome = r.error
-    ? classifyDispatchOutcome({ type: "error", error: r.error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) })
-    : classifyDispatchOutcome({ type: "close", exitCode: r.status, signal: r.signal, path: executable, cwd });
-  if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${r.error.message}`);
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
-  writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
-  return outcome;
+function normalizedDispatchAttempt(runtimeCfg, outcome) {
+  return {
+    runtime: runtimeCfg.runtime || "codex",
+    model: runtimeCfg.model,
+    effort: runtimeCfg.effort,
+    outcome: {
+      kind: outcome?.kind,
+      code: outcome?.code ?? null,
+      exitCode: outcome?.exitCode ?? null,
+      signal: outcome?.signal ?? null,
+    },
+  };
 }
 
-export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null, onSpawn = null } = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const executable = pick.runtimeExecutable || cmd;
-  const env = dispatchEnvironment(anchorPath, pick);
-  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
-  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
-  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
+function runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata = false } = {}) {
+  const runtime = runtimeCfg.runtime || "codex";
+  const sourceAnchorPath = pick.sourceAnchorPath || anchorPath;
+  const host = os.hostname();
+  return {
+    runtimeCfg,
+    executable,
+    laneKey: usePickMetadata && pick.runtimeLaneKey ? pick.runtimeLaneKey : runtimeLaneKey(sourceAnchorPath, runtime, host),
+    scope: usePickMetadata && pick.runtimeScope ? pick.runtimeScope : `runtime:${runtime}:${host}`,
+    stableTarget: usePickMetadata && pick.runtimeStableTarget
+      ? pick.runtimeStableTarget
+      : JSON.stringify({ sourceAnchorPath, runtime, host }),
+  };
+}
+
+function runDispatchAttempt({
+  executable, command, cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn,
+  classifyCodexStdout = createCodexUsageEvidenceCollector,
+  writeChunkFn = fs.writeSync,
+}) {
   return new Promise((resolve) => {
+    let child;
     let settled = false;
+    let capacityAttachFailed = false;
+    let logWriteFailed = false;
+    const collector = runtimeCfg.runtime === "codex" ? classifyCodexStdout() : null;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
-      fs.closeSync(fd);
-      logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
-      writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
-      resolve(outcome);
+      resolve({ outcome, runtimeCfg, executable, usageExhausted: !logWriteFailed && Boolean(collector?.exhausted()) });
     };
-    let child;
+    const ioFailure = () => {
+      if (logWriteFailed || settled) return;
+      logWriteFailed = true;
+      try { child?.kill?.("SIGTERM"); } catch { /* close remains authoritative */ }
+    };
+    const write = (chunk, classify = false) => {
+      if (logWriteFailed || settled) return;
+      try {
+        writeChunkFn(fd, chunk);
+        if (classify) collector?.push(chunk);
+      } catch {
+        ioFailure();
+      }
+    };
     try {
-      child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
-    } catch (e) {
-      finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+      child = spawnFn(executable, command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], signal: signal || undefined });
+    } catch (error) {
+      finish(classifyDispatchOutcome({ type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
       return;
     }
-    if (onSpawn) {
-      try {
-        if (!Number.isInteger(child?.pid) || child.pid <= 0) throw new Error("spawned child has no verifiable PID");
-        if (onSpawn(child.pid, child) === false) throw new Error("capacity ledger rejected child PID");
-      } catch (error) {
-        const attachError = new Error(`capacity PID attachment failed: ${error.message}`);
-        attachError.code = "CAPACITY_ATTACH_FAILED";
-        logFor(anchorPath, sweep, `FATAL ${attachError.message}; terminating child ${child?.pid || "unknown"}`);
-        child.on("error", (childError) => {
-          logFor(anchorPath, sweep, `child error while awaiting capacity-safe termination: ${childError.message}`);
-        });
-        child.once("close", () => finish(classifyDispatchOutcome({
-          type: "error",
-          error: attachError,
-          path: executable,
-          cwd,
-          cwdExists: fs.existsSync(cwd),
-          executableExists: fs.existsSync(executable),
-        })));
-        try { child.kill?.("SIGTERM"); } catch (killError) {
-          logFor(anchorPath, sweep, `could not terminate child after PID attachment failure: ${killError.message}`);
-        }
-        return;
-      }
-    }
-    child.on("error", (e) => {
-      logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
-      const interrupted = e.code === "ABORT_ERR" || signal?.aborted;
+    child.stdout?.on("data", (chunk) => write(chunk, true));
+    child.stderr?.on("data", (chunk) => write(chunk));
+    child.on("error", (error) => {
+      if (capacityAttachFailed || logWriteFailed || settled) return;
+      const interrupted = error.code === "ABORT_ERR" || signal?.aborted;
       finish(classifyDispatchOutcome(interrupted
         ? { type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }
-        : { type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+        : { type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
     });
-    child.on("close", (exitCode, childSignal) => finish(signal?.aborted
-      ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
-      : (childDeferredOutcomeForPick(pick) || classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }))));
+    child.once("close", (exitCode, childSignal) => {
+      if (capacityAttachFailed) {
+        const error = new Error("capacity PID attachment failed");
+        error.code = "CAPACITY_ATTACH_FAILED";
+        finish(classifyDispatchOutcome({ type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+        return;
+      }
+      if (logWriteFailed) {
+        finish({ kind: "dispatch-io-error", code: "LOG_WRITE_FAILED", exitCode: null, signal: null, path: executable, cwd });
+        return;
+      }
+      collector?.finish();
+      finish(signal?.aborted
+        ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
+        : classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }));
+    });
+    if (!onSpawn) return;
+    try {
+      if (!Number.isInteger(child?.pid) || child.pid <= 0) throw new Error("spawned child has no verifiable PID");
+      if (onSpawn(child.pid, child) === false) throw new Error("capacity ledger rejected child PID");
+    } catch (error) {
+      capacityAttachFailed = true;
+      logFor(cwd, runtimeCfg.runtime || "codex", `FATAL capacity PID attachment failed: ${error.message}; terminating child ${child?.pid || "unknown"}`);
+      try { child.kill?.("SIGTERM"); } catch { /* close remains authoritative */ }
+    }
   });
+}
+
+export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
+  spawnFn = spawn,
+  signal = null,
+  onSpawn = null,
+  resolveRuntimeExecutableFn = resolveRuntimeExecutable,
+  writeChunkFn = fs.writeSync,
+} = {}) {
+  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const command = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const executable = pick.runtimeExecutable || command.cmd;
+  const env = dispatchEnvironment(anchorPath, pick);
+  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  fs.mkdirSync(dir, { recursive: true });
+  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
+  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
+  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
+  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+  const fd = fs.openSync(logFile, "a");
+  const startedAt = new Date().toISOString();
+  const primaryMeta = runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata: true });
+  const finish = (outcome, finalMeta, attempts, fallbackUsed = false) => {
+    const result = {
+      ...outcome,
+      finalRuntimeConfig: finalMeta.runtimeCfg,
+      finalRuntimeExecutable: finalMeta.executable,
+      finalRuntimeLaneKey: finalMeta.laneKey,
+      finalRuntimeScope: finalMeta.scope,
+      finalRuntimeStableTarget: finalMeta.stableTarget,
+      fallbackUsed,
+      attempts: attempts.slice(0, 2),
+    };
+    fs.closeSync(fd);
+    logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${result.kind}${result.exitCode === null ? "" : ` ${result.exitCode}`}${result.signal ? ` ${result.signal}` : ""})`);
+    writeRunRecord({
+      pick,
+      runtimeCfg: finalMeta.runtimeCfg,
+      resolvedRuntimeExecutable: finalMeta.executable,
+      logFile,
+      outcome: result,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      fallbackUsed,
+      attempts,
+    });
+    return result;
+  };
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
+  const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn });
+  const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome);
+  const deferred = childDeferredOutcomeForPick(pick);
+  if (deferred) return finish(deferred, primaryMeta, [primaryAttempt]);
+  const fallbackCfg = fallbackRuntimeConfigForSweep(config, sweep);
+  const fallbackEligible = primary.outcome.kind === "exit"
+    && Number.isInteger(primary.outcome.exitCode)
+    && primary.outcome.exitCode !== 0
+    && primary.usageExhausted
+    && fallbackCfg;
+  if (!fallbackEligible) return finish(primary.outcome, primaryMeta, [primaryAttempt]);
+  if (signal?.aborted) return finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd: command.cwd }), primaryMeta, [primaryAttempt]);
+  const fallbackCommand = buildCommand({ ...fallbackCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const resolution = resolveRuntimeExecutableFn("claude", env);
+  const fallbackMeta = runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path || null);
+  if (signal?.aborted) return finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd: command.cwd }), primaryMeta, [primaryAttempt]);
+  if (!resolution.ok) {
+    const missing = classifyDispatchOutcome({
+      type: "error",
+      error: { code: resolution.code || "ENOENT" },
+      path: fallbackMeta.executable || fallbackCommand.cmd,
+      cwd: fallbackCommand.cwd,
+      cwdExists: fs.existsSync(fallbackCommand.cwd),
+      executableExists: false,
+    });
+    return finish(missing, fallbackMeta, [primaryAttempt]);
+  }
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} fallback: ${runtimeSummary(fallbackCfg)} → ${resolution.path} ${fallbackCommand.args.slice(0, 3).join(" ")} …`);
+  const fallback = await runDispatchAttempt({
+    executable: resolution.path,
+    command: fallbackCommand,
+    cwd: fallbackCommand.cwd,
+    env,
+    fd,
+    runtimeCfg: fallbackCfg,
+    signal,
+    spawnFn,
+    onSpawn,
+    writeChunkFn,
+  });
+  const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome);
+  return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
 }
 
 export function attachUpdateFailuresToAnchors(anchors, updateFailures, {
@@ -5737,14 +5842,21 @@ async function tick({ dryRun = false } = {}) {
       const pick = result.pick;
       const active = activeByAnchor.get(pick.anchorPath);
       if (!active) return null;
-      const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
+      const runtimeCfg = result.finalRuntimeConfig || runtimeConfigForSweep(pick.config, pick.sweep);
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
+      const fallbackFailure = result.fallbackUsed
+        && result.attempts?.length === 2
+        && result.attempts[0]?.runtime === "codex"
+        && result.attempts[0]?.outcome?.kind === "exit"
+        ? "after Codex usage exhaustion; Claude final attempt"
+        : null;
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
         worktreePath: pick.worktreePath,
         logDir: pick.logDir,
+        fallbackFailure,
       }) : runtime;
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
       const dependencyDeferred = result.kind === "dependency-deferred";
@@ -5760,20 +5872,20 @@ async function tick({ dryRun = false } = {}) {
           `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
         ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
-        const key = pick.runtimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
+        const key = result.finalRuntimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
         runtimeCache.set(key, { ok: false, runtime: runtimeName, code: "ENOENT", path: null, source: null });
         if (!reportedRuntimeFailures.has(key)) {
           reportedRuntimeFailures.add(key);
           localFailures.push(failureEventFor(
             pick.anchorPath,
             pick.config,
-            pick.runtimeScope || `runtime:${runtimeName}:${os.hostname()}`,
+            result.finalRuntimeScope || `runtime:${runtimeName}:${os.hostname()}`,
             "runtime-disappeared",
-            pick.runtimeStableTarget || JSON.stringify({ sourceAnchorPath: pick.sourceAnchorPath || pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
+            result.finalRuntimeStableTarget || JSON.stringify({ sourceAnchorPath: pick.sourceAnchorPath || pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
             `${runtimeName} executable disappeared after preflight on ${os.hostname()}`,
           ));
           writeCurrentTick();

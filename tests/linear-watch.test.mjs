@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, spawnSync as spawnProcessSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
@@ -56,6 +57,26 @@ import {
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
 } from "../scripts/linear-watch.mjs";
+
+function pipedDispatchChild(pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killCalls = [];
+  child.kill = (signal) => { child.killCalls.push(signal); return true; };
+  child.close = (exitCode, signal = null) => child.emit("close", exitCode, signal);
+  return child;
+}
+
+function queuedDispatchSpawn(children, calls = []) {
+  return (executable, args, options) => {
+    calls.push({ executable, args, options });
+    const child = children.shift();
+    assert.ok(child, "spawn queue exhausted");
+    return child;
+  };
+}
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const minsAgo = (m) => new Date(NOW - m * 60000).toISOString();
@@ -4395,6 +4416,249 @@ test("Codex usage evidence: finish parses a bounded final stdout line", () => {
   oversized.finish();
   assert.equal(oversized.exhausted(), false);
 });
+
+test("dispatchAsync fallback: Codex exhaustion runs one sequential Claude attempt with the same child context", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-success-"));
+  const primary = pipedDispatchChild(801);
+  const fallback = pipedDispatchChild(802);
+  const calls = [];
+  const controller = new AbortController();
+  const childEnv = { AUTO_SWEEP_ISSUE: "COD-144", AUTO_SWEEP_WORKTREE: "/worktrees/COD-144", AUTO_SWEEP_LOG_DIR: "/logs/COD-144" };
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "high" } } },
+  }, {
+    issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex", childEnv,
+  }, {
+    signal: controller.signal,
+    spawnFn: queuedDispatchSpawn([primary, fallback], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].executable, "/resolved/codex");
+  assert.equal(calls[1].executable, "/resolved/claude");
+  assert.equal(calls[1].options.cwd, calls[0].options.cwd);
+  assert.equal(calls[1].options.env, calls[0].options.env);
+  assert.equal(calls[1].options.env.AUTO_SWEEP_WORKTREE, "/worktrees/COD-144");
+  assert.equal(calls[1].options.env.AUTO_SWEEP_LOG_DIR, "/logs/COD-144");
+  assert.equal(calls[1].options.signal, controller.signal);
+  assert.equal(calls[1].args[1], calls[0].args.at(-1));
+  fallback.close(0);
+  const outcome = await run;
+  assert.equal(outcome.kind, "success");
+  assert.equal(outcome.fallbackUsed, true);
+  assert.deepEqual(outcome.finalRuntimeConfig, { runtime: "claude", model: "claude-sonnet-5", effort: "high" });
+  assert.equal(outcome.finalRuntimeExecutable, "/resolved/claude");
+  assert.equal(outcome.attempts.length, 2);
+  assert.deepEqual(outcome.attempts.map((attempt) => attempt.runtime), ["codex", "claude"]);
+  const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(anchorPath, "logs", recordFile), "utf8").trim());
+  assert.equal(record.runtime, "claude");
+  assert.equal(record.model, "claude-sonnet-5");
+  assert.equal(record.resolvedRuntimeExecutable, "/resolved/claude");
+  assert.equal(record.fallbackUsed, true);
+  assert.equal(record.attempts.length, 2);
+});
+
+test("dispatchAsync fallback: stderr usage text is logged but never authorizes Claude", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-stderr-separation-"));
+  const primary = pipedDispatchChild(805);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stderr.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+  assert.equal(outcome.kind, "exit");
+  assert.equal(calls.length, 1);
+  assert.equal(outcome.fallbackUsed, false);
+});
+
+test("dispatchAsync fallback: successful, anomalous, ordinary, and interrupted Codex attempts never fall back", async () => {
+  const cases = [
+    { name: "success", close: [0, null], exhausted: true, kind: "success" },
+    { name: "null exit", close: [null, null], exhausted: true, kind: "exit" },
+    { name: "ordinary exit", close: [1, null], exhausted: false, kind: "exit" },
+    { name: "signal", close: [null, "SIGTERM"], exhausted: true, kind: "signal" },
+  ];
+  for (const fixture of cases) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), `linear-fallback-${fixture.name}-`));
+    const primary = pipedDispatchChild(810);
+    const calls = [];
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+      spawnFn: queuedDispatchSpawn([primary], calls),
+      resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+    });
+    if (fixture.exhausted) primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    primary.close(...fixture.close);
+    const outcome = await run;
+    assert.equal(outcome.kind, fixture.kind, fixture.name);
+    assert.equal(calls.length, 1, fixture.name);
+    assert.equal(outcome.fallbackUsed, false, fixture.name);
+    assert.equal(outcome.attempts.length, 1, fixture.name);
+  }
+});
+
+test("dispatchAsync fallback: absent configuration preserves the exhausted Codex attribution", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-absent-"));
+  const primary = pipedDispatchChild(820);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: queuedDispatchSpawn([primary], calls) });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+  assert.equal(calls.length, 1);
+  assert.equal(outcome.kind, "exit");
+  assert.equal(outcome.finalRuntimeConfig.runtime, "codex");
+  assert.equal(outcome.fallbackUsed, false);
+});
+
+test("dispatchAsync fallback deferral: dependency and repository outcome files outrank a qualifying exhausted failure", async () => {
+  for (const fixture of [
+    { kind: "dependency-deferred", expected: "dependency-deferred", dependencyExitCode: 3 },
+    { kind: "repo-routing-deferred", expected: "repo-routing-deferred", routeExitCode: 3 },
+  ]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-deferral-"));
+    const outcomePath = path.join(anchorPath, "outcome.json");
+    const primary = pipedDispatchChild(830);
+    const calls = [];
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, {
+      issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), outcomePath, runtimeExecutable: "/resolved/codex",
+    }, { spawnFn: queuedDispatchSpawn([primary], calls) });
+    primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    fs.writeFileSync(outcomePath, JSON.stringify({ version: 1, issueIdentifier: "COD-144", ...fixture }));
+    primary.close(1);
+    const outcome = await run;
+    assert.equal(outcome.kind, fixture.expected);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("dispatchAsync fallback: abort gaps before and after resolution prevent Claude spawn", async () => {
+  for (const fixture of ["before resolver", "after resolver"]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-abort-"));
+    const primary = pipedDispatchChild(840);
+    const calls = [];
+    const controller = new AbortController();
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+      signal: controller.signal,
+      spawnFn: queuedDispatchSpawn([primary], calls),
+      resolveRuntimeExecutableFn: () => {
+        if (fixture === "after resolver") controller.abort({ signal: "SIGTERM" });
+        return { ok: true, path: "/resolved/claude" };
+      },
+    });
+    primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    primary.close(1);
+    if (fixture === "before resolver") controller.abort({ signal: "SIGTERM" });
+    const outcome = await run;
+    assert.equal(outcome.kind, "interrupted", fixture);
+    assert.equal(calls.length, 1, fixture);
+  }
+});
+
+test("dispatchAsync fallback: records both PIDs and fails closed when Claude is unavailable or fails", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-final-failure-"));
+  const primary = pipedDispatchChild(850);
+  const fallback = pipedDispatchChild(851);
+  const pids = [];
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary, fallback], calls), onSpawn: (pid) => pids.push(pid),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  fallback.close(7);
+  const outcome = await run;
+  assert.equal(outcome.kind, "exit");
+  assert.equal(outcome.exitCode, 7);
+  assert.deepEqual(pids, [850, 851]);
+  assert.equal(outcome.attempts.length, 2);
+  assert.equal(calls.length, 2);
+
+  const missingPrimary = pipedDispatchChild(852);
+  const missingCalls = [];
+  const missingRun = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-145", logDir: path.join(anchorPath, "missing-logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([missingPrimary], missingCalls),
+    resolveRuntimeExecutableFn: () => ({ ok: false, runtime: "claude", code: "ENOENT", path: null }),
+  });
+  missingPrimary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  missingPrimary.close(1);
+  const missing = await missingRun;
+  assert.equal(missing.kind, "executable-enoent");
+  assert.equal(missing.finalRuntimeConfig.runtime, "claude");
+  assert.equal(missing.finalRuntimeExecutable, null);
+  assert.equal(missing.finalRuntimeLaneKey.includes("claude"), true);
+  assert.equal(missingCalls.length, 1);
+});
+
+test("dispatchAsync fallback PID: rejected second attachment kills Claude and waits for close", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-pid-"));
+  const primary = pipedDispatchChild(860);
+  const fallback = pipedDispatchChild(861);
+  let settled = false;
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary, fallback]),
+    onSpawn: (pid) => pid !== 861,
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  }).then((outcome) => { settled = true; return outcome; });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fallback.killCalls, ["SIGTERM"]);
+  assert.equal(settled, false);
+  fallback.close(null, "SIGTERM");
+  const outcome = await run;
+  assert.equal(outcome.code, "CAPACITY_ATTACH_FAILED");
+});
+
+test("dispatchAsync fallback: stdout and stderr log write failures kill and await one typed I/O outcome", async () => {
+  for (const stream of ["stdout", "stderr"]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), `linear-fallback-${stream}-io-`));
+    const primary = pipedDispatchChild(870);
+    let writes = 0;
+    let settled = false;
+    const run = dispatchAsync(anchorPath, "dev", {}, {
+      issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+    }, {
+      spawnFn: queuedDispatchSpawn([primary]),
+      writeChunkFn: () => { writes += 1; throw new Error(`${stream} write failed`); },
+    }).then((outcome) => { settled = true; return outcome; });
+    primary[stream].write("provider output must not escape");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(writes, 1, stream);
+    assert.deepEqual(primary.killCalls, ["SIGTERM"], stream);
+    assert.equal(settled, false, stream);
+    primary.close(1);
+    const outcome = await run;
+    assert.equal(outcome.kind, "dispatch-io-error", stream);
+    assert.equal(outcome.code, "LOG_WRITE_FAILED", stream);
+    assert.equal(outcome.attempts.length, 1, stream);
+  }
+});
+
 test("dispatchAsync: child dependency outcome channel overrides a superficially successful runtime exit", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dependency-outcome-"));
   const logDir = path.join(anchorPath, "logs");
