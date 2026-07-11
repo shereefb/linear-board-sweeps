@@ -16,7 +16,7 @@
   },
   "runtimes": {
     "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
-    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high", "fallbacks": [{ "runtime": "claude", "model": "claude-opus-4-8" }] },
     "review": { "runtime": "claude", "model": "claude-opus-4-8" },
     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
