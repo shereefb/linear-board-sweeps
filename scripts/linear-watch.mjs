@@ -4940,6 +4940,24 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       declarationAttempted = true;
       await addCommentFn(apiKey, card.id, claimDeclarationMarker({ claim: cfg.claim, ownerToken: owner, declarationId }));
       await applyLabelEditFn(apiKey, claimTarget, { add: { [cfg.claim]: claimId } });
+      await sleepFn(CLAIM_CONFIRM_DELAY_MS);
+      const winner = await fetchCardFn(apiKey, card.id);
+      const winnerRoute = routingConfigured
+        ? resolveCardRepoRoute({ config, card: winner, repoPairs })
+        : card.repoRoute;
+      if (!claimConfirmed(winner, cfg, { ownerToken: owner, declarationId }, cfg.states)
+        || (routingConfigured && !sameCardRepoRoute(card.repoRoute, winnerRoute))) {
+        if (routingConfigured && !sameCardRepoRoute(card.repoRoute, winnerRoute)) onRouteFailure(card, winnerRoute);
+        const ownership = resolveCardClaim(winner, cfg.claim);
+        if ((ownership.status === "owned" || ownership.status === "orphan-declaration")
+            && ownership.ownerToken === owner && ownership.declarationId === declarationId) {
+          await cleanupOwnAttempt(winner);
+        } else if (ownership.status !== "owned") {
+          throw safetyError(card, `claim confirmation is ${ownership.status} (${ownership.reason})`);
+        }
+        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
+        continue;
+      }
       await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Compatibility heartbeat for declaration ${declarationId}.`);
       await sleepFn(CLAIM_CONFIRM_DELAY_MS);
       const fresh = await fetchCardFn(apiKey, card.id);
@@ -4947,16 +4965,17 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
         ? resolveCardRepoRoute({ config, card: fresh, repoPairs })
         : card.repoRoute;
       if (!claimConfirmed(fresh, cfg, { ownerToken: owner, declarationId }, cfg.states)
-        || (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute))) {
+          || latestHeartbeatOwner(fresh, cfg.claim) !== owner
+          || (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute))) {
         if (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute)) onRouteFailure(card, freshRoute);
         const ownership = resolveCardClaim(fresh, cfg.claim);
         if ((ownership.status === "owned" || ownership.status === "orphan-declaration")
             && ownership.ownerToken === owner && ownership.declarationId === declarationId) {
           await cleanupOwnAttempt(fresh);
         } else if (ownership.status !== "owned") {
-          throw safetyError(card, `claim confirmation is ${ownership.status} (${ownership.reason})`);
+          throw safetyError(card, `compatibility confirmation is ${ownership.status} (${ownership.reason})`);
         }
-        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
+        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: compatibility confirmation failed`);
         continue;
       }
       claimed.push({

@@ -3485,6 +3485,7 @@ test("claimCardSlots: declaration precedes label and exact declaration reaches t
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
   const calls = [];
   const comments = [];
+  let reads = 0;
   const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
@@ -3496,11 +3497,12 @@ test("claimCardSlots: declaration precedes label and exact declaration reaches t
     applyLabelEditFn: async () => { calls.push("label"); },
     sleepFn: async () => {},
     fetchCardFn: async () => {
-      calls.push("final-read");
+      reads += 1;
+      calls.push(reads === 1 ? "winner-read" : "final-read");
       return { ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [...comments] };
     },
   });
-  assert.deepEqual(calls, ["declaration", "label", "compatibility-heartbeat", "final-read"]);
+  assert.deepEqual(calls, ["declaration", "label", "winner-read", "compatibility-heartbeat", "final-read"]);
   assert.equal(claimed[0].claimDeclarationId, "decl-winner");
   assert.equal(latestHeartbeatOwner(claimed[0].card, "dev:in-progress"), claimed[0].ownerToken);
   const releaseEdits = [];
@@ -3517,11 +3519,15 @@ test("claimCardSlots: only the first declaration wins and a loser never removes 
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
   const removals = [];
   let ourDeclaration;
+  let compatibilityHeartbeats = 0;
   const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-loser",
-    addCommentFn: async (_key, _id, body) => { if (body.startsWith("[auto-sweep-claim ")) ourDeclaration = body; },
+    addCommentFn: async (_key, _id, body) => {
+      if (body.startsWith("[auto-sweep-claim ")) ourDeclaration = body;
+      else compatibilityHeartbeats += 1;
+    },
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals.push(edit); },
     sleepFn: async () => {},
     fetchCardFn: async () => ({
@@ -3536,6 +3542,69 @@ test("claimCardSlots: only the first declaration wins and a loser never removes 
   });
   assert.deepEqual(claimed, []);
   assert.deepEqual(removals, []);
+  assert.equal(compatibilityHeartbeats, 0);
+});
+test("claimCardSlots: winner compatibility heartbeat write failure closes before label cleanup", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const comments = [];
+  const edits = [];
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-heartbeat-write",
+    addCommentFn: async (_key, _id, body) => {
+      if (body.startsWith(`${HEARTBEAT_TAG} `)) throw new Error("compatibility heartbeat unavailable");
+      comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) });
+    },
+    applyLabelEditFn: async (_key, _fresh, edit) => edits.push(edit),
+    sleepFn: async () => {},
+    fetchCardFn: async () => ({ ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [...comments] }),
+  });
+  assert.deepEqual(claimed, []);
+  assert.deepEqual(edits, [{ add: { "dev:in-progress": "claim-id" } }, { remove: ["dev:in-progress"] }]);
+  assert.equal(comments.at(-1).body, claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-heartbeat-write", reason: "failed" }));
+});
+test("claimCardSlots: winner compatibility confirmation failure closes before label cleanup", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const comments = [];
+  const edits = [];
+  let reads = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-heartbeat-confirm",
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
+    applyLabelEditFn: async (_key, _fresh, edit) => edits.push(edit),
+    sleepFn: async () => {},
+    fetchCardFn: async () => {
+      reads += 1;
+      const visible = [...comments];
+      if (reads === 2) visible.push({ id: "foreign-heartbeat", body: `${HEARTBEAT_TAG} ${claimIso(9)} owner=foreign claim=dev:in-progress]`, createdAt: claimIso(9) });
+      return { ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: visible };
+    },
+  });
+  assert.deepEqual(claimed, []);
+  assert.deepEqual(edits, [{ add: { "dev:in-progress": "claim-id" } }, { remove: ["dev:in-progress"] }]);
+  assert.equal(comments.at(-1).body, claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-heartbeat-confirm", reason: "failed" }));
+});
+test("claimCardSlots: label loss after winner heartbeat closes the exact orphan declaration", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const comments = [];
+  let reads = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-label-loss",
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
+    applyLabelEditFn: async () => {},
+    sleepFn: async () => {},
+    fetchCardFn: async () => {
+      reads += 1;
+      return { ...card, labelNames: reads === 1 ? ["dev:in-progress"] : [], commentsComplete: true, comments: [...comments] };
+    },
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(comments.at(-1).body, claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-label-loss", reason: "failed" }));
 });
 test("claimCardSlots: malformed final history denies dispatch without removing the shared label", async () => {
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
@@ -3627,7 +3696,7 @@ test("claimCardSlots: a stable routed claim returns the confirmed primary repo",
   const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
   const card = dependencyReadyCard({ id: "issue-id", identifier: "SAF-207", stateName: "Dev", labelNames: ["app:guide"], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
   card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
-  let declarationBody = "";
+  const comments = [];
   const claimed = await claimCardSlots("key", "/managed/guide", config, "dev", [card], {
     parentRunId: "run-id",
     limit: 1,
@@ -3638,13 +3707,13 @@ test("claimCardSlots: a stable routed claim returns the confirmed primary repo",
     fetchClaimCardFn: async () => ({ ...card }),
     applyLabelEditFn: async () => {},
     declarationTokenFn: () => "decl-stable",
-    addCommentFn: async (_key, _id, body) => { if (body.startsWith("[auto-sweep-claim ")) declarationBody = body; },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
     sleepFn: async () => {},
     fetchCardFn: async () => dependencyReadyCard({
       ...card,
       labelNames: ["app:guide", "dev:in-progress"],
       commentsComplete: true,
-      comments: [{ id: "c1", body: declarationBody, createdAt: claimIso(1) }],
+      comments: [...comments],
     }),
   });
   assert.equal(claimed.length, 1);
