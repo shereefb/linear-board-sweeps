@@ -2,6 +2,43 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.8] - 2026-07-11
+
+### Changed
+
+- Carry versioned performance budgets from Spec into kind-specific, commit-bound Dev proof and honest QA consumption without weakening existing review or Ship gates.
+- Distinguish measured benchmarks from deterministic work bounds for pagination, retry, prefetch, latency, and resource constraints.
+
+### Fixed
+
+- Invalidate stale proof after affected-path QA changes and share one fail-closed legacy boundary with other versioned contracts in either landing order.
+- Bump the marker so installed anchors receive all three sweep skill updates.
+### Added
+
+- Persist host-wide Codex and Claude usage cooldowns for one hour, route new work to a healthy configured runtime, and admit only one probe when a cooldown expires.
+- Expose cooling runtimes and next probe times in local logs and `doctor` output.
+
+### Changed
+
+- Treat daily provider usage exhaustion as quiet deferred scheduler state: preserve exact claims and worktrees without creating Linear Todos, comments, labels, or state churn when every configured runtime is cooling.
+- Replace per-card fallback-lane advancement with one shared provider-cooldown authority that survives launcher restarts.
+
+### Fixed
+
+- Count only candidate Codex error envelopes against bounded usage-evidence limits, so routine JSONL traffic cannot hide a later supported usage-limit event.
+- Recognize bounded Claude CLI usage-limit stderr separately from authentication, overload, transient rate limits, and ordinary agent failures.
+
+## [1.2.0.7] - 2026-07-10
+
+### Changed
+
+- Require material Spec cards to carry an auditable `scope-closure/v1` inventory whose stable surface IDs map into implementation tasks, proofs, rollout evidence, and owners before handoff.
+- Compose scope closure with correctness and adaptive review depth without adding a review pass or weakening safety gates.
+
+### Fixed
+
+- Preserve material self-check omissions as `review/scope-gap` evidence, and prove the VERSION-triggered updater installs the changed canonical skill bytes.
+
 ## [1.2.0.6] - 2026-07-10
 
 ### Added

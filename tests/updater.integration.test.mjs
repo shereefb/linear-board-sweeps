@@ -45,6 +45,19 @@ test("refreshAnchorSkills: commits to main even when a feature branch is checked
     // main (locally and on origin) has the new version; the feature branch does NOT.
     assert.equal(g(anchor, "show", "main:.claude/skills/.sweep-version").trim(), "9.9.9");
     assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version").trim(), "9.9.9");
+    for (const stage of ["spec", "dev", "qa"]) {
+      const shown = spawnSync(
+        "git",
+        ["show", `main:.claude/skills/${stage}-sweep/SKILL.md`],
+        { cwd: anchor, encoding: null },
+      );
+      assert.equal(shown.status, 0, shown.stderr.toString("utf8"));
+      assert.deepEqual(
+        shown.stdout,
+        fs.readFileSync(path.join(KIT, "skills", `${stage}-sweep`, "SKILL.md")),
+        `${stage}-sweep bytes were not propagated`,
+      );
+    }
     const onFeature = spawnSync("git", ["show", "COD-1-feature:.claude/skills/.sweep-version"], { cwd: anchor, encoding: "utf8" }).stdout.trim();
     assert.equal(onFeature, "0.0.1"); // feature branch untouched
     // Primary tree is still on the feature branch, and the temp worktree is gone.
@@ -186,6 +199,47 @@ test("refreshAnchorSkills: a no-change retry pushes a marker commit left local b
     assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "9.9.7");
   } finally {
     if (fs.existsSync(offlineOrigin) && !fs.existsSync(origin)) fs.renameSync(offlineOrigin, origin);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runUpdate: newer VERSION installs matching spec-sweep bytes on anchor main", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-update-success-"));
+  try {
+    const kitOrigin = path.join(root, "kit-origin.git");
+    const kit = path.join(root, "kit");
+    const anchorOrigin = path.join(root, "anchor-origin.git");
+    const anchor = path.join(root, "anchor");
+    const stateDir = path.join(root, "state");
+    const nl = String.fromCharCode(10);
+
+    g(root, "init", "--bare", "-b", "main", kitOrigin);
+    g(root, "clone", kitOrigin, kit);
+    g(kit, "config", "user.email", "t@t.t");
+    g(kit, "config", "user.name", "t");
+    fs.cpSync(path.join(KIT, "skills"), path.join(kit, "skills"), { recursive: true });
+    fs.writeFileSync(path.join(kit, "VERSION"), `9.9.9${nl}`);
+    g(kit, "add", "skills", "VERSION");
+    g(kit, "commit", "-m", "seed newer kit");
+    g(kit, "push", "origin", "main");
+
+    g(root, "init", "--bare", "-b", "main", anchorOrigin);
+    g(root, "clone", anchorOrigin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), `0.0.1${nl}`);
+    g(anchor, "add", ".claude/skills/.sweep-version");
+    g(anchor, "commit", "-m", "seed old anchor");
+    g(anchor, "push", "origin", "main");
+
+    const failures = [];
+    runUpdate({ autoUpdate: true, kitPath: kit, kitRef: "main", repos: [anchor] }, (...args) => failures.push(args), { stateDir });
+    assert.deepEqual(failures, []);
+    g(anchor, "fetch", "origin", "main");
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "9.9.9");
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/spec-sweep/SKILL.md"), fs.readFileSync(path.join(kit, "skills", "spec-sweep", "SKILL.md"), "utf8").trim());
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
