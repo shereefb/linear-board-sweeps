@@ -343,7 +343,8 @@ function eventObservation(event, run) {
     summary: event.summary,
     references: [`learning-event:${event.eventId}`],
   };
-  if (event.kind === "review" && event.category !== "completed") return { ...base, signal: "review-finding" };
+  if (event.kind === "review" && event.category === "completed") return { ...base, signal: "review-completed" };
+  if (event.kind === "review") return { ...base, signal: "review-finding" };
   if (event.kind === "qa" && !["environment-start"].includes(event.category)) return {
     ...base,
     signal: "qa-result",
@@ -1418,10 +1419,12 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     ? owned.filter((item) => item.signal === evaluation.signal
       && detectorSemanticKey(evaluation.detectorId, item, evaluation.signal) === semanticKey)
     : owned;
+  const reviewExposureSatisfied = evaluation.detectorId !== "repeated-review-finding"
+    || new Set(owned.filter((item) => item.signal === "review-completed").map((item) => item.cardId).filter(Boolean)).size >= 5;
   const values = scoped.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
   let status = windowReady ? "inconclusive-evidence" : "not-due";
   const scopedContract = Boolean(evaluation.detectorId && evaluation.signal && semanticKey);
-  if (windowReady && coverageComplete && ownership && (values.length || scopedContract)) {
+  if (windowReady && coverageComplete && ownership && reviewExposureSatisfied && (values.length || scopedContract)) {
     let value;
     if (evaluation.aggregation === "p90") value = percentile(values, 0.9);
     else if (evaluation.aggregation === "count") value = new Set(scoped.map((item) => item.evidenceId || item.eventId || item.runId || item.cardId).filter(Boolean)).size;

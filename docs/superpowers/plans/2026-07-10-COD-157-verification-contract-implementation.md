@@ -15,7 +15,7 @@
 - Preserve TDD, both Dev code-review passes, QA, Signoff, and the human-only Ship move.
 - Continue emitting every verified material gap as `review/test-gap`; never suppress or reclassify a finding to improve the metric.
 - Keep each `skills/<sweep>-sweep/SKILL.md` byte-identical to `.claude/skills/<sweep>-sweep/SKILL.md` after synchronization.
-- Rebase on current `origin/main` before release edits. Increment the patch component of the live `VERSION` exactly once and use that concrete value in `VERSION` and `CHANGELOG.md`; do not assume COD-155's planned version has or has not landed.
+- Reconcile current `origin/main` before release edits. Allocate the next four-component marker from every live remote `VERSION`, incrementing only component `v[3]`, and use that unique concrete value in `VERSION` and `CHANGELOG.md`; do not assume another feature's planned marker has or has not landed.
 - Reuse one git-history ancestry helper for COD-155 and COD-157 if both contracts are present; locate each rollout from the first commit adding its versioned literal to the canonical/installed Spec skill.
 - The existing two `tests/linear.test.mjs` failures caused by absent `repoRouting.byLabel` are baseline evidence, not COD-157 scope. Focused COD-157 tests must be green and the full suite must introduce no new failure.
 
@@ -380,12 +380,15 @@ Expected: PASS, proving current updater behavior copies all three changed skill 
 - [ ] **Step 3: Rebase and calculate the one concrete release version**
 
 ```bash
-git fetch origin main
-git rebase origin/main
-node -e 'const v=require("fs").readFileSync("VERSION","utf8").trim().split(".").map(Number); if(v.length!==3||v.some(Number.isNaN)) process.exit(2); v[2]++; console.log(v.join("."))'
+git fetch origin --prune
+git for-each-ref --format='%(refname)' refs/remotes/origin | while read -r ref; do git show "$ref:VERSION" 2>/dev/null || true; done | rg '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -V -u > "$AUTO_SWEEP_TMPDIR/live-versions.txt"
+MAX_VERSION=$(tail -1 "$AUTO_SWEEP_TMPDIR/live-versions.txt")
+NEXT_VERSION=$(node -e 'const v=process.argv[1].split(".").map(Number); if(v.length!==4||v.some(Number.isNaN)) process.exit(2); v[3]+=1; process.stdout.write(v.join("."))' "$MAX_VERSION")
+! rg -qx "$NEXT_VERSION" "$AUTO_SWEEP_TMPDIR/live-versions.txt"
+printf '%s\n' "$NEXT_VERSION"
 ```
 
-Expected: one semantic patch version exactly one higher than the live `VERSION`. Record that output and use it verbatim in Steps 4-5. If COD-155 landed during rebase, its marker is naturally the input; if not, COD-157 takes the next live patch and COD-155 must later rebase rather than reserve a gap.
+Expected: one four-component version exactly one higher than the greatest marker on all live remote refs, with the uniqueness check exiting 0. Record `NEXT_VERSION` and use it verbatim in Steps 4-5. Immediately before committing the release edits, fetch and repeat this calculation; if another branch claimed the marker, reconcile current `origin/main` and allocate again rather than reserving or reusing a value.
 
 - [ ] **Step 4: Update VERSION and CHANGELOG with the recorded concrete value**
 
