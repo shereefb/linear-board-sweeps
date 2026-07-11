@@ -4,13 +4,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { claimCloseMarker, parseClaimMarker, resolveClaimOwnership } from "./claim-ownership.mjs";
 //
 // Usage:
 //   node linear.mjs whoami
 //   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
 //   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
-//   node linear.mjs move-card-bottom-if-current "<Issue>" "<ExpectedState>" "<DestinationState>" "<OwnedClaim>" "<OwnerToken>"
+//   node linear.mjs move-card-bottom-if-current "<Issue>" "<ExpectedState>" "<DestinationState>" "<OwnedClaim>" "<OwnerToken>" "<DeclarationId>"
 //   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
 //   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
 //   node linear.mjs dependency-status "<Issue>"             # JSON; exits 0 ready, 3 blocked, 2 unreadable
@@ -541,10 +542,12 @@ export async function moveCardBottomIfCurrent(
   destinationState,
   ownedClaim,
   ownerToken,
+  declarationId,
   { gqlFn = gql, log = console.log } = {},
 ) {
-  if (![issueIdentifier, expectedState, destinationState, ownedClaim, ownerToken].every((value) => typeof value === "string" && value)) {
-    throw new Error("usage: move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken>");
+  if (![issueIdentifier, expectedState, destinationState, ownedClaim, ownerToken, declarationId]
+    .every((value) => typeof value === "string" && value)) {
+    throw new Error("usage: move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> <DeclarationId>");
   }
   const metadata = await gqlFn(
     `query($id:String!){ issue(id:$id){ id identifier project { id } team { states(first:100){ nodes { id name } } } } }`,
@@ -577,7 +580,6 @@ export async function moveCardBottomIfCurrent(
       || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
     throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
   }
-  const heartbeat = latestClaimHeartbeat(comments, ownedClaim);
   const decision = guardedTerminalMoveDecision({
     stateName: finalIssue.state.name,
     expectedState,
@@ -585,12 +587,42 @@ export async function moveCardBottomIfCurrent(
     labelNames: labels.map((label) => label.name),
     ownedClaim,
     ownerToken,
-    heartbeatOwner: heartbeat.owner,
-    heartbeatMalformed: heartbeat.malformed,
+    heartbeatOwner: ownerToken,
+    heartbeatMalformed: false,
   });
   if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
+  const ownership = resolveClaimOwnership({ comments, complete: true, claim: ownedClaim, labelPresent: true });
+  if (ownership.status !== "owned" || ownership.ownerToken !== ownerToken || ownership.declarationId !== declarationId) {
+    return { moved: false, issue: finalIssue.identifier, reason: "owner-mismatch" };
+  }
   const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;
   if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
+  const closeBody = claimCloseMarker({ claim: ownedClaim, declarationId, reason: "terminal" });
+  const closeResult = await gqlFn(
+    `mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`,
+    { id: issue.id, b: closeBody },
+  );
+  if (closeResult?.commentCreate?.success !== true) throw new Error(`Issue "${issueIdentifier}" terminal claim close failed.`);
+  let closedComments;
+  try {
+    closedComments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close unverified.`, { cause });
+  }
+  const closedOwnership = resolveClaimOwnership({
+    comments: closedComments,
+    complete: true,
+    claim: ownedClaim,
+    labelPresent: true,
+  });
+  const exactCloseVisible = closedComments.some((comment) => {
+    const marker = parseClaimMarker(comment);
+    return marker?.type === "close" && marker.claim === ownedClaim
+      && marker.declarationId === declarationId && marker.reason === "terminal";
+  });
+  if (!exactCloseVisible || closedOwnership.status !== "legacy-unowned") {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close unverified.`);
+  }
   const input = guardedTerminalMoveInput(destinationStateId, destination, ownedClaimId);
   const result = await gqlFn(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
@@ -716,7 +748,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     "move-card-bottom-if-current": async () => {
       try {
-        const result = await moveCardBottomIfCurrent(args[0], args[1], args[2], args[3], args[4], { log: () => {} });
+        const result = await moveCardBottomIfCurrent(args[0], args[1], args[2], args[3], args[4], args[5], { log: () => {} });
         console.log(JSON.stringify(result));
         process.exitCode = result.moved ? 0 : 3;
       } catch (error) {
@@ -804,7 +836,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> <DeclarationId> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

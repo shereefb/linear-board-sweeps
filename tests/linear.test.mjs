@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { claimCloseMarker, claimDeclarationMarker, claimHeartbeatMarker } from "../scripts/claim-ownership.mjs";
 import {
   positionAfter, reviewLensLabels, bottomSortOrder, issueUpdateToStateBottomInput,
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
@@ -240,10 +241,17 @@ test("guarded terminal move input removes only the owned claim", () => {
   });
 });
 
-test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUpdate", async () => {
+test("guarded terminal move closes the exact declaration before issueUpdate", async () => {
   const calls = [];
+  let commentRead = 0;
   const gqlFn = async (query, variables) => {
-    calls.push({ query, variables });
+    const kind = query.includes("project { id }") ? "metadata"
+      : query.includes("issues(first:100") ? "destination"
+        : query.includes("comments(first:100") ? (commentRead++ === 0 ? "final-read" : "close-read")
+          : query.includes("labels(first:250)") ? "final-facts"
+            : query.includes("commentCreate") ? "close"
+              : query.includes("issueUpdate") ? "issue-update" : "unexpected";
+    calls.push({ kind, query, variables });
     if (query.includes("project { id }")) return { issue: {
       id: "issue-142", identifier: "COD-142", project: { id: "project" },
       team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
@@ -254,32 +262,74 @@ test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUp
         { id: "passed", name: "qa:passed" }, { id: "claim", name: "qa:in-progress" }, { id: "product", name: "frontend" },
       ] },
     } };
-    if (query.includes("comments(first:100")) return { issue: {
-      comments: { pageInfo: { hasNextPage: false }, nodes: [
-        { id: "legacy-heartbeat", body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
-      ] },
-    } };
+    if (query.includes("comments(first:100")) {
+      const nodes = [{
+        id: "declaration", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner-142", declarationId: "decl-142" }),
+        createdAt: "2026-07-10T10:00:00.000Z",
+      }];
+      if (commentRead > 1) nodes.push({
+        id: "close", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl-142", reason: "terminal" }),
+        createdAt: "2026-07-10T10:06:00.000Z",
+      });
+      return { issue: { comments: { pageInfo: { hasNextPage: false }, nodes } } };
+    }
     if (query.includes("issues(first:100")) return {
       issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ id: "other", sortOrder: -8 }] },
     };
+    if (query.includes("commentCreate")) return { commentCreate: { success: true } };
     if (query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: {
       identifier: "COD-142", state: { name: "Ship" }, sortOrder: -9, url: "https://linear/COD-142",
     } } };
     throw new Error(`unexpected query: ${query}`);
   };
 
-  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
+  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", "decl-142", { gqlFn, log: () => {} });
   assert.equal(result.moved, true);
-  const destinationIndex = calls.findIndex((call) => call.query.includes("issues(first:100"));
-  const commentsIndex = calls.findIndex((call) => call.query.includes("comments(first:100"));
-  const finalFactsIndex = calls.findIndex((call) => call.query.includes("labels(first:250"));
+  const destinationIndex = calls.findIndex((call) => call.kind === "destination");
+  const commentsIndex = calls.findIndex((call) => call.kind === "final-read");
+  const finalFactsIndex = calls.findIndex((call) => call.kind === "final-facts");
   assert.ok(destinationIndex >= 0 && commentsIndex > destinationIndex, "destination pagination must precede claim-history pagination");
   assert.ok(finalFactsIndex > commentsIndex, "the final state/labels guard must follow claim-history pagination");
+  assert.deepEqual(calls.map((call) => call.kind), [
+    "metadata", "destination", "final-read", "final-facts", "close", "close-read", "issue-update",
+  ]);
+  assert.equal(calls.find((call) => call.kind === "close").variables.b,
+    claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl-142", reason: "terminal" }));
   assert.deepEqual(calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{
     id: "issue-142",
     input: { stateId: "ship-state", sortOrder: -9, removedLabelIds: ["claim"] },
   }]);
   assert.equal(Object.hasOwn(calls.find((call) => call.query.includes("issueUpdate")).variables.input, "labelIds"), false);
+});
+
+test("guarded terminal move denies a stale declaration even with a late heartbeat", async () => {
+  const calls = [];
+  const comments = [
+    { id: "old-declaration", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "old-owner", declarationId: "old-decl" }), createdAt: "2026-07-10T10:00:00.000Z" },
+    { id: "old-close", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "old-decl", reason: "released" }), createdAt: "2026-07-10T10:01:00.000Z" },
+    { id: "new-declaration", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: "2026-07-10T10:02:00.000Z" },
+    { id: "late-old-heartbeat", body: claimHeartbeatMarker({ claim: "qa:in-progress", declarationId: "old-decl", at: "2026-07-10T10:05:00.000Z" }), createdAt: "2026-07-10T10:05:00.000Z" },
+  ];
+  const gqlFn = async (query) => {
+    calls.push(query);
+    if (query.includes("project { id }")) return { issue: {
+      id: "issue-142", identifier: "COD-142", project: { id: "project" },
+      team: { states: { nodes: [{ id: "ship-state", name: "Ship" }] } },
+    } };
+    if (query.includes("issues(first:100")) return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    if (query.includes("comments(first:100")) return { issue: { comments: { pageInfo: { hasNextPage: false }, nodes: comments } } };
+    if (query.includes("labels(first:250)")) return { issue: {
+      id: "issue-142", identifier: "COD-142", state: { name: "QA" },
+      labels: { pageInfo: { hasNextPage: false }, nodes: [{ id: "claim", name: "qa:in-progress" }] },
+    } };
+    throw new Error(`unexpected query: ${query}`);
+  };
+
+  const result = await moveCardBottomIfCurrent(
+    "COD-142", "QA", "Ship", "qa:in-progress", "old-owner", "old-decl", { gqlFn, log: () => {} },
+  );
+  assert.deepEqual(result, { moved: false, issue: "COD-142", reason: "owner-mismatch" });
+  assert.equal(calls.some((query) => query.includes("commentCreate") || query.includes("issueUpdate")), false);
 });
 
 for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["dev:in-progress", "foreign-claim"]]) {
@@ -306,7 +356,7 @@ for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["d
       throw new Error(`unexpected query: ${query}`);
     };
     assert.deepEqual(
-      await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} }),
+      await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", "decl-142", { gqlFn, log: () => {} }),
       { moved: false, issue: "COD-142", reason },
     );
     assert.equal(calls.some((query) => query.includes("issueUpdate")), false);
@@ -340,7 +390,7 @@ test("moveCardBottomIfCurrent denies a blocker added while claim history paginat
     throw new Error(`unexpected query: ${query}`);
   };
 
-  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
+  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", "decl-142", { gqlFn, log: () => {} });
   assert.deepEqual(result, { moved: false, issue: "COD-142", reason: "blocking-label" });
   assert.ok(calls.findIndex((query) => query.includes("comments(first:100"))
     < calls.findIndex((query) => query.includes("labels(first:250)")));
@@ -463,7 +513,7 @@ test("fetchIssueDependencies rejects query failures instead of returning an empt
 });
 
 const linearCli = fileURLToPath(new URL("../scripts/linear.mjs", import.meta.url));
-function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in-progress"], ownerToken = "owner-142", heartbeatOwner = "owner-142", unreadable = false, commentsComplete = true } = {}) {
+function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in-progress"], ownerToken = "owner-142", declarationOwner = "owner-142", declarationId = "decl-142", unreadable = false, commentsComplete = true } = {}) {
   const metadataIssue = unreadable ? null : {
     id: "issue-142", identifier: "COD-142", project: { id: "project" },
     team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
@@ -472,22 +522,31 @@ function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in
     id: "issue-142", identifier: "COD-142", state: { name: stateName },
     labels: { pageInfo: { hasNextPage: false }, nodes: labelNames.map((name, index) => ({ id: `label-${index}`, name })) },
   };
-  const finalComments = unreadable ? null : { pageInfo: { hasNextPage: !commentsComplete, endCursor: null }, nodes: [
-    { id: "legacy-heartbeat", body: `[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=${heartbeatOwner} claim=qa:in-progress]`, createdAt: "2026-07-10T10:05:00.000Z" },
-  ] };
-  const preloadSource = `globalThis.fetch = async (_url, options) => {
+  const declarationComment = {
+    id: "declaration",
+    body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: declarationOwner, declarationId }),
+    createdAt: "2026-07-10T10:00:00.000Z",
+  };
+  const closeComment = {
+    id: "close",
+    body: claimCloseMarker({ claim: "qa:in-progress", declarationId, reason: "terminal" }),
+    createdAt: "2026-07-10T10:06:00.000Z",
+  };
+  const preloadSource = `let closed = false;
+  globalThis.fetch = async (_url, options) => {
     const { query } = JSON.parse(options.body);
     let data;
-    if (query.includes("comments(first:100")) data = { issue: { comments: ${JSON.stringify(finalComments)} } };
+    if (query.includes("comments(first:100")) data = { issue: { comments: ${unreadable ? "null" : `{ pageInfo: { hasNextPage: ${!commentsComplete}, endCursor: null }, nodes: closed ? ${JSON.stringify([declarationComment, closeComment])} : ${JSON.stringify([declarationComment])} }`} } };
     else if (query.includes("labels(first:250)")) data = { issue: ${JSON.stringify(finalIssue)} };
     else if (query.includes("issue(id:$id)")) data = { issue: ${JSON.stringify(metadataIssue)} };
     else if (query.includes("issues(first:100")) data = { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    else if (query.includes("commentCreate")) { closed = true; data = { commentCreate: { success: true } }; }
     else if (query.includes("issueUpdate")) data = { issueUpdate: { success: true, issue: { identifier: "COD-142", state: { name: "Ship" }, sortOrder: 0, url: "https://linear/COD-142" } } };
     else throw new Error("unexpected query: " + query);
     return { json: async () => ({ data }) };
   };`;
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
-  return spawnSync(process.execPath, ["--import", preload, linearCli, "move-card-bottom-if-current", "COD-142", "QA", "Ship", "qa:in-progress", ownerToken], {
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "move-card-bottom-if-current", "COD-142", "QA", "Ship", "qa:in-progress", ownerToken, declarationId], {
     encoding: "utf8",
     env: { ...process.env, LINEAR_API_KEY: "key" },
   });
@@ -502,7 +561,7 @@ test("move-card-bottom-if-current CLI maps moved, denied, and unreadable outcome
   assert.equal(denied.status, 3, denied.stderr);
   assert.deepEqual(JSON.parse(denied.stdout), { moved: false, issue: "COD-142", reason: "source-state-changed" });
 
-  const newerOwner = runGuardedMoveCli({ heartbeatOwner: "newer-owner" });
+  const newerOwner = runGuardedMoveCli({ declarationOwner: "newer-owner" });
   assert.equal(newerOwner.status, 3, newerOwner.stderr);
   assert.equal(JSON.parse(newerOwner.stdout).reason, "owner-mismatch");
 
