@@ -8,7 +8,7 @@ const dev = read("skills/dev-sweep/SKILL.md");
 const qa = read("skills/qa-sweep/SKILL.md");
 
 test("spec-sweep emits a risk-linked verification contract", () => {
-  assert.match(spec, /Verification contract: verification-contract\/v1[^\n]*required | not required/i);
+  assert.match(spec, /Verification contract: verification-contract\/v1[^\n]*(?:required|not required)/i);
   assert.match(spec, /Source requirement \/ C ID\(s\)[^]*Behavior \/ risk[^]*Failure this proof must catch[^]*Required proof[^]*Acceptance/i);
   assert.match(spec, /stable `?V1\.\.Vn`? IDs|stable V1\.\.Vn IDs/i);
   assert.match(spec, /Tier 0[^]*at least Tier 1/i);
