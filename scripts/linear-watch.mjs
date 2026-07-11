@@ -6290,27 +6290,34 @@ export function classifyPostDispatchProgress(result = {}, card = {}, { resumeRec
 
   if (card?.commentsComplete !== true) return invalid("incomplete-history", "complete claim history is required");
   if (ownership.status === "ambiguous") return invalid("ambiguous-history", ownership.reason || "claim history is ambiguous");
+  const markers = (card.comments || []).map(parseClaimMarker).filter(Boolean);
+  const dispatchedDeclaration = markers.find((marker) => marker.type === "declaration"
+    && marker.claim === cfg?.claim && marker.declarationId === pick.claimDeclarationId);
+  const currentBoundary = markers.find((marker) => marker.commentId === ownership.boundaryCommentId);
   const closedOwnedEpoch = ownership.status === "closed"
-    && (card.comments || []).some((comment) => {
-      const marker = parseClaimMarker(comment);
-      return marker?.type === "close" && marker.claim === cfg?.claim
-        && marker.declarationId === pick.claimDeclarationId;
-    });
+    && dispatchedDeclaration?.ownerToken === pick.ownerToken
+    && currentBoundary?.type === "close"
+    && currentBoundary.claim === cfg?.claim
+    && currentBoundary.declarationId === pick.claimDeclarationId;
   if (!ownsOpenClaim && !closedOwnedEpoch) return invalid("ownership-mismatch", "post-run claim history does not match the dispatched epoch");
 
   if (["dependency-deferred", "repo-routing-deferred"].includes(result.kind)) {
     return valid(result.kind, "verified child preflight deferred material work");
   }
-  const matchingResume = resumeRecord
-    && resumeRecord.sweep === pick.sweep
-    && resumeRecord.ownerToken === pick.ownerToken
-    && resumeRecord.claimDeclarationId === pick.claimDeclarationId;
+  const verifiedResume = resumeRecord?.kind === "resume" ? resumeRecord.record : null;
+  const matchingResume = verifiedResume
+    && verifiedResume.sweep === pick.sweep
+    && verifiedResume.ownerToken === pick.ownerToken
+    && verifiedResume.claimDeclarationId === pick.claimDeclarationId;
   if (matchingResume && ownsOpenClaim) return valid("resume-needed", "verified resume metadata preserves the open epoch");
   if (result.kind !== "success") return invalid("dispatch-failed", "child did not exit successfully");
   if (closedOwnedEpoch && blockingLabelsForIssue(card.labelNames).length) {
     return valid("blocked", "closed epoch has an observable blocker");
   }
-  if (closedOwnedEpoch && !cfg.states.includes(card.stateName)) {
+  const workflowOrder = ["Backlog", "Spec", "Dev", "QA", "Signoff", "Ship", "Done"];
+  const sourceRank = Math.max(...cfg.states.map((state) => workflowOrder.indexOf(state)));
+  const destinationRank = workflowOrder.indexOf(card.stateName);
+  if (closedOwnedEpoch && sourceRank >= 0 && destinationRank > sourceRank) {
     return valid("advanced", "closed epoch reached a downstream state");
   }
   return invalid("successful-no-op", "child exited successfully without an observable terminal outcome");

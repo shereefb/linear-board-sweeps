@@ -105,8 +105,34 @@ test("classifyPostDispatchProgress accepts dependency and route deferrals", () =
 
 test("classifyPostDispatchProgress accepts verified resume metadata", () => {
   const result = postDispatchResult();
-  const resumeRecord = { sweep: "ship", ownerToken: "owner", claimDeclarationId: "decl" };
+  const resumeRecord = { kind: "resume", record: { sweep: "ship", ownerToken: "owner", claimDeclarationId: "decl" } };
   assert.equal(classifyPostDispatchProgress(result, postDispatchCard(), { resumeRecord }).kind, "resume-needed");
+});
+
+test("classifyPostDispatchProgress rejects minimal unverified resume metadata", () => {
+  const resumeRecord = { sweep: "ship", ownerToken: "owner", claimDeclarationId: "decl" };
+  assert.equal(classifyPostDispatchProgress(postDispatchResult(), postDispatchCard(), { resumeRecord }).kind, "successful-no-op");
+});
+
+test("classifyPostDispatchProgress rejects a close whose declaration belongs to another owner", () => {
+  const card = postDispatchCard("Done", { close: true });
+  card.comments[0] = { ...card.comments[0], body: claimDeclarationMarker({ claim: "ship:in-progress", ownerToken: "other", declarationId: "decl" }) };
+  assert.equal(classifyPostDispatchProgress(postDispatchResult(), card).kind, "ownership-mismatch");
+});
+
+test("classifyPostDispatchProgress requires the dispatched close to be the current boundary", () => {
+  const card = postDispatchCard("Done", { close: true });
+  card.comments.push(
+    { id: "new-decl", body: claimDeclarationMarker({ claim: "ship:in-progress", ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: "2026-07-11T00:00:03.000Z" },
+    { id: "new-close", body: claimCloseMarker({ claim: "ship:in-progress", declarationId: "new-decl", reason: "terminal" }), createdAt: "2026-07-11T00:00:04.000Z" },
+  );
+  assert.equal(classifyPostDispatchProgress(postDispatchResult(), card).kind, "ownership-mismatch");
+});
+
+test("classifyPostDispatchProgress rejects backward and unrelated states as advancement", () => {
+  for (const stateName of ["QA", "Backlog", "Todo", "Canceled"]) {
+    assert.equal(classifyPostDispatchProgress(postDispatchResult(), postDispatchCard(stateName, { close: true })).kind, "successful-no-op", stateName);
+  }
 });
 
 test("classifyPostDispatchProgress rejects mismatched ownership", () => {
