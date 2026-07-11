@@ -6539,7 +6539,7 @@ export function recordSuccessfulNoOpTelemetry(telemetry = {}, issueIdentifier) {
 }
 
 const MAX_STRANDED_CLAIM_COUNT = 1_000_000;
-const STRANDED_CLAIM_CLASSIFICATIONS = ["claim-release-failed", "complete-read-failed", "owned-claim-unreleased"];
+const STRANDED_CLAIM_CLASSIFICATIONS = ["claim-release-failed", "owned-claim-unreleased"];
 
 function boundedStrandedClaims(value = {}) {
   return Object.fromEntries(STRANDED_CLAIM_CLASSIFICATIONS
@@ -6549,10 +6549,14 @@ function boundedStrandedClaims(value = {}) {
 }
 
 export function recordStrandedClaimTelemetry(telemetry = {}, reconciliation = {}) {
+  if (reconciliation.success === true || reconciliation.progress?.ownsOpenClaim !== true) return telemetry;
   let classification = null;
-  if (reconciliation.progress?.kind === "complete-read-failed") classification = "complete-read-failed";
-  else if (reconciliation.claimResult?.attempted === true && reconciliation.claimResult.released !== true) classification = "claim-release-failed";
-  else if (reconciliation.progress?.ownsOpenClaim === true && reconciliation.success !== true) classification = "owned-claim-unreleased";
+  if (reconciliation.claimResult?.attempted === true) {
+    if (reconciliation.claimResult.released === true) return telemetry;
+    classification = "claim-release-failed";
+  } else {
+    classification = "owned-claim-unreleased";
+  }
   if (!classification) return telemetry;
   const prior = Number.isSafeInteger(telemetry.strandedClaims?.[classification])
     ? telemetry.strandedClaims[classification]

@@ -139,6 +139,30 @@ test("stranded claim telemetry producer feeds bounded doctor classifications", a
   assert.doesNotMatch(JSON.stringify(report.strandedClaims), /secret release detail/);
 });
 
+test("verified successful no-op claim cleanup does not produce stranded telemetry", async () => {
+  const result = {
+    ...postDispatchResult(),
+    success: true,
+    pick: { ...postDispatchResult().pick, issueId: "issue", issueIdentifier: "COD-179" },
+  };
+  const reconciliation = await reconcileDispatchProgress("key", result, "codex", {
+    fetchClaimCardFn: async () => postDispatchCard(),
+    releaseFailedDispatchClaimFn: async () => true,
+  });
+  assert.equal(reconciliation.progress.ownsOpenClaim, true);
+  assert.deepEqual(reconciliation.claimResult, { attempted: true, released: true });
+  assert.deepEqual(recordStrandedClaimTelemetry({}, reconciliation), {});
+});
+
+test("stranded telemetry requires exact open-claim evidence when cleanup was not attempted", () => {
+  assert.deepEqual(recordStrandedClaimTelemetry({}, {
+    success: false, progress: { kind: "complete-read-failed", ownsOpenClaim: false }, claimResult: null,
+  }), {});
+  assert.deepEqual(recordStrandedClaimTelemetry({}, {
+    success: false, progress: { kind: "successful-no-op", ownsOpenClaim: true }, claimResult: null,
+  }), { strandedClaims: { "owned-claim-unreleased": 1 } });
+});
+
 test("classifyPostDispatchProgress accepts a legitimate blocker with a closed epoch", () => {
   const value = classifyPostDispatchProgress(postDispatchResult(), postDispatchCard("Ship", { close: true, labels: ["blocked:needs-user"] }));
   assert.equal(value.kind, "blocked");
