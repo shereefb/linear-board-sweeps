@@ -20,7 +20,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { isUtf8 } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
   bottomSortOrder,
@@ -67,16 +69,24 @@ const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
 const OBSERVATIONS = path.join(STATE_DIR, "observations.json");
+const RESUME_NEEDED = path.join(STATE_DIR, "resume-needed.json");
+const RUNTIME_COOLDOWNS = path.join(STATE_DIR, "runtime-cooldowns.json");
 const LEARNING_RUNS_DIR = path.join(STATE_DIR, "runs");
 const LEARNING_STATE_PATH = path.join(STATE_DIR, "learning-state.json");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
+export const RESUME_STATE_VERSION = 1;
+export const RUNTIME_COOLDOWN_STATE_VERSION = 1;
+export const RUNTIME_COOLDOWN_MS = 60 * 60_000;
+export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
+export const RESUME_PROTECTION_MAX_AGE_MS = 24 * 3600000;
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
 
 export const INTERVAL_S = 600;
 export const HEARTBEAT_TAG = "[auto-sweep-heartbeat";
+export const RETRY_TAG = "[auto-sweep-retry";
 export const REAPER_TAG = "[auto-sweep-reaper]"; // crash-reap audit marker — COUNTED by the escalate-crash counter
 export const ORPHAN_TAG = "[auto-sweep-orphan]"; // foreign/orphan claim release — distinct so it doesn't inflate the crash count
 export const PARK_TAG = "[auto-sweep-parked]"; // bounce-escalation park — distinct from REAPER_TAG and BOUNCE_TAG
@@ -120,7 +130,7 @@ export const SWEEP_ORDER = ["ship", "qa", "dev", "spec"];
 // The kit skill directories the auto-updater propagates to anchors — one per sweep.
 export const SKILL_DIRS = SWEEPS.map((s) => `${s}-sweep`);
 // Human-invoked skills copied to anchors but never included in scheduled dispatch.
-export const MANUAL_SKILL_DIRS = ["unblock-sweep"];
+export const MANUAL_SKILL_DIRS = ["unblock-sweep", "manual-sweep"];
 export const PROPAGATED_SKILL_DIRS = [...SKILL_DIRS, ...MANUAL_SKILL_DIRS];
 // Holding states can carry a stale claim but are fetched by NO sweep (a sweep's
 // own states are reaped in the main loop). qa moves a card to "Signoff" and
@@ -440,6 +450,17 @@ export function runtimeConfigForSweep(config = {}, sweep) {
   };
 }
 
+export function fallbackRuntimeConfigForSweep(config = {}, sweep) {
+  if (!SWEEPS.includes(sweep)) return null;
+  const primary = runtimeConfigForSweep(config, sweep);
+  const fallback = config?.runtimes?.[sweep]?.fallback;
+  const model = typeof fallback?.model === "string" ? fallback.model.trim() : "";
+  const validEfforts = new Set(["low", "medium", "high", "xhigh", "max"]);
+  if (primary.runtime !== "codex" || fallback?.runtime !== "claude" || !model) return null;
+  if (fallback.effort !== undefined && !validEfforts.has(fallback.effort)) return null;
+  return { runtime: "claude", model, effort: fallback.effort };
+}
+
 function whichRuntime(runtime, env) {
   const result = spawnSync("/usr/bin/which", [runtime], { env, encoding: "utf8" });
   return result.status === 0 ? result.stdout.trim() : null;
@@ -503,7 +524,7 @@ export function preflightRuntimeCandidates(candidates, {
   const ready = [];
   const failures = [];
   for (const pick of candidates || []) {
-    const runtime = runtimeConfigForSweep(pick.config || {}, pick.sweep).runtime || "codex";
+    const runtime = (pick.runtimeOverride || runtimeConfigForSweep(pick.config || {}, pick.sweep)).runtime || "codex";
     const sourceAnchorPath = pick.sourceAnchorPath || pick.anchorPath;
     const key = runtimeLaneKey(sourceAnchorPath, runtime, host);
     let resolution = cache.get(key);
@@ -539,12 +560,11 @@ export function buildCommand({ runtime, sweep, model, effort, anchorPath, issueI
   if (runtime === "claude") {
     const args = ["-p", prompt];
     if (model) args.push("--model", model);
-    // NOTE: Claude Code reasoning-effort flag to be confirmed against the CLI;
-    // effort is currently not emitted for claude (codex is the primary runtime).
+    if (effort) args.push("--effort", effort);
     return { cmd: "claude", args, cwd: anchorPath };
   }
   // default: codex
-  const args = ["exec", "--cd", anchorPath];
+  const args = ["exec", "--json", "--cd", anchorPath];
   if (model) args.push("-m", model);
   if (effort) args.push("-c", `model_reasoning_effort=${effort}`);
   args.push(prompt);
@@ -611,11 +631,17 @@ function liveClaimLabel(card, now, releasedIds = new Set()) {
 
 // Decide reaping/escalation for one (workspace, sweep). Pure: returns actions;
 // the caller executes them against Linear.
-export function reapDecisions(cards, cfg, now) {
+export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } = {}) {
   const out = [];
   for (const card of cards) {
     if (!hasLabel(card, cfg.claim)) continue;
     if (heartbeatAgeMin(card, now) <= cfg.staleMin) continue; // fresh/alive
+    const preserved = protectedClaim(card);
+    if (preserved) {
+      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim,
+        ownerToken: preserved.ownerToken, protectionState: preserved.protectionState });
+      continue;
+    }
     const priorReaps = countMarkers(card, REAPER_TAG, now);
     if (priorReaps + 1 >= CRASH_ESCALATE_AFTER) {
       out.push({ id: card.id, identifier: card.identifier, action: "escalate-crash", releaseClaim: cfg.claim, count: priorReaps + 1 });
@@ -809,6 +835,7 @@ export function actionableCards(cards, cfg, now, releasedIds = new Set()) {
   return cards.filter((card) => {
     if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false; // blocked
     if (!cardDependencyEligibility(card).eligible) return false;
+    if (retryCooldown(card, cfg, now)?.active) return false;
     const liveClaim = liveClaimLabel(card, now, releasedIds);
     return !liveClaim; // exclude cards owned by a live run
   });
@@ -1290,6 +1317,10 @@ export function heartbeatOwner(body) {
 }
 
 export function latestHeartbeatOwner(card, claim = null) {
+  return latestHeartbeat(card, claim)?.owner || null;
+}
+
+export function latestHeartbeat(card, claim = null) {
   const beats = (card?.comments || [])
     .map((c) => {
       const body = c.body || "";
@@ -1297,18 +1328,36 @@ export function latestHeartbeatOwner(card, claim = null) {
       if (claim && !body.includes(claim)) return null;
       const owner = heartbeatOwner(body);
       const t = Date.parse(c.createdAt);
-      return owner && !Number.isNaN(t) ? { owner, t } : null;
+      return owner && !Number.isNaN(t) ? { owner, createdAt: c.createdAt, timestamp: t, commentId: c.id || "" } : null;
     })
     .filter(Boolean)
-    .sort((a, b) => b.t - a.t);
-  return beats[0]?.owner || null;
+    .sort((a, b) => b.timestamp - a.timestamp || String(a.commentId).localeCompare(String(b.commentId)));
+  return beats[0] || null;
 }
 
-export function claimConfirmed(card, cfg, owner, expectedStates = []) {
+export function retryCooldown(card, cfg, now = Date.now()) {
+  if (!cfg?.claim) return null;
+  const claimNames = ALL_CLAIMS.map((claim) => claim.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const pattern = new RegExp(`^\\[auto-sweep-retry claim=(${claimNames}) owner=([A-Za-z0-9._:-]+)\\]`);
+  const heartbeat = latestHeartbeat(card, cfg.claim);
+  if (!heartbeat) return null;
+  const valid = (card?.comments || []).map((comment) => {
+    const match = String(comment.body || "").match(pattern);
+    const timestamp = Date.parse(comment.createdAt);
+    if (!match || match[1] !== cfg.claim || match[2] !== heartbeat.owner || Number.isNaN(timestamp)) return null;
+    const ageMin = (now - timestamp) / 60000;
+    if (timestamp < heartbeat.timestamp || ageMin < 0 || ageMin > cfg.staleMin) return null;
+    return { active: true, owner: match[2], createdAt: comment.createdAt, timestamp, ageMin, commentId: comment.id || "" };
+  }).filter(Boolean).sort((a, b) => b.timestamp - a.timestamp || String(a.commentId).localeCompare(String(b.commentId)));
+  return valid[0] || null;
+}
+
+export function claimConfirmed(card, cfg, owner, expectedStates = [], now = Date.now()) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
   if (!cardDependencyEligibility(card).eligible) return false;
+  if (retryCooldown(card, cfg, now)?.active) return false;
   return latestHeartbeatOwner(card, cfg.claim) === owner;
 }
 
@@ -1364,6 +1413,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options =
     ...paths,
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
+      ...(pick.ownerToken ? { AUTO_SWEEP_OWNER_TOKEN: pick.ownerToken } : {}),
       AUTO_SWEEP_CARD_RUN_ID: cardRunId,
       AUTO_SWEEP_SWEEP: pick.sweep,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
@@ -1449,6 +1499,7 @@ export function sameRepoAvailableSlots({ cards = [], cfg, anchorPath, sweep, act
 }
 
 export function selectCandidateCardsForAdmission(candidate, { now = Date.now() } = {}) {
+  if (candidate.resume) return [candidate.topCard || candidate.cards?.[0]].filter(Boolean);
   const stage = candidate.sweep;
   if (stage === "ship") return [candidate.topCard || candidate.cards?.[0]].filter(Boolean);
   const limit = candidate.slotLimit ?? sameRepoCardLimit(candidate.config || {}, stage);
@@ -1495,6 +1546,7 @@ export function admissionDemandsForCandidates(candidates, {
         cards: [card],
         count: 1,
         slotLimit: 1,
+        ...(candidate.resume ? { resume: true, ownerToken: candidate.ownerToken, worktreePath: candidate.worktreePath, branch: candidate.branch } : {}),
       });
     }
   }
@@ -2009,6 +2061,227 @@ export function createObservationStore({
     };
   };
   return { observationPath, sync, markCapacityDeferred, clear, get, snapshot };
+}
+
+function resumeIdentity(value = {}) {
+  return [value.sourceWorkspace || value.sourceAnchorPath || value.anchorPath, value.sweep, value.issueIdentifier];
+}
+function resumeKey(value) { return JSON.stringify(resumeIdentity(value).map((part) => part || "")); }
+function validResumeRecord(value) {
+  return Boolean(value && typeof value === "object" && typeof value.sourceWorkspace === "string" && value.sourceWorkspace
+    && typeof value.sweep === "string" && value.sweep && typeof value.issueIdentifier === "string" && value.issueIdentifier
+    && typeof value.ownerToken === "string" && value.ownerToken && typeof value.worktreePath === "string" && value.worktreePath
+    && typeof value.branch === "string" && value.branch && typeof value.repoEntry === "string" && value.repoEntry
+    && typeof value.reason === "string" && value.reason && Number.isFinite(Date.parse(value.nextEligibleAt || ""))
+    && Number.isInteger(value.attempts) && value.attempts >= 0);
+}
+
+// Local, atomic recovery state. A malformed file deliberately protects nothing:
+// callers must rediscover from the claimed card/worktree instead of guessing.
+export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, now = Date.now,
+  readJsonFn = (target) => fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : null,
+  writeJsonFn = atomicWriteJson } = {}) {
+  const read = () => {
+    try {
+      const raw = readJsonFn(resumePath);
+      if (raw === null || raw === undefined) return { healthy: true, entries: {} };
+      if (!raw || raw.version !== RESUME_STATE_VERSION || !raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)
+        || Object.values(raw.entries).some((entry) => !validResumeRecord(entry))) return { healthy: false, entries: {} };
+      return { healthy: true, entries: structuredClone(raw.entries) };
+    } catch { return { healthy: false, entries: {} }; }
+  };
+  const persist = (state) => { if (!dryRun) writeJsonFn(resumePath, { version: RESUME_STATE_VERSION, entries: state.entries }); };
+  const get = (pick) => { const state = read(); return state.healthy ? state.entries[resumeKey(pick)] || null : null; };
+  const upsert = (record) => {
+    if (!validResumeRecord(record)) return null;
+    const prior = read();
+    const state = prior.healthy ? prior : { healthy: true, entries: {} };
+    const key = resumeKey(record); const timestamp = new Date(now()).toISOString();
+    state.entries[key] = { ...state.entries[key], ...record, createdAt: state.entries[key]?.createdAt || record.createdAt || timestamp, updatedAt: timestamp };
+    persist(state); return structuredClone(state.entries[key]);
+  };
+  const clear = (pick) => {
+    const state = read(); const key = resumeKey(pick); const entry = state.entries[key];
+    if (!state.healthy || !entry || (pick.ownerToken && entry.ownerToken !== pick.ownerToken)) return false;
+    delete state.entries[key]; persist(state); return true;
+  };
+  const due = (pick) => { const entry = get(pick); return entry && Date.parse(entry.nextEligibleAt) <= now() ? entry : null; };
+  const protectedClaim = (card, cfg, at = now(), { validateRecord = () => true } = {}) => {
+    const state = read();
+    const sweep = cfg && Object.keys(SWEEP_CFG).find((s) => SWEEP_CFG[s] === cfg);
+    const scoped = card?.sourceWorkspace || card?.sourceAnchorPath || card?.anchorPath;
+    const entry = state.healthy ? Object.values(state.entries).find((candidate) => candidate.sweep === sweep && candidate.issueIdentifier === card?.identifier && (!scoped || candidate.sourceWorkspace === scoped)) : null;
+    const updatedAt = Date.parse(entry?.updatedAt || entry?.createdAt || "");
+    if (!entry || !cfg || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
+    const validForResume = Number.isFinite(updatedAt) && at - updatedAt <= RESUME_PROTECTION_MAX_AGE_MS
+      && entry.attempts <= 4 && validateRecord(entry);
+    // Retry eligibility is bounded, claim safety is not. A stale or mismatched
+    // record still protects preserved WIP until rediscovery or explicit human
+    // resolution; it must never fall through to ordinary stale-claim reaping.
+    return { ...entry, protectionState: validForResume ? "resume" : "needs-resolution" };
+  };
+  return { resumePath, read, get, upsert, clear, due, protectedClaim };
+}
+
+function runtimeCooldownKey({ host, runtime, model = null } = {}) {
+  return JSON.stringify([String(host || ""), String(runtime || ""), model ? String(model) : ""]);
+}
+
+function validRuntimeCooldown(value) {
+  return Boolean(value && typeof value === "object"
+    && typeof value.host === "string" && value.host
+    && ["codex", "claude"].includes(value.runtime)
+    && (value.model === null || value.model === undefined || typeof value.model === "string")
+    && value.reason === "usage-exhausted"
+    && Number.isFinite(Date.parse(value.cooldownUntil || ""))
+    && Number.isFinite(Date.parse(value.updatedAt || "")));
+}
+
+export function createRuntimeCooldownStore({
+  cooldownPath = RUNTIME_COOLDOWNS,
+  dryRun = false,
+  now = Date.now,
+  readJsonFn = (target) => fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : null,
+  writeJsonFn = atomicWriteJson,
+} = {}) {
+  const read = () => {
+    try {
+      const raw = readJsonFn(cooldownPath);
+      if (raw === null || raw === undefined) return { healthy: true, entries: {} };
+      if (!raw || raw.version !== RUNTIME_COOLDOWN_STATE_VERSION || !raw.entries || typeof raw.entries !== "object"
+        || Array.isArray(raw.entries) || Object.values(raw.entries).some((entry) => !validRuntimeCooldown(entry))) {
+        return { healthy: false, entries: {} };
+      }
+      return { healthy: true, entries: structuredClone(raw.entries) };
+    } catch { return { healthy: false, entries: {} }; }
+  };
+  const persist = (state) => { if (!dryRun) writeJsonFn(cooldownPath, { version: RUNTIME_COOLDOWN_STATE_VERSION, entries: state.entries }); };
+  const get = (lane) => {
+    const state = read();
+    if (!state.healthy) return null;
+    return state.entries[runtimeCooldownKey(lane)] || (lane.model ? state.entries[runtimeCooldownKey({ ...lane, model: null })] : null) || null;
+  };
+  const markExhausted = ({ host, runtime, model = null }) => {
+    if (!host || !["codex", "claude"].includes(runtime)) return null;
+    const prior = read();
+    const state = prior.healthy ? prior : { healthy: true, entries: {} };
+    const timestamp = new Date(now()).toISOString();
+    const key = runtimeCooldownKey({ host, runtime, model });
+    state.entries[key] = { host, runtime, model, reason: "usage-exhausted", cooldownUntil: new Date(now() + RUNTIME_COOLDOWN_MS).toISOString(), updatedAt: timestamp };
+    persist(state);
+    return structuredClone(state.entries[key]);
+  };
+  const clear = (lane) => {
+    const state = read();
+    if (!state.healthy) return false;
+    const keys = [runtimeCooldownKey(lane), ...(lane.model ? [runtimeCooldownKey({ ...lane, model: null })] : [])];
+    let changed = false;
+    for (const key of keys) if (state.entries[key]) { delete state.entries[key]; changed = true; }
+    if (changed) persist(state);
+    return changed;
+  };
+  const status = (lane) => {
+    const entry = get(lane);
+    if (!entry) return { kind: "ready", entry: null };
+    return { kind: Date.parse(entry.cooldownUntil) > now() ? "cooling" : "probe-due", entry };
+  };
+  const snapshot = () => read();
+  return { get, status, markExhausted, clear, snapshot };
+}
+
+export function selectRuntimeForCooldown(config, sweep, {
+  store,
+  host = os.hostname(),
+  probes = new Set(),
+} = {}) {
+  if (store?.snapshot?.().healthy === false) return { runtimeConfig: null, deferredUntil: null, probe: false, storeHealthy: false };
+  const primary = runtimeConfigForSweep(config, sweep);
+  const fallback = fallbackRuntimeConfigForSweep(config, sweep);
+  const candidates = [primary, fallback].filter(Boolean);
+  const deferred = [];
+  for (const runtimeConfig of candidates) {
+    const lane = { host, runtime: runtimeConfig.runtime, model: runtimeConfig.model };
+    const state = store?.status(lane) || { kind: "ready", entry: null };
+    if (state.kind === "ready") return { runtimeConfig, deferredUntil: null, probe: false };
+    const probeKey = runtimeCooldownKey({ host, runtime: runtimeConfig.runtime, model: state.entry?.model || null });
+    if (state.kind === "probe-due" && !probes.has(probeKey)) {
+      probes.add(probeKey);
+      return { runtimeConfig, deferredUntil: null, probe: true };
+    }
+    if (state.entry?.cooldownUntil) deferred.push(state.entry.cooldownUntil);
+  }
+  return { runtimeConfig: null, deferredUntil: deferred.sort()[0] || null, probe: false };
+}
+
+export function successfulSameStateRecoveryDecision(pick, card, { gitFn = git, existsFn = fs.existsSync } = {}) {
+  const cfg = SWEEP_CFG[pick?.sweep];
+  if (!cfg || !card || !cfg.states.includes(card.stateName) || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== pick.ownerToken) return { kind: "preserve", reason: "claim ownership or state changed" };
+  const worktree = pick.worktreePath;
+  if (!worktree || !existsFn(worktree)) return { kind: "resume-needed", reason: "worktree unavailable", branch: pick.branch || pick.issueIdentifier };
+  const status = gitFn(worktree, ["status", "--porcelain", "--untracked-files=all"], { allowFail: true });
+  if (status.status !== 0) return { kind: "resume-needed", reason: "worktree status unavailable", branch: pick.branch || pick.issueIdentifier };
+  if (status.out) return { kind: "resume-needed", reason: "worktree has uncommitted changes", branch: pick.branch || pick.issueIdentifier };
+  const branch = pick.branch || pick.issueIdentifier;
+  const fetch = gitFn(worktree, ["fetch", "origin", branch], { allowFail: true });
+  const remote = fetch.status === 0 && gitFn(worktree, ["rev-parse", "--verify", `origin/${branch}`], { allowFail: true });
+  const ahead = remote?.status === 0 && gitFn(worktree, ["rev-list", "--count", `origin/${branch}..${branch}`], { allowFail: true });
+  if (!remote || remote.status !== 0 || ahead.status !== 0 || Number(ahead.out || "1") > 0) return { kind: "resume-needed", reason: "branch is not proven pushed to origin", branch };
+  return { kind: "release", reason: "clean worktree and pushed branch", branch };
+}
+
+export function resumeAdmissionDecision(pick, freshCard, record, now = Date.now()) {
+  const cfg = SWEEP_CFG[pick?.sweep];
+  if (!cfg || !record || Date.parse(record.nextEligibleAt || "") > now) return { kind: "skip", reason: "not due" };
+  const expectedBranch = pick.issueIdentifier;
+  const expectedWorktree = cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute);
+  const exact = record.sourceWorkspace === (pick.sourceAnchorPath || pick.anchorPath)
+    && record.sweep === pick.sweep && record.issueIdentifier === pick.issueIdentifier && record.ownerToken === pick.ownerToken
+    && record.branch === expectedBranch && pick.branch === expectedBranch
+    && record.worktreePath === expectedWorktree && pick.worktreePath === expectedWorktree
+    && record.repoEntry === (pick.repoRoute?.repoEntry || ".")
+    && freshCard?.stateName && cfg.states.includes(freshCard.stateName) && hasLabel(freshCard, cfg.claim)
+    && latestHeartbeatOwner(freshCard, cfg.claim) === record.ownerToken;
+  return exact ? { kind: "resume", record } : { kind: "preserve", reason: "resume identity no longer matches claimed card" };
+}
+
+export function rediscoveredResumeRecordForCard({ sourceWorkspace, anchorPath, sweep, card }, now = Date.now()) {
+  const ownerToken = latestHeartbeatOwner(card, SWEEP_CFG[sweep]?.claim);
+  if (!ownerToken || !card?.repoRoute?.ok) return null;
+  return {
+    sourceWorkspace, sweep, issueIdentifier: card.identifier, issueId: card.id, ownerToken,
+    worktreePath: cardWorktreePath(anchorPath, {}, card.identifier, card.repoRoute), branch: card.identifier,
+    repoEntry: card.repoRoute.repoEntry, reason: "rediscovered dirty worktree",
+    nextEligibleAt: new Date(now).toISOString(), attempts: 0,
+  };
+}
+
+export function classifyCapacityOutcome(outcome, logTail = "") {
+  if (!outcome || ["success", "dependency-deferred", "repo-routing-deferred"].includes(outcome.kind)) return null;
+  const text = String(logTail).slice(-16_384).toLowerCase();
+  if (/\b(429|quota|rate limit|too many requests)\b/.test(text)) return "quota";
+  if (/model.{0,32}(capacity|overloaded|unavailable)|capacity exceeded|server overloaded/.test(text)) return "model-capacity";
+  return null;
+}
+export function capacityRetryAt(now, attempts = 0) {
+  const delays = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000];
+  return now + delays[Math.min(Math.max(0, Number(attempts) || 0), delays.length - 1)];
+}
+
+function insidePath(target, root) { const rel = path.relative(root, target); return !rel.startsWith("..") && !path.isAbsolute(rel); }
+export function generatedArtifactCleanupTargets(pick = {}) {
+  const forbidden = [pick.anchorPath, ...(pick.managedRepoPaths || []), pick.worktreePath].filter(Boolean).map((p) => {
+    try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+  });
+  const allowedRoots = [pick.tmpDir, pick.logDir, pick.screenshotDir, pick.browserProfileDir].filter(Boolean);
+  const out = [];
+  for (const candidate of allowedRoots) {
+    try {
+      const resolved = fs.realpathSync(candidate);
+      if (forbidden.some((root) => insidePath(resolved, root) || insidePath(root, resolved))) continue;
+      if (!out.includes(resolved)) out.push(resolved);
+    } catch { /* absent paths are never cleanup targets */ }
+  }
+  return out;
 }
 
 function defaultMemoryPressureSample(spawnFn = spawnSync) {
@@ -3680,6 +3953,46 @@ export function dependencyReadFailureEvents(error, { anchorPath, projectId, seen
   }];
 }
 
+// Admission needs the complete coordination window, while cleanup only needs a
+// recent snapshot. Work backwards from Linear's newest-100 page, stopping as
+// soon as the oldest valid comment covers the largest claim window.
+export async function completeRecentIssueComments(apiKey, issueId, seedConnection, cutoff, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seenCursors = new Set();
+  let connection = seedConnection;
+  let pages = 0;
+  const covered = () => comments.some((comment) => {
+    const timestamp = Date.parse(comment.createdAt);
+    return !Number.isNaN(timestamp) && timestamp <= cutoff;
+  });
+  while (true) {
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasPreviousPage !== "boolean") {
+      throw new Error(`coordination comments for ${issueId} are missing data or pageInfo`);
+    }
+    comments.push(...connection.nodes);
+    pages += 1;
+    if (covered() || !connection.pageInfo.hasPreviousPage) {
+      const byId = new Map();
+      for (const comment of comments) {
+        const timestamp = Date.parse(comment.createdAt);
+        if (!Number.isNaN(timestamp) && timestamp >= cutoff && !byId.has(comment.id)) byId.set(comment.id, comment);
+      }
+      return [...byId.values()];
+    }
+    if (pages >= 20 || comments.length >= 2000) throw new Error(`coordination comments for ${issueId} reached the active-window cap before cutoff`);
+    const cursor = connection.pageInfo.startCursor;
+    if (!cursor || seenCursors.has(cursor)) throw new Error(`coordination comments for ${issueId} pagination cursor cycle or incomplete page`);
+    seenCursors.add(cursor);
+    const result = await gqlFn(
+      `query($id:String!,$cursor:String!){ issue(id:$id){ comments(last:100, before:$cursor){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } } } }`,
+      { id: issueId, cursor },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, `coordination comments for ${issueId}`);
+    connection = data?.issue?.comments;
+  }
+}
+
 export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, states, {
   gqlFn = gql,
   fetchIssueDependenciesFn = fetchIssueDependencies,
@@ -3696,7 +4009,7 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
          nodes{ id identifier updatedAt sortOrder
            state{ name }
            labels{ nodes{ id name } }
-           comments(last:100){ nodes{ body createdAt } }
+           comments(last:100){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } }
            inverseRelations(first:50){
              pageInfo{ hasNextPage endCursor }
              nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3710,6 +4023,10 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
       throw new Error("scheduled queue snapshot is missing issues data or pageInfo");
     }
     for (const node of connection.nodes) {
+      node.comments = {
+        ...node.comments,
+        nodes: await completeRecentIssueComments(apiKey, node.id, node.comments, Date.now() - MAX_STALE_MIN * 60_000, { gqlFn }),
+      };
       const card = await normalizeQueueCard(node, apiKey, { gqlFn, fetchIssueDependenciesFn });
       if (!byState.has(card.stateName)) byState.set(card.stateName, []);
       byState.get(card.stateName).push(card);
@@ -3801,7 +4118,7 @@ async function fetchCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } }
+       comments(last:100){ pageInfo{ hasPreviousPage startCursor } nodes{ id body createdAt } }
        inverseRelations(first:50){
          pageInfo{ hasNextPage endCursor }
          nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3811,6 +4128,10 @@ async function fetchCard(apiKey, issueId) {
   );
   const n = d.issue;
   if (!n) throw new Error(`issue not found: ${issueId}`);
+  n.comments = {
+    ...n.comments,
+    nodes: await completeRecentIssueComments(apiKey, n.id, n.comments, Date.now() - MAX_STALE_MIN * 60_000, { gqlFn: gql }),
+  };
   return normalizeQueueCard(n, apiKey, { gqlFn: gql, fetchIssueDependenciesFn: fetchIssueDependencies });
 }
 
@@ -3818,7 +4139,7 @@ async function fetchClaimCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } } } }`,
+       comments(last:100){ nodes{ id body createdAt } } } }`,
     { id: issueId },
     apiKey,
   );
@@ -3930,6 +4251,9 @@ async function setIssueLabels(apiKey, issueId, labelIds) {
 
 async function addComment(apiKey, issueId, body) {
   await gql(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body }, apiKey);
+}
+async function updateComment(apiKey, commentId, body) {
+  await gql(`mutation($id:String!,$b:String!){ commentUpdate(id:$id, input:{ body:$b }){ success } }`, { id: commentId, b: body }, apiKey);
 }
 
 async function fetchIssueLabels(apiKey, issueId) {
@@ -4251,6 +4575,9 @@ export function checkoutDispatchBlockers(pick, reg = {}, { gitFn = git } = {}) {
   }
   return checkouts
     .map((checkout) => dirtyCheckoutEvent(pick, checkout, { gitFn }))
+    // A verified resume is deliberately the one exception: its deterministic
+    // card worktree is known preserved WIP. Every other checkout stays guarded.
+    .filter((event) => !(pick.resume && event?.kind === "dirty-checkout" && event.stableTarget === `worktree:${pick.worktreePath}`))
     .filter(Boolean);
 }
 
@@ -4303,6 +4630,8 @@ export function doctorReport({
   capacityLedgerPath = CAPACITY_LEDGER,
   observationState = null,
   observationPath = OBSERVATIONS,
+  runtimeCooldownState = null,
+  runtimeCooldownPath = RUNTIME_COOLDOWNS,
   resolveRuntimeFn = resolveRuntimeExecutable,
   runtimeEnvBySource = null,
   learningState = null,
@@ -4360,6 +4689,12 @@ export function doctorReport({
     dependency: telemetry.dependencyDeferredCount || 0,
     capacity: telemetry.capacityDeferredCount ?? waits.length,
   };
+  const cooldowns = runtimeCooldownState || createRuntimeCooldownStore({ cooldownPath: runtimeCooldownPath, now: () => now }).snapshot();
+  report.runtimeCooldowns = {
+    healthy: cooldowns.healthy !== false,
+    entries: Object.values(cooldowns.entries || {}).map((entry) => ({ ...entry, state: Date.parse(entry.cooldownUntil) > now ? "cooling" : "probe-due" })),
+  };
+  if (!report.runtimeCooldowns.healthy) report.ok = false;
   report.resources = {
     loadAverage1m: telemetry.loadAverage1m,
     freeMemoryBytes: telemetry.freeMemoryBytes,
@@ -4497,7 +4832,11 @@ export function formatDoctorReport(report) {
     `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
     `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
     `capacity: ${report.capacity.active}/${report.capacity.max}${highWater}${report.capacity.healthy ? "" : " BLOCKED"}`,
+    `runtime-cooldowns: ${(report.runtimeCooldowns?.entries || []).length}`,
   ];
+  for (const entry of report.runtimeCooldowns?.entries || []) {
+    lines.push(`  ${entry.runtime}${entry.model ? `/${entry.model}` : ""}: ${entry.state} until ${entry.cooldownUntil}`);
+  }
   if (!report.capacity.healthy) {
     for (const error of report.capacity.errors || []) lines.push(`  capacity error: ${error}`);
   }
@@ -4725,8 +5064,41 @@ export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
   return true;
 }
 
+export async function releaseFailedDispatchClaim(apiKey, pick, result, runtime, {
+  fetchClaimCardFn = fetchClaimCard,
+  applyLabelEditFn = applyLabelEdit,
+  addCommentFn = addComment,
+} = {}) {
+  const cfg = SWEEP_CFG[pick.sweep];
+  if (!cfg || !pick.issueId || !pick.ownerToken) return false;
+  const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+  if (!hasLabel(fresh, cfg.claim) || latestHeartbeatOwner(fresh, cfg.claim) !== pick.ownerToken) return false;
+  const detail = result?.kind === "signal" ? String(result.signal || "signal").replace(/[^A-Za-z0-9_-]/g, "") : String(result?.exitCode ?? result?.code ?? "nonzero").replace(/[^A-Za-z0-9_-]/g, "");
+  const runtimeSummary = String(runtime || "runtime").replace(/[^A-Za-z0-9 ._/-]/g, "").slice(0, 120);
+  await addCommentFn(apiKey, fresh.id, `${RETRY_TAG} claim=${cfg.claim} owner=${pick.ownerToken}] ${ORPHAN_TAG} terminal failure observed (kind=${result?.kind || "unknown"}; detail=${detail || "unknown"}; runtime=${runtimeSummary}). Cooldown is based on this Linear timestamp.`);
+  const second = await fetchClaimCardFn(apiKey, pick.issueId);
+  if (!hasLabel(second, cfg.claim) || latestHeartbeatOwner(second, cfg.claim) !== pick.ownerToken) return false;
+  const expectedLabels = new Set((second.labelNames || []).filter((name) => name !== cfg.claim));
+  await applyLabelEditFn(apiKey, second, { remove: [cfg.claim] });
+  const verified = await fetchClaimCardFn(apiKey, pick.issueId);
+  const missing = [...expectedLabels].filter((name) => !hasLabel(verified, name));
+  if (hasLabel(verified, cfg.claim) || missing.length) {
+    const error = new Error(`terminal claim cleanup verification failed for ${pick.issueIdentifier}`);
+    error.code = "CLAIM_CLEANUP_UNVERIFIED";
+    throw error;
+  }
+  return true;
+}
+
 export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   releaseOwnedDispatchClaimFn = releaseOwnedDispatchClaim,
+  releaseFailedDispatchClaimFn = releaseFailedDispatchClaim,
+  fetchClaimCardFn = fetchClaimCard,
+  resumeStore = null,
+  recoveryDecisionFn = successfulSameStateRecoveryDecision,
+  addCommentFn = addComment,
+  updateCommentFn = updateComment,
+  now = Date.now,
 } = {}) {
   const pick = result?.pick || {};
   const cfg = SWEEP_CFG[pick.sweep];
@@ -4736,8 +5108,13 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const routingDeferred = result.kind === "repo-routing-deferred";
   const successfulCompletion = result.kind === "success";
   const interrupted = result.kind === "interrupted";
-  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted) {
+  const terminalFailure = result.kind === "exit" || result.kind === "signal";
+  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
     return { attempted: false, released: false, reasonKind: null };
+  }
+  if (terminalFailure) {
+    const released = await releaseFailedDispatchClaimFn(apiKey, pick, result, runtime);
+    return { attempted: true, released, reasonKind: "terminal failure cooldown" };
   }
   const reasonKind = successfulCompletion
     ? "successful same-state completion"
@@ -4753,6 +5130,37 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
       : successfulCompletion
         ? `successful child via ${runtime} exited while the card remained in ${cfg.states.join("/")}`
         : `dispatcher via ${runtime} could not start`;
+  // Same-state success is the only path that may have local WIP. Re-read before
+  // deciding, then retain the exact owned claim whenever Git cannot prove a clean
+  // branch is already on origin. Keeping this behind the store option preserves
+  // the public compatibility wrapper for older callers/tests.
+  if (successfulCompletion && resumeStore) {
+    const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+    const recovery = recoveryDecisionFn(pick, fresh);
+    if (recovery.kind !== "release") {
+      const eligible = new Date(now()).toISOString();
+      const record = resumeStore.upsert({
+        sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+        sweep: pick.sweep,
+        issueIdentifier: pick.issueIdentifier,
+        issueId: pick.issueId,
+        ownerToken: pick.ownerToken,
+        worktreePath: pick.worktreePath,
+        branch: recovery.branch || pick.issueIdentifier,
+        repoEntry: pick.repoRoute?.repoEntry || ".",
+        reason: sanitizeFailureMessage(recovery.reason),
+        nextEligibleAt: eligible,
+        attempts: 0,
+      });
+      if (!record) return { attempted: true, released: false, reasonKind: "resume-store-unavailable" };
+      const marker = `${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}] Preserved local worktree for ${pick.issueIdentifier}; ${record.reason}. Resume eligible ${eligible}.`;
+      const prior = (fresh.comments || []).find((comment) => (comment.body || "").includes(`${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}]`));
+      if (prior?.id) await updateCommentFn(apiKey, prior.id, marker);
+      else if (!prior) await addCommentFn(apiKey, fresh.id, marker);
+      return { attempted: true, released: false, reasonKind: "resume-needed", record };
+    }
+    resumeStore.clear({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier, ownerToken: pick.ownerToken });
+  }
   const released = await releaseOwnedDispatchClaimFn(apiKey, pick, reason, {
     expectedStates: successfulCompletion ? cfg.states : [],
   });
@@ -4767,33 +5175,15 @@ export async function expandDispatchBatch(batch, {
   childIndexAllocator = createChildIndexAllocator(),
   claimCardSlotsFn = claimCardSlots,
   labelMap: providedLabelMap = null,
-  fetchRouteCardFn = fetchClaimCard,
   onRouteFailure = () => {},
   onSafetyInvariant = () => {},
 } = {}) {
   const expanded = [];
   for (const pick of batch) {
-    if (pick.sweep === "ship") {
-      let routedPick = pick;
-      if (!dryRun && repoRoutingConfigured(pick.config)) {
-        const active = activeByAnchor.get(pick.anchorPath);
-        try {
-          const fresh = await fetchRouteCardFn(active?.apiKey, pick.issueId || pick.issueIdentifier);
-          const freshRoute = resolveCardRepoRoute({ config: pick.config, card: fresh, repoPairs: active?.repoPairs || pick.repoPairs || [] });
-          if (!sameCardRepoRoute(pick.repoRoute, freshRoute)) {
-            onRouteFailure(pick, freshRoute);
-            logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: route changed before Ship spawn (${freshRoute.message || freshRoute.label || "unknown"})`);
-            continue;
-          }
-          routedPick = { ...pick, topCard: { ...fresh, repoRoute: freshRoute }, repoRoute: freshRoute };
-        } catch (error) {
-          const failure = { ok: false, code: "route-read-failed", message: `could not re-read ${pick.issueIdentifier} repository route: ${error.message}` };
-          onRouteFailure(pick, failure);
-          logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: ${failure.message}`);
-          continue;
-        }
-      }
-      expanded.push(withCardDispatchEnv(routedPick, parentRunId, childIndexAllocator.next()));
+    // Resume demands are already claimed by their original owner. Never run the
+    // ordinary claim handshake (which would create a second heartbeat/owner).
+    if (pick.resume) {
+      expanded.push(withCardDispatchEnv(pick, parentRunId, childIndexAllocator.next()));
       continue;
     }
     const rawSlotLimit = pick.slotLimit;
@@ -4840,6 +5230,7 @@ export async function expandDispatchBatch(batch, {
         managedRepoPaths: pick.managedRepoPaths,
         config: pick.config,
         repoPairs: pick.repoPairs,
+        globalRunsDir: pick.globalRunsDir,
         sweep: pick.sweep,
         count: 1,
         topCard: slot.card,
@@ -4854,6 +5245,8 @@ export async function expandDispatchBatch(batch, {
         rotationRank: pick.rotationRank,
         handoffHops: pick.handoffHops,
         runtimeExecutable: pick.runtimeExecutable,
+        runtimeOverride: pick.runtimeOverride,
+        runtimeCooldownProbe: pick.runtimeCooldownProbe,
         runtimeLaneKey: pick.runtimeLaneKey,
         runtimeScope: pick.runtimeScope,
         runtimeStableTarget: pick.runtimeStableTarget,
@@ -5144,6 +5537,160 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
 
+const CODEX_USAGE_LIMIT_PREFIXES = ["You've hit your usage limit.", "You've hit your usage limit for "];
+const CODEX_USAGE_MAX_LINE_BYTES = 16 * 1024;
+const CODEX_USAGE_MAX_CANDIDATES = 32;
+const CODEX_USAGE_MAX_CANDIDATE_BYTES = 64 * 1024;
+
+export function isCodexUsageExhaustedEvent(value) {
+  const message = value?.type === "error"
+    ? value.message
+    : value?.type === "turn.failed" ? value?.error?.message : null;
+  return typeof message === "string"
+    && CODEX_USAGE_LIMIT_PREFIXES.some((prefix) => message.startsWith(prefix));
+}
+
+export function createCodexUsageEvidenceCollector() {
+  const decoder = new StringDecoder("utf8");
+  let line = "";
+  let lineBytes = 0;
+  let discardingLine = false;
+  let rawLineChunks = [];
+  let rawLineBytes = 0;
+  let rawLineTooLong = false;
+  const completedLineUtf8 = [];
+  let candidateCount = 0;
+  let candidateBytes = 0;
+  let classificationDisabled = false;
+  let exhausted = false;
+  let finished = false;
+
+  const classifyLine = () => {
+    if (classificationDisabled || !line.length) return;
+    let value;
+    try { value = JSON.parse(line); } catch { return; }
+    if (value?.type !== "error" && value?.type !== "turn.failed") return;
+    candidateCount += 1;
+    candidateBytes += lineBytes;
+    if (candidateCount > CODEX_USAGE_MAX_CANDIDATES || candidateBytes > CODEX_USAGE_MAX_CANDIDATE_BYTES) {
+      classificationDisabled = true;
+      exhausted = false;
+      return;
+    }
+    if (isCodexUsageExhaustedEvent(value)) exhausted = true;
+  };
+
+  const resetLine = () => {
+    line = "";
+    lineBytes = 0;
+    discardingLine = false;
+  };
+
+  const rawLineIsUtf8 = () => !rawLineTooLong && isUtf8(Buffer.concat(rawLineChunks, rawLineBytes));
+
+  const resetRawLine = () => {
+    rawLineChunks = [];
+    rawLineBytes = 0;
+    rawLineTooLong = false;
+  };
+
+  const appendRaw = (chunk) => {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    let start = 0;
+    while (start < bytes.length) {
+      const newline = bytes.indexOf(0x0a, start);
+      const end = newline === -1 ? bytes.length : newline;
+      const segment = bytes.subarray(start, end);
+      if (!rawLineTooLong) {
+        if (rawLineBytes + segment.length <= CODEX_USAGE_MAX_LINE_BYTES) {
+          rawLineChunks.push(segment);
+          rawLineBytes += segment.length;
+        } else {
+          rawLineChunks = [];
+          rawLineBytes = 0;
+          rawLineTooLong = true;
+        }
+      }
+      if (newline === -1) break;
+      completedLineUtf8.push(rawLineIsUtf8());
+      resetRawLine();
+      start = newline + 1;
+    }
+  };
+
+  const appendDecoded = (text) => {
+    for (const character of text) {
+      if (character === "\n") {
+        const utf8Line = completedLineUtf8.shift() === true;
+        if (!discardingLine && utf8Line) classifyLine();
+        resetLine();
+        continue;
+      }
+      if (discardingLine) continue;
+      const characterBytes = Buffer.byteLength(character);
+      if (lineBytes + characterBytes > CODEX_USAGE_MAX_LINE_BYTES) {
+        line = "";
+        lineBytes = 0;
+        discardingLine = true;
+        continue;
+      }
+      line += character;
+      lineBytes += characterBytes;
+    }
+  };
+
+  return {
+    push(chunk) {
+      if (finished || chunk == null) return;
+      appendRaw(chunk);
+      appendDecoded(decoder.write(chunk));
+    },
+    finish() {
+      if (finished) return;
+      finished = true;
+      appendDecoded(decoder.end());
+      if (!discardingLine && rawLineIsUtf8()) classifyLine();
+      resetLine();
+      resetRawLine();
+    },
+    exhausted() {
+      return exhausted;
+    },
+  };
+}
+
+const CLAUDE_USAGE_LIMIT_PREFIXES = ["You've hit your limit", "Claude usage limit reached"];
+
+export function createClaudeUsageEvidenceCollector() {
+  const decoder = new StringDecoder("utf8");
+  let line = "";
+  let bytes = 0;
+  let exhausted = false;
+  let disabled = false;
+  let finished = false;
+  const classify = () => {
+    const text = line.trim();
+    if (CLAUDE_USAGE_LIMIT_PREFIXES.some((prefix) => text.startsWith(prefix))) exhausted = true;
+    line = "";
+    bytes = 0;
+  };
+  const append = (text) => {
+    for (const character of text) {
+      if (character === "\n") { if (!disabled) classify(); continue; }
+      if (disabled) continue;
+      const size = Buffer.byteLength(character);
+      if (bytes + size > CODEX_USAGE_MAX_LINE_BYTES) { disabled = true; exhausted = false; line = ""; continue; }
+      line += character;
+      bytes += size;
+    }
+  };
+  return {
+    push(chunk) { if (!finished && chunk != null) append(decoder.write(chunk)); },
+    finish() { if (finished) return; finished = true; append(decoder.end()); if (!disabled && line) classify(); },
+    exhausted() { return exhausted; },
+  };
+}
+
 export function classifyDispatchOutcome(event = {}) {
   const base = {
     code: null,
@@ -5324,7 +5871,12 @@ export function appendLauncherEvidenceRun(input, {
   return record;
 }
 
-function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt }) {
+function writeRunRecord({
+  pick = {}, runtimeCfg = {}, logFile, outcome, startedAt, endedAt,
+  resolvedRuntimeExecutable = pick.runtimeExecutable,
+  fallbackUsed = false,
+  attempts = null,
+}) {
   if (!pick.issueIdentifier || !pick.logDir) return;
   let metrics = {};
   try {
@@ -5366,7 +5918,7 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     claimAt: telemetry.claimAt,
     dispatchAt: startedAt,
     queueWaitMs: telemetry.queueWaitMs,
-    resolvedRuntimeExecutable: pick.runtimeExecutable,
+    resolvedRuntimeExecutable,
     capacitySlot: telemetry.capacitySlot,
     capacityHighWater: Math.max(telemetry.capacityHighWater || 0, metrics.capacityHighWater || 0) || undefined,
     loadAverage1m: metrics.loadAverage1m,
@@ -5382,6 +5934,7 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     exitCode: outcome?.exitCode ?? null,
     startedAt,
     endedAt,
+    ...(fallbackUsed ? { fallbackUsed: true, attempts: (attempts || []).slice(0, 2) } : {}),
   };
   fs.mkdirSync(pick.logDir, { recursive: true });
   const f = path.join(pick.logDir, `run-records-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.jsonl`);
@@ -5403,98 +5956,230 @@ function dispatchEnvironment(anchorPath, pick = {}) {
   };
 }
 
-function dispatch(anchorPath, sweep, config, pick = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const executable = pick.runtimeExecutable || cmd;
-  const env = dispatchEnvironment(anchorPath, pick);
-  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
-  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
-  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
-  const r = spawnSync(executable, args, { cwd, env, stdio: ["ignore", fd, fd] });
-  fs.closeSync(fd);
-  const outcome = r.error
-    ? classifyDispatchOutcome({ type: "error", error: r.error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) })
-    : classifyDispatchOutcome({ type: "close", exitCode: r.status, signal: r.signal, path: executable, cwd });
-  if (r.error) logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${r.error.message}`);
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
-  writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
-  return outcome;
+function normalizedDispatchAttempt(runtimeCfg, outcome, usageExhausted = false) {
+  return {
+    runtime: runtimeCfg.runtime || "codex",
+    model: runtimeCfg.model,
+    effort: runtimeCfg.effort,
+    outcome: {
+      kind: outcome?.kind,
+      code: outcome?.code ?? null,
+      exitCode: outcome?.exitCode ?? null,
+      signal: outcome?.signal ?? null,
+    },
+    ...(usageExhausted ? { usageExhausted: true } : {}),
+  };
 }
 
-export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null, onSpawn = null } = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
-  const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
-  const executable = pick.runtimeExecutable || cmd;
-  const env = dispatchEnvironment(anchorPath, pick);
-  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
-  fs.mkdirSync(dir, { recursive: true });
-  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
-  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
-  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
-  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
-  const fd = fs.openSync(logFile, "a");
-  const startedAt = new Date().toISOString();
-  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${args.slice(0, 3).join(" ")} …`);
+export function isFinalProviderUsageExhaustion(result = {}) {
+  const finalAttempt = result.attempts?.at(-1);
+  const finalRuntime = result.finalRuntimeConfig?.runtime;
+  return result.kind === "exit"
+    && finalAttempt?.usageExhausted === true
+    && finalAttempt.runtime === finalRuntime;
+}
+
+export function shouldClearRuntimeCooldown(result = {}, pick = {}) {
+  return result.kind === "success" || (pick.runtimeCooldownProbe === true && !isFinalProviderUsageExhaustion(result));
+}
+
+export function fallbackFailureAttribution(result) {
+  const primary = result?.attempts?.[0];
+  const exhaustedPrimary = result?.fallbackUsed === true
+    && primary?.runtime === "codex"
+    && primary?.outcome?.kind === "exit"
+    && Number.isInteger(primary.outcome.exitCode)
+    && primary.outcome.exitCode !== 0;
+  if (!exhaustedPrimary) return null;
+  if (result.attempts.length === 1
+    && result.kind === "executable-enoent"
+    && result.finalRuntimeConfig?.runtime === "claude") {
+    return "after Codex usage exhaustion; Claude fallback executable resolution failed";
+  }
+  return result.attempts.length === 2 ? "after Codex usage exhaustion; Claude final attempt" : null;
+}
+
+function runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata = false } = {}) {
+  const runtime = runtimeCfg.runtime || "codex";
+  const sourceAnchorPath = pick.sourceAnchorPath || anchorPath;
+  const host = os.hostname();
+  return {
+    runtimeCfg,
+    executable,
+    laneKey: usePickMetadata && pick.runtimeLaneKey ? pick.runtimeLaneKey : runtimeLaneKey(sourceAnchorPath, runtime, host),
+    scope: usePickMetadata && pick.runtimeScope ? pick.runtimeScope : `runtime:${runtime}:${host}`,
+    stableTarget: usePickMetadata && pick.runtimeStableTarget
+      ? pick.runtimeStableTarget
+      : JSON.stringify({ sourceAnchorPath, runtime, host }),
+  };
+}
+
+function runDispatchAttempt({
+  executable, command, cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn,
+  classifyCodexStdout = createCodexUsageEvidenceCollector,
+  classifyClaudeStderr = createClaudeUsageEvidenceCollector,
+  writeChunkFn = fs.writeSync,
+}) {
   return new Promise((resolve) => {
+    let child;
     let settled = false;
+    let capacityAttachFailed = false;
+    let logWriteFailed = false;
+    const collector = runtimeCfg.runtime === "codex"
+      ? classifyCodexStdout()
+      : runtimeCfg.runtime === "claude" ? classifyClaudeStderr() : null;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
-      fs.closeSync(fd);
-      logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${outcome.kind}${outcome.exitCode === null ? "" : ` ${outcome.exitCode}`}${outcome.signal ? ` ${outcome.signal}` : ""})`);
-      writeRunRecord({ pick, runtimeCfg, logFile, outcome, startedAt, endedAt: new Date().toISOString() });
-      resolve(outcome);
+      resolve({ outcome, runtimeCfg, executable, usageExhausted: !logWriteFailed && Boolean(collector?.exhausted()) });
     };
-    let child;
+    const ioFailure = () => {
+      if (logWriteFailed || settled) return;
+      logWriteFailed = true;
+      try { child?.kill?.("SIGTERM"); } catch { /* close remains authoritative */ }
+    };
+    const write = (chunk, classify = false) => {
+      if (logWriteFailed || settled) return;
+      try {
+        writeChunkFn(fd, chunk);
+        if (classify) collector?.push(chunk);
+      } catch {
+        ioFailure();
+      }
+    };
     try {
-      child = spawnFn(executable, args, { cwd, env, stdio: ["ignore", fd, fd], signal: signal || undefined });
-    } catch (e) {
-      finish(classifyDispatchOutcome({ type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+      child = spawnFn(executable, command.args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], signal: signal || undefined });
+    } catch (error) {
+      finish(classifyDispatchOutcome({ type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
       return;
     }
-    if (onSpawn) {
-      try {
-        if (!Number.isInteger(child?.pid) || child.pid <= 0) throw new Error("spawned child has no verifiable PID");
-        if (onSpawn(child.pid, child) === false) throw new Error("capacity ledger rejected child PID");
-      } catch (error) {
-        const attachError = new Error(`capacity PID attachment failed: ${error.message}`);
-        attachError.code = "CAPACITY_ATTACH_FAILED";
-        logFor(anchorPath, sweep, `FATAL ${attachError.message}; terminating child ${child?.pid || "unknown"}`);
-        child.on("error", (childError) => {
-          logFor(anchorPath, sweep, `child error while awaiting capacity-safe termination: ${childError.message}`);
-        });
-        child.once("close", () => finish(classifyDispatchOutcome({
-          type: "error",
-          error: attachError,
-          path: executable,
-          cwd,
-          cwdExists: fs.existsSync(cwd),
-          executableExists: fs.existsSync(executable),
-        })));
-        try { child.kill?.("SIGTERM"); } catch (killError) {
-          logFor(anchorPath, sweep, `could not terminate child after PID attachment failure: ${killError.message}`);
-        }
-        return;
-      }
-    }
-    child.on("error", (e) => {
-      logFor(anchorPath, sweep, `FATAL dispatch could not start ${executable}: ${e.message}`);
-      const interrupted = e.code === "ABORT_ERR" || signal?.aborted;
+    child.stdout?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "codex"));
+    child.stderr?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "claude"));
+    child.on("error", (error) => {
+      if (capacityAttachFailed || logWriteFailed || settled) return;
+      const interrupted = error.code === "ABORT_ERR" || signal?.aborted;
       finish(classifyDispatchOutcome(interrupted
         ? { type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }
-        : { type: "error", error: e, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+        : { type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
     });
-    child.on("close", (exitCode, childSignal) => finish(signal?.aborted
-      ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
-      : (childDeferredOutcomeForPick(pick) || classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }))));
+    child.once("close", (exitCode, childSignal) => {
+      if (capacityAttachFailed) {
+        const error = new Error("capacity PID attachment failed");
+        error.code = "CAPACITY_ATTACH_FAILED";
+        finish(classifyDispatchOutcome({ type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
+        return;
+      }
+      if (logWriteFailed) {
+        finish({ kind: "dispatch-io-error", code: "LOG_WRITE_FAILED", exitCode: null, signal: null, path: executable, cwd });
+        return;
+      }
+      collector?.finish();
+      finish(signal?.aborted
+        ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
+        : classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }));
+    });
+    if (!onSpawn) return;
+    try {
+      if (!Number.isInteger(child?.pid) || child.pid <= 0) throw new Error("spawned child has no verifiable PID");
+      if (onSpawn(child.pid, child) === false) throw new Error("capacity ledger rejected child PID");
+    } catch (error) {
+      capacityAttachFailed = true;
+      logFor(cwd, runtimeCfg.runtime || "codex", `FATAL capacity PID attachment failed: ${error.message}; terminating child ${child?.pid || "unknown"}`);
+      try { child.kill?.("SIGTERM"); } catch { /* close remains authoritative */ }
+    }
   });
+}
+
+export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
+  spawnFn = spawn,
+  signal = null,
+  onSpawn = null,
+  resolveRuntimeExecutableFn = resolveRuntimeExecutable,
+  writeChunkFn = fs.writeSync,
+} = {}) {
+  const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
+  const command = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const executable = pick.runtimeExecutable || command.cmd;
+  const env = dispatchEnvironment(anchorPath, pick);
+  const dir = pick.logDir || path.join(STATE_DIR, anchorSlug(anchorPath), sweep);
+  fs.mkdirSync(dir, { recursive: true });
+  if (pick.tmpDir) fs.mkdirSync(pick.tmpDir, { recursive: true });
+  if (pick.screenshotDir) fs.mkdirSync(pick.screenshotDir, { recursive: true });
+  if (pick.browserProfileDir) fs.mkdirSync(pick.browserProfileDir, { recursive: true });
+  const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+  const fd = fs.openSync(logFile, "a");
+  const startedAt = new Date().toISOString();
+  const primaryMeta = runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata: true });
+  const finish = (outcome, finalMeta, attempts, fallbackUsed = false) => {
+    const result = {
+      ...outcome,
+      finalRuntimeConfig: finalMeta.runtimeCfg,
+      finalRuntimeExecutable: finalMeta.executable,
+      finalRuntimeLaneKey: finalMeta.laneKey,
+      finalRuntimeScope: finalMeta.scope,
+      finalRuntimeStableTarget: finalMeta.stableTarget,
+      fallbackUsed,
+      attempts: attempts.slice(0, 2),
+    };
+    fs.closeSync(fd);
+    logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} end (${result.kind}${result.exitCode === null ? "" : ` ${result.exitCode}`}${result.signal ? ` ${result.signal}` : ""})`);
+    writeRunRecord({
+      pick,
+      runtimeCfg: finalMeta.runtimeCfg,
+      resolvedRuntimeExecutable: finalMeta.executable,
+      logFile,
+      outcome: result,
+      startedAt,
+      endedAt: new Date().toISOString(),
+      fallbackUsed,
+      attempts,
+    });
+    return result;
+  };
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
+  const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn });
+  const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome, primary.usageExhausted);
+  const deferred = childDeferredOutcomeForPick(pick);
+  if (deferred) return finish(deferred, primaryMeta, [primaryAttempt]);
+  const fallbackCfg = fallbackRuntimeConfigForSweep(config, sweep);
+  const fallbackEligible = runtimeCfg.runtime === "codex"
+    && primary.outcome.kind === "exit"
+    && Number.isInteger(primary.outcome.exitCode)
+    && primary.outcome.exitCode !== 0
+    && primary.usageExhausted
+    && fallbackCfg;
+  if (!fallbackEligible) return finish(primary.outcome, primaryMeta, [primaryAttempt]);
+  if (signal?.aborted) return finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd: command.cwd }), primaryMeta, [primaryAttempt]);
+  const fallbackCommand = buildCommand({ ...fallbackCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
+  const resolution = resolveRuntimeExecutableFn("claude", env);
+  const fallbackMeta = runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path || null);
+  if (signal?.aborted) return finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd: command.cwd }), primaryMeta, [primaryAttempt]);
+  if (!resolution.ok) {
+    const missing = classifyDispatchOutcome({
+      type: "error",
+      error: { code: resolution.code || "ENOENT" },
+      path: fallbackMeta.executable || fallbackCommand.cmd,
+      cwd: fallbackCommand.cwd,
+      cwdExists: fs.existsSync(fallbackCommand.cwd),
+      executableExists: false,
+    });
+    return finish(missing, fallbackMeta, [primaryAttempt], true);
+  }
+  logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} fallback: ${runtimeSummary(fallbackCfg)} → ${resolution.path} ${fallbackCommand.args.slice(0, 3).join(" ")} …`);
+  const fallback = await runDispatchAttempt({
+    executable: resolution.path,
+    command: fallbackCommand,
+    cwd: fallbackCommand.cwd,
+    env,
+    fd,
+    runtimeCfg: fallbackCfg,
+    signal,
+    spawnFn,
+    onSpawn,
+    writeChunkFn,
+  });
+  const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome, fallback.usageExhausted);
+  return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
 }
 
 export function attachUpdateFailuresToAnchors(anchors, updateFailures, {
@@ -5571,6 +6256,9 @@ async function tick({ dryRun = false } = {}) {
     const childIndexAllocator = createChildIndexAllocator();
     const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
     const observationStore = createObservationStore({ dryRun });
+    const resumeStore = createResumeStore({ dryRun });
+    const runtimeCooldownStore = createRuntimeCooldownStore({ dryRun });
+    const runtimeCooldownProbes = new Set();
     const resourceSampler = createResourceSampler();
     const dependencyDeferredKeys = new Set();
     const dependencyDeferredIssues = new Map();
@@ -5604,20 +6292,64 @@ async function tick({ dryRun = false } = {}) {
       const pick = result.pick;
       const active = activeByAnchor.get(pick.anchorPath);
       if (!active) return null;
-      const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
+      const runtimeCfg = result.finalRuntimeConfig || runtimeConfigForSweep(pick.config, pick.sweep);
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
+      const fallbackFailure = fallbackFailureAttribution(result);
+      const exhaustedAttempts = (result.attempts || []).filter((attempt) => attempt?.usageExhausted === true);
+      const providerUsageExhausted = exhaustedAttempts.length > 0;
+      const finalUsageExhausted = isFinalProviderUsageExhaustion(result);
+      let finalCooldown = null;
+      for (const attempt of exhaustedAttempts) {
+        finalCooldown = runtimeCooldownStore.markExhausted({ host: os.hostname(), runtime: attempt.runtime });
+        logFor(pick.anchorPath, pick.sweep, `${attempt.runtime} usage exhausted; cooling until ${finalCooldown?.cooldownUntil || "unknown"}`);
+      }
+      if (shouldClearRuntimeCooldown(result, pick)) {
+        runtimeCooldownStore.clear({ host: os.hostname(), runtime: runtimeCfg.runtime, model: runtimeCfg.model });
+      } else if (finalUsageExhausted && pick.issueIdentifier && finalCooldown) {
+        resumeStore.upsert({
+          sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+          sweep: pick.sweep,
+          issueIdentifier: pick.issueIdentifier,
+          issueId: pick.issueId,
+          ownerToken: pick.ownerToken,
+          worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
+          branch: pick.branch || pick.issueIdentifier,
+          repoEntry: pick.repoRoute?.repoEntry || ".",
+          reason: "provider usage exhausted",
+          nextEligibleAt: finalCooldown.cooldownUntil,
+          attempts: 0,
+        });
+      }
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
         worktreePath: pick.worktreePath,
         logDir: pick.logDir,
+        fallbackFailure,
       }) : runtime;
       const startFailure = ["executable-enoent", "cwd-enoent", "spawn-error"].includes(result.kind);
       const dependencyDeferred = result.kind === "dependency-deferred";
       const routingDeferred = result.kind === "repo-routing-deferred";
       const detail = result.signal || result.code || result.exitCode;
-      const failures = routingDeferred
+      const capacityKind = providerUsageExhausted ? null : classifyCapacityOutcome(result, (() => {
+        try {
+          const file = path.join(pick.logDir || "", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+          return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(-16_384) : "";
+        } catch { return ""; }
+      })());
+      if (capacityKind && pick.issueIdentifier) {
+        const previous = resumeStore.get({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier });
+        const attempts = Math.min(4, (previous?.reason === "capacity" ? previous.attempts : 0) + 1);
+        const nextEligibleAt = new Date(capacityRetryAt(Date.now(), attempts - 1)).toISOString();
+        resumeStore.upsert({
+          sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier,
+          issueId: pick.issueId, ownerToken: pick.ownerToken, worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
+          branch: pick.issueIdentifier, repoEntry: pick.repoRoute?.repoEntry || ".", reason: "capacity", nextEligibleAt, attempts,
+        });
+        logFor(pick.anchorPath, pick.sweep, `${pick.issueIdentifier} capacity deferred (${capacityKind}); retry eligible ${nextEligibleAt}`);
+      }
+      const failures = (capacityKind || finalUsageExhausted) ? [] : routingDeferred
         ? [failureEventFor(
           pick.anchorPath,
           pick.config,
@@ -5627,20 +6359,20 @@ async function tick({ dryRun = false } = {}) {
           `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
         ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
-        const key = pick.runtimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
+        const key = result.finalRuntimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
         runtimeCache.set(key, { ok: false, runtime: runtimeName, code: "ENOENT", path: null, source: null });
         if (!reportedRuntimeFailures.has(key)) {
           reportedRuntimeFailures.add(key);
           localFailures.push(failureEventFor(
             pick.anchorPath,
             pick.config,
-            pick.runtimeScope || `runtime:${runtimeName}:${os.hostname()}`,
+            result.finalRuntimeScope || `runtime:${runtimeName}:${os.hostname()}`,
             "runtime-disappeared",
-            pick.runtimeStableTarget || JSON.stringify({ sourceAnchorPath: pick.sourceAnchorPath || pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
+            result.finalRuntimeStableTarget || JSON.stringify({ sourceAnchorPath: pick.sourceAnchorPath || pick.anchorPath, runtime: runtimeName, host: os.hostname() }),
             `${runtimeName} executable disappeared after preflight on ${os.hostname()}`,
           ));
           writeCurrentTick();
@@ -5648,7 +6380,7 @@ async function tick({ dryRun = false } = {}) {
       }
       if (pick.issueIdentifier) {
         try {
-          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime);
+          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime, { resumeStore });
           if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `owned claim release failed ${pick.issueIdentifier}: ${e.message}`);
@@ -5656,13 +6388,15 @@ async function tick({ dryRun = false } = {}) {
           writeCurrentTick();
         }
       }
-      try {
-        await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
-      } catch (e) {
-        const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
-        logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
-        recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
-        writeCurrentTick();
+      if (!finalUsageExhausted) {
+        try {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
+        } catch (e) {
+          const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
+          logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
+          writeCurrentTick();
+        }
       }
       if (dependencyDeferred) {
         const key = observationKey(pick);
@@ -5855,7 +6589,30 @@ async function tick({ dryRun = false } = {}) {
       atomicWriteJson(CURRENT_TICK, tickState);
     };
     const preflightCandidatesForTick = async (candidates) => {
-      const checked = preflightRuntimeCandidates(candidates, {
+      const cooldownReady = [];
+      for (const pick of candidates || []) {
+        const selected = selectRuntimeForCooldown(pick.config || {}, pick.sweep, {
+          store: runtimeCooldownStore,
+          host: os.hostname(),
+          probes: runtimeCooldownProbes,
+        });
+        if (!selected.runtimeConfig) {
+          capacityDeferredKeys.add(observationKey(pick));
+          logFor(pick.anchorPath, pick.sweep, `runtime-cooldown defer${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}; next probe ${selected.deferredUntil || "pending"}`);
+          continue;
+        }
+        cooldownReady.push({
+          ...pick,
+          runtimeOverride: selected.runtimeConfig,
+          runtimeCooldownProbe: selected.probe,
+          ...(selected.probe ? {
+            count: 1,
+            cards: [pick.topCard || pick.cards?.[0]].filter(Boolean),
+            slotLimit: 1,
+          } : {}),
+        });
+      }
+      const checked = preflightRuntimeCandidates(cooldownReady, {
         host: os.hostname(),
         cache: runtimeCache,
         envForCandidate: (pick) => dispatchEnvironment(pick.anchorPath, pick),
@@ -6129,7 +6886,31 @@ async function tick({ dryRun = false } = {}) {
           const cfg = SWEEP_CFG[sweep];
           if (!cleanupCardsByState) continue;
           const cards = cfg.states.flatMap((state) => cleanupCardsByState.get(state) || []);
-          const reaps = reapDecisions(cards, cfg, now);
+          const reapActions = reapDecisions(cards, cfg, now, {
+            protectedClaim: (card) => resumeStore.protectedClaim({ ...card, sourceWorkspace: active.sourceAnchorPath }, cfg, now, {
+              validateRecord: (record) => {
+                const routedCard = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+                if (!routedCard) return false;
+                return record.repoEntry === routedCard.repoRoute.repoEntry
+                  && record.branch === card.identifier
+                  && record.worktreePath === cardWorktreePath(anchorPath, config, card.identifier, routedCard.repoRoute);
+              },
+            }),
+          });
+          const protectedReaps = reapActions.filter((decision) => decision.action === "protect-resume");
+          const reaps = reapActions.filter((decision) => decision.action !== "protect-resume");
+          if (!dryRun) {
+            for (const decision of protectedReaps) {
+              const card = cards.find((candidate) => candidate.id === decision.id);
+              try {
+                const detail = decision.protectionState === "needs-resolution"
+                  ? "Preserved resume-needed worktree remains protected; recovery metadata needs rediscovery or explicit human resolution."
+                  : "Preserved resume-needed worktree remains protected on this host.";
+                await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=${decision.ownerToken} claim=${cfg.claim}] ${detail}`);
+                logFor(anchorPath, sweep, `protect-resume ${decision.identifier}`);
+              } catch (error) { recordFailure(sweep, "resume-heartbeat", decision.identifier, error.message); }
+            }
+          }
           // Bounce-escalation is a backward-oscillation guard for the earlier stages.
           // Skip it for ship: a card in "Ship" was human-approved, and its
           // historical bounce markers (from earlier dev/qa churn) must not re-block it.
@@ -6179,6 +6960,37 @@ async function tick({ dryRun = false } = {}) {
             logFor(anchorPath, sweep, `repo-routing-skip ${failure.identifier}: ${failure.message}`);
           }
           const actionable = routed.cards;
+          // A retained claim is normally invisible to actionableCards(). Consult
+          // the local store explicitly and admit only the exact preserved tuple.
+          // This is intentionally before ordinary candidates so SAF-210-shaped
+          // WIP is resumed in its original deterministic worktree.
+          const resumes = [];
+          for (const card of cards) {
+            const routedResume = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+            if (!routedResume) continue;
+            const resumePickKey = { sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier };
+            // If the atomic record was lost, recover only the conservative,
+            // machine-local proof: matching live claim plus a dirty deterministic
+            // worktree. Never attempt cleanup or release in this discovery path.
+            if (!resumeStore.get(resumePickKey) && sweep === "dev" && hasLabel(card, cfg.claim)) {
+              const rediscovered = rediscoveredResumeRecordForCard({
+                sourceWorkspace: active.sourceAnchorPath, anchorPath, sweep, card: routedResume,
+              }, now);
+              const dirty = rediscovered && dirtyCheckoutEvent({ sweep, worktreePath: rediscovered.worktreePath,
+                issueIdentifier: card.identifier }, { role: "worktree", path: rediscovered.worktreePath });
+              if (dirty?.kind === "dirty-checkout") resumeStore.upsert(rediscovered);
+            }
+            const record = resumeStore.due(resumePickKey);
+            if (!record) continue;
+            const resumePick = {
+              anchorPath, sourceAnchorPath: active.sourceAnchorPath, config, sweep,
+              issueId: card.id, issueIdentifier: card.identifier, ownerToken: record.ownerToken,
+              worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute,
+            };
+            if (resumeAdmissionDecision(resumePick, card, record, now).kind === "resume") {
+              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute });
+            }
+          }
           const actionableIds = new Set(actionable.map((card) => card.identifier));
           const scopeKey = JSON.stringify([active.sourceAnchorPath, sweep]);
           for (const key of [...dependencyDeferredKeys]) {
@@ -6222,6 +7034,7 @@ async function tick({ dryRun = false } = {}) {
             if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
             continue;
           }
+          candidates.push(...resumes);
           if (actionable.length > 0) candidates.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
         }
 

@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn as spawnProcess, spawnSync as spawnProcessSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
@@ -16,7 +17,7 @@ import {
   normalizeRegistry, materializeManagedWorkspacePlan, materializeManagedWorkspace, syncAllowedEnvFiles,
   recoveredTargetsForManagedWorkspace, handoffDirtyCheckoutFailures, handoffRepoRoutingDecision,
   dirtyCheckoutEvent, doctorReport, formatDoctorReport,
-  worktreePath, runtimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
+  worktreePath, runtimeConfigForSweep, fallbackRuntimeConfigForSweep, resolveRuntimeExecutable, preflightRuntimeCandidates, buildCommand, lockIsReclaimable, isNewerVersion,
   heartbeatAgeMin, countMarkers, reapDecisions, bounceDecisions, bouncePairKey,
   countActionable, actionableCards, applyDecisionsInMemory,
   annotateBoundedDependencyCycles, dependencyCycleFailureEvents,
@@ -27,20 +28,22 @@ import {
   runAdmissionDemands,
   parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
-  latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
+  latestHeartbeat, latestHeartbeatOwner, retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
-  fetchScheduledPassCards, fetchScheduledQueueCards,
+  rediscoveredResumeRecordForCard,
+  fetchScheduledPassCards, fetchScheduledQueueCards, completeRecentIssueComments,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
   OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS, MAX_DEPENDENCY_DEFERRED_ISSUES,
+  RESUME_STATE_VERSION,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
   LEGACY_CLEANUP_STATES, CLAIM_CLEANUP_STATES, MAX_STALE_MIN,
-  REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG,
+  REAPER_TAG, BOUNCE_TAG, HEARTBEAT_TAG, RETRY_TAG, ORPHAN_TAG,
   BLOCKING_LABELS, MANUAL_SKILL_DIRS, PROPAGATED_SKILL_DIRS,
   UNBLOCK_STATE_ORDER, orderUnblockCards,
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
@@ -55,12 +58,194 @@ import {
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
+  createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
+  classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
+
+function pipedDispatchChild(pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killCalls = [];
+  child.kill = (signal) => { child.killCalls.push(signal); return true; };
+  child.close = (exitCode, signal = null) => child.emit("close", exitCode, signal);
+  return child;
+}
+
+function queuedDispatchSpawn(children, calls = []) {
+  return (executable, args, options) => {
+    calls.push({ executable, args, options });
+    const child = children.shift();
+    assert.ok(child, "spawn queue exhausted");
+    return child;
+  };
+}
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const minsAgo = (m) => new Date(NOW - m * 60000).toISOString();
 const hoursAgo = (h) => new Date(NOW - h * 3600000).toISOString();
 const dependencyReadyCard = (card = {}) => ({ blockers: [], blockersComplete: true, ...card });
+
+test("resume store: persists only a valid exact record and protects its matching claim", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "resume-store-"));
+  const statePath = path.join(dir, "resume-needed.json");
+  const now = Date.parse("2026-07-10T12:00:00Z");
+  const store = createResumeStore({ resumePath: statePath, now: () => now });
+  const record = store.upsert({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", issueId: "id-210", ownerToken: "owner-210", worktreePath: "/managed/.worktrees/SAF-210", branch: "SAF-210", repoEntry: ".", reason: "dirty", nextEligibleAt: new Date(now).toISOString(), attempts: 0 });
+  assert.equal(record.issueIdentifier, "SAF-210");
+  assert.equal(store.due({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210" }).ownerToken, "owner-210");
+  assert.equal(store.protectedClaim({ identifier: "SAF-210", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=owner-210 claim=dev:in-progress]`, createdAt: new Date(now).toISOString() }] }, SWEEP_CFG.dev, now).ownerToken, "owner-210");
+  assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other" }), false);
+  assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner-210" }), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("resume store: a valid rediscovery repairs malformed persisted state", () => {
+  let persisted = { version: RESUME_STATE_VERSION, entries: { broken: { ownerToken: "partial" } } };
+  const store = createResumeStore({ now: () => NOW, readJsonFn: () => persisted,
+    writeJsonFn: (_path, value) => { persisted = value; } });
+  const record = { sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-149", issueId: "issue-149",
+    ownerToken: "owner-149", worktreePath: "/managed/app/.worktrees/COD-149", branch: "COD-149", repoEntry: "app",
+    reason: "rediscovered dirty worktree", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  assert.equal(store.upsert(record)?.issueIdentifier, "COD-149");
+  assert.equal(store.get(record)?.ownerToken, "owner-149");
+});
+
+test("same-state recovery: dirty and unpushed work preserves the claim, only clean pushed work releases", () => {
+  const pick = { sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: "/wt", branch: "SAF-210" };
+  const card = { stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
+  const dirty = successfulSameStateRecoveryDecision(pick, card, { gitFn: (_cwd, args) => args[0] === "status" ? { status: 0, out: " M test.mjs\n?? new.test.mjs\n" } : { status: 0, out: "0" } });
+  assert.equal(dirty.kind, "resume-needed");
+  const unpushed = successfulSameStateRecoveryDecision(pick, card, { gitFn: (_cwd, args) => args[0] === "status" ? { status: 0, out: "" } : args[0] === "rev-list" ? { status: 0, out: "1" } : { status: 0, out: "ok" } });
+  assert.equal(unpushed.kind, "resume-needed");
+  const clean = successfulSameStateRecoveryDecision(pick, card, { existsFn: () => true, gitFn: (_cwd, args) => args[0] === "status" ? ({ status: 0, out: "" }) : args[0] === "rev-list" ? ({ status: 0, out: "0" }) : ({ status: 0, out: "ok" }) });
+  assert.equal(clean.kind, "release");
+});
+
+test("resume admission: only an exact due claimed record can bypass ordinary dirty blocking", () => {
+  const pick = { anchorPath: "/managed", config: { repos: ["managed"] }, sweep: "dev", issueIdentifier: "SAF-210", issueId: "id", ownerToken: "owner", worktreePath: "/managed/.worktrees/SAF-210", branch: "SAF-210", repoRoute: { repoEntry: ".", managedRepoPath: "/managed" } };
+  const card = { ...pick, stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: pick.worktreePath, branch: "SAF-210", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "resume");
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other", worktreePath: pick.worktreePath, branch: "SAF-210", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+  assert.equal(resumeAdmissionDecision({ ...pick, worktreePath: "/tmp/arbitrary", branch: "other" }, card,
+    { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: "/tmp/arbitrary", branch: "other", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+});
+
+test("resume reaper protection expires and validates the deterministic tuple", () => {
+  let persisted = null;
+  const store = createResumeStore({ now: () => NOW, readJsonFn: () => persisted,
+    writeJsonFn: (_path, value) => { persisted = value; } });
+  const record = { sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-149", issueId: "issue-149",
+    ownerToken: "owner-149", worktreePath: "/managed/app/.worktrees/COD-149", branch: "COD-149", repoEntry: "app",
+    reason: "dirty", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  store.upsert(record);
+  const card = { identifier: "COD-149", labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(100)} owner=owner-149 claim=dev:in-progress]`, createdAt: minsAgo(100) }] };
+  assert.ok(store.protectedClaim(card, SWEEP_CFG.dev, NOW, { validateRecord: () => true }));
+  assert.equal(store.protectedClaim(card, SWEEP_CFG.dev, NOW + 25 * 3600000,
+    { validateRecord: () => true }).protectionState, "needs-resolution");
+  assert.equal(store.protectedClaim(card, SWEEP_CFG.dev, NOW,
+    { validateRecord: () => false }).protectionState, "needs-resolution");
+  const decisions = reapDecisions([{ ...card, id: "issue-149", updatedAt: minsAgo(100) }], SWEEP_CFG.dev,
+    NOW + 25 * 3600000, { protectedClaim: (candidate) => store.protectedClaim(candidate, SWEEP_CFG.dev,
+      NOW + 25 * 3600000, { validateRecord: () => false }) });
+  assert.deepEqual(decisions.map((decision) => decision.action), ["protect-resume"]);
+  assert.equal(decisions[0].protectionState, "needs-resolution");
+});
+
+test("resume rediscovery: routed cards preserve their routed worktree and repo identity", () => {
+  const card = {
+    id: "issue-210", identifier: "SAF-210", stateName: "Dev", labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-210 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    repoRoute: { ok: true, repoEntry: "safetaper-guide", managedRepoPath: "/managed/guide" },
+  };
+  const record = rediscoveredResumeRecordForCard({
+    sourceWorkspace: "/source/coach", anchorPath: "/managed/coach", sweep: "dev", card,
+  }, NOW);
+  assert.equal(record.repoEntry, "safetaper-guide");
+  assert.equal(record.worktreePath, "/managed/guide/.worktrees/SAF-210");
+  assert.equal(record.ownerToken, "owner-210");
+});
+
+test("capacity outcome: recognized quota failures defer with bounded retry and configured fallback", () => {
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "Error: model capacity exceeded"), "model-capacity");
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "429 quota exceeded"), "quota");
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "syntax error"), null);
+  assert.equal(capacityRetryAt(NOW, 0), NOW + 60_000);
+  assert.equal(capacityRetryAt(NOW, 99), NOW + 60 * 60_000);
+});
+
+test("runtime cooldown store: persists one-hour provider exhaustion and clears on success", () => {
+  let raw = null;
+  let now = NOW;
+  const store = createRuntimeCooldownStore({
+    cooldownPath: "/state/runtime-cooldowns.json",
+    now: () => now,
+    readJsonFn: () => raw,
+    writeJsonFn: (_path, value) => { raw = structuredClone(value); },
+  });
+  const marked = store.markExhausted({ host: "runner", runtime: "codex" });
+  assert.equal(Date.parse(marked.cooldownUntil), NOW + 60 * 60_000);
+  assert.equal(store.get({ host: "runner", runtime: "codex" }).reason, "usage-exhausted");
+
+  now += 30 * 60_000;
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "cooling");
+  now += 31 * 60_000;
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "probe-due");
+  assert.equal(store.clear({ host: "runner", runtime: "codex" }), true);
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "ready");
+});
+
+test("runtime cooldown routing: skips a cooling primary and quietly defers when both providers cool", () => {
+  let raw = null;
+  const store = createRuntimeCooldownStore({
+    now: () => NOW,
+    readJsonFn: () => raw,
+    writeJsonFn: (_path, value) => { raw = structuredClone(value); },
+  });
+  const config = { runtimes: { dev: {
+    runtime: "codex", model: "gpt-5.6-terra",
+    fallback: { runtime: "claude", model: "claude-sonnet-5" },
+  } } };
+  store.markExhausted({ host: "runner", runtime: "codex" });
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner" }).runtimeConfig.runtime, "claude");
+  store.markExhausted({ host: "runner", runtime: "claude" });
+  const deferred = selectRuntimeForCooldown(config, "dev", { store, host: "runner" });
+  assert.equal(deferred.runtimeConfig, null);
+  assert.equal(deferred.deferredUntil, new Date(NOW + 60 * 60_000).toISOString());
+});
+
+test("runtime cooldown routing: admits only one probe for an expired runtime", () => {
+  let raw = null;
+  let now = NOW;
+  const store = createRuntimeCooldownStore({ now: () => now, readJsonFn: () => raw, writeJsonFn: (_path, value) => { raw = structuredClone(value); } });
+  const config = { runtimes: { dev: { runtime: "codex", model: "gpt", fallback: { runtime: "claude", model: "claude" } } } };
+  store.markExhausted({ host: "runner", runtime: "codex" });
+  store.markExhausted({ host: "runner", runtime: "claude" });
+  now += 60 * 60_000;
+  const probes = new Set();
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig.runtime, "codex");
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig.runtime, "claude");
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig, null);
+});
+
+test("runtime cooldown routing: malformed persisted state fails closed", () => {
+  const store = createRuntimeCooldownStore({ readJsonFn: () => ({ version: 1, entries: { bad: { runtime: "codex" } } }) });
+  const selected = selectRuntimeForCooldown({ runtimes: { dev: { runtime: "codex" } } }, "dev", { store, host: "runner" });
+  assert.equal(selected.runtimeConfig, null);
+  assert.equal(selected.storeHealthy, false);
+});
+
+test("generated artifact cleanup: rejects repositories, worktrees, ancestors, and symlink escapes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cleanup-"));
+  const repo = path.join(root, "repo"); const wt = path.join(repo, ".worktrees", "SAF-210"); const cache = path.join(root, "cache", "run", "tmp");
+  fs.mkdirSync(wt, { recursive: true }); fs.mkdirSync(cache, { recursive: true });
+  fs.symlinkSync(wt, path.join(root, "cache", "run", "escape"));
+  const targets = generatedArtifactCleanupTargets({ tmpDir: cache, logDir: path.join(root, "logs"), screenshotDir: wt, browserProfileDir: path.join(root, "cache", "run", "escape"), worktreePath: wt, anchorPath: repo, managedRepoPaths: [repo] });
+  assert.deepEqual(targets, [fs.realpathSync(cache)]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 // ── workspace resolution ─────────────────────────────────────────────────────
 test("resolveRepos: folder names resolve as siblings under the anchor's parent", () => {
@@ -567,21 +752,83 @@ test("runtimeConfigForSweep: review is role config only and never scheduled", ()
     runtimes: { review: { runtime: "claude", model: "claude-opus-4-8" } },
   }, "dev"), { runtime: "codex", model: undefined, effort: undefined });
 });
-test("default configs use the stage-specific GPT-5.6 models", () => {
+test("fallbackRuntimeConfigForSweep: accepts only scheduled codex-to-claude fallback", () => {
+  const config = { runtimes: {
+    dev: {
+      runtime: "codex", model: "gpt-5.6-terra", effort: "high",
+      fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "high" },
+    },
+    review: { runtime: "claude", model: "claude-opus-4-8", fallback: { runtime: "codex" } },
+  } };
+  const original = structuredClone(config);
+  assert.deepEqual(fallbackRuntimeConfigForSweep(config, "dev"), {
+    runtime: "claude", model: "claude-sonnet-5", effort: "high",
+  });
+  assert.equal(fallbackRuntimeConfigForSweep(config, "review"), null);
+  assert.equal(fallbackRuntimeConfigForSweep({}, "dev"), null);
+  assert.deepEqual(config, original);
+});
+test("fallbackRuntimeConfigForSweep: rejects malformed, unsupported, and incomplete fallbacks", () => {
+  const valid = { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } };
+  const cases = [
+    ["malformed fallback", { runtime: "codex", fallback: [] }],
+    ["non-Codex primary", { runtime: "claude", fallback: { runtime: "claude", model: "claude-sonnet-5" } }],
+    ["non-Claude fallback", { runtime: "codex", fallback: { runtime: "codex", model: "claude-sonnet-5" } }],
+    ["missing model", { runtime: "codex", fallback: { runtime: "claude" } }],
+    ["blank model", { runtime: "codex", fallback: { runtime: "claude", model: "   " } }],
+    ["non-string model", { runtime: "codex", fallback: { runtime: "claude", model: 5 } }],
+    ["invalid effort", { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "ultra" } }],
+  ];
+  for (const [name, stage] of cases) {
+    assert.equal(fallbackRuntimeConfigForSweep({ runtimes: { dev: stage } }, "dev"), null, name);
+  }
+  assert.equal(fallbackRuntimeConfigForSweep({ runtimes: { dev: valid } }, "unknown"), null);
+  assert.deepEqual(fallbackRuntimeConfigForSweep({ runtimes: { dev: valid } }, "dev"), {
+    runtime: "claude", model: "claude-sonnet-5", effort: undefined,
+  });
+});
+test("default configs retain Codex primaries and declare the four Claude usage fallbacks", () => {
   const expected = {
     spec: { runtime: "codex", model: "gpt-5.6-sol", effort: "high" },
     dev: { runtime: "codex", model: "gpt-5.6-terra", effort: "high" },
     qa: { runtime: "codex", model: "gpt-5.6-sol", effort: "medium" },
     ship: { runtime: "codex", model: "gpt-5.6-terra", effort: "medium" },
   };
+  const expectedFallbacks = {
+    spec: { runtime: "claude", model: "claude-fable-5" },
+    dev: { runtime: "claude", model: "claude-sonnet-5", effort: "high" },
+    qa: { runtime: "claude", model: "claude-opus-4-8" },
+    ship: { runtime: "claude", model: "claude-sonnet-5", effort: "medium" },
+  };
   for (const file of ["templates/linear-sweep.json", ".claude/linear-sweep.json"]) {
     const config = JSON.parse(fs.readFileSync(file, "utf8"));
     for (const sweep of SWEEPS) {
       assert.deepEqual(runtimeConfigForSweep(config, sweep), expected[sweep], `${file} ${sweep}`);
       assert.deepEqual({ runtime: config.runtime, ...config.models[sweep] }, expected[sweep], `${file} legacy ${sweep}`);
+      assert.deepEqual(config.runtimes[sweep].fallback, expectedFallbacks[sweep], `${file} fallback ${sweep}`);
+      assert.deepEqual(fallbackRuntimeConfigForSweep(config, sweep), {
+        ...expectedFallbacks[sweep], effort: expectedFallbacks[sweep].effort,
+      }, `${file} resolved fallback ${sweep}`);
     }
     assert.deepEqual(config.runtimes.review, { runtime: "claude", model: "claude-opus-4-8" }, `${file} review`);
   }
+});
+
+test("operator docs explain Claude usage fallback configuration and limits", () => {
+  const readme = fs.readFileSync("README.md", "utf8");
+  assert.doesNotMatch(readme, /Claude usage fallback \(planned, COD-144\)/);
+  assert.match(readme, /one capacity reservation[^\n]*at most two sequential attempts/i);
+  assert.match(readme, /auth, model, network, overload, signal, and transient rate-limit failures[^\n]*fail closed/i);
+  assert.match(readme, /normalized run-record `attempts`/i);
+
+  const setup = fs.readFileSync("SETUP.md", "utf8");
+  for (const stage of SWEEPS) assert.match(setup, new RegExp(`"${stage}"\\s*:\\s*\\{[^\\n]*"fallback"`), `SETUP ${stage} fallback`);
+  assert.match(setup, /claude --version/);
+  assert.match(setup, /attended `claude` login verification/i);
+  assert.match(setup, /Codex JSONL[^\n]*source\/version compatibility/i);
+  assert.match(setup, /remove `fallback`[^\n]*disable/i);
+  assert.match(setup, /dry-run[^\n]*cannot synthesize a real exhaustion event/i);
+  assert.match(setup, /node --test --test-name-pattern='default configs\|operator docs\|runtime' tests\/linear-watch\.test\.mjs tests\/agents-snippet\.test\.mjs/);
 });
 
 test("SWEEP_CFG fetches concise board states", () => {
@@ -599,12 +846,13 @@ test("SWEEP_CFG.dev fetches Dev only; active dev is the claim label", () => {
 test("buildCommand: codex with model + effort emits both flags before the prompt", () => {
   const { cmd, args } = buildCommand({ runtime: "codex", sweep: "dev", model: "gpt-5.5-codex", effort: "high", anchorPath: "/ws/a" });
   assert.equal(cmd, "codex");
-  assert.deepEqual(args.slice(0, 6), ["exec", "--cd", "/ws/a", "-m", "gpt-5.5-codex", "-c"]);
-  assert.equal(args[6], "model_reasoning_effort=high");
+  assert.deepEqual(args.slice(0, 7), ["exec", "--json", "--cd", "/ws/a", "-m", "gpt-5.5-codex", "-c"]);
+  assert.equal(args[7], "model_reasoning_effort=high");
   assert.match(args[args.length - 1], /Follow the dev-sweep skill/);
 });
 test("buildCommand: omitted model/effort emit no flags (runtime default)", () => {
   const { args } = buildCommand({ runtime: "codex", sweep: "spec", anchorPath: "/ws/a" });
+  assert.ok(args.includes("--json"));
   assert.ok(!args.includes("-m"));
   assert.ok(!args.includes("-c"));
 });
@@ -613,11 +861,16 @@ test("buildCommand: single-card dispatch names the issue and forbids other cards
   assert.match(args.at(-1), /COD-123 only/);
   assert.match(args.at(-1), /Do not process other cards/);
 });
-test("buildCommand: claude passes --model and -p prompt", () => {
-  const { cmd, args } = buildCommand({ runtime: "claude", sweep: "qa", model: "claude-opus-4-8", anchorPath: "/ws/a" });
+test("buildCommand: claude passes model, effort, and -p prompt", () => {
+  const { cmd, args } = buildCommand({ runtime: "claude", sweep: "ship", model: "claude-sonnet-5", effort: "medium", anchorPath: "/ws" });
   assert.equal(cmd, "claude");
   assert.equal(args[0], "-p");
-  assert.deepEqual(args.slice(2), ["--model", "claude-opus-4-8"]);
+  assert.deepEqual(args.slice(-4), ["--model", "claude-sonnet-5", "--effort", "medium"]);
+});
+test("buildCommand: claude omits effort when unset", () => {
+  const { args } = buildCommand({ runtime: "claude", sweep: "qa", model: "claude-opus-4-8", anchorPath: "/ws/a" });
+  assert.ok(!args.includes("--effort"));
+  assert.deepEqual(args.slice(-2), ["--model", "claude-opus-4-8"]);
 });
 
 // ── PID lock ─────────────────────────────────────────────────────────────────
@@ -1374,6 +1627,44 @@ test("actionableCards: live dev claim in Dev is not double-dispatched", () => {
 test("actionableCards: stale dev claim in Dev becomes actionable", () => {
   const card = dependencyReadyCard({ id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
+});
+test("retryCooldown requires an anchored current-claim marker owned by the latest heartbeat", () => {
+  const owner = "owner-1";
+  const heartbeat = { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) };
+  const retry = { id: "retry", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}] ${ORPHAN_TAG} terminal failure observed`, createdAt: minsAgo(1) };
+  const card = dependencyReadyCard({ id: "cooling", updatedAt: minsAgo(1), labelNames: [], comments: [heartbeat, retry] });
+  assert.equal(latestHeartbeat(card, "dev:in-progress").owner, owner);
+  assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW).active, true);
+  assert.equal(retryCooldown(card, SWEEP_CFG.spec, NOW), null);
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
+});
+test("retryCooldown rejects malformed, forged, stale, and future markers", () => {
+  const owner = "owner-1";
+  const heartbeat = { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) };
+  const valid = (id, body, createdAt) => dependencyReadyCard({ id, updatedAt: minsAgo(1), labelNames: [], comments: [heartbeat, { id, body, createdAt }] });
+  const cases = [
+    valid("quoted", `>${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(1)),
+    valid("wrong-claim", `${RETRY_TAG} claim=qa:in-progress owner=${owner}]`, minsAgo(1)),
+    valid("wrong-owner", `${RETRY_TAG} claim=dev:in-progress owner=other]`, minsAgo(1)),
+    valid("old", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(3)),
+    valid("future", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, new Date(NOW + 60_000).toISOString()),
+    valid("expired", `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, minsAgo(91)),
+  ];
+  for (const card of cases) assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW), null, card.id);
+});
+test("retryCooldown uses a stable comment-id tie break and claim confirmation refuses cooling cards", () => {
+  const owner = "owner-1";
+  const createdAt = minsAgo(1);
+  const card = dependencyReadyCard({
+    id: "tie", stateName: "Dev", labelNames: ["dev:in-progress"], updatedAt: createdAt,
+    comments: [
+      { id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(2)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(2) },
+      { id: "b", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, createdAt },
+      { id: "a", body: `${RETRY_TAG} claim=dev:in-progress owner=${owner}]`, createdAt },
+    ],
+  });
+  assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW).commentId, "a");
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"], NOW), false);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
   const card = dependencyReadyCard({
@@ -2698,6 +2989,25 @@ test("claimConfirmed rejects cards with absent relation metadata", () => {
 });
 
 // ── dependency-aware queue snapshots ────────────────────────────────────────
+test("coordination comments complete the active window and fail closed on a cursor cycle", async () => {
+  const cutoff = NOW - MAX_STALE_MIN * 60_000;
+  const seed = {
+    pageInfo: { hasPreviousPage: true, startCursor: "page-1" },
+    nodes: [{ id: "new", body: "new", createdAt: minsAgo(1) }],
+  };
+  const calls = [];
+  const comments = await completeRecentIssueComments("key", "issue-1", seed, cutoff, {
+    gqlFn: async (_query, variables) => {
+      calls.push(variables.cursor);
+      return { issue: { comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [{ id: "retry", body: "retry", createdAt: minsAgo(120) }] } } };
+    },
+  });
+  assert.deepEqual(calls, ["page-1"]);
+  assert.deepEqual(comments.map((comment) => comment.id), ["new", "retry"]);
+  await assert.rejects(completeRecentIssueComments("key", "issue-1", seed, cutoff, {
+    gqlFn: async () => ({ issue: { comments: { pageInfo: { hasPreviousPage: true, startCursor: "page-1" }, nodes: [{ id: "older", body: "old", createdAt: minsAgo(1) }] } } }),
+  }), /cursor cycle/);
+});
 test("queue snapshot requests all scheduled states once and partitions dependency-normalized cards", async () => {
   const states = SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states);
   const calls = [];
@@ -2709,12 +3019,12 @@ test("queue snapshot requests all scheduled states once and partitions dependenc
         nodes: [
           {
             id: "spec-id", identifier: "COD-1", updatedAt: minsAgo(1), sortOrder: 20,
-            state: { name: "Spec" }, labels: { nodes: [] }, comments: { nodes: [] },
+            state: { name: "Spec" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
             inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
           },
           {
             id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-            state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+            state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
             inverseRelations: {
               pageInfo: { hasNextPage: false, endCursor: null },
               nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
@@ -2739,7 +3049,7 @@ test("queue snapshot requests all scheduled states once and partitions dependenc
 test("queue snapshot annotates a visible cycle and produces one deduplicated failure event for Todo and doctor", async () => {
   const node = (id, identifier, state, blockerId, blockerIdentifier, blockerState) => ({
     id, identifier, updatedAt: minsAgo(1), sortOrder: 10,
-    state: { name: state }, labels: { nodes: [] }, comments: { nodes: [] },
+    state: { name: state }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
     inverseRelations: {
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{ id: `rel-${id}`, type: "blocks", issue: { id: blockerId, identifier: blockerIdentifier, state: { id: `${blockerId}-state`, name: blockerState, type: "started" } } }],
@@ -2788,7 +3098,7 @@ test("queue snapshot completes relation overflow before the card becomes eligibl
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{
         id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
         inverseRelations: {
           pageInfo: { hasNextPage: true, endCursor: "relations-1" },
           nodes: [{ id: "rel-1", type: "blocks", issue: { id: "done-id", identifier: "COD-0", state: { id: "done-state", name: "Done", type: "completed" } } }],
@@ -2816,7 +3126,7 @@ test("queue snapshot rejects relation overflow that cannot be completed", async 
       pageInfo: { hasNextPage: false, endCursor: null },
       nodes: [{
         id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-        state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+        state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
         inverseRelations: { pageInfo: { hasNextPage: true, endCursor: "relations-1" }, nodes: [] },
       }],
     },
@@ -2838,7 +3148,7 @@ test("partial GraphQL queue snapshot fails closed before selecting returned card
         pageInfo: { hasNextPage: false, endCursor: null },
         nodes: [{
           id: "dev-id", identifier: "COD-2", updatedAt: minsAgo(1), sortOrder: 10,
-          state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+          state: { name: "Dev" }, labels: { nodes: [] }, comments: { pageInfo: { hasPreviousPage: false, startCursor: null }, nodes: [] },
           inverseRelations: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
         }],
       },
@@ -2965,23 +3275,28 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
   assert.equal(paths.globalRunsDir, globalRunsDir);
-  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "run-id", 2, { globalRunsDir });
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "run-id", 2, { globalRunsDir });
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
+  assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
   assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
   assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
   assert.match(pick.learningEventsPath, /learning-events-[a-f0-9]{16}\.jsonl$/);
   assert.equal(pick.globalRunsDir, globalRunsDir);
-  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1 }, "later-run-id", 2, { globalRunsDir });
+  const laterPick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "later-run-id", 2, { globalRunsDir });
   assert.notEqual(laterPick.learningEventsPath, pick.learningEventsPath);
   for (const key of ["AUTO_SWEEP_LOG_DIR", "AUTO_SWEEP_TMPDIR", "AUTO_SWEEP_SCREENSHOT_DIR", "AUTO_SWEEP_BROWSER_PROFILE_DIR"]) {
     assert.equal(pick.childEnv[key].startsWith("/ws/repo"), false, key);
   }
   assert.equal(pick.sameRepoLimit, 4);
+});
+test("card dispatch env omits owner token when the pick has none", () => {
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6" }, "run-id");
+  assert.equal(Object.hasOwn(pick.childEnv, "AUTO_SWEEP_OWNER_TOKEN"), false);
 });
 
 test("run records embed structured events and mirror the exact record into the global daily index", async () => {
@@ -3119,7 +3434,7 @@ test("card dispatch env uses the routed managed sibling for worktrees and export
   assert.equal(pick.childEnv.AUTO_SWEEP_REPO_LABEL, "app:guide");
   assert.equal(pick.childEnv.AUTO_SWEEP_REPO_ENTRY, "safetaper-guide");
 });
-test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
+test("expandDispatchBatch: Ship claims ordinary demand and receives the owner-token env", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
   const globalRunsDir = path.join(anchorPath, "global-runs");
   const productionRunsDir = path.join(os.homedir(), ".local", "state", "linear-board-sweeps", "runs");
@@ -3128,6 +3443,8 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
     return [name, { size: stat.size, mtimeMs: stat.mtimeMs }];
   }));
   const productionBefore = snapshotProductionIndex();
+  let claimCalls = 0;
+  const shipCard = dependencyReadyCard({ id: "ship-id", identifier: "COD-77", sortOrder: 10 });
   const [pick] = await expandDispatchBatch([{
     anchorPath,
     sourceAnchorPath: "/source/repo",
@@ -3135,13 +3452,28 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
     config: { repos: [anchorPath] },
     sweep: "ship",
     count: 1,
-    topCard: dependencyReadyCard({ id: "ship-id", identifier: "COD-77", sortOrder: 10 }),
+    topCard: shipCard,
+    cards: [shipCard],
     issueId: "ship-id",
     issueIdentifier: "COD-77",
-    ownerToken: "ship-owner",
-  }], { dryRun: false, parentRunId: "ship-run", activeByAnchor: new Map(), now: NOW });
+  }], {
+    dryRun: false,
+    parentRunId: "ship-run",
+    activeByAnchor: new Map([[anchorPath, { apiKey: "key", repoPairs: [] }]]),
+    now: NOW,
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async (_apiKey, _anchorPath, _config, sweep, cards, options) => {
+      claimCalls += 1;
+      assert.equal(sweep, "ship");
+      assert.equal(options.limit, 1);
+      assert.equal(cards[0].identifier, "COD-77");
+      return [{ ...cards[0], card: cards[0], slotIndex: 0, ownerToken: "ship-owner" }];
+    },
+  });
+  assert.equal(claimCalls, 1);
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
   assert.equal(pick.issueId, "ship-id");
   assert.match(pick.logDir, /ship\/COD-77$/);
 
@@ -3154,6 +3486,7 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   child.emit("close", 0, null);
   assert.equal((await run).kind, "success");
   assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-77");
+  assert.equal(spawnedEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
   assert.equal(pick.globalRunsDir, globalRunsDir);
   const recordName = fs.readdirSync(pick.logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
@@ -3178,12 +3511,17 @@ test("expandDispatchBatch: Ship route-label races fail before child expansion", 
     issueIdentifier: "SAF-9",
     repoRoute,
     topCard: { id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"], repoRoute },
+    cards: [{ id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"], repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => ({ id: "issue-id", identifier: "SAF-9", labelNames: ["app:coach"] }),
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async (_apiKey, _anchorPath, _config, _sweep, cards, _options, deps) => {
+      deps.onRouteFailure(cards[0], { message: "repository route changed before claim" });
+      return [];
+    },
     onRouteFailure: (_pick, failure) => failures.push(failure),
   });
   assert.deepEqual(children, []);
@@ -3207,12 +3545,14 @@ test("expandDispatchBatch: a stable Ship route expands the routed production wor
     issueIdentifier: fresh.identifier,
     repoRoute,
     topCard: { ...fresh, repoRoute },
+    cards: [{ ...fresh, repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => fresh,
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async () => [{ ...fresh, card: fresh, repoRoute, slotIndex: 0, ownerToken: "ship-owner" }],
   });
   assert.equal(child.worktreePath, "/managed/guide/.worktrees/SAF-9");
   assert.equal(child.childEnv.AUTO_SWEEP_REPO, "/managed/guide");
@@ -3225,13 +3565,17 @@ test("expandDispatchBatch: a failed Ship route read creates no child and reports
   const repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
   const failures = [];
   const children = await expandDispatchBatch([{
-    anchorPath: "/managed/guide", config, repoPairs, sweep: "ship", issueId: card.id, issueIdentifier: card.identifier, repoRoute, topCard: { ...card, repoRoute },
+    anchorPath: "/managed/guide", config, repoPairs, sweep: "ship", issueId: card.id, issueIdentifier: card.identifier, repoRoute, topCard: { ...card, repoRoute }, cards: [{ ...card, repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/guide", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => { throw new Error("Linear unavailable"); },
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async () => {
+      failures.push({ message: "could not re-read SAF-9 repository route: Linear unavailable" });
+      return [];
+    },
     onRouteFailure: (_pick, failure) => failures.push(failure),
   });
   assert.deepEqual(children, []);
@@ -3499,6 +3843,43 @@ test("releaseOwnedDispatchClaim: successful completion only releases a claim whi
     addCommentFn: async () => {},
   }), false);
 });
+test("releaseFailedDispatchClaim writes the retry marker before removing and verifies the full label set", async () => {
+  const calls = [];
+  const pick = { sweep: "dev", issueId: "issue-148", issueIdentifier: "COD-148", ownerToken: "owner-148" };
+  const before = {
+    id: "issue-148", identifier: "COD-148", stateName: "Dev",
+    labelNames: ["dev:in-progress", "security"], labelIds: { "dev:in-progress": "claim", security: "security" },
+    comments: [{ id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-148 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  const verified = { ...before, labelNames: ["security"], labelIds: { security: "security" } };
+  let reads = 0;
+  const released = await watchModule.releaseFailedDispatchClaim("key", pick, { kind: "exit", exitCode: 1 }, "codex / gpt", {
+    fetchClaimCardFn: async () => { reads += 1; calls.push("fetch"); return reads === 3 ? verified : { ...before, labelIds: { ...before.labelIds }, labelNames: [...before.labelNames] }; },
+    addCommentFn: async (_key, _id, body) => calls.push(body),
+    applyLabelEditFn: async (_key, card, edit) => { calls.push(edit); card.labelNames = ["security"]; card.labelIds = { security: "security" }; },
+  });
+  assert.equal(released, true);
+  assert.equal(calls[0], "fetch");
+  assert.match(calls[1], /^\[auto-sweep-retry claim=dev:in-progress owner=owner-148\] \[auto-sweep-orphan\]/);
+  assert.equal(calls[2], "fetch");
+  assert.deepEqual(calls[3], { remove: ["dev:in-progress"] });
+  assert.equal(calls[4], "fetch");
+});
+test("releaseFailedDispatchClaim leaves the claim when the marker cannot be written", async () => {
+  let edits = 0;
+  const fresh = {
+    id: "issue-148", identifier: "COD-148", labelNames: ["dev:in-progress"], labelIds: { "dev:in-progress": "claim" },
+    comments: [{ id: "beat", body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-148 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+  };
+  await assert.rejects(watchModule.releaseFailedDispatchClaim("key", {
+    sweep: "dev", issueId: "issue-148", issueIdentifier: "COD-148", ownerToken: "owner-148",
+  }, { kind: "signal", signal: "SIGTERM" }, "codex", {
+    fetchClaimCardFn: async () => fresh,
+    addCommentFn: async () => { throw new Error("comment unavailable"); },
+    applyLabelEditFn: async () => { edits += 1; },
+  }), /comment unavailable/);
+  assert.equal(edits, 0);
+});
 test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
   assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
   const calls = [];
@@ -3516,12 +3897,14 @@ test("reconcileOwnedDispatchClaim: successful child completion invokes state-sco
   assert.match(calls[0][2], /successful child via codex \/ gpt-5\.6 exited/);
   assert.deepEqual(calls[0][3], { expectedStates: ["Dev"] });
 
+  const failureCalls = [];
   assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
     kind: "exit",
     pick: { sweep: "dev", issueId: "issue-141", issueIdentifier: "COD-141", ownerToken: "owner-141" },
   }, "codex", {
-    releaseOwnedDispatchClaimFn: async () => { throw new Error("ordinary child failures keep their claim for stale-run handling"); },
-  }), { attempted: false, released: false, reasonKind: null });
+    releaseFailedDispatchClaimFn: async (...args) => { failureCalls.push(args); return true; },
+  }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" });
+  assert.equal(failureCalls.length, 1);
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
@@ -3679,6 +4062,7 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
   assert.equal(result.dispatches[0].triggeredBy.kind, "same-repo-refill");
   assert.equal(result.dispatches[0].triggeredBy.issue, "COD-4");
   assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_APP_PORT, "47040");
+  assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-COD-5");
   assert.equal(refillBudget.remaining, 7);
   assert.match(logs.find((line) => line.includes("refill-trigger")), /COD-4: dev 1\/4/);
 });
@@ -4165,10 +4549,13 @@ test("dry-run and child expansion apply limits independently to routed sibling r
     sweep: "qa",
     count: 2,
     cards: [card("coach", "SAF-1", 2), card("guide", "SAF-2", 1)],
+    runtimeOverride: { runtime: "claude", model: "claude-sonnet-5" },
+    runtimeCooldownProbe: true,
   };
   assert.deepEqual(dryRunDispatchMessages([candidate]).slice(1).map((message) => message.body.match(/repo=([^ ]+)/)?.[1]), ["coach", "guide"]);
   const children = await expandDispatchBatch([candidate], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW });
   assert.deepEqual(children.map((child) => child.issueIdentifier), ["SAF-1", "SAF-2"]);
+  assert.ok(children.every((child) => child.runtimeOverride.runtime === "claude" && child.runtimeCooldownProbe === true));
 });
 test("dispatchBatch: dispatches every selected child and returns structured results", async () => {
   const calls = [];
@@ -4253,6 +4640,446 @@ test("classifyDispatchOutcome: exit 127, signal, interruption, and success remai
     kind: "success", code: null, exitCode: 0, signal: null, ...base,
   });
 });
+
+// Envelope: openai/codex bfe31598 exec_events.rs; message family: protocol/error.rs.
+const PERSONAL_LIMIT_ERROR = { type: "error", message: "You've hit your usage limit. Try again later." };
+const MODEL_LIMIT_FAILURE = { type: "turn.failed", error: { message: "You've hit your usage limit for codex_other. Switch to another model now, or try again later." } };
+const TPM_LIMIT = { type: "error", message: "Rate limit reached for gpt-5 on tokens per min. Please try again in 11s." };
+const WORKSPACE_CREDITS = { type: "error", message: "Your workspace has run out of credits." };
+
+test("Codex usage evidence: recognizes only source-pinned terminal error envelopes", () => {
+  assert.equal(isCodexUsageExhaustedEvent(PERSONAL_LIMIT_ERROR), true);
+  assert.equal(isCodexUsageExhaustedEvent(MODEL_LIMIT_FAILURE), true);
+
+  for (const value of [
+    { type: "agent.message", message: PERSONAL_LIMIT_ERROR.message },
+    { type: "item.completed", item: { message: PERSONAL_LIMIT_ERROR.message } },
+    { type: "error", message: "The service is overloaded. Try again later." },
+    { type: "error", message: "Context window exceeded." },
+    { type: "error", message: "Authentication required." },
+    { type: "error", message: "Quota exceeded." },
+    TPM_LIMIT,
+    WORKSPACE_CREDITS,
+    { type: "error", message: "Your workspace spending limit has been reached." },
+    { type: "error", message: "Your workspace credit balance is empty." },
+    { type: "turn.failed", error: { details: PERSONAL_LIMIT_ERROR.message } },
+    { type: "error" },
+    { type: "turn.failed" },
+    [],
+    null,
+    "You've hit your usage limit.",
+  ]) assert.equal(isCodexUsageExhaustedEvent(value), false);
+});
+
+test("Codex usage evidence: streams split stdout JSON and excludes log-only stderr", () => {
+  const collector = createCodexUsageEvidenceCollector();
+  const encoded = Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  collector.push(encoded.subarray(0, 17));
+  collector.push(encoded.subarray(17));
+  collector.finish();
+  assert.equal(collector.exhausted(), true);
+
+  const stdoutCollector = createCodexUsageEvidenceCollector();
+  const stderrLogOnly = Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  assert.ok(stderrLogOnly.length > 0);
+  stdoutCollector.finish();
+  assert.equal(stdoutCollector.exhausted(), false);
+});
+
+test("Codex usage evidence: fails closed on oversized, malformed, and bounded candidate streams", () => {
+  const oversizedPositive = { ...PERSONAL_LIMIT_ERROR, message: `${PERSONAL_LIMIT_ERROR.message}${"x".repeat(16 * 1024)}` };
+  const discarded = createCodexUsageEvidenceCollector();
+  discarded.push(Buffer.from(`${JSON.stringify(oversizedPositive)}\n`));
+  discarded.finish();
+  assert.equal(discarded.exhausted(), false);
+
+  const longLineThenPositive = createCodexUsageEvidenceCollector();
+  longLineThenPositive.push(Buffer.from(`${JSON.stringify(oversizedPositive)}\n${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  longLineThenPositive.finish();
+  assert.equal(longLineThenPositive.exhausted(), true);
+
+  const malformed = createCodexUsageEvidenceCollector();
+  malformed.push(Buffer.from([0x7b, 0x22, 0xff, 0x0a]));
+  malformed.push(Buffer.from("{not json}\n"));
+  malformed.finish();
+  assert.equal(malformed.exhausted(), false);
+
+  const routineTraffic = createCodexUsageEvidenceCollector();
+  routineTraffic.push(Buffer.from(`${Array.from({ length: 100 }, () => JSON.stringify({ type: "item.completed" })).join("\n")}\n`));
+  routineTraffic.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  routineTraffic.finish();
+  assert.equal(routineTraffic.exhausted(), true);
+
+  const candidateOverflow = createCodexUsageEvidenceCollector();
+  candidateOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  candidateOverflow.push(Buffer.from(`${Array.from({ length: 32 }, () => JSON.stringify({ type: "error", message: "ordinary terminal error" })).join("\n")}\n`));
+  candidateOverflow.finish();
+  assert.equal(candidateOverflow.exhausted(), false);
+
+  const byteOverflow = createCodexUsageEvidenceCollector();
+  byteOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  byteOverflow.push(Buffer.from(`${Array.from({ length: 5 }, () => JSON.stringify({ type: "error", message: "x".repeat(14 * 1024) })).join("\n")}\n`));
+  byteOverflow.finish();
+  assert.equal(byteOverflow.exhausted(), false);
+  assert.equal("events" in byteOverflow, false);
+  assert.equal(Object.values(byteOverflow).some(Array.isArray), false);
+});
+
+test("Codex usage evidence: rejects a malformed UTF-8 positive error line", () => {
+  const collector = createCodexUsageEvidenceCollector();
+  collector.push(Buffer.concat([
+    Buffer.from('{"type":"error","message":"You\'ve hit your usage limit.'),
+    Buffer.from([0xff]),
+    Buffer.from('"}\n'),
+  ]));
+  collector.finish();
+  assert.equal(collector.exhausted(), false);
+});
+
+test("Codex usage evidence: finish parses a bounded final stdout line", () => {
+  const bounded = createCodexUsageEvidenceCollector();
+  bounded.push(Buffer.from(JSON.stringify(PERSONAL_LIMIT_ERROR)));
+  bounded.finish();
+  assert.equal(bounded.exhausted(), true);
+
+  const oversized = createCodexUsageEvidenceCollector();
+  oversized.push(Buffer.from("x".repeat(16 * 1024 + 1)));
+  oversized.finish();
+  assert.equal(oversized.exhausted(), false);
+});
+
+test("Claude usage evidence: recognizes only bounded stderr limit lines", () => {
+  for (const message of ["You've hit your limit · resets 8pm", "Claude usage limit reached. Try again later."]) {
+    const collector = createClaudeUsageEvidenceCollector();
+    collector.push(Buffer.from(`${message}\n`));
+    collector.finish();
+    assert.equal(collector.exhausted(), true);
+  }
+  for (const message of ["Authentication required", "429 rate limit", "The service is overloaded", "agent said: You've hit your limit"]) {
+    const collector = createClaudeUsageEvidenceCollector();
+    collector.push(Buffer.from(`${message}\n`));
+    collector.finish();
+    assert.equal(collector.exhausted(), false);
+  }
+});
+
+test("dispatchAsync fallback: Codex exhaustion runs one sequential Claude attempt with the same child context", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-success-"));
+  const primary = pipedDispatchChild(801);
+  const fallback = pipedDispatchChild(802);
+  const calls = [];
+  const controller = new AbortController();
+  const childEnv = { AUTO_SWEEP_ISSUE: "COD-144", AUTO_SWEEP_WORKTREE: "/worktrees/COD-144", AUTO_SWEEP_LOG_DIR: "/logs/COD-144" };
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5", effort: "high" } } },
+  }, {
+    issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex", childEnv,
+  }, {
+    signal: controller.signal,
+    spawnFn: queuedDispatchSpawn([primary, fallback], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].executable, "/resolved/codex");
+  assert.equal(calls[1].executable, "/resolved/claude");
+  assert.equal(calls[1].options.cwd, calls[0].options.cwd);
+  assert.equal(calls[1].options.env, calls[0].options.env);
+  assert.equal(calls[1].options.env.AUTO_SWEEP_WORKTREE, "/worktrees/COD-144");
+  assert.equal(calls[1].options.env.AUTO_SWEEP_LOG_DIR, "/logs/COD-144");
+  assert.equal(calls[1].options.signal, controller.signal);
+  assert.equal(calls[1].args[1], calls[0].args.at(-1));
+  fallback.close(0);
+  const outcome = await run;
+  assert.equal(outcome.kind, "success");
+  assert.equal(outcome.fallbackUsed, true);
+  assert.deepEqual(outcome.finalRuntimeConfig, { runtime: "claude", model: "claude-sonnet-5", effort: "high" });
+  assert.equal(outcome.finalRuntimeExecutable, "/resolved/claude");
+  assert.equal(outcome.attempts.length, 2);
+  assert.equal(outcome.attempts[0].usageExhausted, true);
+  assert.deepEqual(outcome.attempts.map((attempt) => attempt.runtime), ["codex", "claude"]);
+  const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(anchorPath, "logs", recordFile), "utf8").trim());
+  assert.equal(record.runtime, "claude");
+  assert.equal(record.model, "claude-sonnet-5");
+  assert.equal(record.resolvedRuntimeExecutable, "/resolved/claude");
+  assert.equal(record.fallbackUsed, true);
+  assert.equal(record.attempts.length, 2);
+});
+
+test("dispatchAsync cooldown route: direct Claude exhaustion is normalized without another fallback", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-claude-exhaustion-"));
+  const child = pipedDispatchChild(803);
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", model: "gpt", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, {
+    issueIdentifier: "COD-144",
+    runtimeOverride: { runtime: "claude", model: "claude-sonnet-5" },
+    runtimeExecutable: "/resolved/claude",
+  }, { spawnFn: queuedDispatchSpawn([child]) });
+  child.stderr.write("You've hit your limit · resets 8pm\n");
+  child.close(1);
+  const result = await run;
+  assert.equal(result.finalRuntimeConfig.runtime, "claude");
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0].usageExhausted, true);
+  assert.equal(result.fallbackUsed, false);
+  assert.equal(isFinalProviderUsageExhaustion(result), true);
+});
+
+test("provider usage reconciliation: unresolved Claude is actionable rather than final exhaustion", () => {
+  assert.equal(isFinalProviderUsageExhaustion({
+    kind: "executable-enoent",
+    finalRuntimeConfig: { runtime: "claude" },
+    attempts: [{ runtime: "codex", usageExhausted: true, outcome: { kind: "exit", exitCode: 1 } }],
+  }), false);
+  assert.equal(isFinalProviderUsageExhaustion({
+    kind: "exit",
+    finalRuntimeConfig: { runtime: "claude" },
+    attempts: [
+      { runtime: "codex", usageExhausted: true, outcome: { kind: "exit", exitCode: 1 } },
+      { runtime: "claude", outcome: { kind: "exit", exitCode: 7 } },
+    ],
+  }), false);
+  assert.equal(shouldClearRuntimeCooldown({ kind: "spawn-error", attempts: [], finalRuntimeConfig: { runtime: "codex" } }, { runtimeCooldownProbe: true }), true);
+  assert.equal(shouldClearRuntimeCooldown({ kind: "exit", attempts: [{ runtime: "codex", usageExhausted: true }], finalRuntimeConfig: { runtime: "codex" } }, { runtimeCooldownProbe: true }), false);
+});
+
+test("dispatchAsync fallback: stderr usage text is logged but never authorizes Claude", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-stderr-separation-"));
+  const primary = pipedDispatchChild(805);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stderr.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+  assert.equal(outcome.kind, "exit");
+  assert.equal(calls.length, 1);
+  assert.equal(outcome.fallbackUsed, false);
+});
+
+test("dispatchAsync fallback: successful, anomalous, ordinary, and interrupted Codex attempts never fall back", async () => {
+  const cases = [
+    { name: "success", close: [0, null], exhausted: true, kind: "success" },
+    { name: "null exit", close: [null, null], exhausted: true, kind: "exit" },
+    { name: "ordinary exit", close: [1, null], exhausted: false, kind: "exit" },
+    { name: "signal", close: [null, "SIGTERM"], exhausted: true, kind: "signal" },
+  ];
+  for (const fixture of cases) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), `linear-fallback-${fixture.name}-`));
+    const primary = pipedDispatchChild(810);
+    const calls = [];
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+      spawnFn: queuedDispatchSpawn([primary], calls),
+      resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+    });
+    if (fixture.exhausted) primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    primary.close(...fixture.close);
+    const outcome = await run;
+    assert.equal(outcome.kind, fixture.kind, fixture.name);
+    assert.equal(calls.length, 1, fixture.name);
+    assert.equal(outcome.fallbackUsed, false, fixture.name);
+    assert.equal(outcome.attempts.length, 1, fixture.name);
+  }
+});
+
+test("dispatchAsync fallback: absent configuration preserves the exhausted Codex attribution", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-absent-"));
+  const primary = pipedDispatchChild(820);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: queuedDispatchSpawn([primary], calls) });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+  assert.equal(calls.length, 1);
+  assert.equal(outcome.kind, "exit");
+  assert.equal(outcome.finalRuntimeConfig.runtime, "codex");
+  assert.equal(outcome.fallbackUsed, false);
+});
+
+test("dispatchAsync fallback deferral: dependency and repository outcome files outrank a qualifying exhausted failure", async () => {
+  for (const fixture of [
+    { kind: "dependency-deferred", expected: "dependency-deferred", dependencyExitCode: 3 },
+    { kind: "repo-routing-deferred", expected: "repo-routing-deferred", routeExitCode: 3 },
+  ]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-deferral-"));
+    const outcomePath = path.join(anchorPath, "outcome.json");
+    const primary = pipedDispatchChild(830);
+    const calls = [];
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, {
+      issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), outcomePath, runtimeExecutable: "/resolved/codex",
+    }, { spawnFn: queuedDispatchSpawn([primary], calls) });
+    primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    fs.writeFileSync(outcomePath, JSON.stringify({ version: 1, issueIdentifier: "COD-144", ...fixture }));
+    primary.close(1);
+    const outcome = await run;
+    assert.equal(outcome.kind, fixture.expected);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test("dispatchAsync fallback: abort gaps before and after resolution prevent Claude spawn", async () => {
+  for (const fixture of ["before resolver", "after resolver"]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-abort-"));
+    const primary = pipedDispatchChild(840);
+    const calls = [];
+    const controller = new AbortController();
+    const run = dispatchAsync(anchorPath, "dev", {
+      runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+    }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+      signal: controller.signal,
+      spawnFn: queuedDispatchSpawn([primary], calls),
+      resolveRuntimeExecutableFn: () => {
+        if (fixture === "after resolver") controller.abort({ signal: "SIGTERM" });
+        return { ok: true, path: "/resolved/claude" };
+      },
+    });
+    primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+    primary.close(1);
+    if (fixture === "before resolver") controller.abort({ signal: "SIGTERM" });
+    const outcome = await run;
+    assert.equal(outcome.kind, "interrupted", fixture);
+    assert.equal(calls.length, 1, fixture);
+  }
+});
+
+test("dispatchAsync fallback: records both PIDs and fails closed when Claude is unavailable or fails", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-final-failure-"));
+  const primary = pipedDispatchChild(850);
+  const fallback = pipedDispatchChild(851);
+  const pids = [];
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary, fallback], calls), onSpawn: (pid) => pids.push(pid),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  fallback.close(7);
+  const outcome = await run;
+  assert.equal(outcome.kind, "exit");
+  assert.equal(outcome.exitCode, 7);
+  assert.deepEqual(pids, [850, 851]);
+  assert.equal(outcome.attempts.length, 2);
+  assert.equal(calls.length, 2);
+
+  const missingPrimary = pipedDispatchChild(852);
+  const missingCalls = [];
+  const missingRun = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-145", logDir: path.join(anchorPath, "missing-logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([missingPrimary], missingCalls),
+    resolveRuntimeExecutableFn: () => ({ ok: false, runtime: "claude", code: "ENOENT", path: null }),
+  });
+  missingPrimary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  missingPrimary.close(1);
+  const missing = await missingRun;
+  assert.equal(missing.kind, "executable-enoent");
+  assert.equal(missing.finalRuntimeConfig.runtime, "claude");
+  assert.equal(missing.finalRuntimeExecutable, null);
+  assert.equal(missing.finalRuntimeLaneKey.includes("claude"), true);
+  assert.equal(missingCalls.length, 1);
+});
+
+test("dispatchAsync fallback: Claude resolution failure preserves the exhausted Codex audit path without a second attempt", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-resolution-failure-"));
+  const primary = pipedDispatchChild(855);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-146", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: false, runtime: "claude", code: "ENOENT", path: null }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+
+  assert.equal(outcome.kind, "executable-enoent");
+  assert.equal(outcome.finalRuntimeConfig.runtime, "claude");
+  assert.equal(outcome.fallbackUsed, true);
+  assert.equal(outcome.attempts.length, 1);
+  assert.equal(outcome.attempts[0].runtime, "codex");
+  assert.equal(isFinalProviderUsageExhaustion(outcome), false);
+  assert.equal(calls.length, 1);
+
+  const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(anchorPath, "logs", recordFile), "utf8").trim());
+  assert.equal(record.runtime, "claude");
+  assert.equal(record.fallbackUsed, true);
+  assert.equal(record.attempts.length, 1);
+  assert.equal(record.attempts[0].runtime, "codex");
+
+  assert.equal(typeof watchModule.fallbackFailureAttribution, "function");
+  assert.equal(
+    watchModule.fallbackFailureAttribution(outcome),
+    "after Codex usage exhaustion; Claude fallback executable resolution failed",
+  );
+});
+
+test("dispatchAsync fallback PID: rejected second attachment kills Claude and waits for close", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-pid-"));
+  const primary = pipedDispatchChild(860);
+  const fallback = pipedDispatchChild(861);
+  let settled = false;
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary, fallback]),
+    onSpawn: (pid) => pid !== 861,
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+  }).then((outcome) => { settled = true; return outcome; });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(fallback.killCalls, ["SIGTERM"]);
+  assert.equal(settled, false);
+  fallback.close(null, "SIGTERM");
+  const outcome = await run;
+  assert.equal(outcome.code, "CAPACITY_ATTACH_FAILED");
+});
+
+test("dispatchAsync fallback: stdout and stderr log write failures kill and await one typed I/O outcome", async () => {
+  for (const stream of ["stdout", "stderr"]) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), `linear-fallback-${stream}-io-`));
+    const primary = pipedDispatchChild(870);
+    let writes = 0;
+    let settled = false;
+    const run = dispatchAsync(anchorPath, "dev", {}, {
+      issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+    }, {
+      spawnFn: queuedDispatchSpawn([primary]),
+      writeChunkFn: () => { writes += 1; throw new Error(`${stream} write failed`); },
+    }).then((outcome) => { settled = true; return outcome; });
+    primary[stream].write("provider output must not escape");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(writes, 1, stream);
+    assert.deepEqual(primary.killCalls, ["SIGTERM"], stream);
+    assert.equal(settled, false, stream);
+    primary.close(1);
+    const outcome = await run;
+    assert.equal(outcome.kind, "dispatch-io-error", stream);
+    assert.equal(outcome.code, "LOG_WRITE_FAILED", stream);
+    assert.equal(outcome.attempts.length, 1, stream);
+  }
+});
+
 test("dispatchAsync: child dependency outcome channel overrides a superficially successful runtime exit", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dependency-outcome-"));
   const logDir = path.join(anchorPath, "logs");
@@ -4525,8 +5352,8 @@ test("SWEEP_CFG.ship exists and the derived lists include it", () => {
 test("SWEEP_CFG: every scheduled sweep treats manual-only cards as blocked", () => {
   for (const sweep of SWEEPS) assert.ok(SWEEP_CFG[sweep].blocked.includes("sweep:manual-only"), `${sweep} missing manual-only blocker`);
 });
-test("manual unblock skill propagates but is never scheduled", () => {
-  assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep"]);
+test("manual operator skills propagate but are never scheduled", () => {
+  assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep", "manual-sweep"]);
   assert.ok(PROPAGATED_SKILL_DIRS.includes("unblock-sweep"));
   assert.ok(!SWEEPS.includes("unblock"));
   assert.ok(!SKILL_DIRS.includes("unblock-sweep"));

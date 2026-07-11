@@ -4,7 +4,7 @@
 
 Factory Learning observes bounded structured evidence through three lenses: reliability, quality/rework, and throughput/cost. A single registry-pinned learning runner executes only after delivery work drains and never receives repository write tools or secret-bearing environment values. Medium- and high-confidence findings automatically create or update `factory:learning-generated` cards at the bottom of Spec; low-confidence patterns accumulate without creating cards.
 
-Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. Done cards are evaluated against their declared baseline and fixed window, producing exactly one of `verified-improvement`, `no-measurable-change`, `regression`, or `inconclusive-evidence`. Only no-change/regression plus fresh qualified evidence can create a linked next generation. Generation three is the cap; later qualifying evidence updates that Done card and adds `blocked:needs-user` for the manual unblock queue.
+Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. A `factory:learning-generated` card never auto-ships or uses the auto-ship marker and always requires the human move to Ship. Done cards are evaluated against their declared baseline and fixed window, producing exactly one of `verified-improvement`, `no-measurable-change`, `regression`, or `inconclusive-evidence`. Only no-change/regression plus fresh qualified evidence can create a linked next generation. Generation three is the cap; later qualifying evidence updates that Done card and adds `blocked:needs-user` for the manual unblock queue.
 
 Use `learning-status --json`, `learning-run --dry-run`, and the `doctor` learning block for read-only operation. The dry-run does not write Linear or advance state. Repo-local `learning.enabled` opts a workspace into observation even while delivery is paused; exactly one registry-pinned runner performs writes after delivery work drains. Missing provenance or route labels, incomplete pagination, partial GraphQL data, ambiguous ownership, and corrupt state all fail learning closed without failing ordinary sweeps.
 
@@ -12,7 +12,7 @@ The sweeps assume this board shape. `scripts/linear.mjs setup-team` creates anyt
 
 ## Statuses (workflow states)
 
-The pipeline flows left → right. Linear ships most of these by default; the sweeps add six (`Spec`, `Dev`, `QA`, `Signoff`, `Ship`, `Archived`). `Signoff` and `Ship` are positioned between `QA` and `Done`. **`Ship` is the human gate: only a person moves a card into it, and ship-sweep merges + deploys only from there.**
+The pipeline flows left → right. Linear ships most of these by default; the sweeps add six (`Spec`, `Dev`, `QA`, `Signoff`, `Ship`, `Archived`). `Signoff` and `Ship` are positioned between `QA` and `Done`. The normal path is `QA` → `Signoff` → human approval → `Ship`; commit-bound QA-to-Ship automatic routing is allowed only for an unchanged reviewed SHA after full QA. `requireShipApproval: true` always preserves `Signoff`. `qa-sweep` never merges or deploys; the single-runner ship-sweep is the only production path.
 
 | Status | Type | Meaning | Who moves it here |
 |--------|------|---------|-------------------|
@@ -20,8 +20,8 @@ The pipeline flows left → right. Linear ships most of these by default; the sw
 | `Spec` | unstarted | Selected but under-specified | human, or dev-sweep bouncing a weak card |
 | `Dev` | unstarted | Designed + spec'd + reviewed to its final adaptive tier | **spec-sweep** |
 | `QA` | started | Built, pushed, awaiting QA | **dev-sweep** |
-| `Signoff` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** |
-| `Ship` | started | Human reviewed and approved shipping after `Signoff`, or after a dev-marked fast path | **human, manually (only)** |
+| `Signoff` | started | Smoke-tested green, evidence attached, awaiting human sign-off | **qa-sweep** for normal and denied fast paths |
+| `Ship` | started | Approved for the single-runner production sweep | **human** after `Signoff`, or **qa-sweep** for an eligible unchanged fast path |
 | `Done` | completed | Merged + deployed + canary-verified | **ship-sweep** |
 | `Todo` | unstarted | **A human action item the agent can't do** (see below) | dev/qa-sweep (or any sweep) spins these off |
 | `Canceled` | canceled | Won't do | human |
@@ -55,7 +55,7 @@ For an independently completable prerequisite, create or reuse its issue, create
 
 An in-progress claim means a child process owns the card. After a successful child exit, the launcher re-reads the card. If the card remains in that sweep's workflow state and the latest heartbeat owner still matches the completed child, the launcher removes only that owned claim before discovering refill work. Forward progress, another owner's newer heartbeat, or an unreadable issue leaves the label untouched. A freed Ship slot may refill from any correctly routed Ship card in the same registered source workspace, while the capacity ledger continues to allow only one active Ship child for that workspace.
 
-**Planned (COD-148):** after an observed nonzero child exit or OS signal, the launcher writes `[auto-sweep-retry claim=<claim> owner=<owner>]`, re-proves the latest heartbeat owner, removes only that claim, and verifies the remaining full label set. The marker cools only that claim stage for its existing 45/90/120-minute stale interval. Admission validates exact marker grammar, owner/heartbeat provenance, and Linear server time; it pages at most 20 pages/2,000 comments inside the active 120-minute coordination window and fails closed if history remains incomplete. Failed results do not trigger same-tick refill or handoff. Silent/frozen children continue through `[auto-sweep-reaper]` and stale-claim evidence.
+After an observed nonzero child exit or OS signal, the launcher writes `[auto-sweep-retry claim=<claim> owner=<owner>]` before releasing the claim, re-proves the latest heartbeat owner, removes only that claim, and verifies the remaining full label set. The marker cools only that claim stage for its existing 45/90/120-minute stale interval. Admission accepts only exact line-anchored marker grammar with matching claim, owner/heartbeat provenance, and Linear server time; it pages at most 20 pages/2,000 comments inside the active 120-minute coordination window and fails closed if history remains incomplete. Failed results do not trigger same-tick refill or handoff. Silent/frozen children continue through `[auto-sweep-reaper]` and stale-claim evidence.
 
 Bounded cycle detection is an operational limitation, not a full graph crawl: diagnosis is only as complete as the active registered queue and relations returned to the service account. Multi-hop cycles through other workflow states, projects, teams, or invisible relations may not be diagnosed, and cross-team token visibility can omit data the launcher cannot know exists. This is not an organization-wide guarantee; operators must inspect persistent waits and access boundaries rather than assuming no reported cycle means no cycle.
 
@@ -72,7 +72,7 @@ Claim/release + blocked signals. The sweeps create these if missing.
 | `qa:passed` | qa-sweep's green signal; ship-sweep's pre-merge evidence |
 | `ship:in-progress` | ship-sweep owns this card (stale after 120 min) |
 | `ship:approved` | *(optional)* deliberate human ship approval, required only when `config.requireShipApproval` is true |
-| `fast-path:eligible` | dev-sweep's conservative marker for tiny, high-confidence changes; lets a human skip `Signoff` by manually moving from `QA` to `Ship` |
+| `fast-path:eligible` | dev-sweep's conservative marker for tiny, high-confidence changes, bound by audit comment to the reviewed full origin SHA |
 | `blocked:open-questions` | spec-sweep asked the owner questions; waiting on a reply |
 | `blocked:needs-user` | dev/qa/ship blocked on a human (decision, credential, deploy) |
 | `sweep:manual-only` | direct user conversation or another non-sweep skill owns the card; scheduled sweeps skip it until a human clears the label |
@@ -95,9 +95,11 @@ After writing the implementation plan, spec-sweep reassesses the concrete file m
 
 ## Fast-path eligibility
 
-Fast path is enabled by default in `linear-sweep.json`. Dev-sweep may add `fast-path:eligible` only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. Set `fastPath.enabled` to `false` to require normal QA for every card. Dev-sweep still moves the card to `QA`; it never moves a card to `Ship`.
+Fast path is enabled by default in `linear-sweep.json`. Dev-sweep may identify candidacy only after implementation, verification, code review, and independent review are all green and the change is below the configured size/risk thresholds. It pushes first, proves the full origin SHA is the reviewed final commit, then adds `fast-path:eligible` and `[auto-sweep-fast-path <KEY> head=<full-git-sha>]`. If that proof fails, it does not label the card. Dev-sweep still moves every successful card to `QA`; it never moves a card to `Ship`.
 
-A human can then either leave the card in `QA` for normal qa-sweep, or manually move it directly to `Ship` to skip `Signoff`. ship-sweep accepts `qa:passed` or enabled `fast-path:eligible` evidence, but only after the card is already in the human-gated `Ship` column and has no live foreign `*:in-progress` claim. If `fastPath.enabled` is `false`, ship-sweep requires `qa:passed`.
+qa-sweep always performs full QA and adds `qa:passed`. It re-reads the final origin SHA and the latest well-formed issue marker; only an exact unchanged match with enabled fast path, no policy blockers, and `requireShipApproval === false` moves automatically from `QA` to `Ship` with `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]`. A SHA mismatch removes the stale eligibility label and records both SHAs. Every policy denial is still a QA pass and moves to `Signoff`; `fastPath.enabled: false` or `requireShipApproval: true` always preserves `Signoff`.
+
+The QA queue move never merges, deploys, or immediately launches ship-sweep. The existing single-runner Ship queue discovers the card normally and applies its unchanged sanity, merge, deploy, and canary gates.
 
 Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity, and domain labels are optional and team-specific — the sweeps don't require them.
 
@@ -105,7 +107,7 @@ Type labels (`Feature`/`Bug`/`Improvement` or your team's equivalent), Severity,
 
 `auto-sweep` is a **project-level** label (not an issue label), and it is the on/off switch for the auto-sweep launcher (`scripts/linear-watch.mjs`). A registered workspace is swept automatically **iff its Linear project carries this label** — add it in the Linear UI to activate a project, remove it to pause, without touching the machine that runs the launcher. Projects without it are ignored even if their anchor is registered.
 
-The launcher also writes/reads a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO>]` (a running sweep proving it's alive), `[auto-sweep-reaper]` (a stale claim it auto-released), `[auto-sweep-orphan]` (a launcher-owned claim released after a start/defer failure or a successful same-state child exit), `[auto-sweep-retry claim=<claim> owner=<owner>]` (**planned, COD-148**: an observed failed child whose claim is replaced by a stage-scoped cooldown), `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`), `[auto-sweep-tick-failure <fingerprint>]` (a self-clearing scheduled launcher failure Todo), and `[auto-sweep-tick-recovered <fingerprint> <ISO>]` (the launcher observed recovery and moved that Todo to Done).
+The launcher and sweeps write/read a few **audit-marker comments** on cards (you don't create these by hand): `[auto-sweep-heartbeat <ISO> owner=<token> claim=<claim>]` (a running sweep proving claim ownership and liveness), `[auto-sweep-reaper]` (a stale claim it auto-released), `[auto-sweep-orphan]` (a launcher-owned claim released after a start/defer failure, a successful same-state child exit, or alongside a retry marker), `[auto-sweep-retry claim=<claim> owner=<owner>]` (an observed failed child whose claim is replaced by a server-timed, stage-scoped cooldown), `[auto-sweep-bounce <from>→<to>]` (a card that moved backward — two within 48h and the card is parked with `blocked:needs-user`), `[auto-sweep-fast-path <KEY> head=<full-git-sha>]` (Dev's reviewed origin commit), `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` (QA's automatic handoff of that unchanged commit), `[auto-sweep-tick-failure <fingerprint>]` (a self-clearing scheduled launcher failure Todo), and `[auto-sweep-tick-recovered <fingerprint> <ISO>]` (the launcher observed recovery and moved that Todo to Done).
 
 ## Manual unblock workflow
 
@@ -121,6 +123,6 @@ After upgrading a legacy installation, perform a one-time dry-run audit across e
 - When one project contains cards with different primary repos, configure `repoRouting.byLabel`. Every scheduled card must carry exactly one mapped label; missing, ambiguous, invalid, or changed routing fails closed before claim/spawn and surfaces a self-clearing routing failure. `AUTO_SWEEP_REPO` is the selected managed primary repo; configured siblings are available only for explicit multi-repo scope.
 - Put the `<PREFIX>-###` key in the branch name / PR title / commit subjects where practical.
 - Cards created or moved by direct user conversation or non-sweep skills should carry `sweep:manual-only` unless the user explicitly wants unattended sweeps to pick them up right away.
-- Raw ideas → `Backlog`. Selected-but-underspecified → `Spec`. Designed/active → `Dev` (active work carries `dev:in-progress`). PR/review → `QA`. QA-passed, awaiting sign-off → `Signoff`. Tiny fast-path-eligible changes may be moved by a human from `QA` directly to `Ship`; otherwise human-approved shipping happens from `Signoff` → `Ship`. Shipped + verified → `Done`.
+- Raw ideas → `Backlog`. Selected-but-underspecified → `Spec`. Designed/active → `Dev` (active work carries `dev:in-progress`). PR/review → `QA`. Normal QA passes and every fast-path denial → `Signoff` → human-approved `Ship`. An eligible unchanged fast path may move automatically from `QA` directly to `Ship` after full QA. Shipped + verified → `Done`.
 - Work discovered after the fact → a `Done` card titled `Completed: …` with a short plain-English summary + evidence.
 - Every question during an unattended sweep run goes to a **card comment** — never block on interactive input.

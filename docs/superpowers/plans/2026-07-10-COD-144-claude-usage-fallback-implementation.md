@@ -16,6 +16,7 @@
 - One demand keeps one claim, worktree, environment, capacity reservation, and final reconciliation across both attempts.
 - No new package dependency, provider framework, retry loop, account probe, workflow state, deployment behavior, or application code.
 - Provider output never becomes command/config input and never enters Linear comments, failure Todos, learning evidence, or structured run records.
+- Persist positively classified provider exhaustion as a host-wide runtime cooldown for 60 minutes; all-provider exhaustion is a quiet local deferral with no Linear writes.
 - Parsing limits: stdout-only; 16 KiB maximum in-progress line; 32 candidate error events; 64 KiB candidate bytes; overflow fails closed while both streams continue to the log.
 - A valid dependency/repository outcome file and launcher cancellation outrank exhaustion evidence.
 - Configured fallback mapping: Spec Fable 5/default effort; Dev Sonnet 5/high; QA Opus 4.8/default effort; Ship Sonnet 5/medium.
@@ -57,6 +58,37 @@
 - Persisting exhausted-lane state across cards/ticks; each dispatched card tests its configured primary, allowing a reset Codex allowance to recover naturally.
 - Packaging/release automation or any production deploy.
 - Refactoring unrelated scheduler, capacity, learning, or Linear APIs.
+
+## Revision tasks: quiet daily recovery
+
+### Task 7: Correct the bounded Codex classifier
+
+- Add a regression fixture containing more than 32 ordinary JSONL events followed by one supported usage-limit envelope.
+- Prove the test fails before the fix.
+- Count the 32-event/64-KiB budgets only after an event is structurally identified as an `error` or `turn.failed` candidate. Parse and discard ordinary events without consuming either budget.
+- Preserve fail-closed behavior when candidate limits are exceeded.
+
+### Task 8: Persist shared runtime cooldowns
+
+- Add a versioned atomic cooldown store keyed by host/runtime and optional trusted model scope.
+- Store only normalized reason, `cooldownUntil`, timestamps, and bounded probe metadata; reject malformed state fail closed.
+- Default the cooldown to exactly 60 minutes and renew it by 60 minutes after each confirmed exhaustion.
+- Add restart, corruption, expiry, renewal, model-scope, and success-clear tests.
+
+### Task 9: Route and defer without Linear noise
+
+- Before runtime executable preflight, replace a cooling primary with its configured non-cooling fallback.
+- If every configured lane is cooling, omit the demand from admission and expose a local deferred diagnostic; do not claim a new card.
+- For an already claimed card whose final attempt exhausts the last available provider, persist an exact resume record due at the cooldown boundary and retain its existing claim/worktree without adding or updating a Linear comment.
+- Ensure one expired lane becomes probe-eligible globally; successful execution clears its cooldown and a repeated exhaustion renews it.
+- Provider exhaustion must bypass COD-149's generic capacity classifier so no per-card fallback counter or failure Todo is produced.
+
+### Task 10: Surface and ship
+
+- Add bounded cooldown details to JSON and human `doctor` output and local launcher logs.
+- Document the one-hour quiet recovery policy and the distinction between usage exhaustion and authentication/configuration failures.
+- Run focused red/green tests, the full Node suite, JSON parsing checks, and a scheduled dry-run.
+- Merge to `main`, push, refresh the installed kit, and verify the installed marker plus doctor output.
 
 ### Task 1: Resolve fallback config and build deterministic runtime commands
 

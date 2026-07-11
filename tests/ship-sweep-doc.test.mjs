@@ -38,6 +38,8 @@ test("generated learning cards cannot fast-path and require qa:passed at Ship", 
     const body = fs.readFileSync(path, "utf8");
     assert.match(body, /factory:learning-generated[^\n]*require `qa:passed`/i, path);
     assert.match(body, /never accept `fast-path:eligible`/i, path);
+    assert.match(body, /factory:learning-generated[^\n]*auto-ship marker[^\n]*block/i, `${path}: generated auto-marker must block Ship`);
+    assert.match(body, /factory:learning-generated[^\n]*human[^\n]*Ship/i, `${path}: generated cards must require human Ship`);
   }
 });
 
