@@ -54,6 +54,7 @@ import {
 import {
   claimCloseMarker,
   claimDeclarationMarker,
+  parseClaimMarker,
   resolveClaimOwnership,
 } from "./claim-ownership.mjs";
 
@@ -676,7 +677,7 @@ export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } =
     if (heartbeatAgeMin(card, now) <= cfg.staleMin) continue; // fresh/alive
     const preserved = protectedClaim(card);
     if (preserved) {
-      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim, ownerToken: preserved.ownerToken });
+      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim, ownerToken: preserved.ownerToken, claimDeclarationId: preserved.claimDeclarationId });
       continue;
     }
     const priorReaps = countMarkers(card, REAPER_TAG, now);
@@ -1426,6 +1427,9 @@ export function cardRunPaths(anchorPath, config, sweep, slot, parentRunId, child
 
 export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options = {}) {
   if (!pick.issueIdentifier) return pick;
+  if (Boolean(pick.ownerToken) !== Boolean(pick.claimDeclarationId)) {
+    throw new Error("claim owner and declaration must be provided together");
+  }
   const cardRunId = `${parentRunId}:${pick.sweep}:${pick.issueIdentifier}:${pick.slotIndex || 0}:${childIndex}`;
   const sourceWorkspace = canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath);
   const globalRunsDir = Object.hasOwn(options, "globalRunsDir")
@@ -1577,7 +1581,7 @@ export function admissionDemandsForCandidates(candidates, {
         cards: [card],
         count: 1,
         slotLimit: 1,
-        ...(candidate.resume ? { resume: true, ownerToken: candidate.ownerToken, worktreePath: candidate.worktreePath, branch: candidate.branch } : {}),
+        ...(candidate.resume ? { resume: true, ownerToken: candidate.ownerToken, claimDeclarationId: candidate.claimDeclarationId, worktreePath: candidate.worktreePath, branch: candidate.branch } : {}),
       });
     }
   }
@@ -2102,6 +2106,7 @@ function validResumeRecord(value) {
   return Boolean(value && typeof value === "object" && typeof value.sourceWorkspace === "string" && value.sourceWorkspace
     && typeof value.sweep === "string" && value.sweep && typeof value.issueIdentifier === "string" && value.issueIdentifier
     && typeof value.ownerToken === "string" && value.ownerToken && typeof value.worktreePath === "string" && value.worktreePath
+    && (value.claimDeclarationId === undefined || (typeof value.claimDeclarationId === "string" && value.claimDeclarationId))
     && typeof value.branch === "string" && value.branch && typeof value.repoEntry === "string" && value.repoEntry
     && typeof value.reason === "string" && value.reason && Number.isFinite(Date.parse(value.nextEligibleAt || ""))
     && Number.isInteger(value.attempts) && value.attempts >= 0);
@@ -2132,7 +2137,8 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
   };
   const clear = (pick) => {
     const state = read(); const key = resumeKey(pick); const entry = state.entries[key];
-    if (!state.healthy || !entry || (pick.ownerToken && entry.ownerToken !== pick.ownerToken)) return false;
+    if (!state.healthy || !entry || !pick.ownerToken || entry.ownerToken !== pick.ownerToken) return false;
+    if (entry.claimDeclarationId && entry.claimDeclarationId !== pick.claimDeclarationId) return false;
     delete state.entries[key]; persist(state); return true;
   };
   const due = (pick) => { const entry = get(pick); return entry && Date.parse(entry.nextEligibleAt) <= now() ? entry : null; };
@@ -2141,7 +2147,12 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
     const sweep = cfg && Object.keys(SWEEP_CFG).find((s) => SWEEP_CFG[s] === cfg);
     const scoped = card?.sourceWorkspace || card?.sourceAnchorPath || card?.anchorPath;
     const entry = state.healthy ? Object.values(state.entries).find((candidate) => candidate.sweep === sweep && candidate.issueIdentifier === card?.identifier && (!scoped || candidate.sourceWorkspace === scoped)) : null;
-    if (!entry || !cfg || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
+    if (!entry || !cfg || !hasLabel(card, cfg.claim)) return null;
+    if (entry.claimDeclarationId) {
+      const ownership = resolveCardClaim(card, cfg.claim);
+      if (ownership.status !== "owned" || ownership.ownerToken !== entry.ownerToken
+          || ownership.declarationId !== entry.claimDeclarationId) return null;
+    } else if (latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
     return entry;
   };
   return { resumePath, read, get, upsert, clear, due, protectedClaim };
@@ -2149,7 +2160,11 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
 
 export function successfulSameStateRecoveryDecision(pick, card, { gitFn = git, existsFn = fs.existsSync } = {}) {
   const cfg = SWEEP_CFG[pick?.sweep];
-  if (!cfg || !card || !cfg.states.includes(card.stateName) || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== pick.ownerToken) return { kind: "preserve", reason: "claim ownership or state changed" };
+  const ownership = cfg && card ? resolveCardClaim(card, cfg.claim) : null;
+  if (!cfg || !card || !pick.ownerToken || !pick.claimDeclarationId
+      || !cfg.states.includes(card.stateName) || !hasLabel(card, cfg.claim)
+      || ownership.status !== "owned" || ownership.ownerToken !== pick.ownerToken
+      || ownership.declarationId !== pick.claimDeclarationId) return { kind: "preserve", reason: "claim ownership or state changed" };
   const worktree = pick.worktreePath;
   if (!worktree || !existsFn(worktree)) return { kind: "resume-needed", reason: "worktree unavailable", branch: pick.branch || pick.issueIdentifier };
   const status = gitFn(worktree, ["status", "--porcelain", "--untracked-files=all"], { allowFail: true });
@@ -2168,10 +2183,13 @@ export function resumeAdmissionDecision(pick, freshCard, record, now = Date.now(
   if (!cfg || !record || Date.parse(record.nextEligibleAt || "") > now) return { kind: "skip", reason: "not due" };
   const exact = record.sourceWorkspace === (pick.sourceAnchorPath || pick.anchorPath)
     && record.sweep === pick.sweep && record.issueIdentifier === pick.issueIdentifier && record.ownerToken === pick.ownerToken
+    && record.claimDeclarationId && record.claimDeclarationId === pick.claimDeclarationId
     && record.worktreePath === pick.worktreePath && record.repoEntry === (pick.repoRoute?.repoEntry || ".")
-    && freshCard?.stateName && cfg.states.includes(freshCard.stateName) && hasLabel(freshCard, cfg.claim)
-    && latestHeartbeatOwner(freshCard, cfg.claim) === record.ownerToken;
-  return exact ? { kind: "resume", record } : { kind: "preserve", reason: "resume identity no longer matches claimed card" };
+    && freshCard?.stateName && cfg.states.includes(freshCard.stateName) && hasLabel(freshCard, cfg.claim);
+  const ownership = exact ? resolveCardClaim(freshCard, cfg.claim) : null;
+  const authoritative = ownership?.status === "owned" && ownership.ownerToken === record.ownerToken
+    && ownership.declarationId === record.claimDeclarationId;
+  return exact && authoritative ? { kind: "resume", record } : { kind: "preserve", reason: "resume identity no longer matches claimed card" };
 }
 
 export function classifyCapacityOutcome(outcome, logTail = "") {
@@ -4885,9 +4903,16 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       await addCommentFn(apiKey, card.id, claimCloseMarker({ claim: cfg.claim, declarationId, reason: "failed" }));
       const closed = await fetchCardFn(apiKey, card.id);
       const closedOwnership = resolveCardClaim(closed, cfg.claim);
-      const closedExactly = hasLabel(closed, cfg.claim)
+      const exactClose = closed.commentsComplete === true && (closed.comments || []).some((comment) => {
+        const marker = parseClaimMarker(comment);
+        return marker?.type === "close" && marker.claim === cfg.claim
+          && marker.declarationId === declarationId && marker.reason === "failed";
+      });
+      const closedExactly = exactClose && (hasLabel(closed, cfg.claim)
         ? closedOwnership.status === "legacy-unowned"
-        : closedOwnership.status === "closed";
+        : closedOwnership.status === "closed");
+      if (exactClose && closedOwnership.status === "owned"
+          && (closedOwnership.ownerToken !== owner || closedOwnership.declarationId !== declarationId)) return false;
       if (!closedExactly) throw safetyError(card, `claim close was not authoritative (${closedOwnership.status}/${closedOwnership.reason})`);
       if (hasLabel(closed, cfg.claim)) await applyLabelEditFn(apiKey, closed, { remove: [cfg.claim] });
       return true;
@@ -4915,6 +4940,7 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       declarationAttempted = true;
       await addCommentFn(apiKey, card.id, claimDeclarationMarker({ claim: cfg.claim, ownerToken: owner, declarationId }));
       await applyLabelEditFn(apiKey, claimTarget, { add: { [cfg.claim]: claimId } });
+      await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Compatibility heartbeat for declaration ${declarationId}.`);
       await sleepFn(CLAIM_CONFIRM_DELAY_MS);
       const fresh = await fetchCardFn(apiKey, card.id);
       const freshRoute = routingConfigured
@@ -5027,6 +5053,7 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
         issueIdentifier: pick.issueIdentifier,
         issueId: pick.issueId,
         ownerToken: pick.ownerToken,
+        claimDeclarationId: pick.claimDeclarationId,
         worktreePath: pick.worktreePath,
         branch: recovery.branch || pick.issueIdentifier,
         repoEntry: pick.repoRoute?.repoEntry || ".",
@@ -5041,7 +5068,7 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
       else if (!prior) await addCommentFn(apiKey, fresh.id, marker);
       return { attempted: true, released: false, reasonKind: "resume-needed", record };
     }
-    resumeStore.clear({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier, ownerToken: pick.ownerToken });
+    resumeStore.clear({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier, ownerToken: pick.ownerToken, claimDeclarationId: pick.claimDeclarationId });
   }
   const released = await releaseOwnedDispatchClaimFn(apiKey, pick, reason, {
     expectedStates: successfulCompletion ? cfg.states : [],
@@ -5929,7 +5956,7 @@ async function tick({ dryRun = false } = {}) {
         const nextEligibleAt = new Date(capacityRetryAt(Date.now(), attempts - 1)).toISOString();
         resumeStore.upsert({
           sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier,
-          issueId: pick.issueId, ownerToken: pick.ownerToken, worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
+          issueId: pick.issueId, ownerToken: pick.ownerToken, claimDeclarationId: pick.claimDeclarationId, worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
           branch: pick.issueIdentifier, repoEntry: pick.repoRoute?.repoEntry || ".", reason: "capacity", nextEligibleAt, attempts,
         });
         logFor(pick.anchorPath, pick.sweep, `${pick.issueIdentifier} capacity deferred (${capacityKind}); retry eligible ${nextEligibleAt}`);
@@ -6521,10 +6548,13 @@ async function tick({ dryRun = false } = {}) {
             // worktree. Never attempt cleanup or release in this discovery path.
             if (!resumeStore.get(resumePickKey) && sweep === "dev" && hasLabel(card, cfg.claim)) {
               const owner = latestHeartbeatOwner(card, cfg.claim);
+              const ownership = resolveCardClaim(card, cfg.claim);
+              const claimDeclarationId = ownership.status === "owned" && ownership.ownerToken === owner
+                ? ownership.declarationId : undefined;
               const worktreePath = cardWorktreePath(anchorPath, config, card.identifier);
               const dirty = dirtyCheckoutEvent({ sweep, worktreePath, issueIdentifier: card.identifier }, { role: "worktree", path: worktreePath });
               if (owner && dirty?.kind === "dirty-checkout") resumeStore.upsert({
-                ...resumePickKey, issueId: card.id, ownerToken: owner, worktreePath, branch: card.identifier,
+                ...resumePickKey, issueId: card.id, ownerToken: owner, claimDeclarationId, worktreePath, branch: card.identifier,
                 repoEntry: ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(now).toISOString(), attempts: 0,
               });
             }
@@ -6534,11 +6564,11 @@ async function tick({ dryRun = false } = {}) {
             if (!routedResume) continue;
             const resumePick = {
               anchorPath, sourceAnchorPath: active.sourceAnchorPath, config, sweep,
-              issueId: card.id, issueIdentifier: card.identifier, ownerToken: record.ownerToken,
+              issueId: card.id, issueIdentifier: card.identifier, ownerToken: record.ownerToken, claimDeclarationId: record.claimDeclarationId,
               worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute,
             };
             if (resumeAdmissionDecision(resumePick, card, record, now).kind === "resume") {
-              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute, ...(record.reason === "capacity" ? { runtimeOverride: runtimeFallbackForAttempt(config, sweep, record.attempts) } : {}) });
+              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, claimDeclarationId: record.claimDeclarationId, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute, ...(record.reason === "capacity" ? { runtimeOverride: runtimeFallbackForAttempt(config, sweep, record.attempts) } : {}) });
             }
           }
           const actionableIds = new Set(actionable.map((card) => card.identifier));
