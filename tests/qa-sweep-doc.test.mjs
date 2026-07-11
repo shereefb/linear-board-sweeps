@@ -27,6 +27,14 @@ test("all claim-owning sweeps separate declarations from liveness", () => {
   }
 });
 
+test("Ship scheduled mode accepts only its exact immutable pre-claim", () => {
+  for (const path of [".claude/skills/ship-sweep/SKILL.md", "skills/ship-sweep/SKILL.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /scheduled single-card[\s\S]{0,900}exact[\s\S]{0,300}owner[\s\S]{0,300}declaration/i);
+    assert.match(body, /treat[\s\S]{0,200}pre-claim[\s\S]{0,250}not[\s\S]{0,120}competing/i);
+  }
+});
+
 test("sweep distributions document the commit-bound QA handoff", () => {
   for (const { canonical, distributed } of sweepPairs) {
     assert.equal(
