@@ -1,6 +1,6 @@
 # COD-169: Immutable Claim Declarations
 
-**Status:** Approved design, awaiting written-spec review
+**Status:** Implemented and released in v1.3.0.0
 **Date:** 2026-07-11
 **Issue:** COD-169
 **Related:** COD-142

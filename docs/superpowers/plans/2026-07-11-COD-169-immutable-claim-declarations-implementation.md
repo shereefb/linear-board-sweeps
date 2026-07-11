@@ -31,7 +31,7 @@
 - Produces: `CLAIM_PROTOCOL_VERSION`, marker constants, `claimDeclarationMarker(input)`, `claimHeartbeatMarker(input)`, `claimCloseMarker(input)`, `claimResetMarker(input)`, `parseClaimMarker(comment)`, and `resolveClaimOwnership(input)`.
 - `resolveClaimOwnership` returns one frozen result with `status` in `owned | closed | legacy-unowned | orphan-declaration | unclaimed | ambiguous`, stable `reason`, and, only for `owned`, `ownerToken`, `declarationId`, `declaredAt`, `heartbeatAt`, and `livenessAt`.
 
-- [ ] **Step 1: Write the failing marker and resolver matrix**
+- [x] **Step 1: Write the failing marker and resolver matrix**
 
 ```js
 test("first declaration owns the epoch and later declarations never promote", () => {
@@ -60,12 +60,12 @@ test("a delayed heartbeat for a closed declaration cannot affect the next epoch"
 
 Also cover deterministic `createdAt,id` ordering, matching heartbeat liveness, unknown/losing heartbeats, all close reasons, exact-target reset boundaries, stage isolation, label-without-declaration, declaration-without-label, incomplete input, malformed relevant markers, unreadable timestamps, conflicting duplicate declaration IDs, unknown/losing close references, and invalid reset targets. Prove that duplicate/delayed close or reset markers for an already-closed exact target are idempotent no-ops after a newer epoch starts.
 
-- [ ] **Step 2: Run the focused suite and verify RED**
+- [x] **Step 2: Run the focused suite and verify RED**
 
 Run: `node --test tests/claim-ownership.test.mjs`
 Expected: FAIL because `scripts/claim-ownership.mjs` does not exist.
 
-- [ ] **Step 3: Implement strict marker builders, parser, ordering, and epoch fold**
+- [x] **Step 3: Implement strict marker builders, parser, ordering, and epoch fold**
 
 ```js
 export const CLAIM_PROTOCOL_VERSION = "v1";
@@ -89,12 +89,12 @@ export function resolveClaimOwnership({ comments, complete, claim, labelPresent 
 }
 ```
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run: `node --test tests/claim-ownership.test.mjs`
 Expected: all claim protocol tests pass.
 
-- [ ] **Step 5: Commit the pure protocol**
+- [x] **Step 5: Commit the pure protocol**
 
 ```bash
 git add scripts/claim-ownership.mjs tests/claim-ownership.test.mjs
@@ -114,7 +114,7 @@ git commit -m "feat(COD-169): add immutable claim protocol"
 - Produces: `fetchCompleteClaimComments(apiKey, issueId, { gqlFn }) -> Promise<Comment[]>`, `withCompleteClaimHistory(card, comments)`, and CLI-side `fetchCompleteIssueComments(issueId, { gqlFn })`.
 - Every hydrated card carries `commentsComplete: true`; scheduled snapshots explicitly carry `commentsComplete: false` and are never authoritative for ownership.
 
-- [ ] **Step 1: Add failing pagination, cursor-cycle, and incomplete-snapshot tests**
+- [x] **Step 1: Add failing pagination, cursor-cycle, and incomplete-snapshot tests**
 
 ```js
 test("fetchCompleteClaimComments paginates oldest-to-newest with ids", async () => {
@@ -130,12 +130,12 @@ test("scheduled snapshots are never complete ownership evidence", () => {
 });
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `node --test --test-name-pattern='CompleteClaim|claim history|scheduled snapshots' tests/linear-watch.test.mjs tests/linear.test.mjs`
 Expected: FAIL because the complete-history helpers are absent.
 
-- [ ] **Step 3: Implement cycle-safe pagination and authoritative hydration**
+- [x] **Step 3: Implement cycle-safe pagination and authoritative hydration**
 
 ```js
 export async function fetchCompleteClaimComments(apiKey, issueId, { gqlFn = gql } = {}) {
@@ -158,7 +158,7 @@ export async function fetchCompleteClaimComments(apiKey, issueId, { gqlFn = gql 
 
 Change GraphQL selections that feed snapshots to include comment IDs. Hydrate only cards whose claim history is material: claim candidates during final acquisition, cards carrying any in-progress label before reaping/cleanup/resume decisions, and terminal helper targets.
 
-- [ ] **Step 4: Replace `latestClaimHeartbeat` in `linear.mjs` with the shared resolver input**
+- [x] **Step 4: Replace `latestClaimHeartbeat` in `linear.mjs` with the shared resolver input**
 
 ```js
 const ownership = resolveClaimOwnership({
@@ -171,12 +171,12 @@ const ownership = resolveClaimOwnership({
 
 Do not change terminal eligibility yet; Task 5 wires the new declaration argument.
 
-- [ ] **Step 5: Run focused and existing Linear tests**
+- [x] **Step 5: Run focused and existing Linear tests**
 
 Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass, including cursor-cycle failures.
 
-- [ ] **Step 6: Commit complete history support**
+- [x] **Step 6: Commit complete history support**
 
 ```bash
 git add scripts/linear-watch.mjs scripts/linear.mjs tests/linear-watch.test.mjs tests/linear.test.mjs
@@ -193,7 +193,7 @@ git commit -m "feat(COD-169): require complete claim history"
 - Consumes: Task 1 marker builders/resolver and Task 2 complete reads.
 - Produces: `declarationToken()`, `claimConfirmed(card, cfg, ownership, expectedStates)`, picks with `ownerToken` plus `claimDeclarationId`, and `AUTO_SWEEP_CLAIM_DECLARATION` in child environments.
 
-- [ ] **Step 1: Write failing simultaneous-claim and propagation tests**
+- [x] **Step 1: Write failing simultaneous-claim and propagation tests**
 
 ```js
 test("claimCardSlots dispatches only the first declaration winner", async () => {
@@ -211,12 +211,12 @@ test("withCardDispatchEnv propagates immutable declaration identity", () => {
 
 Also assert declaration-before-label call order, final complete read, malformed history denial, route-race denial, and cleanup behavior after each acquisition failure point.
 
-- [ ] **Step 2: Run acquisition tests and verify RED**
+- [x] **Step 2: Run acquisition tests and verify RED**
 
 Run: `node --test --test-name-pattern='claimCardSlots|claim declaration|withCardDispatchEnv' tests/linear-watch.test.mjs`
 Expected: FAIL because picks do not carry declarations and acquisition still posts a heartbeat after the label.
 
-- [ ] **Step 3: Implement declaration token generation and acquisition ordering**
+- [x] **Step 3: Implement declaration token generation and acquisition ordering**
 
 ```js
 export function declarationToken({ randomUUID = crypto.randomUUID } = {}) {
@@ -233,7 +233,7 @@ if (!claimConfirmed(fresh, cfg, { ownerToken: owner, declarationId }, cfg.states
 
 Losers never remove the label. A failed attempt may close only its own active declaration; otherwise it records the existing safety invariant and stops.
 
-- [ ] **Step 4: Add declaration identity to picks, env, run records, and refill/handoff copies**
+- [x] **Step 4: Add declaration identity to picks, env, run records, and refill/handoff copies**
 
 ```js
 claimed.push({ ...fresh, ownerToken: owner, claimDeclarationId: declarationId, sweep, slotIndex });
@@ -243,12 +243,12 @@ AUTO_SWEEP_CLAIM_DECLARATION: pick.claimDeclarationId,
 
 Trace every object spread/copy that currently carries `ownerToken`, including same-repo refill and Ship refill.
 
-- [ ] **Step 5: Run focused tests and the full launcher suite**
+- [x] **Step 5: Run focused tests and the full launcher suite**
 
 Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`
 Expected: all acquisition, environment, refill, and legacy scheduler tests pass.
 
-- [ ] **Step 6: Commit declaration acquisition**
+- [x] **Step 6: Commit declaration acquisition**
 
 ```bash
 git add scripts/linear-watch.mjs tests/linear-watch.test.mjs
@@ -265,7 +265,7 @@ git commit -m "feat(COD-169): claim cards with immutable declarations"
 - Consumes: exact `{ ownerToken, claimDeclarationId }` from Task 3.
 - Produces: `closeOwnedClaim(apiKey, card, cfg, identity, reason, deps)`, declaration-aware `heartbeatAgeMin`, `reapDecisions`, `foreignClaimReleases`, `releaseOwnedDispatchClaim`, `successfulSameStateRecoveryDecision`, `resumeAdmissionDecision`, and resume state version `2`.
 
-- [ ] **Step 1: Write failing stale-child, close-order, and resume tests**
+- [x] **Step 1: Write failing stale-child, close-order, and resume tests**
 
 ```js
 test("release closes and verifies the epoch before removing the label", async () => {
@@ -282,12 +282,12 @@ test("a stale child cannot release a newer declaration", async () => {
 
 Cover liveness fallback to declaration time, delayed old heartbeat, protected resume heartbeat referencing the declaration, same-state recovery, dependency/routing/start failure, orphan cleanup, foreign claims, retry cooldown, crash escalation, close-write failure, verification failure, stranded closed label cleanup, resume record mismatch, and v1 resume-store fail-closed migration.
 
-- [ ] **Step 2: Run lifecycle tests and verify RED**
+- [x] **Step 2: Run lifecycle tests and verify RED**
 
 Run: `node --test --test-name-pattern='reap|orphan|releaseOwned|resume|same-state|declaration' tests/linear-watch.test.mjs`
 Expected: FAIL because lifecycle code still trusts the latest heartbeat owner and removes before audit.
 
-- [ ] **Step 3: Implement one close-before-mutation helper**
+- [x] **Step 3: Implement one close-before-mutation helper**
 
 ```js
 export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
@@ -305,11 +305,11 @@ export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
 
 Administrative reapers use the same ordering after proving stale liveness; legacy/orphan reset uses `claimResetMarker({ claim, target: declarationId || "legacy", reason })` and may remove only after that exact reset boundary is visible in a complete re-read. A delayed duplicate reset for an already-reset target is a no-op against any newer epoch.
 
-- [ ] **Step 4: Replace every heartbeat-owner lifecycle check**
+- [x] **Step 4: Replace every heartbeat-owner lifecycle check**
 
 Update live-claim filtering, own reaps, foreign/orphan reaps, retry paths, successful same-state release, dependency/repository deferral, spawn failure cleanup, resume protection/discovery/admission, and completion refill. Remove `heartbeatOwner` and `latestHeartbeatOwner` once no production caller remains.
 
-- [ ] **Step 5: Version resume state and persist declaration identity**
+- [x] **Step 5: Version resume state and persist declaration identity**
 
 ```js
 export const RESUME_STATE_VERSION = 2;
@@ -319,12 +319,12 @@ typeof value.claimDeclarationId === "string" && value.claimDeclarationId
 
 Old v1 records remain unreadable and protect nothing; live declared cards are rediscovered only when the exact declaration and deterministic dirty worktree both match.
 
-- [ ] **Step 6: Run lifecycle and full launcher tests**
+- [x] **Step 6: Run lifecycle and full launcher tests**
 
 Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass, including stale-child and stranded-label cases.
 
-- [ ] **Step 7: Commit lifecycle migration**
+- [x] **Step 7: Commit lifecycle migration**
 
 ```bash
 git add scripts/linear-watch.mjs tests/linear-watch.test.mjs
@@ -341,7 +341,7 @@ git commit -m "feat(COD-169): close claim epochs before release"
 - Consumes: shared resolver and `claimCloseMarker`.
 - Produces: `move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> <DeclarationId>` and updated `moveCardBottomIfCurrent(..., declarationId, deps)`.
 
-- [ ] **Step 1: Write failing exact-declaration and ordering tests**
+- [x] **Step 1: Write failing exact-declaration and ordering tests**
 
 ```js
 test("guarded terminal move closes the exact declaration before issueUpdate", async () => {
@@ -361,12 +361,12 @@ test("guarded terminal move denies a stale declaration even with a late heartbea
 
 Retain QA-only `QA -> Signoff|Ship` destination enforcement, Factory Learning exclusion, blocker/foreign-claim checks, delta label removal, CLI exit `0/3/2`, and destination pagination.
 
-- [ ] **Step 2: Run focused CLI tests and verify RED**
+- [x] **Step 2: Run focused CLI tests and verify RED**
 
 Run: `node --test --test-name-pattern='guarded terminal|move-card-bottom-if-current' tests/linear.test.mjs`
 Expected: FAIL because the helper accepts no declaration ID and performs no close boundary.
 
-- [ ] **Step 3: Implement final ownership read, close, close verification, and update**
+- [x] **Step 3: Implement final ownership read, close, close verification, and update**
 
 ```js
 const ownership = resolveClaimOwnership({ comments, complete: true, claim: ownedClaim, labelPresent: true });
@@ -379,12 +379,12 @@ if (!epochClosedBy(closedIssue, ownedClaim, declarationId)) throw new Error("ter
 await issueUpdate({ stateId: destinationStateId, sortOrder, removedLabelIds: [ownedClaimId] });
 ```
 
-- [ ] **Step 4: Run CLI, resolver, and launcher suites**
+- [x] **Step 4: Run CLI, resolver, and launcher suites**
 
 Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass.
 
-- [ ] **Step 5: Commit guarded terminal migration**
+- [x] **Step 5: Commit guarded terminal migration**
 
 ```bash
 git add scripts/linear.mjs tests/linear.test.mjs
@@ -421,7 +421,7 @@ git commit -m "feat(COD-169): require declarations for terminal moves"
 - Consumes: the final marker grammar and environment variables.
 - Produces: `claim-migration-status --json`, identical canonical/mirrored skills, and complete rollout documentation.
 
-- [ ] **Step 1: Write failing skill-contract and migration-diagnostic tests**
+- [x] **Step 1: Write failing skill-contract and migration-diagnostic tests**
 
 ```js
 test("all claim-owning sweeps separate declarations from liveness", () => {
@@ -439,16 +439,16 @@ test("claim migration status reports legacy, orphan, active, and ambiguous claim
 });
 ```
 
-- [ ] **Step 2: Run documentation tests and verify RED**
+- [x] **Step 2: Run documentation tests and verify RED**
 
 Run: `node --test tests/qa-sweep-doc.test.mjs tests/manual-sweep-doc.test.mjs tests/agents-snippet.test.mjs tests/linear-watch.test.mjs`
 Expected: FAIL because skills and diagnostics still describe heartbeat ownership.
 
-- [ ] **Step 3: Update every sweep lifecycle contract**
+- [x] **Step 3: Update every sweep lifecycle contract**
 
 Scheduled runs require both environment variables. Attended runs create both random tokens, post one declaration, add the label, final-read exact ownership, heartbeat by declaration, and close before every claim-affecting exit. QA terminal examples pass the sixth CLI declaration argument. Heartbeats explicitly say “liveness only; never ownership.”
 
-- [ ] **Step 4: Add bounded migration status output**
+- [x] **Step 4: Add bounded migration status output**
 
 ```js
 export function claimMigrationSummary(cards) {
@@ -465,11 +465,11 @@ export function claimMigrationSummary(cards) {
 
 `node scripts/linear-watch.mjs claim-migration-status --json` performs read-only registered-workspace scans, complete-hydrates claim-bearing cards, emits bounded identifiers/reasons, and exits nonzero when fresh legacy or ambiguous claims prevent rollout.
 
-- [ ] **Step 5: Update operator docs and config comments**
+- [x] **Step 5: Update operator docs and config comments**
 
 Document first-declaration-wins epochs, complete-history reads, close-before-mutation, legacy drain/reset, rollback restrictions, and the migration command. Preserve QA auto-ship, Factory Learning, manual handoff, and single-runner Ship language.
 
-- [ ] **Step 6: Verify canonical mirrors and documentation tests**
+- [x] **Step 6: Verify canonical mirrors and documentation tests**
 
 Run:
 
@@ -485,7 +485,7 @@ node --test tests/qa-sweep-doc.test.mjs tests/manual-sweep-doc.test.mjs tests/ag
 
 Expected: all comparisons and tests pass.
 
-- [ ] **Step 7: Commit contracts and migration tooling**
+- [x] **Step 7: Commit contracts and migration tooling**
 
 ```bash
 git add skills .claude/skills scripts/linear-watch.mjs tests AGENTS.md README.md SETUP.md docs/linear-rules.md .claude/linear-sweep.json templates/linear-sweep.json

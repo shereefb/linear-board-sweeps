@@ -2,6 +2,13 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.1] - 2026-07-11
+
+### Fixed
+
+- Complete the operator command reference for guarded terminal moves and claim migration diagnostics/resets.
+- Document declaration-scoped resume-resolution notices and mark the immutable claim design and implementation plan as shipped.
+
 ## [1.3.0.0] - 2026-07-11
 
 ### Added
