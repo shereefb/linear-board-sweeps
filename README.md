@@ -8,6 +8,8 @@ Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human
 
 **Planned (COD-155):** behavior-changing specs will carry a versioned correctness contract whose invariant IDs remain traceable through implementation proofs and QA evidence. Existing review findings remain structured Factory Learning evidence; the contract strengthens prevention without bypassing review, QA, Signoff, or the human Ship gate.
 
+**Planned (COD-158):** materially performance-sensitive specs will carry a versioned performance contract whose stable budget IDs remain traceable through implementation tasks, benchmark evidence, and QA. Applicability follows the actual performance surface rather than labels alone, and the contract preserves engineering review, code review, QA, Signoff, and the human Ship gate.
+
 A portable kit that installs a **Linear-driven, cross-runtime (Claude Code + Codex) feature workflow** into any repo. Four autonomous "board sweeps" carry work across a Linear board, with a human gate before anything ships:
 
 ```
