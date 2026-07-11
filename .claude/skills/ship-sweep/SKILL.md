@@ -37,7 +37,7 @@ While holding the claim, post `[auto-sweep-heartbeat v1 claim=ship:in-progress d
 
 ## 1. Select cards (top-of-column order, drain queue, claimed)
 
-**Scheduled single-card mode:** process only `AUTO_SWEEP_ISSUE` after the immutable claim preflight above. Do not list the queue, create a replacement claim, or apply the attended skip/reclaim rules to the launcher's exact pre-claim.
+**Scheduled single-card mode:** process only `AUTO_SWEEP_ISSUE` after the immutable claim preflight above. Fresh-read its labels and, if `blocked:needs-user` or `sweep:manual-only` is present, stop and preserve those blocker labels before entering either the fresh or resume path. Do not list the queue, create a replacement claim, or apply the attended ownership skip/reclaim rules to the launcher's exact pre-claim.
 
 **Attended or multi-card queue mode:** list "Ship" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
 - **Skip** if `blocked:needs-user` or `sweep:manual-only` and no new human reply resolves it. A live `ship:in-progress` epoch belongs to another run.

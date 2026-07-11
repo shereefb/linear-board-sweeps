@@ -34,6 +34,7 @@ test("Ship scheduled mode accepts only its exact immutable pre-claim", () => {
     assert.match(body, /scheduled single-card[\s\S]{0,300}nonempty[\s\S]{0,600}exact[\s\S]{0,300}owner[\s\S]{0,300}declaration/i);
     assert.match(body, /treat[\s\S]{0,200}pre-claim[\s\S]{0,250}not[\s\S]{0,120}competing/i);
     assert.match(selection, /scheduled single-card[\s\S]{0,300}(?:do not|does not)[\s\S]{0,200}(?:claim|replace)/i);
+    assert.match(selection, /scheduled single-card[\s\S]{0,500}blocked:needs-user[\s\S]{0,200}sweep:manual-only[\s\S]{0,300}(?:fresh|resume)/i);
     assert.match(selection, /attended[\s\S]{0,300}reclaim[\s\S]{0,300}exact[\s\S]{0,300}stale/i);
     assert.match(selection, /never reclaim[\s\S]{0,300}(?:newer|incomplete)[\s\S]{0,200}(?:malformed|ambiguous)/i);
   }
