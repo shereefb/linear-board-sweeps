@@ -55,12 +55,64 @@ import {
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
+  createResumeStore, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
+  classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const minsAgo = (m) => new Date(NOW - m * 60000).toISOString();
 const hoursAgo = (h) => new Date(NOW - h * 3600000).toISOString();
 const dependencyReadyCard = (card = {}) => ({ blockers: [], blockersComplete: true, ...card });
+
+test("resume store: persists only a valid exact record and protects its matching claim", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "resume-store-"));
+  const statePath = path.join(dir, "resume-needed.json");
+  const now = Date.parse("2026-07-10T12:00:00Z");
+  const store = createResumeStore({ resumePath: statePath, now: () => now });
+  const record = store.upsert({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", issueId: "id-210", ownerToken: "owner-210", worktreePath: "/managed/.worktrees/SAF-210", branch: "SAF-210", repoEntry: ".", reason: "dirty", nextEligibleAt: new Date(now).toISOString(), attempts: 0 });
+  assert.equal(record.issueIdentifier, "SAF-210");
+  assert.equal(store.due({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210" }).ownerToken, "owner-210");
+  assert.equal(store.protectedClaim({ identifier: "SAF-210", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=owner-210 claim=dev:in-progress]`, createdAt: new Date(now).toISOString() }] }, SWEEP_CFG.dev, now).ownerToken, "owner-210");
+  assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other" }), false);
+  assert.equal(store.clear({ sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner-210" }), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("same-state recovery: dirty and unpushed work preserves the claim, only clean pushed work releases", () => {
+  const pick = { sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: "/wt", branch: "SAF-210" };
+  const card = { stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
+  const dirty = successfulSameStateRecoveryDecision(pick, card, { gitFn: (_cwd, args) => args[0] === "status" ? { status: 0, out: " M test.mjs\n?? new.test.mjs\n" } : { status: 0, out: "0" } });
+  assert.equal(dirty.kind, "resume-needed");
+  const unpushed = successfulSameStateRecoveryDecision(pick, card, { gitFn: (_cwd, args) => args[0] === "status" ? { status: 0, out: "" } : args[0] === "rev-list" ? { status: 0, out: "1" } : { status: 0, out: "ok" } });
+  assert.equal(unpushed.kind, "resume-needed");
+  const clean = successfulSameStateRecoveryDecision(pick, card, { existsFn: () => true, gitFn: (_cwd, args) => args[0] === "status" ? ({ status: 0, out: "" }) : args[0] === "rev-list" ? ({ status: 0, out: "0" }) : ({ status: 0, out: "ok" }) });
+  assert.equal(clean.kind, "release");
+});
+
+test("resume admission: only an exact due claimed record can bypass ordinary dirty blocking", () => {
+  const pick = { anchorPath: "/managed", config: { repos: ["."] }, sweep: "dev", issueIdentifier: "SAF-210", issueId: "id", ownerToken: "owner", worktreePath: "/managed/.worktrees/SAF-210", repoRoute: { repoEntry: "." } };
+  const card = { ...pick, stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: pick.worktreePath, repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "resume");
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other", worktreePath: pick.worktreePath, repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+});
+
+test("capacity outcome: recognized quota failures defer with bounded retry and configured fallback", () => {
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "Error: model capacity exceeded"), "model-capacity");
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "429 quota exceeded"), "quota");
+  assert.equal(classifyCapacityOutcome({ kind: "exit" }, "syntax error"), null);
+  assert.equal(capacityRetryAt(NOW, 0), NOW + 60_000);
+  assert.equal(capacityRetryAt(NOW, 99), NOW + 60 * 60_000);
+});
+
+test("generated artifact cleanup: rejects repositories, worktrees, ancestors, and symlink escapes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cleanup-"));
+  const repo = path.join(root, "repo"); const wt = path.join(repo, ".worktrees", "SAF-210"); const cache = path.join(root, "cache", "run", "tmp");
+  fs.mkdirSync(wt, { recursive: true }); fs.mkdirSync(cache, { recursive: true });
+  fs.symlinkSync(wt, path.join(root, "cache", "run", "escape"));
+  const targets = generatedArtifactCleanupTargets({ tmpDir: cache, logDir: path.join(root, "logs"), screenshotDir: wt, browserProfileDir: path.join(root, "cache", "run", "escape"), worktreePath: wt, anchorPath: repo, managedRepoPaths: [repo] });
+  assert.deepEqual(targets, [fs.realpathSync(cache)]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 // ── workspace resolution ─────────────────────────────────────────────────────
 test("resolveRepos: folder names resolve as siblings under the anchor's parent", () => {

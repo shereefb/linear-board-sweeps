@@ -67,11 +67,14 @@ const CURRENT_TICK = path.join(STATE_DIR, "current-tick.json");
 const LAST_TICK = path.join(STATE_DIR, "last-tick");
 const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
 const OBSERVATIONS = path.join(STATE_DIR, "observations.json");
+const RESUME_NEEDED = path.join(STATE_DIR, "resume-needed.json");
 const LEARNING_RUNS_DIR = path.join(STATE_DIR, "runs");
 const LEARNING_STATE_PATH = path.join(STATE_DIR, "learning-state.json");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
+export const RESUME_STATE_VERSION = 1;
+export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
 
@@ -440,6 +443,14 @@ export function runtimeConfigForSweep(config = {}, sweep) {
   };
 }
 
+export function runtimeFallbackForAttempt(config = {}, sweep, attempts = 0) {
+  const primary = runtimeConfigForSweep(config, sweep);
+  const raw = config?.runtimes?.[sweep]?.fallbacks;
+  const fallbacks = Array.isArray(raw) ? raw.filter((lane) => lane && typeof lane.runtime === "string") : [];
+  const fallback = fallbacks[Math.max(0, Math.floor(Number(attempts) || 0) - 1)];
+  return fallback ? { ...primary, ...fallback } : primary;
+}
+
 function whichRuntime(runtime, env) {
   const result = spawnSync("/usr/bin/which", [runtime], { env, encoding: "utf8" });
   return result.status === 0 ? result.stdout.trim() : null;
@@ -503,7 +514,7 @@ export function preflightRuntimeCandidates(candidates, {
   const ready = [];
   const failures = [];
   for (const pick of candidates || []) {
-    const runtime = runtimeConfigForSweep(pick.config || {}, pick.sweep).runtime || "codex";
+    const runtime = (pick.runtimeOverride || runtimeConfigForSweep(pick.config || {}, pick.sweep)).runtime || "codex";
     const sourceAnchorPath = pick.sourceAnchorPath || pick.anchorPath;
     const key = runtimeLaneKey(sourceAnchorPath, runtime, host);
     let resolution = cache.get(key);
@@ -611,11 +622,16 @@ function liveClaimLabel(card, now, releasedIds = new Set()) {
 
 // Decide reaping/escalation for one (workspace, sweep). Pure: returns actions;
 // the caller executes them against Linear.
-export function reapDecisions(cards, cfg, now) {
+export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } = {}) {
   const out = [];
   for (const card of cards) {
     if (!hasLabel(card, cfg.claim)) continue;
     if (heartbeatAgeMin(card, now) <= cfg.staleMin) continue; // fresh/alive
+    const preserved = protectedClaim(card);
+    if (preserved) {
+      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim, ownerToken: preserved.ownerToken });
+      continue;
+    }
     const priorReaps = countMarkers(card, REAPER_TAG, now);
     if (priorReaps + 1 >= CRASH_ESCALATE_AFTER) {
       out.push({ id: card.id, identifier: card.identifier, action: "escalate-crash", releaseClaim: cfg.claim, count: priorReaps + 1 });
@@ -1449,6 +1465,7 @@ export function sameRepoAvailableSlots({ cards = [], cfg, anchorPath, sweep, act
 }
 
 export function selectCandidateCardsForAdmission(candidate, { now = Date.now() } = {}) {
+  if (candidate.resume) return [candidate.topCard || candidate.cards?.[0]].filter(Boolean);
   const stage = candidate.sweep;
   if (stage === "ship") return [candidate.topCard || candidate.cards?.[0]].filter(Boolean);
   const limit = candidate.slotLimit ?? sameRepoCardLimit(candidate.config || {}, stage);
@@ -1495,6 +1512,7 @@ export function admissionDemandsForCandidates(candidates, {
         cards: [card],
         count: 1,
         slotLimit: 1,
+        ...(candidate.resume ? { resume: true, ownerToken: candidate.ownerToken, worktreePath: candidate.worktreePath, branch: candidate.branch } : {}),
       });
     }
   }
@@ -2009,6 +2027,115 @@ export function createObservationStore({
     };
   };
   return { observationPath, sync, markCapacityDeferred, clear, get, snapshot };
+}
+
+function resumeIdentity(value = {}) {
+  return [value.sourceWorkspace || value.sourceAnchorPath || value.anchorPath, value.sweep, value.issueIdentifier];
+}
+function resumeKey(value) { return JSON.stringify(resumeIdentity(value).map((part) => part || "")); }
+function validResumeRecord(value) {
+  return Boolean(value && typeof value === "object" && typeof value.sourceWorkspace === "string" && value.sourceWorkspace
+    && typeof value.sweep === "string" && value.sweep && typeof value.issueIdentifier === "string" && value.issueIdentifier
+    && typeof value.ownerToken === "string" && value.ownerToken && typeof value.worktreePath === "string" && value.worktreePath
+    && typeof value.branch === "string" && value.branch && typeof value.repoEntry === "string" && value.repoEntry
+    && typeof value.reason === "string" && value.reason && Number.isFinite(Date.parse(value.nextEligibleAt || ""))
+    && Number.isInteger(value.attempts) && value.attempts >= 0);
+}
+
+// Local, atomic recovery state. A malformed file deliberately protects nothing:
+// callers must rediscover from the claimed card/worktree instead of guessing.
+export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, now = Date.now,
+  readJsonFn = (target) => fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : null,
+  writeJsonFn = atomicWriteJson } = {}) {
+  const read = () => {
+    try {
+      const raw = readJsonFn(resumePath);
+      if (raw === null || raw === undefined) return { healthy: true, entries: {} };
+      if (!raw || raw.version !== RESUME_STATE_VERSION || !raw.entries || typeof raw.entries !== "object" || Array.isArray(raw.entries)
+        || Object.values(raw.entries).some((entry) => !validResumeRecord(entry))) return { healthy: false, entries: {} };
+      return { healthy: true, entries: structuredClone(raw.entries) };
+    } catch { return { healthy: false, entries: {} }; }
+  };
+  const persist = (state) => { if (!dryRun) writeJsonFn(resumePath, { version: RESUME_STATE_VERSION, entries: state.entries }); };
+  const get = (pick) => { const state = read(); return state.healthy ? state.entries[resumeKey(pick)] || null : null; };
+  const upsert = (record) => {
+    if (!validResumeRecord(record)) return null;
+    const state = read(); if (!state.healthy) return null;
+    const key = resumeKey(record); const timestamp = new Date(now()).toISOString();
+    state.entries[key] = { ...state.entries[key], ...record, createdAt: state.entries[key]?.createdAt || record.createdAt || timestamp, updatedAt: timestamp };
+    persist(state); return structuredClone(state.entries[key]);
+  };
+  const clear = (pick) => {
+    const state = read(); const key = resumeKey(pick); const entry = state.entries[key];
+    if (!state.healthy || !entry || (pick.ownerToken && entry.ownerToken !== pick.ownerToken)) return false;
+    delete state.entries[key]; persist(state); return true;
+  };
+  const due = (pick) => { const entry = get(pick); return entry && Date.parse(entry.nextEligibleAt) <= now() ? entry : null; };
+  const protectedClaim = (card, cfg, at = now()) => {
+    const state = read();
+    const sweep = cfg && Object.keys(SWEEP_CFG).find((s) => SWEEP_CFG[s] === cfg);
+    const scoped = card?.sourceWorkspace || card?.sourceAnchorPath || card?.anchorPath;
+    const entry = state.healthy ? Object.values(state.entries).find((candidate) => candidate.sweep === sweep && candidate.issueIdentifier === card?.identifier && (!scoped || candidate.sourceWorkspace === scoped)) : null;
+    if (!entry || !cfg || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
+    return entry;
+  };
+  return { resumePath, read, get, upsert, clear, due, protectedClaim };
+}
+
+export function successfulSameStateRecoveryDecision(pick, card, { gitFn = git, existsFn = fs.existsSync } = {}) {
+  const cfg = SWEEP_CFG[pick?.sweep];
+  if (!cfg || !card || !cfg.states.includes(card.stateName) || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== pick.ownerToken) return { kind: "preserve", reason: "claim ownership or state changed" };
+  const worktree = pick.worktreePath;
+  if (!worktree || !existsFn(worktree)) return { kind: "resume-needed", reason: "worktree unavailable", branch: pick.branch || pick.issueIdentifier };
+  const status = gitFn(worktree, ["status", "--porcelain", "--untracked-files=all"], { allowFail: true });
+  if (status.status !== 0) return { kind: "resume-needed", reason: "worktree status unavailable", branch: pick.branch || pick.issueIdentifier };
+  if (status.out) return { kind: "resume-needed", reason: "worktree has uncommitted changes", branch: pick.branch || pick.issueIdentifier };
+  const branch = pick.branch || pick.issueIdentifier;
+  const fetch = gitFn(worktree, ["fetch", "origin", branch], { allowFail: true });
+  const remote = fetch.status === 0 && gitFn(worktree, ["rev-parse", "--verify", `origin/${branch}`], { allowFail: true });
+  const ahead = remote?.status === 0 && gitFn(worktree, ["rev-list", "--count", `origin/${branch}..${branch}`], { allowFail: true });
+  if (!remote || remote.status !== 0 || ahead.status !== 0 || Number(ahead.out || "1") > 0) return { kind: "resume-needed", reason: "branch is not proven pushed to origin", branch };
+  return { kind: "release", reason: "clean worktree and pushed branch", branch };
+}
+
+export function resumeAdmissionDecision(pick, freshCard, record, now = Date.now()) {
+  const cfg = SWEEP_CFG[pick?.sweep];
+  if (!cfg || !record || Date.parse(record.nextEligibleAt || "") > now) return { kind: "skip", reason: "not due" };
+  const exact = record.sourceWorkspace === (pick.sourceAnchorPath || pick.anchorPath)
+    && record.sweep === pick.sweep && record.issueIdentifier === pick.issueIdentifier && record.ownerToken === pick.ownerToken
+    && record.worktreePath === pick.worktreePath && record.repoEntry === (pick.repoRoute?.repoEntry || ".")
+    && freshCard?.stateName && cfg.states.includes(freshCard.stateName) && hasLabel(freshCard, cfg.claim)
+    && latestHeartbeatOwner(freshCard, cfg.claim) === record.ownerToken;
+  return exact ? { kind: "resume", record } : { kind: "preserve", reason: "resume identity no longer matches claimed card" };
+}
+
+export function classifyCapacityOutcome(outcome, logTail = "") {
+  if (!outcome || ["success", "dependency-deferred", "repo-routing-deferred"].includes(outcome.kind)) return null;
+  const text = String(logTail).slice(-16_384).toLowerCase();
+  if (/\b(429|quota|rate limit|too many requests)\b/.test(text)) return "quota";
+  if (/model.{0,32}(capacity|overloaded|unavailable)|capacity exceeded|server overloaded/.test(text)) return "model-capacity";
+  return null;
+}
+export function capacityRetryAt(now, attempts = 0) {
+  const delays = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000];
+  return now + delays[Math.min(Math.max(0, Number(attempts) || 0), delays.length - 1)];
+}
+
+function insidePath(target, root) { const rel = path.relative(root, target); return !rel.startsWith("..") && !path.isAbsolute(rel); }
+export function generatedArtifactCleanupTargets(pick = {}) {
+  const forbidden = [pick.anchorPath, ...(pick.managedRepoPaths || []), pick.worktreePath].filter(Boolean).map((p) => {
+    try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+  });
+  const allowedRoots = [pick.tmpDir, pick.logDir, pick.screenshotDir, pick.browserProfileDir].filter(Boolean);
+  const out = [];
+  for (const candidate of allowedRoots) {
+    try {
+      const resolved = fs.realpathSync(candidate);
+      if (forbidden.some((root) => insidePath(resolved, root) || insidePath(root, resolved))) continue;
+      if (!out.includes(resolved)) out.push(resolved);
+    } catch { /* absent paths are never cleanup targets */ }
+  }
+  return out;
 }
 
 function defaultMemoryPressureSample(spawnFn = spawnSync) {
@@ -3818,7 +3945,7 @@ async function fetchClaimCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } } } }`,
+       comments(last:100){ nodes{ id body createdAt } } } }`,
     { id: issueId },
     apiKey,
   );
@@ -3930,6 +4057,9 @@ async function setIssueLabels(apiKey, issueId, labelIds) {
 
 async function addComment(apiKey, issueId, body) {
   await gql(`mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`, { id: issueId, b: body }, apiKey);
+}
+async function updateComment(apiKey, commentId, body) {
+  await gql(`mutation($id:String!,$b:String!){ commentUpdate(id:$id, input:{ body:$b }){ success } }`, { id: commentId, b: body }, apiKey);
 }
 
 async function fetchIssueLabels(apiKey, issueId) {
@@ -4251,6 +4381,9 @@ export function checkoutDispatchBlockers(pick, reg = {}, { gitFn = git } = {}) {
   }
   return checkouts
     .map((checkout) => dirtyCheckoutEvent(pick, checkout, { gitFn }))
+    // A verified resume is deliberately the one exception: its deterministic
+    // card worktree is known preserved WIP. Every other checkout stays guarded.
+    .filter((event) => !(pick.resume && event?.kind === "dirty-checkout" && event.stableTarget === `worktree:${pick.worktreePath}`))
     .filter(Boolean);
 }
 
@@ -4727,6 +4860,12 @@ export async function releaseOwnedDispatchClaim(apiKey, pick, reason, {
 
 export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   releaseOwnedDispatchClaimFn = releaseOwnedDispatchClaim,
+  fetchClaimCardFn = fetchClaimCard,
+  resumeStore = null,
+  recoveryDecisionFn = successfulSameStateRecoveryDecision,
+  addCommentFn = addComment,
+  updateCommentFn = updateComment,
+  now = Date.now,
 } = {}) {
   const pick = result?.pick || {};
   const cfg = SWEEP_CFG[pick.sweep];
@@ -4753,6 +4892,37 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
       : successfulCompletion
         ? `successful child via ${runtime} exited while the card remained in ${cfg.states.join("/")}`
         : `dispatcher via ${runtime} could not start`;
+  // Same-state success is the only path that may have local WIP. Re-read before
+  // deciding, then retain the exact owned claim whenever Git cannot prove a clean
+  // branch is already on origin. Keeping this behind the store option preserves
+  // the public compatibility wrapper for older callers/tests.
+  if (successfulCompletion && resumeStore) {
+    const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+    const recovery = recoveryDecisionFn(pick, fresh);
+    if (recovery.kind !== "release") {
+      const eligible = new Date(now()).toISOString();
+      const record = resumeStore.upsert({
+        sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+        sweep: pick.sweep,
+        issueIdentifier: pick.issueIdentifier,
+        issueId: pick.issueId,
+        ownerToken: pick.ownerToken,
+        worktreePath: pick.worktreePath,
+        branch: recovery.branch || pick.issueIdentifier,
+        repoEntry: pick.repoRoute?.repoEntry || ".",
+        reason: sanitizeFailureMessage(recovery.reason),
+        nextEligibleAt: eligible,
+        attempts: 0,
+      });
+      if (!record) return { attempted: true, released: false, reasonKind: "resume-store-unavailable" };
+      const marker = `${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}] Preserved local worktree for ${pick.issueIdentifier}; ${record.reason}. Resume eligible ${eligible}.`;
+      const prior = (fresh.comments || []).find((comment) => (comment.body || "").includes(`${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim}]`));
+      if (prior?.id) await updateCommentFn(apiKey, prior.id, marker);
+      else if (!prior) await addCommentFn(apiKey, fresh.id, marker);
+      return { attempted: true, released: false, reasonKind: "resume-needed", record };
+    }
+    resumeStore.clear({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier, ownerToken: pick.ownerToken });
+  }
   const released = await releaseOwnedDispatchClaimFn(apiKey, pick, reason, {
     expectedStates: successfulCompletion ? cfg.states : [],
   });
@@ -4773,6 +4943,12 @@ export async function expandDispatchBatch(batch, {
 } = {}) {
   const expanded = [];
   for (const pick of batch) {
+    // Resume demands are already claimed by their original owner. Never run the
+    // ordinary claim handshake (which would create a second heartbeat/owner).
+    if (pick.resume) {
+      expanded.push(withCardDispatchEnv(pick, parentRunId, childIndexAllocator.next()));
+      continue;
+    }
     if (pick.sweep === "ship") {
       let routedPick = pick;
       if (!dryRun && repoRoutingConfigured(pick.config)) {
@@ -5404,7 +5580,7 @@ function dispatchEnvironment(anchorPath, pick = {}) {
 }
 
 function dispatch(anchorPath, sweep, config, pick = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
   const executable = pick.runtimeExecutable || cmd;
   const env = dispatchEnvironment(anchorPath, pick);
@@ -5429,7 +5605,7 @@ function dispatch(anchorPath, sweep, config, pick = {}) {
 }
 
 export function dispatchAsync(anchorPath, sweep, config, pick = {}, { spawnFn = spawn, signal = null, onSpawn = null } = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
   const { cmd, args, cwd } = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
   const executable = pick.runtimeExecutable || cmd;
   const env = dispatchEnvironment(anchorPath, pick);
@@ -5571,6 +5747,7 @@ async function tick({ dryRun = false } = {}) {
     const childIndexAllocator = createChildIndexAllocator();
     const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
     const observationStore = createObservationStore({ dryRun });
+    const resumeStore = createResumeStore({ dryRun });
     const resourceSampler = createResourceSampler();
     const dependencyDeferredKeys = new Set();
     const dependencyDeferredIssues = new Map();
@@ -5604,7 +5781,7 @@ async function tick({ dryRun = false } = {}) {
       const pick = result.pick;
       const active = activeByAnchor.get(pick.anchorPath);
       if (!active) return null;
-      const runtimeCfg = runtimeConfigForSweep(pick.config, pick.sweep);
+      const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(pick.config, pick.sweep);
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
@@ -5617,7 +5794,24 @@ async function tick({ dryRun = false } = {}) {
       const dependencyDeferred = result.kind === "dependency-deferred";
       const routingDeferred = result.kind === "repo-routing-deferred";
       const detail = result.signal || result.code || result.exitCode;
-      const failures = routingDeferred
+      const capacityKind = classifyCapacityOutcome(result, (() => {
+        try {
+          const file = path.join(pick.logDir || "", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
+          return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(-16_384) : "";
+        } catch { return ""; }
+      })());
+      if (capacityKind && pick.issueIdentifier) {
+        const previous = resumeStore.get({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier });
+        const attempts = Math.min(4, (previous?.reason === "capacity" ? previous.attempts : 0) + 1);
+        const nextEligibleAt = new Date(capacityRetryAt(Date.now(), attempts - 1)).toISOString();
+        resumeStore.upsert({
+          sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier,
+          issueId: pick.issueId, ownerToken: pick.ownerToken, worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
+          branch: pick.issueIdentifier, repoEntry: pick.repoRoute?.repoEntry || ".", reason: "capacity", nextEligibleAt, attempts,
+        });
+        logFor(pick.anchorPath, pick.sweep, `${pick.issueIdentifier} capacity deferred (${capacityKind}); retry eligible ${nextEligibleAt}`);
+      }
+      const failures = capacityKind ? [] : routingDeferred
         ? [failureEventFor(
           pick.anchorPath,
           pick.config,
@@ -5648,7 +5842,7 @@ async function tick({ dryRun = false } = {}) {
       }
       if (pick.issueIdentifier) {
         try {
-          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime);
+          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime, { resumeStore });
           if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `owned claim release failed ${pick.issueIdentifier}: ${e.message}`);
@@ -6129,7 +6323,20 @@ async function tick({ dryRun = false } = {}) {
           const cfg = SWEEP_CFG[sweep];
           if (!cleanupCardsByState) continue;
           const cards = cfg.states.flatMap((state) => cleanupCardsByState.get(state) || []);
-          const reaps = reapDecisions(cards, cfg, now);
+          const reapActions = reapDecisions(cards, cfg, now, {
+            protectedClaim: (card) => resumeStore.protectedClaim({ ...card, sourceWorkspace: active.sourceAnchorPath }, cfg, now),
+          });
+          const protectedReaps = reapActions.filter((decision) => decision.action === "protect-resume");
+          const reaps = reapActions.filter((decision) => decision.action !== "protect-resume");
+          if (!dryRun) {
+            for (const decision of protectedReaps) {
+              const card = cards.find((candidate) => candidate.id === decision.id);
+              try {
+                await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=${decision.ownerToken} claim=${cfg.claim}] Preserved resume-needed worktree remains protected on this host.`);
+                logFor(anchorPath, sweep, `protect-resume ${decision.identifier}`);
+              } catch (error) { recordFailure(sweep, "resume-heartbeat", decision.identifier, error.message); }
+            }
+          }
           // Bounce-escalation is a backward-oscillation guard for the earlier stages.
           // Skip it for ship: a card in "Ship" was human-approved, and its
           // historical bounce markers (from earlier dev/qa churn) must not re-block it.
@@ -6179,6 +6386,38 @@ async function tick({ dryRun = false } = {}) {
             logFor(anchorPath, sweep, `repo-routing-skip ${failure.identifier}: ${failure.message}`);
           }
           const actionable = routed.cards;
+          // A retained claim is normally invisible to actionableCards(). Consult
+          // the local store explicitly and admit only the exact preserved tuple.
+          // This is intentionally before ordinary candidates so SAF-210-shaped
+          // WIP is resumed in its original deterministic worktree.
+          const resumes = [];
+          for (const card of cards) {
+            const resumePickKey = { sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier };
+            // If the atomic record was lost, recover only the conservative,
+            // machine-local proof: matching live claim plus a dirty deterministic
+            // worktree. Never attempt cleanup or release in this discovery path.
+            if (!resumeStore.get(resumePickKey) && sweep === "dev" && hasLabel(card, cfg.claim)) {
+              const owner = latestHeartbeatOwner(card, cfg.claim);
+              const worktreePath = cardWorktreePath(anchorPath, config, card.identifier);
+              const dirty = dirtyCheckoutEvent({ sweep, worktreePath, issueIdentifier: card.identifier }, { role: "worktree", path: worktreePath });
+              if (owner && dirty?.kind === "dirty-checkout") resumeStore.upsert({
+                ...resumePickKey, issueId: card.id, ownerToken: owner, worktreePath, branch: card.identifier,
+                repoEntry: ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(now).toISOString(), attempts: 0,
+              });
+            }
+            const record = resumeStore.due(resumePickKey);
+            if (!record) continue;
+            const routedResume = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+            if (!routedResume) continue;
+            const resumePick = {
+              anchorPath, sourceAnchorPath: active.sourceAnchorPath, config, sweep,
+              issueId: card.id, issueIdentifier: card.identifier, ownerToken: record.ownerToken,
+              worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute,
+            };
+            if (resumeAdmissionDecision(resumePick, card, record, now).kind === "resume") {
+              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute, ...(record.reason === "capacity" ? { runtimeOverride: runtimeFallbackForAttempt(config, sweep, record.attempts) } : {}) });
+            }
+          }
           const actionableIds = new Set(actionable.map((card) => card.identifier));
           const scopeKey = JSON.stringify([active.sourceAnchorPath, sweep]);
           for (const key of [...dependencyDeferredKeys]) {
@@ -6222,6 +6461,7 @@ async function tick({ dryRun = false } = {}) {
             if (actionable.length > 0) logFor(anchorPath, sweep, `${actionable.length} actionable — not shipRunner, skipping dispatch`);
             continue;
           }
+          candidates.push(...resumes);
           if (actionable.length > 0) candidates.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: actionable.length, topCard, topSortOrder: topCard.sortOrder, cards: actionable });
         }
 
