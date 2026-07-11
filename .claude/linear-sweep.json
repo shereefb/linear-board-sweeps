@@ -34,7 +34,7 @@
       "ship": 1
     }
   },
-  "$comment_learning": "Dogfood the Factory Learning Loop in this workspace. The registry runner remains machine-local; generated cards require normal QA, Signoff, and human Ship approval.",
+  "$comment_learning": "Dogfood the Factory Learning Loop in this workspace. The registry runner remains machine-local; factory:learning-generated cards require normal QA, Signoff, and human Ship approval and never use the auto-ship marker.",
   "learning": {
     "enabled": true,
     "lenses": {
@@ -51,9 +51,9 @@
     "perf":     { "labels": ["performance"] },
     "research": { "labels": ["integration", "research"] }
   },
-  "$comment_requireShipApproval": "Optional. When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge.",
+  "$comment_requireShipApproval": "Optional. When true, qa-sweep always preserves Signoff and ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge.",
   "requireShipApproval": false,
-  "$comment_fastPath": "Enabled by default. Dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from QA directly to Ship to skip Signoff. Set enabled to false to require normal Signoff for every card. ship-sweep still merges only from human-moved Ship.",
+  "$comment_fastPath": "Enabled by default. Dev-sweep may mark a tiny, high-confidence, low-risk change only after its pushed full origin SHA matches the reviewed final commit. Commit-bound QA-to-Ship automatic routing occurs after full QA only when that SHA is unchanged and requireShipApproval is false. factory:learning-generated cards never use the auto-ship marker and always preserve Signoff for the human Ship move. Normal denials, enabled false, and requireShipApproval true preserve Signoff. qa-sweep never merges or deploys, no immediate QA-to-Ship launcher handoff is added, and ship-sweep remains single-runner.",
   "fastPath": {
     "enabled": true,
     "maxChangedFiles": 2,

@@ -1380,6 +1380,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options =
     ...paths,
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
+      ...(pick.ownerToken ? { AUTO_SWEEP_OWNER_TOKEN: pick.ownerToken } : {}),
       AUTO_SWEEP_CARD_RUN_ID: cardRunId,
       AUTO_SWEEP_SWEEP: pick.sweep,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,

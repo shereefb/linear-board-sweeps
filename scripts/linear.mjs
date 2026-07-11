@@ -10,6 +10,7 @@ import path from "node:path";
 //   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
 //   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
+//   node linear.mjs move-card-bottom-if-current "<Issue>" "<ExpectedState>" "<DestinationState>" "<OwnedClaim>" "<OwnerToken>"
 //   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
 //   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
 //   node linear.mjs dependency-status "<Issue>"             # JSON; exits 0 ready, 3 blocked, 2 unreadable
@@ -80,6 +81,37 @@ export function repoRouteEligibility(labelNames, byLabel, expectedLabel, expecte
   return { eligible: true, reason: "ready", matches };
 }
 
+const QA_HANDOFF_BLOCKING_LABELS = new Set([
+  "blocked:open-questions",
+  "blocked:needs-user",
+  "qa:needs-changes",
+  "sweep:manual-only",
+]);
+const FULL_GIT_SHA = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
+
+export function qaHandoffDecision(input = {}) {
+  const facts = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
+  const deny = (reason) => ({ destination: WORKFLOW_STATES.signoff, eligible: false, reason });
+
+  if (facts.fastPathEnabled !== undefined && typeof facts.fastPathEnabled !== "boolean") return deny("invalid-fast-path-enabled");
+  if (facts.fastPathEnabled === false) return deny("fast-path-disabled");
+  if (facts.requireShipApproval !== undefined && typeof facts.requireShipApproval !== "boolean") return deny("invalid-ship-approval");
+  if (facts.requireShipApproval === true) return deny("ship-approval-required");
+  if (labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
+  if (facts.stateName !== WORKFLOW_STATES.qa) return deny("not-in-qa");
+  if (!labels.has("fast-path:eligible")) return deny("missing-fast-path-label");
+  if (!labels.has("qa:passed")) return deny("missing-qa-pass");
+  if ([...QA_HANDOFF_BLOCKING_LABELS].some((label) => labels.has(label))) return deny("blocked");
+  if (facts.hasForeignClaim !== false) return deny("foreign-claim");
+  if (facts.reviewedHead == null || facts.reviewedHead === "") return deny("missing-reviewed-head");
+  if (typeof facts.reviewedHead !== "string" || !FULL_GIT_SHA.test(facts.reviewedHead)) return deny("invalid-reviewed-head");
+  if (facts.finalHead == null || facts.finalHead === "") return deny("missing-final-head");
+  if (typeof facts.finalHead !== "string" || !FULL_GIT_SHA.test(facts.finalHead)) return deny("invalid-final-head");
+  if (facts.reviewedHead.toLowerCase() !== facts.finalHead.toLowerCase()) return deny("head-mismatch");
+  return { destination: WORKFLOW_STATES.ship, eligible: true, reason: "eligible" };
+}
+
 // The canonical board definition the sweeps depend on:
 export const REQUIRED_STATES = [
   { name: WORKFLOW_STATES.spec, type: "unstarted", color: "#9b59b6" },
@@ -147,6 +179,70 @@ export function bottomSortOrder(cards, gap = 1) {
 
 export function issueUpdateToStateBottomInput(stateId, destinationCards) {
   return { stateId, sortOrder: bottomSortOrder(destinationCards) };
+}
+
+const TERMINAL_MOVE_BLOCKING_LABELS = new Set([
+  "blocked:open-questions",
+  "blocked:needs-user",
+  "qa:needs-changes",
+  "sweep:manual-only",
+]);
+const TERMINAL_MOVE_CLAIM_BY_STATE = Object.freeze({
+  [WORKFLOW_STATES.spec]: "spec:in-progress",
+  [WORKFLOW_STATES.dev]: "dev:in-progress",
+  [WORKFLOW_STATES.qa]: "qa:in-progress",
+  [WORKFLOW_STATES.ship]: "ship:in-progress",
+});
+const CLAIM_HEARTBEAT_PREFIX = "[auto-sweep-heartbeat";
+const CLAIM_HEARTBEAT = /^\[auto-sweep-heartbeat\s+\S+\s+owner=([^\]\s]+)\s+claim=([^\]\s]+)\]/;
+
+export function latestClaimHeartbeat(comments, ownedClaim, { complete = true } = {}) {
+  if (!complete) throw new Error("comments incomplete");
+  if (!Array.isArray(comments)) throw new Error("comments unreadable");
+  const relevant = comments
+    .filter((comment) => typeof comment?.body === "string"
+      && comment.body.includes(CLAIM_HEARTBEAT_PREFIX)
+      && comment.body.includes(`claim=${ownedClaim}`))
+    .map((comment) => {
+      const createdAt = Date.parse(comment.createdAt);
+      if (Number.isNaN(createdAt)) throw new Error("heartbeat comment timestamp unreadable");
+      return { body: comment.body, createdAt };
+    })
+    .sort((a, b) => b.createdAt - a.createdAt);
+  if (!relevant.length) return { owner: null, malformed: false };
+  const match = relevant[0].body.match(CLAIM_HEARTBEAT);
+  if (!match || match[2] !== ownedClaim) return { owner: null, malformed: true };
+  return { owner: match[1], malformed: false };
+}
+
+export function guardedTerminalMoveDecision(input = {}) {
+  const facts = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
+  const deny = (reason) => ({ eligible: false, reason });
+  if (facts.expectedState !== WORKFLOW_STATES.qa
+    || ![WORKFLOW_STATES.signoff, WORKFLOW_STATES.ship].includes(facts.destinationState)) {
+    return deny("invalid-destination");
+  }
+  if (TERMINAL_MOVE_CLAIM_BY_STATE[facts.expectedState] !== facts.ownedClaim) return deny("invalid-owned-claim");
+  if (facts.stateName !== facts.expectedState) return deny("source-state-changed");
+  if (!labels.has(facts.ownedClaim)) return deny("owned-claim-missing");
+  if ([...TERMINAL_MOVE_BLOCKING_LABELS].some((label) => labels.has(label))) return deny("blocking-label");
+  if (facts.expectedState === WORKFLOW_STATES.qa
+    && facts.destinationState === WORKFLOW_STATES.ship
+    && labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
+  if ([...labels].some((label) => label.endsWith(":in-progress") && label !== facts.ownedClaim)) return deny("foreign-claim");
+  if (typeof facts.ownerToken !== "string" || !facts.ownerToken) return deny("missing-owner-token");
+  if (facts.heartbeatMalformed === true) return deny("malformed-heartbeat");
+  if (typeof facts.heartbeatOwner !== "string" || !facts.heartbeatOwner) return deny("missing-owner-heartbeat");
+  if (facts.heartbeatOwner !== facts.ownerToken) return deny("owner-mismatch");
+  return { eligible: true, reason: "ready" };
+}
+
+export function guardedTerminalMoveInput(stateId, destinationCards, ownedClaimId) {
+  return {
+    ...issueUpdateToStateBottomInput(stateId, destinationCards),
+    removedLabelIds: [ownedClaimId],
+  };
 }
 
 export function retireStateAuditComment(sourceState, destinationState) {
@@ -407,6 +503,71 @@ async function moveCardBottom(issueIdentifier, stateName) {
   return moved;
 }
 
+export async function moveCardBottomIfCurrent(
+  issueIdentifier,
+  expectedState,
+  destinationState,
+  ownedClaim,
+  ownerToken,
+  { gqlFn = gql, log = console.log } = {},
+) {
+  if (![issueIdentifier, expectedState, destinationState, ownedClaim, ownerToken].every((value) => typeof value === "string" && value)) {
+    throw new Error("usage: move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken>");
+  }
+  const metadata = await gqlFn(
+    `query($id:String!){ issue(id:$id){ id identifier project { id } team { states(first:100){ nodes { id name } } } } }`,
+    { id: issueIdentifier },
+  );
+  const issue = metadata?.issue;
+  const states = issue?.team?.states?.nodes;
+  if (!issue?.id || !issue?.identifier || !issue?.project?.id || !Array.isArray(states)) {
+    throw new Error(`Issue "${issueIdentifier}" not found or destination metadata unreadable.`);
+  }
+  const destinationStateId = states.find((state) => state.name === destinationState)?.id;
+  if (!destinationStateId) throw new Error(`State "${destinationState}" not found on the issue's team.`);
+  const destination = (await destinationCardsWith(gqlFn, issue.project.id, destinationState))
+    .filter((card) => card.id !== issue.id);
+
+  const current = await gqlFn(
+    `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } comments(first:250){ pageInfo { hasNextPage } nodes { body createdAt } } } }`,
+    { id: issue.id },
+  );
+  const finalIssue = current?.issue;
+  const labels = finalIssue?.labels?.nodes;
+  const comments = finalIssue?.comments?.nodes;
+  if (!finalIssue?.id || !finalIssue?.identifier || typeof finalIssue?.state?.name !== "string"
+      || !Array.isArray(labels) || finalIssue.labels?.pageInfo?.hasNextPage !== false
+      || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
+    throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
+  }
+  if (!Array.isArray(comments) || finalIssue.comments?.pageInfo?.hasNextPage !== false) {
+    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`);
+  }
+  const heartbeat = latestClaimHeartbeat(comments, ownedClaim);
+  const decision = guardedTerminalMoveDecision({
+    stateName: finalIssue.state.name,
+    expectedState,
+    destinationState,
+    labelNames: labels.map((label) => label.name),
+    ownedClaim,
+    ownerToken,
+    heartbeatOwner: heartbeat.owner,
+    heartbeatMalformed: heartbeat.malformed,
+  });
+  if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
+  const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;
+  if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
+  const input = guardedTerminalMoveInput(destinationStateId, destination, ownedClaimId);
+  const result = await gqlFn(
+    `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
+    { id: issue.id, input },
+  );
+  const moved = result?.issueUpdate?.issue;
+  if (result?.issueUpdate?.success !== true || !moved) throw new Error(`Issue "${issueIdentifier}" guarded move failed.`);
+  log(`${moved.identifier} -> ${moved.state.name} bottom (sortOrder=${moved.sortOrder})\n  ${moved.url}`);
+  return { moved: true, issue: moved.identifier, destination: moved.state.name, sortOrder: moved.sortOrder, url: moved.url };
+}
+
 async function projectStateIds(projectId) {
   return projectStateIdsWith(gql, projectId);
 }
@@ -519,6 +680,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "ensure-project": () => ensureProject(args[0], args[1]),
     "create-card": () => createCard(args[0], args[1], args[2], args[3], args[4]),
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
+    "move-card-bottom-if-current": async () => {
+      try {
+        const result = await moveCardBottomIfCurrent(args[0], args[1], args[2], args[3], args[4], { log: () => {} });
+        console.log(JSON.stringify(result));
+        process.exitCode = result.moved ? 0 : 3;
+      } catch (error) {
+        console.error(String(error.message || error));
+        process.exitCode = 2;
+      }
+    },
     "retire-state": () => retireState(args[0], args[1], args[2]),
     "rename-states": () => renameWorkflowStates(args[0]),
     "repo-status": async () => {
@@ -599,7 +770,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });

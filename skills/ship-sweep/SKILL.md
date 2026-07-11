@@ -1,15 +1,15 @@
 ---
 name: ship-sweep
-description: Merge + deploy the configured Linear project's human-approved "Ship" cards to production, canary-verify, then move to "Done". The only sweep that touches prod. Project-agnostic — reads .claude/linear-sweep.json. Runs single-runner (one designated host). Use when asked to "ship the Ship cards", "run the ship sweep", or on a schedule.
+description: Merge + deploy the configured Linear project's human-approved or commit-bound auto-promoted "Ship" cards to production, canary-verify, then move to "Done". The only sweep that touches prod. Project-agnostic — reads .claude/linear-sweep.json. Runs single-runner (one designated host). Use when asked to "ship the Ship cards", "run the ship sweep", or on a schedule.
 ---
 
 # Ship Sweep
 
 ### Direct manual handoff
 
-Only a matching `MANUAL_SWEEP_STAGE=ship` invocation may process a manual-only card. It must validate the named issue, expected `Signoff` state, route, dependencies, and all foreign claims; write/reuse `[manual-sweep-handoff ship <id>]`; move to Ship; re-read; then continue. Require the current human `[manual-sweep-ship-approval ...]`, request label, `fast-path:eligible`, `qa:passed`, and `ship:approved` when configured. Scheduled runs retain the human-moved Ship requirement.
+Only a matching `MANUAL_SWEEP_STAGE=ship` invocation may process a manual-only card. It must validate the named issue, expected `Signoff` state, route, dependencies, and all foreign claims; write/reuse `[manual-sweep-handoff ship <id>]`; move to Ship; re-read; then continue. Require the current human `[manual-sweep-ship-approval ...]`, request label, `fast-path:eligible`, `qa:passed`, and `ship:approved` when configured. Scheduled runs accept only a human-approved Ship card or a commit-bound card auto-promoted by qa-sweep.
 
-Take cards a human has approved into **"Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. This is the **only** sweep that merges and deploys — every card it touches was either smoke-tested green by qa-sweep (`qa:passed`) or marked by dev-sweep as `fast-path:eligible`, and explicitly moved to "Ship" by a person. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change.
+Take cards in **"Ship"** and land them: merge to `main`, deploy to production, canary-verify, and move to **"Done"** with evidence. Cards arrive either through human approval after `Signoff` or are automatically promoted by qa-sweep under the commit-bound fast-path policy. This is the **only sweep that merges and deploys**. If anything is off, it stops before or after deploy and flags a human; it never silently ships a broken change. `requireShipApproval: true` remains a deliberate human act: QA keeps every passing card in `Signoff` until that approval path moves it to `Ship`.
 
 > **Runtime (Claude Code + Codex).** Cross-runtime skill — map its actions to your runtime's tools. On **Codex**, see `AGENTS.md` "Board sweeps" for the mapping (`shell`, `apply_patch`, `spawn_agent`/`wait_agent`, `update_plan`) and use your own commit attribution. On **Claude Code**, use the Skill tool + Task subagents. "Deploy" = `config.deploy`; "canary" = the `/canary` skill (or, on Codex, a post-deploy health check of the same URLs/endpoints).
 
@@ -53,7 +53,15 @@ Branch by what you find:
 | Yes | No | **resuming after a crash post-merge** | do NOT re-merge — go straight to §5 (deploy), then §6–7 |
 | Yes | Yes | **resuming the tail** | just run §6 canary (if not recorded) and §7 |
 
-**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND `config.fastPath.enabled !== false`); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present. For `factory:learning-generated`, require `qa:passed` unconditionally and never accept `fast-path:eligible`, even if that stale label is present. **Any missing → comment exactly what's missing, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive an enabled explicit fast-path marker, or (when required) wasn't explicitly approved.
+**Sanity gate (fresh path only).** Before merging, confirm: the `<PREFIX>-###` branch exists on origin for each configured repo the card claims to touch; either `qa:passed` is present OR (`fast-path:eligible` is present AND raw `config.fastPath?.enabled` is exactly `true` or omitted, never malformed); no live foreign `*:in-progress` claim remains on the card; the build/tests are green in reconstructed worktree(s); QA/dev evidence does not point to an unconfigured sibling repo; `config.deploy` covers every repo/production target being shipped; and — if `config.requireShipApproval` is true — the `ship:approved` label is present.
+
+For `factory:learning-generated`, require `qa:passed` unconditionally, never accept `fast-path:eligible`, and require the human move from `Signoff` to `Ship`; any issue-specific auto-ship marker is stale or invalid for this card type and must block before merge.
+
+Also inspect the latest issue-specific comment beginning `[auto-sweep-auto-ship <KEY>`. When such a comment is present, it must exactly match `[auto-sweep-auto-ship <KEY> head=<full-git-sha>]` with the matching issue key and a full Git SHA. Fetch origin, resolve the current origin branch SHA, and require exact equality with that marker before continuing. A missing/malformed SHA or mismatch blocks before merge with the marker and current-origin evidence; leave the card in `Ship`, add `blocked:needs-user`, and remove `ship:in-progress`. If no issue-specific auto-ship marker exists, preserve the legacy/human-moved Ship behavior and the other sanity gates. This binding applies only on the fresh path; resume-after-merge still keys on the merge commit.
+
+**Any missing or malformed gate → comment exactly what's wrong, add `blocked:needs-user`, remove `ship:in-progress`, leave the card in "Ship", and stop.** Do not merge a card that didn't actually pass QA or receive valid enabled fast-path evidence, or (when required) wasn't explicitly approved. If origin advanced or changed after QA, the auto marker mismatch must block rather than ship the newer commit.
+
+**Blocking-label defense in depth.** Fresh-read the card before merge and reject `blocked:open-questions` before merge; reject `blocked:needs-user` before merge; reject `qa:needs-changes` before merge; and reject `sweep:manual-only` before merge. This check remains mandatory even though QA's delta claim removal preserves labels added concurrently after its final guard read.
 
 ## 3. Optional final security gate
 
@@ -61,9 +69,10 @@ If the card is security-labelled (per `config.reviewLenses`), run `/cso` on the 
 
 ## 4. Merge → cleanup
 
-1. **Merge to `main`** (`--no-ff`), resolving against `origin/main` first (merge origin/main, rebuild, retest if needed).
-2. **Push `main`** with the shared push discipline (fetch → rebase/merge origin/main → push; retry up to 2×; never force). Push **every** repo you merged.
-3. **Only after the push lands**, clean up: delete the merged branch, `git worktree prune`, close/merge the PR. (Order matters — resume detection in §2 finds the merge commit on `main`, so the branch may safely be gone, but the push must have landed first.)
+1. **Pre-merge commit-binding recheck.** For a card with an auto-ship marker, re-fetch origin immediately before the merge, resolve the current origin branch SHA again, and compare it exactly with the marker SHA again. If origin advanced, changed, disappeared, or mismatches, block before merge with exact evidence as in §2. This second fetch closes the window after initial sanity/build/security work.
+2. **Merge to `main`** (`--no-ff`), resolving against `origin/main` first (merge origin/main, rebuild, retest if needed).
+3. **Push `main`** with the shared push discipline (fetch → rebase/merge origin/main → push; retry up to 2×; never force). Push **every** repo you merged.
+4. **Only after the push lands**, clean up: delete the merged branch, `git worktree prune`, close/merge the PR. (Order matters — resume detection in §2 finds the merge commit on `main`, so the branch may safely be gone, but the push must have landed first.)
 
 ## 5. Deploy
 
@@ -135,7 +144,7 @@ Every card must be resumable on any machine — this run, the launcher, and any 
 
 ## Guardrails
 
-- **Ships to production** — the highest-risk sweep. Only ever ship a card that is `qa:passed` or has `fast-path:eligible` while `config.fastPath.enabled !== false`, is green-building, has no live foreign in-progress claim, and a human moved to "Ship" (and, if `requireShipApproval`, carries `ship:approved`). When in doubt, `blocked:needs-user` and stop; never deploy a card that didn't pass QA or receive enabled fast-path eligibility.
+- **Ships to production** — the highest-risk sweep. Only ever ship a card that reached `Ship` through human approval or commit-bound QA auto-promotion, is `qa:passed` or has `fast-path:eligible` with valid raw fast-path config, is green-building, has no live foreign in-progress claim, and — if `requireShipApproval` — carries `ship:approved`. A present auto-ship marker must equal current origin both at sanity and immediately before merge. When in doubt, `blocked:needs-user` and stop; never deploy a card that did not satisfy the unchanged sanity gate.
 - Never treat a docs/spec merge in the anchor repo as proof that sibling app code shipped. If implementation/QA evidence is in another repo, that repo must be configured and shipped, or the card must be split/manual-shipped with explicit audit comments.
 - **Single-runner.** Never run two ship agents against the same card/repo concurrently; dispatch is pinned to one host.
 - One card at a time, but keep draining until the actionable "Ship" queue is empty and a final re-list confirms it. Use top-of-column order, claim/release via `ship:in-progress`, and stay within `config.project`.
