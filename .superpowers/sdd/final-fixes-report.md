@@ -101,3 +101,25 @@ node --test tests/*.test.mjs
 ```
 
 Result: 689 passed, 0 failed, 0 skipped/cancelled/todo.
+
+## Retention-persistence failure seam
+
+Admission cleanup now treats `retainReservation: true` as an irreversible safety intent. If `reservation.retain()` returns false or throws, the admission promise rejects with that persistence failure, but `finally` never calls `release()` and therefore cannot delete the original live-child PID entry. Capacity remains fail-closed and replacement work is deferred.
+
+RED:
+
+```text
+node --test --test-name-pattern='never releases a live orphan when retention persistence fails' tests/linear-watch.test.mjs
+```
+
+Result: failed because `release()` was called once after the retention error.
+
+GREEN:
+
+```text
+node --test --test-name-pattern='retains a proven live orphan|never releases a live orphan when retention persistence fails|unconfirmed forced termination preserves|bounds a forced child' tests/linear-watch.test.mjs
+```
+
+Result: 4 passed, 0 failed. Both false-return and thrown-retain fixtures preserve the entry, reject with the persistence error, and admit no replacement.
+
+Final full-suite result: 690 passed, 0 failed, 0 skipped/cancelled/todo.

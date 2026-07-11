@@ -1830,6 +1830,42 @@ test("capacity admission retains a proven live orphan until child death is obser
   assert.equal(ledger.reconcile().active, 0);
   assert.ok(ledger.reserve({ stage: "qa", trigger: "initial", issueIdentifier: "COD-180", workspace: "/managed" }));
 });
+test("capacity admission never releases a live orphan when retention persistence fails", async () => {
+  for (const mode of ["false", "throw"]) {
+    let releases = 0;
+    let executions = 0;
+    let reserved = false;
+    const entry = { token: `orphan-${mode}`, childPid: 99, retainedOrphan: undefined };
+    const ledger = {
+      reserve: () => !reserved ? (reserved = true, {
+        attachChildPid: () => true,
+        retain: () => {
+          if (mode === "throw") throw new Error("retention write failed");
+          return false;
+        },
+        release: () => { releases += 1; entry.deleted = true; return true; },
+      }) : null,
+      reconcile: () => ({ healthy: true, active: reserved && !entry.deleted ? 1 : 0, max: 1, entries: reserved && !entry.deleted ? [entry] : [] }),
+    };
+    const queue = createAdmissionQueue({
+      ledger,
+      executeDemand: async () => {
+        executions += 1;
+        return { kind: "timeout-termination-failed", retainReservation: true, cleanupUncertain: true };
+      },
+    });
+    await assert.rejects(
+      admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: `COD-${mode}`, workspace: "/managed" }, { queue }),
+      mode === "throw" ? /retention write failed/ : /failed to retain orphaned child capacity reservation/,
+    );
+    const replacement = await admitDemand({ stage: "qa", trigger: "initial", issueIdentifier: `NEXT-${mode}`, workspace: "/managed" }, { queue });
+    await queue.whenIdle();
+    assert.equal(replacement, null, mode);
+    assert.equal(releases, 0, mode);
+    assert.equal(entry.deleted, undefined, mode);
+    assert.equal(executions, 1, mode);
+  }
+});
 test("capacity admission: same-stage handoff discovered under the held token runs before queued initial work", async () => {
   let stored = null;
   const order = [];

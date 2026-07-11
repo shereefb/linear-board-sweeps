@@ -3039,10 +3039,12 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
     (async () => {
       let confirmed = false;
       let retainedReservation = false;
+      let retentionRequested = false;
       try {
         const result = await executeDemand(item.demand, reservation);
         confirmed = Boolean(result);
         if (result?.retainReservation === true) {
+          retentionRequested = true;
           retainedReservation = reservation.retain?.() === true;
           if (!retainedReservation) throw new Error("failed to retain orphaned child capacity reservation");
         } else if (result && beforeRelease) await beforeRelease(result, item.demand, { admitDemand: enqueue });
@@ -3051,7 +3053,7 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
         if (!confirmed && onUnconfirmedDemand) {
           try { await onUnconfirmedDemand(item.demand); } catch { /* telemetry cleanup must not change admission outcome */ }
         }
-        if (!retainedReservation) reservation.release();
+        if (!retentionRequested) reservation.release();
       }
     })().then(item.resolve, item.reject).finally(() => {
       localActive -= 1;
