@@ -563,46 +563,59 @@ export async function moveCardBottomIfCurrent(
   const destination = (await destinationCardsWith(gqlFn, issue.project.id, destinationState))
     .filter((card) => card.id !== issue.id);
 
+  const readCurrentFacts = async () => {
+    const current = await gqlFn(
+      `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } } }`,
+      { id: issue.id },
+    );
+    const currentIssue = current?.issue;
+    const currentLabels = currentIssue?.labels?.nodes;
+    if (currentIssue?.id !== issue.id || currentIssue?.identifier !== issue.identifier
+        || typeof currentIssue?.state?.name !== "string"
+        || !Array.isArray(currentLabels) || currentIssue.labels?.pageInfo?.hasNextPage !== false
+        || currentLabels.some((label) => !label?.id || typeof label?.name !== "string")) {
+      throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
+    }
+    return { issue: currentIssue, labels: currentLabels };
+  };
+  const terminalDecision = (currentIssue, currentLabels) => guardedTerminalMoveDecision({
+    stateName: currentIssue.state.name,
+    expectedState,
+    destinationState,
+    labelNames: currentLabels.map((label) => label.name),
+    ownedClaim,
+    ownerToken,
+    heartbeatOwner: ownerToken,
+    heartbeatMalformed: false,
+  });
+
   let comments;
   try {
     comments = await fetchCompleteIssueComments(issue.id, { gqlFn });
   } catch (cause) {
     throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`, { cause });
   }
-  const current = await gqlFn(
-    `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } } }`,
-    { id: issue.id },
-  );
-  const finalIssue = current?.issue;
-  const labels = finalIssue?.labels?.nodes;
-  if (!finalIssue?.id || !finalIssue?.identifier || typeof finalIssue?.state?.name !== "string"
-      || !Array.isArray(labels) || finalIssue.labels?.pageInfo?.hasNextPage !== false
-      || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
-    throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
-  }
-  const decision = guardedTerminalMoveDecision({
-    stateName: finalIssue.state.name,
-    expectedState,
-    destinationState,
-    labelNames: labels.map((label) => label.name),
-    ownedClaim,
-    ownerToken,
-    heartbeatOwner: ownerToken,
-    heartbeatMalformed: false,
-  });
+  const { issue: finalIssue, labels } = await readCurrentFacts();
+  const decision = terminalDecision(finalIssue, labels);
   if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
   const ownership = resolveClaimOwnership({ comments, complete: true, claim: ownedClaim, labelPresent: true });
   if (ownership.status !== "owned" || ownership.ownerToken !== ownerToken || ownership.declarationId !== declarationId) {
     return { moved: false, issue: finalIssue.identifier, reason: "owner-mismatch" };
   }
-  const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;
-  if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
   const closeBody = claimCloseMarker({ claim: ownedClaim, declarationId, reason: "terminal" });
   const closeResult = await gqlFn(
-    `mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success } }`,
+    `mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success comment { id body createdAt } } }`,
     { id: issue.id, b: closeBody },
   );
-  if (closeResult?.commentCreate?.success !== true) throw new Error(`Issue "${issueIdentifier}" terminal claim close failed.`);
+  const createdClose = closeResult?.commentCreate?.comment;
+  const createdMarker = parseClaimMarker(createdClose);
+  if (closeResult?.commentCreate?.success !== true || !createdClose?.id
+      || createdClose.body !== closeBody || typeof createdClose.createdAt !== "string"
+      || !Number.isFinite(Date.parse(createdClose.createdAt))
+      || createdMarker?.type !== "close" || createdMarker.claim !== ownedClaim
+      || createdMarker.declarationId !== declarationId || createdMarker.reason !== "terminal") {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close failed.`);
+  }
   let closedComments;
   try {
     closedComments = await fetchCompleteIssueComments(issue.id, { gqlFn });
@@ -615,21 +628,32 @@ export async function moveCardBottomIfCurrent(
     claim: ownedClaim,
     labelPresent: true,
   });
-  const exactCloseVisible = closedComments.some((comment) => {
-    const marker = parseClaimMarker(comment);
-    return marker?.type === "close" && marker.claim === ownedClaim
-      && marker.declarationId === declarationId && marker.reason === "terminal";
-  });
-  if (!exactCloseVisible || closedOwnership.status !== "legacy-unowned") {
+  const rereadClose = closedComments.find((comment) => comment.id === createdClose.id);
+  const rereadMarker = parseClaimMarker(rereadClose);
+  if (closedOwnership.status !== "legacy-unowned"
+      || closedOwnership.boundaryCommentId !== createdClose.id
+      || rereadMarker?.type !== "close" || rereadMarker.claim !== ownedClaim
+      || rereadMarker.declarationId !== declarationId || rereadMarker.reason !== "terminal") {
     throw new Error(`Issue "${issueIdentifier}" terminal claim close unverified.`);
   }
+  const { issue: postCloseIssue, labels: postCloseLabels } = await readCurrentFacts();
+  const postCloseDecision = terminalDecision(postCloseIssue, postCloseLabels);
+  if (!postCloseDecision.eligible) {
+    return { moved: false, issue: postCloseIssue.identifier, reason: postCloseDecision.reason };
+  }
+  const ownedClaimId = postCloseLabels.find((label) => label.name === ownedClaim)?.id;
+  if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
   const input = guardedTerminalMoveInput(destinationStateId, destination, ownedClaimId);
   const result = await gqlFn(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
     { id: issue.id, input },
   );
   const moved = result?.issueUpdate?.issue;
-  if (result?.issueUpdate?.success !== true || !moved) throw new Error(`Issue "${issueIdentifier}" guarded move failed.`);
+  if (result?.issueUpdate?.success !== true || moved?.identifier !== issue.identifier
+      || moved?.state?.name !== destinationState || moved?.sortOrder !== input.sortOrder
+      || typeof moved?.url !== "string" || !moved.url) {
+    throw new Error(`Issue "${issueIdentifier}" guarded move response unreadable.`);
+  }
   log(`${moved.identifier} -> ${moved.state.name} bottom (sortOrder=${moved.sortOrder})\n  ${moved.url}`);
   return { moved: true, issue: moved.identifier, destination: moved.state.name, sortOrder: moved.sortOrder, url: moved.url };
 }
