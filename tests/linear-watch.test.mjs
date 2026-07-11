@@ -7348,6 +7348,25 @@ test("healthStatus: live current tick remains unhealthy after a systemic failure
   });
   assert.deepEqual(healthy, { ok: true, reason: "tick in progress (pid 42)" });
 });
+test("healthStatus rejects a live tick with expired child evidence", () => {
+  const status = healthStatus({
+    currentTick: {
+      status: "running",
+      pid: 42,
+      failures: [],
+      telemetry: { children: [{
+        issue: "COD-179", sweep: "ship", workspace: "/source/app", state: "active",
+        startedAt: new Date(NOW - dispatchDeadlineMs("ship") - 1).toISOString(),
+        lastLivenessAt: new Date(NOW - 1_000).toISOString(), outcomeKind: null,
+      }] },
+    },
+    lastTick: null,
+    isAlive: () => true,
+    now: NOW,
+  });
+  assert.equal(status.ok, false);
+  assert.match(status.reason, /expired child.*COD-179/i);
+});
 test("finalizeTickState: writes versioned last-tick before removing current-tick", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-"));
   const currentPath = path.join(dir, "current-tick.json");
@@ -7604,6 +7623,44 @@ test("doctor telemetry: JSON and human summaries expose scheduler health and tun
   assert.match(human, /dependency deferred=12/);
   assert.match(human, /capacity deferred=3/);
   assert.match(human, /metrics unavailable: memory_pressure unavailable/);
+});
+test("doctor telemetry exposes successfulNoOps, strandedClaims, oldest actionable Ship, and occupied Ship workspace slots", () => {
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null, shipRunner: true },
+    currentTick: {
+      status: "running", pid: 42, failures: [], telemetry: {
+        successfulNoOpCount: 3,
+        latestSuccessfulNoOpIssue: "COD-179",
+        strandedClaims: { "successful-no-op": 2, "cleanup-failed": 1 },
+      },
+    },
+    capacityState: { healthy: true, active: 3, max: 10, errors: [], entries: [
+      { stage: "ship", workspace: "/source/a", issueIdentifier: "COD-180" },
+      { stage: "dev", workspace: "/source/a", issueIdentifier: "COD-181" },
+      { stage: "ship", workspace: "/source/b", issueIdentifier: "COD-182" },
+    ] },
+    observationState: { healthy: true, errors: [], entries: [
+      { sourceWorkspace: "/source/new", sweep: "ship", issueIdentifier: "COD-190", firstObservedActionableAt: new Date(NOW - 60_000).toISOString(), queueWaitMs: 60_000 },
+      { sourceWorkspace: "/source/old", sweep: "ship", issueIdentifier: "COD-189", firstObservedActionableAt: new Date(NOW - 300_000).toISOString(), queueWaitMs: 300_000 },
+      { sourceWorkspace: "/source/dev", sweep: "dev", issueIdentifier: "COD-188", firstObservedActionableAt: new Date(NOW - 600_000).toISOString(), queueWaitMs: 600_000 },
+    ] },
+    isAlive: () => true,
+    now: NOW,
+  });
+
+  assert.deepEqual(report.successfulNoOps, { count: 3, latestIssue: "COD-179" });
+  assert.deepEqual(report.strandedClaims, { total: 3, byClassification: { "cleanup-failed": 1, "successful-no-op": 2 } });
+  assert.deepEqual(report.oldestActionableShip, {
+    issue: "COD-189", workspace: "/source/old",
+    firstObservedAt: new Date(NOW - 300_000).toISOString(), waitMs: 300_000,
+  });
+  assert.deepEqual(report.shipWorkspaceSlots, {
+    runner: true,
+    occupied: [{ workspace: "/source/a", issue: "COD-180" }, { workspace: "/source/b", issue: "COD-182" }],
+  });
+  assert.match(formatDoctorReport(report), /successful no-ops: 3 \(latest COD-179\)/);
+  assert.match(formatDoctorReport(report), /oldest actionable Ship: COD-189.*5m/);
+  assert.match(formatDoctorReport(report), /Ship workspace slots: 2 occupied/);
 });
 test("doctor telemetry: malformed observations surface as a metrics gap without hiding ledger health", () => {
   const report = doctorReport({

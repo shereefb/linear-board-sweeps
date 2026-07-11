@@ -2118,6 +2118,16 @@ export function healthStatus({ currentTick = null, lastTick, lockPid = null, isA
     }
     const failures = Array.isArray(currentTick.failures) ? currentTick.failures : [];
     if (failures.length) return { ok: false, reason: `current tick has ${failures.length} systemic failure(s) (pid ${currentTick.pid})` };
+    const expiredChild = (currentTick.telemetry?.children || []).find((child) => {
+      if (child?.state !== "active") return false;
+      const startedAt = Date.parse(child.startedAt);
+      if (!Number.isFinite(startedAt)) return true;
+      try { return now - startedAt > dispatchDeadlineMs(child.sweep); }
+      catch { return true; }
+    });
+    if (expiredChild) {
+      return { ok: false, reason: `expired child ${expiredChild.issue || "unknown"} (${expiredChild.sweep || "unknown"})` };
+    }
     return { ok: true, reason: `tick in progress (pid ${currentTick.pid})` };
   }
   if (lockPid && isAlive(lockPid)) return { ok: true, reason: `tick in progress (pid ${lockPid})` };
@@ -5202,6 +5212,38 @@ export function doctorReport({
     .sort((a, b) => a - b);
   const percentile = (fraction) => waits.length ? waits[Math.max(0, Math.ceil(fraction * waits.length) - 1)] : null;
   report.queue = { observed: waits.length, p50Ms: percentile(0.5), p90Ms: percentile(0.9) };
+  report.successfulNoOps = {
+    count: Number.isSafeInteger(telemetry.successfulNoOpCount) ? telemetry.successfulNoOpCount : 0,
+    latestIssue: typeof telemetry.latestSuccessfulNoOpIssue === "string" ? telemetry.latestSuccessfulNoOpIssue : null,
+  };
+  const strandedByClassification = Object.fromEntries(Object.entries(telemetry.strandedClaims || {})
+    .filter(([classification, count]) => classification && Number.isSafeInteger(count) && count > 0)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .slice(0, 20));
+  report.strandedClaims = {
+    total: Object.values(strandedByClassification).reduce((sum, count) => sum + count, 0),
+    byClassification: strandedByClassification,
+  };
+  const actionableShips = (observations.entries || []).filter((entry) => entry.sweep === "ship")
+    .map((entry) => {
+      const firstObservedAt = entry.firstObservedActionableAt;
+      const waitMs = Math.max(0, now - Date.parse(firstObservedAt));
+      return { issue: entry.issueIdentifier, workspace: entry.sourceWorkspace, firstObservedAt, waitMs };
+    })
+    .filter((entry) => entry.issue && entry.workspace && Number.isFinite(entry.waitMs))
+    .sort((left, right) => right.waitMs - left.waitMs || left.issue.localeCompare(right.issue));
+  report.oldestActionableShip = actionableShips[0] || null;
+  const occupiedShipWorkspaces = new Map();
+  for (const entry of report.capacity.entries || []) {
+    if (entry.stage !== "ship" || typeof entry.workspace !== "string" || !entry.workspace) continue;
+    if (!occupiedShipWorkspaces.has(entry.workspace)) {
+      occupiedShipWorkspaces.set(entry.workspace, { workspace: entry.workspace, issue: entry.issueIdentifier || null });
+    }
+  }
+  report.shipWorkspaceSlots = {
+    runner: reg.shipRunner === true,
+    occupied: [...occupiedShipWorkspaces.values()].sort((left, right) => left.workspace.localeCompare(right.workspace)),
+  };
   report.deferred = {
     dependency: telemetry.dependencyDeferredCount || 0,
     capacity: telemetry.capacityDeferredCount ?? waits.length,
@@ -5377,6 +5419,15 @@ export function formatDoctorReport(report) {
     lines.push(`dependency deferred=${report.deferred.dependency}`);
     lines.push(`capacity deferred=${report.deferred.capacity}`);
   }
+  lines.push(`successful no-ops: ${report.successfulNoOps?.count || 0}${report.successfulNoOps?.latestIssue ? ` (latest ${report.successfulNoOps.latestIssue})` : ""}`);
+  if (report.strandedClaims?.total) {
+    const classifications = Object.entries(report.strandedClaims.byClassification || {}).map(([name, count]) => `${name}=${count}`).join(", ");
+    lines.push(`stranded claims: ${report.strandedClaims.total}${classifications ? ` (${classifications})` : ""}`);
+  }
+  if (report.oldestActionableShip) {
+    lines.push(`oldest actionable Ship: ${report.oldestActionableShip.issue} in ${report.oldestActionableShip.workspace}, waiting ${minutes(report.oldestActionableShip.waitMs)}`);
+  }
+  lines.push(`Ship workspace slots: ${(report.shipWorkspaceSlots?.occupied || []).length} occupied; runner ${report.shipWorkspaceSlots?.runner ? "ON" : "off"}`);
   for (const gap of report.metricsUnavailable || []) lines.push(`metrics unavailable: ${gap}`);
   if (report.learning) {
     lines.push(`learning: ${report.learning.enabled ? "enabled" : "disabled"}, ${report.learning.runner ? "runner" : "non-runner"}, ${report.learning.active ? "active" : "idle"}, ${report.learning.healthy ? "OK" : "RED"}`);
