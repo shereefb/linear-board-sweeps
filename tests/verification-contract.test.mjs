@@ -183,6 +183,23 @@ test("reads required plan IDs only from verification traceability", () => {
   assert.ok(diagnosticCodes(result).includes("missing-plan-mapping"));
 });
 
+test("ignores incidental verification obligations in a plan", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, requiredSpec());
+  fs.writeFileSync(planPath, [
+    requiredPlan(),
+    "",
+    "## Copied verification obligations",
+    table(verificationHeaders, [["V9", "C9", "copied", "copied", "copied", "copied"]]),
+  ].join("\n"));
+
+  const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
+  assert.equal(result.ok, true);
+  assert.ok(!diagnosticCodes(result).includes("invalid-verification-id"));
+});
+
 test("reads required spec IDs only from verification obligations", () => {
   const root = tempDirectory();
   const specPath = path.join(root, "spec.md");
@@ -201,6 +218,21 @@ test("reads required spec IDs only from verification obligations", () => {
   const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
   assert.equal(result.ok, false);
   assert.ok(diagnosticCodes(result).includes("missing-plan-mapping"));
+});
+
+test("rejects plan-only verification IDs", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, requiredSpec());
+  fs.writeFileSync(planPath, requiredPlan([
+    ["V1", "Task 2", "test", "red", "green", "qa", "none"],
+    ["V2", "Task 2", "test", "red", "green", "qa", "none"],
+  ]));
+
+  const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
+  assert.equal(result.ok, false);
+  assert.ok(diagnosticCodes(result).includes("verification-id-mismatch"));
 });
 
 test("rejects arbitrary and nonsequential required verification IDs", () => {

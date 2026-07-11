@@ -76,7 +76,7 @@ function hasStableVerificationIds(ids) {
   return ids.every((id, index) => id === `V${index + 1}`);
 }
 
-export function parseVerificationArtifact(markdown) {
+export function parseVerificationArtifact(markdown, { role } = {}) {
   const diagnostics = [];
   const declaration = markdown.match(/verification contract\s*:\s*verification-contract\/v1\s*[—-]\s*(required|not required)\b/i);
   const applicability = declaration?.[1].toLowerCase();
@@ -86,9 +86,9 @@ export function parseVerificationArtifact(markdown) {
   const obligationTable = tableWithHeaders(tables, verificationHeaders);
   const traceabilityTable = tableWithHeaders(tables, traceabilityHeaders);
   const idsFromTable = (table) => table ? table.rows.map((row) => row[0].trim().toUpperCase()).filter(Boolean) : [];
-  const obligationIds = idsFromTable(obligationTable);
+  const obligationIds = role === "plan" ? [] : idsFromTable(obligationTable);
   const traceabilityIds = idsFromTable(traceabilityTable);
-  const verificationIds = obligationTable ? obligationIds : traceabilityIds;
+  const verificationIds = role === "plan" ? traceabilityIds : obligationTable ? obligationIds : traceabilityIds;
   const duplicateIds = verificationIds.filter((id, index) => verificationIds.indexOf(id) !== index);
   if (duplicateIds.length) diagnostics.push(diagnostic("duplicate-verification-id"));
   if (applicability === "required" && !hasStableVerificationIds(verificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
@@ -96,7 +96,7 @@ export function parseVerificationArtifact(markdown) {
   const correctnessTable = tableWithHeaders(tables, correctnessHeaders);
   const correctnessIds = unique((correctnessTable?.rows ?? []).map((row) => row[0].trim().toUpperCase()).filter((id) => /^C\d+$/.test(id)));
   const sourcesByVerificationId = new Map();
-  if (obligationTable) {
+  if (role !== "plan" && obligationTable) {
     const sourceColumn = verificationHeaders.indexOf("source requirement / c id(s)");
     for (const row of obligationTable.rows) {
       const id = row[0]?.trim().toUpperCase();
@@ -104,7 +104,7 @@ export function parseVerificationArtifact(markdown) {
     }
   }
 
-  if (applicability === "required") {
+  if (applicability === "required" && role !== "plan") {
     for (const correctnessId of correctnessIds) {
       const count = [...sourcesByVerificationId.values()].flat().filter((id) => id === correctnessId).length;
       if (count === 0) diagnostics.push(diagnostic("missing-correctness-source"));
@@ -116,7 +116,7 @@ export function parseVerificationArtifact(markdown) {
     applicability,
     verificationIds: unique(verificationIds),
     diagnostics,
-    hasObligationTable: Boolean(obligationTable),
+    hasObligationTable: role !== "plan" && Boolean(obligationTable),
     hasTraceabilityTable: Boolean(traceabilityTable),
     obligationIds,
     traceabilityRows: traceabilityTable?.rows ?? [],
@@ -167,8 +167,8 @@ function readArtifact(filePath) {
 export function validateVerificationContract({ specPath, planPath, repoRoot = process.cwd() }) {
   const specMarkdown = readArtifact(specPath);
   const planMarkdown = readArtifact(planPath);
-  const spec = parseVerificationArtifact(specMarkdown ?? "");
-  const plan = parseVerificationArtifact(planMarkdown ?? "");
+  const spec = parseVerificationArtifact(specMarkdown ?? "", { role: "spec" });
+  const plan = parseVerificationArtifact(planMarkdown ?? "", { role: "plan" });
   const diagnostics = [...spec.diagnostics, ...plan.diagnostics];
 
   if (!spec.applicability || !plan.applicability) {
@@ -196,6 +196,9 @@ export function validateVerificationContract({ specPath, planPath, repoRoot = pr
     const planVerificationIds = plan.traceabilityIds;
     if (!specVerificationIds.length) diagnostics.push(diagnostic("missing-verification-obligation"));
     if (!hasStableVerificationIds(specVerificationIds) || !hasStableVerificationIds(planVerificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
+    if (specVerificationIds.length !== planVerificationIds.length || specVerificationIds.some((id, index) => id !== planVerificationIds[index])) {
+      diagnostics.push(diagnostic("verification-id-mismatch"));
+    }
     for (const id of specVerificationIds) {
       if (!planVerificationIds.includes(id)) diagnostics.push(diagnostic("missing-plan-mapping"));
     }
