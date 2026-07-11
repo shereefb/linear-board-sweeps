@@ -4612,6 +4612,41 @@ test("dispatchAsync fallback: records both PIDs and fails closed when Claude is 
   assert.equal(missingCalls.length, 1);
 });
 
+test("dispatchAsync fallback: Claude resolution failure preserves the exhausted Codex audit path without a second attempt", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-resolution-failure-"));
+  const primary = pipedDispatchChild(855);
+  const calls = [];
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, { issueIdentifier: "COD-146", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex" }, {
+    spawnFn: queuedDispatchSpawn([primary], calls),
+    resolveRuntimeExecutableFn: () => ({ ok: false, runtime: "claude", code: "ENOENT", path: null }),
+  });
+  primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  const outcome = await run;
+
+  assert.equal(outcome.kind, "executable-enoent");
+  assert.equal(outcome.finalRuntimeConfig.runtime, "claude");
+  assert.equal(outcome.fallbackUsed, true);
+  assert.equal(outcome.attempts.length, 1);
+  assert.equal(outcome.attempts[0].runtime, "codex");
+  assert.equal(calls.length, 1);
+
+  const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));
+  const record = JSON.parse(fs.readFileSync(path.join(anchorPath, "logs", recordFile), "utf8").trim());
+  assert.equal(record.runtime, "claude");
+  assert.equal(record.fallbackUsed, true);
+  assert.equal(record.attempts.length, 1);
+  assert.equal(record.attempts[0].runtime, "codex");
+
+  assert.equal(typeof watchModule.fallbackFailureAttribution, "function");
+  assert.equal(
+    watchModule.fallbackFailureAttribution(outcome),
+    "after Codex usage exhaustion; Claude fallback executable resolution failed",
+  );
+});
+
 test("dispatchAsync fallback PID: rejected second attachment kills Claude and waits for close", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-pid-"));
   const primary = pipedDispatchChild(860);

@@ -5556,6 +5556,22 @@ function normalizedDispatchAttempt(runtimeCfg, outcome) {
   };
 }
 
+export function fallbackFailureAttribution(result) {
+  const primary = result?.attempts?.[0];
+  const exhaustedPrimary = result?.fallbackUsed === true
+    && primary?.runtime === "codex"
+    && primary?.outcome?.kind === "exit"
+    && Number.isInteger(primary.outcome.exitCode)
+    && primary.outcome.exitCode !== 0;
+  if (!exhaustedPrimary) return null;
+  if (result.attempts.length === 1
+    && result.kind === "executable-enoent"
+    && result.finalRuntimeConfig?.runtime === "claude") {
+    return "after Codex usage exhaustion; Claude fallback executable resolution failed";
+  }
+  return result.attempts.length === 2 ? "after Codex usage exhaustion; Claude final attempt" : null;
+}
+
 function runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata = false } = {}) {
   const runtime = runtimeCfg.runtime || "codex";
   const sourceAnchorPath = pick.sourceAnchorPath || anchorPath;
@@ -5716,7 +5732,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
       cwdExists: fs.existsSync(fallbackCommand.cwd),
       executableExists: false,
     });
-    return finish(missing, fallbackMeta, [primaryAttempt]);
+    return finish(missing, fallbackMeta, [primaryAttempt], true);
   }
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""} fallback: ${runtimeSummary(fallbackCfg)} → ${resolution.path} ${fallbackCommand.args.slice(0, 3).join(" ")} …`);
   const fallback = await runDispatchAttempt({
@@ -5845,12 +5861,7 @@ async function tick({ dryRun = false } = {}) {
       const runtimeCfg = result.finalRuntimeConfig || runtimeConfigForSweep(pick.config, pick.sweep);
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
-      const fallbackFailure = result.fallbackUsed
-        && result.attempts?.length === 2
-        && result.attempts[0]?.runtime === "codex"
-        && result.attempts[0]?.outcome?.kind === "exit"
-        ? "after Codex usage exhaustion; Claude final attempt"
-        : null;
+      const fallbackFailure = fallbackFailureAttribution(result);
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
