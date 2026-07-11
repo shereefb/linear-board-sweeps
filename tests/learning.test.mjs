@@ -936,13 +936,29 @@ test("outcome evaluation recomputes its scoped post-Done metric instead of reusi
   const snapshot = (observations) => ({
     capturedThrough: "2026-07-22T00:00:00.000Z", observations, coverage: { complete: true, gaps: [] }, qualifiedFindings: [],
   });
-  assert.equal(evaluateLearningOutcome(evaluation, snapshot([])).status, "verified-improvement");
-  assert.equal(evaluateLearningOutcome(evaluation, snapshot([detectorObservation("review-finding", 0, {
+  const completed = (index, overrides = {}) => detectorObservation("review-completed", index, {
+    occurredAt: new Date(Date.parse("2026-07-18T00:00:00.000Z") + index * 60_000).toISOString(), ...overrides,
+  });
+  const fiveCompleted = Array.from({ length: 5 }, (_, index) => completed(index));
+  const finding = (index) => detectorObservation("review-finding", index, {
     occurredAt: "2026-07-18T00:00:00.000Z", category: "correctness", metrics: { reviewFindingCount: 99 },
-  })])).status, "no-measurable-change");
-  assert.equal(evaluateLearningOutcome(evaluation, snapshot(Array.from({ length: 4 }, (_, index) => detectorObservation("review-finding", index, {
-    occurredAt: `2026-07-${18 + index}T00:00:00.000Z`, category: "correctness", metrics: { reviewFindingCount: 99 },
-  })))).status, "regression");
+  });
+
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([])).status, "inconclusive-evidence");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot(fiveCompleted.slice(0, 4))).status, "inconclusive-evidence");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([
+    ...fiveCompleted.slice(0, 4),
+    completed(5, { cardId: "COD-1" }),
+    ...Array.from({ length: 5 }, (_, index) => completed(index + 6, {
+      sourceWorkspace: "/workspace/unowned", cardId: `COD-unowned-${index}`,
+    })),
+  ])).status, "inconclusive-evidence");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot(fiveCompleted)).status, "verified-improvement");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([...fiveCompleted, finding(0)])).status, "no-measurable-change");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([
+    ...fiveCompleted,
+    ...Array.from({ length: 4 }, (_, index) => finding(index)),
+  ])).status, "regression");
 });
 
 test("recurrence requires fresh independent qualified evidence, permits one active generation, and caps at three", () => {
