@@ -3227,7 +3227,7 @@ test("card dispatch env uses the routed managed sibling for worktrees and export
   assert.equal(pick.childEnv.AUTO_SWEEP_REPO_LABEL, "app:guide");
   assert.equal(pick.childEnv.AUTO_SWEEP_REPO_ENTRY, "safetaper-guide");
 });
-test("expandDispatchBatch: Ship receives the same card env and run-record paths as other stages", async () => {
+test("expandDispatchBatch: Ship claims ordinary demand and receives the owner-token env", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-ship-env-"));
   const globalRunsDir = path.join(anchorPath, "global-runs");
   const productionRunsDir = path.join(os.homedir(), ".local", "state", "linear-board-sweeps", "runs");
@@ -3236,6 +3236,8 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
     return [name, { size: stat.size, mtimeMs: stat.mtimeMs }];
   }));
   const productionBefore = snapshotProductionIndex();
+  let claimCalls = 0;
+  const shipCard = dependencyReadyCard({ id: "ship-id", identifier: "COD-77", sortOrder: 10 });
   const [pick] = await expandDispatchBatch([{
     anchorPath,
     sourceAnchorPath: "/source/repo",
@@ -3243,11 +3245,25 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
     config: { repos: [anchorPath] },
     sweep: "ship",
     count: 1,
-    topCard: dependencyReadyCard({ id: "ship-id", identifier: "COD-77", sortOrder: 10 }),
+    topCard: shipCard,
+    cards: [shipCard],
     issueId: "ship-id",
     issueIdentifier: "COD-77",
-    ownerToken: "ship-owner",
-  }], { dryRun: false, parentRunId: "ship-run", activeByAnchor: new Map(), now: NOW });
+  }], {
+    dryRun: false,
+    parentRunId: "ship-run",
+    activeByAnchor: new Map([[anchorPath, { apiKey: "key", repoPairs: [] }]]),
+    now: NOW,
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async (_apiKey, _anchorPath, _config, sweep, cards, options) => {
+      claimCalls += 1;
+      assert.equal(sweep, "ship");
+      assert.equal(options.limit, 1);
+      assert.equal(cards[0].identifier, "COD-77");
+      return [{ ...cards[0], card: cards[0], slotIndex: 0, ownerToken: "ship-owner" }];
+    },
+  });
+  assert.equal(claimCalls, 1);
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-77");
   assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
@@ -3288,12 +3304,17 @@ test("expandDispatchBatch: Ship route-label races fail before child expansion", 
     issueIdentifier: "SAF-9",
     repoRoute,
     topCard: { id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"], repoRoute },
+    cards: [{ id: "issue-id", identifier: "SAF-9", labelNames: ["app:guide"], repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => ({ id: "issue-id", identifier: "SAF-9", labelNames: ["app:coach"] }),
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async () => {
+      failures.push({ message: "repository route changed before claim" });
+      return [];
+    },
     onRouteFailure: (_pick, failure) => failures.push(failure),
   });
   assert.deepEqual(children, []);
@@ -3317,12 +3338,14 @@ test("expandDispatchBatch: a stable Ship route expands the routed production wor
     issueIdentifier: fresh.identifier,
     repoRoute,
     topCard: { ...fresh, repoRoute },
+    cards: [{ ...fresh, repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => fresh,
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async () => [{ ...fresh, card: fresh, repoRoute, slotIndex: 0, ownerToken: "ship-owner" }],
   });
   assert.equal(child.worktreePath, "/managed/guide/.worktrees/SAF-9");
   assert.equal(child.childEnv.AUTO_SWEEP_REPO, "/managed/guide");
@@ -3335,13 +3358,17 @@ test("expandDispatchBatch: a failed Ship route read creates no child and reports
   const repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
   const failures = [];
   const children = await expandDispatchBatch([{
-    anchorPath: "/managed/guide", config, repoPairs, sweep: "ship", issueId: card.id, issueIdentifier: card.identifier, repoRoute, topCard: { ...card, repoRoute },
+    anchorPath: "/managed/guide", config, repoPairs, sweep: "ship", issueId: card.id, issueIdentifier: card.identifier, repoRoute, topCard: { ...card, repoRoute }, cards: [{ ...card, repoRoute }],
   }], {
     dryRun: false,
     parentRunId: "run-id",
     activeByAnchor: new Map([["/managed/guide", { apiKey: "key", repoPairs }]]),
     now: NOW,
-    fetchRouteCardFn: async () => { throw new Error("Linear unavailable"); },
+    labelMap: { "ship:in-progress": "ship-claim-id" },
+    claimCardSlotsFn: async () => {
+      failures.push({ message: "could not re-read SAF-9 repository route: Linear unavailable" });
+      return [];
+    },
     onRouteFailure: (_pick, failure) => failures.push(failure),
   });
   assert.deepEqual(children, []);

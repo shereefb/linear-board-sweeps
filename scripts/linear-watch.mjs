@@ -4962,7 +4962,6 @@ export async function expandDispatchBatch(batch, {
   childIndexAllocator = createChildIndexAllocator(),
   claimCardSlotsFn = claimCardSlots,
   labelMap: providedLabelMap = null,
-  fetchRouteCardFn = fetchClaimCard,
   onRouteFailure = () => {},
   onSafetyInvariant = () => {},
 } = {}) {
@@ -4972,29 +4971,6 @@ export async function expandDispatchBatch(batch, {
     // ordinary claim handshake (which would create a second heartbeat/owner).
     if (pick.resume) {
       expanded.push(withCardDispatchEnv(pick, parentRunId, childIndexAllocator.next()));
-      continue;
-    }
-    if (pick.sweep === "ship") {
-      let routedPick = pick;
-      if (!dryRun && repoRoutingConfigured(pick.config)) {
-        const active = activeByAnchor.get(pick.anchorPath);
-        try {
-          const fresh = await fetchRouteCardFn(active?.apiKey, pick.issueId || pick.issueIdentifier);
-          const freshRoute = resolveCardRepoRoute({ config: pick.config, card: fresh, repoPairs: active?.repoPairs || pick.repoPairs || [] });
-          if (!sameCardRepoRoute(pick.repoRoute, freshRoute)) {
-            onRouteFailure(pick, freshRoute);
-            logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: route changed before Ship spawn (${freshRoute.message || freshRoute.label || "unknown"})`);
-            continue;
-          }
-          routedPick = { ...pick, topCard: { ...fresh, repoRoute: freshRoute }, repoRoute: freshRoute };
-        } catch (error) {
-          const failure = { ok: false, code: "route-read-failed", message: `could not re-read ${pick.issueIdentifier} repository route: ${error.message}` };
-          onRouteFailure(pick, failure);
-          logFor(pick.anchorPath, pick.sweep, `repo-routing-skip ${pick.issueIdentifier}: ${failure.message}`);
-          continue;
-        }
-      }
-      expanded.push(withCardDispatchEnv(routedPick, parentRunId, childIndexAllocator.next()));
       continue;
     }
     const rawSlotLimit = pick.slotLimit;
@@ -5041,6 +5017,7 @@ export async function expandDispatchBatch(batch, {
         managedRepoPaths: pick.managedRepoPaths,
         config: pick.config,
         repoPairs: pick.repoPairs,
+        globalRunsDir: pick.globalRunsDir,
         sweep: pick.sweep,
         count: 1,
         topCard: slot.card,
