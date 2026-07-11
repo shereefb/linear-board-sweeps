@@ -20,10 +20,12 @@ test("plans make every verification obligation executable", () => {
   assert.match(spec, /manual QA[^]*races[^]*atomicity[^]*persistence/i);
 });
 
-test("dev-sweep enforces rollout and executes narrow proofs before review", () => {
+test("dev-sweep delegates rollout ancestry to the validator and executes narrow proofs before review", () => {
   assert.match(dev, /verification-contract\/v1/i);
-  assert.match(dev, /first[- ]add commit[^]*\.sweep-version[^]*rollout boundary/i);
-  assert.match(dev, /proven[^]*older[^]*legacy[^]*post-boundary[^]*fail closed[^]*incomparable[^]*fail closed/i);
+  assert.match(dev, /artifact(?:'s)? first-add commit[^]*first commit[^]*added[^]*verification-contract\/v1[^]*installed\/canonical Spec skill/i);
+  assert.match(dev, /ancestor[^]*rollout commit[^]*legacy[^]*introduced after[^]*shallow\/incomparable[^]*fail closed/i);
+  assert.doesNotMatch(dev, /\.sweep-version/i);
+  assert.match(dev, /helper alone[^]*Never reimplement rollout ancestry/i);
   assert.match(dev, /map every[^]*V1\.\.Vn[^]*actual diff[^]*narrow proof/i);
   assert.match(dev, /review\/test-gap[^]*missing-design/i);
   assert.match(dev, /Code review[^]*run BOTH/i);
