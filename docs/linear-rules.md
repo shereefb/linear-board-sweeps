@@ -59,6 +59,8 @@ For rollout, `node scripts/linear-watch.mjs claim-migration-status --json` perfo
 
 After an observed nonzero child exit or OS signal, the launcher writes declaration-bound retry evidence, complete-reads and verifies the exact immutable epoch, closes it, and only then removes its claim label. The marker cools only that claim stage for its existing 45/90/120-minute stale interval. Failed results do not trigger same-tick refill or handoff. Silent/frozen children continue through `[auto-sweep-reaper]` and declaration-scoped stale-claim evidence.
 
+When preserved resume metadata is too old, exhausted, or no longer matches its deterministic route, the exact claim remains protected from reaping but is not automatically dispatched. The launcher posts one declaration-scoped `[auto-sweep-resume-resolution v1 claim=<claim> owner=<owner> declaration=<declaration>]` notice for that epoch; later ticks deduplicate the same notice until an operator resolves or resets the preserved work.
+
 Bounded cycle detection is an operational limitation, not a full graph crawl: diagnosis is only as complete as the active registered queue and relations returned to the service account. Multi-hop cycles through other workflow states, projects, teams, or invisible relations may not be diagnosed, and cross-team token visibility can omit data the launcher cannot know exists. This is not an organization-wide guarantee; operators must inspect persistent waits and access boundaries rather than assuming no reported cycle means no cycle.
 
 ## Workflow labels
