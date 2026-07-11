@@ -10,6 +10,7 @@ import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dependencyEligibility } from "../scripts/linear.mjs";
 import { aggregateLearningFindings, buildLearningEvidenceSnapshot } from "../scripts/learning.mjs";
+import { claimCloseMarker, claimDeclarationMarker } from "../scripts/claim-ownership.mjs";
 import * as watchModule from "../scripts/linear-watch.mjs";
 import {
   resolveRepos, resolveWorkspaceRepos, workspaceRepoPairs, resolveCardRepoRoute, routeCardsByRepo, managedWorkspaceRootFor, workspaceRecordForSourceAnchor,
@@ -25,7 +26,7 @@ import {
   withCapacityLedgerMutationLock, shouldStartPostDeliveryLearning,
   dispatchLearningAsync,
   runAdmissionDemands,
-  parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, heartbeatOwner,
+  parallelLimit, sameRepoCardLimit, selectCardSlots, ownerToken, declarationToken, heartbeatOwner,
   drainPassLimit, runDrainLoop, maxSameRepoRefillDispatches, maxHandoffTriggerHops, nextSweepForHandoff, handoffTriggerKey,
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
@@ -2790,24 +2791,27 @@ test("selectCardSlots: chooses top actionable cards and assigns stable slot inde
   const slots = selectCardSlots(cards, SWEEP_CFG.dev, "dev", 2, NOW);
   assert.deepEqual(slots.map((s) => `${s.slotIndex}:${s.identifier}`), ["0:COD-4", "1:COD-3"]);
 });
-test("owner-token claim confirmation uses latest matching heartbeat owner", () => {
+test("claim confirmation requires the exact immutable owner and declaration", () => {
   const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
   assert.equal(owner, "host_a:run:COD-5:0");
   assert.equal(heartbeatOwner(`${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}]`), owner);
+  const declarationId = "decl-5";
   const card = dependencyReadyCard({
     id: "c",
     identifier: "COD-5",
     stateName: "Dev",
     labelNames: ["dev:in-progress"],
-    comments: [
-      { body: `${HEARTBEAT_TAG} ${minsAgo(3)} owner=other] dev:in-progress`, createdAt: minsAgo(3) },
-      { body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner}] dev:in-progress`, createdAt: minsAgo(1) },
-    ],
+    commentsComplete: true,
+    comments: [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: owner, declarationId }), createdAt: claimIso(1) }],
   });
-  assert.equal(latestHeartbeatOwner(card, "dev:in-progress"), owner);
-  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), true);
-  assert.equal(claimConfirmed({ ...card, stateName: "QA" }, SWEEP_CFG.dev, owner, ["Dev"]), false);
-  assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, owner, ["Dev"]), false);
+  const identity = { ownerToken: owner, declarationId };
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, identity, ["Dev"]), true);
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, { ...identity, declarationId: "other" }, ["Dev"]), false);
+  assert.equal(claimConfirmed({ ...card, stateName: "QA" }, SWEEP_CFG.dev, identity, ["Dev"]), false);
+  assert.equal(claimConfirmed({ ...card, labelNames: ["dev:in-progress", "blocked:needs-user"] }, SWEEP_CFG.dev, identity, ["Dev"]), false);
+});
+test("declarationToken returns the injected immutable identity", () => {
+  assert.equal(declarationToken({ randomUUID: () => "decl-id" }), "decl-id");
 });
 test("claimConfirmed rejects a blocker added after scan", () => {
   const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
@@ -2816,11 +2820,12 @@ test("claimConfirmed rejects a blocker added after scan", () => {
     identifier: "COD-5",
     stateName: "Dev",
     labelNames: ["dev:in-progress"],
-    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    commentsComplete: true,
+    comments: [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: owner, declarationId: "decl" }), createdAt: claimIso(1) }],
     blockers: [{ identifier: "COD-1", stateName: "QA" }],
     blockersComplete: true,
   };
-  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), false);
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, { ownerToken: owner, declarationId: "decl" }, ["Dev"]), false);
 });
 test("claimConfirmed rejects cards with absent relation metadata", () => {
   const owner = ownerToken({ host: "host a", parentRunId: "run", issueIdentifier: "COD-5", slotIndex: 0 });
@@ -2831,7 +2836,7 @@ test("claimConfirmed rejects cards with absent relation metadata", () => {
     labelNames: ["dev:in-progress"],
     comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
   };
-  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, owner, ["Dev"]), false);
+  assert.equal(claimConfirmed(card, SWEEP_CFG.dev, { ownerToken: owner, declarationId: "decl" }, ["Dev"]), false);
 });
 
 // ── dependency-aware queue snapshots ────────────────────────────────────────
@@ -3104,13 +3109,14 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.match(paths.tmpDir, /linear-board-sweeps\/run-id\/dev-COD-6-2\/tmp$/);
   assert.equal(paths.portBase, 47020);
   assert.equal(paths.globalRunsDir, globalRunsDir);
-  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6" }, "run-id", 2, { globalRunsDir });
+  const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6", slotIndex: 1, ownerToken: "owner-6", claimDeclarationId: "decl-6" }, "run-id", 2, { globalRunsDir });
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_SOURCE_ANCHOR, "/ws/repo");
   assert.equal(pick.childEnv.AUTO_SWEEP_WORKTREE, "/ws/repo/.worktrees/COD-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_APP_PORT, "47020");
   assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-6");
+  assert.equal(pick.childEnv.AUTO_SWEEP_CLAIM_DECLARATION, "decl-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
   assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
   assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
@@ -3126,6 +3132,7 @@ test("card run paths/env are isolated per issue and slot", () => {
 test("card dispatch env omits owner token when the pick has none", () => {
   const pick = withCardDispatchEnv({ anchorPath: "/ws/repo", config: { repos: ["repo"] }, sweep: "dev", issueIdentifier: "COD-6" }, "run-id");
   assert.equal(Object.hasOwn(pick.childEnv, "AUTO_SWEEP_OWNER_TOKEN"), false);
+  assert.equal(Object.hasOwn(pick.childEnv, "AUTO_SWEEP_CLAIM_DECLARATION"), false);
 });
 
 test("run records embed structured events and mirror the exact record into the global daily index", async () => {
@@ -3148,6 +3155,8 @@ test("run records embed structured events and mirror the exact record into the g
   child.pid = 456;
   const run = dispatchAsync(anchorPath, "dev", {}, {
     issueIdentifier: "COD-143",
+    ownerToken: "owner-143",
+    claimDeclarationId: "decl-143",
     cardRunId: "run-1",
     sweep: "dev",
     sourceAnchorPath: anchorPath,
@@ -3170,6 +3179,8 @@ test("run records embed structured events and mirror the exact record into the g
   assert.equal(localRecord.learningEventCoverageGaps.length, 1);
   assert.equal(localRecord.projectId, "project-1");
   assert.equal(localRecord.repoEntry, "app");
+  assert.equal(localRecord.ownerToken, "owner-143");
+  assert.equal(localRecord.claimDeclarationId, "decl-143");
 });
 
 test("global learning run indexes use the log retention window", () => {
@@ -3449,7 +3460,71 @@ test("claimCardSlots: a failed fresh route read reports a routing failure withou
   assert.equal(claimEdits, 0);
   assert.match(failures[0].message, /could not re-read SAF-207 repository route/);
 });
-test("claimCardSlots: a post-claim route race removes only this attempt's owned claim", async () => {
+test("claimCardSlots: declaration precedes label and exact declaration reaches the child pick", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const calls = [];
+  let declarationBody;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-winner",
+    addCommentFn: async (_key, _id, body) => { calls.push("declaration"); declarationBody = body; },
+    applyLabelEditFn: async () => { calls.push("label"); },
+    sleepFn: async () => {},
+    fetchCardFn: async () => {
+      calls.push("final-read");
+      return { ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
+        { id: "c1", body: declarationBody, createdAt: claimIso(1) },
+      ] };
+    },
+  });
+  assert.deepEqual(calls, ["declaration", "label", "final-read"]);
+  assert.equal(claimed[0].claimDeclarationId, "decl-winner");
+});
+test("claimCardSlots: only the first declaration wins and a loser never removes the shared label", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  const removals = [];
+  let ourDeclaration;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-loser",
+    addCommentFn: async (_key, _id, body) => { ourDeclaration = body; },
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals.push(edit); },
+    sleepFn: async () => {},
+    fetchCardFn: async () => ({
+      ...card,
+      labelNames: ["dev:in-progress"],
+      commentsComplete: true,
+      comments: [
+        { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "winner", declarationId: "decl-winner" }), createdAt: claimIso(1) },
+        { id: "c2", body: ourDeclaration, createdAt: claimIso(2) },
+      ],
+    }),
+  });
+  assert.deepEqual(claimed, []);
+  assert.deepEqual(removals, []);
+});
+test("claimCardSlots: malformed final history denies dispatch without removing the shared label", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  let removals = 0;
+  const safety = [];
+  await assert.rejects(claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl",
+    addCommentFn: async () => {},
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
+    sleepFn: async () => {},
+    fetchCardFn: async () => ({ ...card, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
+      { id: "c1", body: "[auto-sweep-claim v1 claim=dev:in-progress broken]", createdAt: claimIso(1) },
+    ] }),
+    onSafetyInvariant: (value) => safety.push(value),
+  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED");
+  assert.equal(removals, 0);
+  assert.equal(safety.length, 1);
+});
+test("claimCardSlots: a post-claim route race closes then removes only this attempt's owned claim", async () => {
   const repoPairs = [
     { repoEntry: "coach", sourceRepoPath: "/source/coach", managedRepoPath: "/managed/coach" },
     { repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" },
@@ -3466,7 +3541,7 @@ test("claimCardSlots: a post-claim route race removes only this attempt's owned 
   });
   card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
   const edits = [];
-  let heartbeatBody = "";
+  const comments = [];
   const claimed = await claimCardSlots("key", "/managed/coach", config, "dev", [card], {
     parentRunId: "run-id",
     limit: 1,
@@ -3476,12 +3551,14 @@ test("claimCardSlots: a post-claim route race removes only this attempt's owned 
   }, {
     fetchClaimCardFn: async () => ({ ...card }),
     applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
-    addCommentFn: async (_key, _id, body) => { heartbeatBody = body; },
+    declarationTokenFn: () => "decl-route",
+    addCommentFn: async (_key, _id, body) => { comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }); },
     sleepFn: async () => {},
     fetchCardFn: async () => dependencyReadyCard({
       ...card,
       labelNames: ["app:coach", "dev:in-progress"],
-      comments: [{ body: heartbeatBody, createdAt: new Date(NOW).toISOString() }],
+      commentsComplete: true,
+      comments: [...comments],
     }),
   });
   assert.deepEqual(claimed, []);
@@ -3495,7 +3572,7 @@ test("claimCardSlots: a stable routed claim returns the confirmed primary repo",
   const repoPairs = [{ repoEntry: "guide", sourceRepoPath: "/source/guide", managedRepoPath: "/managed/guide" }];
   const card = dependencyReadyCard({ id: "issue-id", identifier: "SAF-207", stateName: "Dev", labelNames: ["app:guide"], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
   card.repoRoute = resolveCardRepoRoute({ config, card, repoPairs });
-  let heartbeatBody = "";
+  let declarationBody = "";
   const claimed = await claimCardSlots("key", "/managed/guide", config, "dev", [card], {
     parentRunId: "run-id",
     limit: 1,
@@ -3505,97 +3582,90 @@ test("claimCardSlots: a stable routed claim returns the confirmed primary repo",
   }, {
     fetchClaimCardFn: async () => ({ ...card }),
     applyLabelEditFn: async () => {},
-    addCommentFn: async (_key, _id, body) => { heartbeatBody = body; },
+    declarationTokenFn: () => "decl-stable",
+    addCommentFn: async (_key, _id, body) => { declarationBody = body; },
     sleepFn: async () => {},
     fetchCardFn: async () => dependencyReadyCard({
       ...card,
       labelNames: ["app:guide", "dev:in-progress"],
-      comments: [{ body: heartbeatBody, createdAt: new Date(NOW).toISOString() }],
+      commentsComplete: true,
+      comments: [{ id: "c1", body: declarationBody, createdAt: claimIso(1) }],
     }),
   });
   assert.equal(claimed.length, 1);
   assert.equal(claimed[0].repoRoute.managedRepoPath, "/managed/guide");
+  assert.equal(claimed[0].claimDeclarationId, "decl-stable");
 });
 
-test("claimCardSlots: confirmation exceptions clean up only the claim owned by this attempt", async () => {
-  assert.equal(typeof watchModule.claimCardSlots, "function");
-  const edits = [];
-  let reads = 0;
-  let owner;
+test("claimCardSlots: an unreadable confirmation records the safety invariant and never removes a label", async () => {
+  let removals = 0;
+  const safety = [];
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-88", sortOrder: 10, labelNames: [], comments: [] });
-  const result = await watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+  await assert.rejects(claimCardSlots("key", "/managed", {}, "dev", [card], {
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
-    applyLabelEditFn: async (_key, fresh, edit) => edits.push({ fresh, edit }),
-    addCommentFn: async (_key, _id, body) => { owner = body.match(/owner=([^ ]+)/)?.[1]; },
-    sleepFn: async () => {},
-    fetchCardFn: async () => { reads += 1; throw new Error("confirmation unavailable"); },
-    fetchClaimCardFn: async () => { reads += 1; return {
-      ...card,
-      labelNames: ["dev:in-progress"],
-      comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
-    }; },
-  });
-  assert.deepEqual(result, []);
-  assert.equal(reads, 2);
-  assert.deepEqual(edits.at(-1).edit, { remove: ["dev:in-progress"] });
-});
-
-test("claimCardSlots: cleanup read/write failures remain truthful and never remove an unverified claim", async () => {
-  assert.equal(typeof watchModule.claimCardSlots, "function");
-  let removalAttempts = 0;
-  let owner;
-  const safetyEvidence = [];
-  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-89", sortOrder: 10, labelNames: [], comments: [] });
-  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
-      parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
-    }, {
-      applyLabelEditFn: async (_key, _fresh, edit) => {
-        if (edit.remove) { removalAttempts += 1; throw new Error("cleanup write unavailable"); }
-      },
-      addCommentFn: async (_key, _id, body) => { owner = body.match(/owner=([^ ]+)/)?.[1]; }, sleepFn: async () => {},
-      fetchCardFn: async () => { throw new Error("confirmation unavailable"); },
-      fetchClaimCardFn: async () => ({
-        ...card,
-        labelNames: ["dev:in-progress"],
-        comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=${owner} claim=dev:in-progress]`, createdAt: minsAgo(1) }],
-      }),
-      onSafetyInvariant: (value) => safetyEvidence.push(value),
-    }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /cleanup write unavailable/.test(error.message));
-  assert.equal(removalAttempts, 1);
-  assert.equal(safetyEvidence.length, 1);
-  assert.equal(safetyEvidence[0].evidence.type, "proven-safety-invariant");
-});
-
-test("claimCardSlots: heartbeat creation failure surfaces an unprovable applied claim", async () => {
-  let removals = 0;
-  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-92", sortOrder: 10, labelNames: [], comments: [] });
-  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
-    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
-  }, {
+    declarationTokenFn: () => "decl-88",
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
-    addCommentFn: async () => { throw new Error("heartbeat comment unavailable"); },
+    addCommentFn: async () => {},
     sleepFn: async () => {},
-    fetchClaimCardFn: async () => ({ ...card, labelNames: ["dev:in-progress"], comments: [] }),
-  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /ownership is not provable/.test(error.message));
+    fetchCardFn: async () => { throw new Error("confirmation unavailable"); },
+    onSafetyInvariant: (value) => safety.push(value),
+  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /confirmation unavailable/.test(error.message));
   assert.equal(removals, 0);
+  assert.equal(safety.length, 1);
 });
 
-test("claimCardSlots: another worker's latest owner is preserved and this attempt fails truthfully", async () => {
+test("claimCardSlots: label-write failure closes its orphan declaration without removing a shared label", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-89", sortOrder: 10, labelNames: [], comments: [] });
+  const comments = [];
+  let reads = 0;
   let removals = 0;
-  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-93", sortOrder: 10, labelNames: [], comments: [] });
-  await assert.rejects(watchModule.claimCardSlots("key", "/managed", {}, "dev", [card], {
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
+    declarationTokenFn: () => "decl-89",
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
+    applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.add) throw new Error("label unavailable"); if (edit.remove) removals += 1; },
+    fetchCardFn: async () => { reads += 1; return { ...card, commentsComplete: true, comments: [...comments] }; },
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(reads, 2);
+  assert.equal(removals, 0);
+  assert.equal(comments.at(-1).body, claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-89", reason: "failed" }));
+});
+
+test("claimCardSlots: a declaration-write failure with no observed declaration never edits the label", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-92", sortOrder: 10, labelNames: [], comments: [] });
+  let edits = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-92",
+    addCommentFn: async () => { throw new Error("declaration unavailable"); },
+    applyLabelEditFn: async () => { edits += 1; },
+    fetchCardFn: async () => ({ ...card, commentsComplete: true, comments: [] }),
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(edits, 0);
+});
+
+test("claimCardSlots: another declaration owner is preserved after an acquisition exception", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-93", sortOrder: 10, labelNames: [], comments: [] });
+  let removals = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "decl-loser",
+    addCommentFn: async () => { throw new Error("declaration response unavailable"); },
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
-    addCommentFn: async () => { throw new Error("heartbeat comment unavailable"); },
-    sleepFn: async () => {},
-    fetchClaimCardFn: async () => ({
+    fetchCardFn: async () => ({
       ...card,
       labelNames: ["dev:in-progress"],
-      comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=other-worker claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+      commentsComplete: true,
+      comments: [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "winner", declarationId: "decl-winner" }), createdAt: claimIso(1) }],
     }),
-  }), (error) => error.code === "CLAIM_CLEANUP_UNVERIFIED" && /latest owner is other-worker/.test(error.message));
+  });
+  assert.deepEqual(claimed, []);
   assert.equal(removals, 0);
 });
 
@@ -3815,7 +3885,7 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
       fetchCards: async () => cards,
       teamLabelMap: async () => ({ "dev:in-progress": "label-dev" }),
       claimCardSlots: async (_apiKey, _anchorPath, _config, sweep, candidateCards, { limit }) =>
-        selectCardSlots(candidateCards, SWEEP_CFG[sweep], sweep, limit, NOW).map((slot) => ({ ...slot, ownerToken: `owner-${slot.identifier}` })),
+        selectCardSlots(candidateCards, SWEEP_CFG[sweep], sweep, limit, NOW).map((slot) => ({ ...slot, ownerToken: `owner-${slot.identifier}`, claimDeclarationId: `decl-${slot.identifier}` })),
       checkoutDispatchBlockers: () => [],
       logFor: (_anchorPath, _sweep, line) => logs.push(line),
     },
@@ -3826,6 +3896,7 @@ test("buildSameRepoRefillDispatches: successful dev completion claims the next t
   assert.equal(result.dispatches[0].triggeredBy.issue, "COD-4");
   assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_APP_PORT, "47040");
   assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_OWNER_TOKEN, "owner-COD-5");
+  assert.equal(result.dispatches[0].childEnv.AUTO_SWEEP_CLAIM_DECLARATION, "decl-COD-5");
   assert.equal(refillBudget.remaining, 7);
   assert.match(logs.find((line) => line.includes("refill-trigger")), /COD-4: dev 1\/4/);
 });

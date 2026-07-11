@@ -51,6 +51,11 @@ import {
   renderFindingCard,
   runLearningDetectors,
 } from "./learning.mjs";
+import {
+  claimCloseMarker,
+  claimDeclarationMarker,
+  resolveClaimOwnership,
+} from "./claim-ownership.mjs";
 
 const CLAIM_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`;
 
@@ -1343,6 +1348,10 @@ export function ownerToken({ host = os.hostname(), parentRunId, issueIdentifier,
   return [host, parentRunId, issueIdentifier, slotIndex].map((p) => String(p ?? "").replace(/\s+/g, "_")).join(":");
 }
 
+export function declarationToken({ randomUUID = crypto.randomUUID } = {}) {
+  return randomUUID();
+}
+
 export function heartbeatOwner(body) {
   return ((body || "").match(/\bowner=([^\]\s]+)/) || [])[1] || null;
 }
@@ -1362,12 +1371,24 @@ export function latestHeartbeatOwner(card, claim = null) {
   return beats[0]?.owner || null;
 }
 
-export function claimConfirmed(card, cfg, owner, expectedStates = []) {
+export function resolveCardClaim(card, claim) {
+  return resolveClaimOwnership({
+    comments: card?.comments,
+    complete: card?.commentsComplete,
+    claim,
+    labelPresent: hasLabel(card, claim),
+  });
+}
+
+export function claimConfirmed(card, cfg, ownership, expectedStates = []) {
   if (!card || !hasLabel(card, cfg.claim)) return false;
   if (expectedStates.length && !expectedStates.includes(card.stateName)) return false;
   if ((cfg.blocked || []).some((b) => hasLabel(card, b))) return false;
   if (!cardDependencyEligibility(card).eligible) return false;
-  return latestHeartbeatOwner(card, cfg.claim) === owner;
+  const resolved = resolveCardClaim(card, cfg.claim);
+  return resolved.status === "owned"
+    && resolved.ownerToken === ownership?.ownerToken
+    && resolved.declarationId === ownership?.declarationId;
 }
 
 function sleep(ms) {
@@ -1423,6 +1444,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options =
     childEnv: {
       AUTO_SWEEP_ISSUE: pick.issueIdentifier,
       ...(pick.ownerToken ? { AUTO_SWEEP_OWNER_TOKEN: pick.ownerToken } : {}),
+      ...(pick.claimDeclarationId ? { AUTO_SWEEP_CLAIM_DECLARATION: pick.claimDeclarationId } : {}),
       AUTO_SWEEP_CARD_RUN_ID: cardRunId,
       AUTO_SWEEP_SWEEP: pick.sweep,
       AUTO_SWEEP_KIT_PATH: KIT_ROOT,
@@ -4814,6 +4836,7 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
   sleepFn = sleep,
   fetchCardFn = fetchCard,
   fetchClaimCardFn = fetchClaimCard,
+  declarationTokenFn = declarationToken,
   onRouteFailure = () => {},
   onSafetyInvariant = () => {},
 } = {}) {
@@ -4823,11 +4846,52 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
   const routingConfigured = repoRoutingConfigured(config);
   const claimed = [];
   const candidates = sortByBoardPosition(actionableCards(cards, cfg, now));
+  const safetyError = (card, message, cause) => {
+    const error = new Error(`claim cleanup unverifiable for ${card.identifier}: ${message}`, { cause });
+    error.code = "CLAIM_CLEANUP_UNVERIFIED";
+    try {
+      onSafetyInvariant({
+        card,
+        evidence: {
+          type: "proven-safety-invariant",
+          occurredAt: new Date().toISOString(),
+          key: "claim-ownership-cleanup-unverified",
+          stage: sweep,
+          subsystem: "claim-admission",
+          reason: error.code,
+          summary: error.message,
+        },
+      });
+    } catch (evidenceError) {
+      error.evidenceCause = evidenceError;
+    }
+    return error;
+  };
   for (const card of candidates) {
     if (claimed.length >= limit) break;
     const slotIndex = claimed.length;
     const owner = ownerToken({ parentRunId, issueIdentifier: card.identifier, slotIndex });
-    let claimApplied = false;
+    const declarationId = declarationTokenFn();
+    let declarationAttempted = false;
+    const cleanupOwnAttempt = async (knownCard = null) => {
+      const latest = knownCard || await fetchCardFn(apiKey, card.id);
+      const ownership = resolveCardClaim(latest, cfg.claim);
+      const exact = (ownership.status === "owned" || ownership.status === "orphan-declaration")
+        && ownership.ownerToken === owner && ownership.declarationId === declarationId;
+      if (!exact) {
+        if (ownership.status === "owned" || ownership.status === "unclaimed" || ownership.status === "closed") return false;
+        throw safetyError(card, `claim ownership is ${ownership.status} (${ownership.reason})`);
+      }
+      await addCommentFn(apiKey, card.id, claimCloseMarker({ claim: cfg.claim, declarationId, reason: "failed" }));
+      const closed = await fetchCardFn(apiKey, card.id);
+      const closedOwnership = resolveCardClaim(closed, cfg.claim);
+      const closedExactly = hasLabel(closed, cfg.claim)
+        ? closedOwnership.status === "legacy-unowned"
+        : closedOwnership.status === "closed";
+      if (!closedExactly) throw safetyError(card, `claim close was not authoritative (${closedOwnership.status}/${closedOwnership.reason})`);
+      if (hasLabel(closed, cfg.claim)) await applyLabelEditFn(apiKey, closed, { remove: [cfg.claim] });
+      return true;
+    };
     try {
       let claimTarget = card;
       if (routingConfigured) {
@@ -4848,19 +4912,23 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
         }
         claimTarget = freshBeforeClaim;
       }
+      declarationAttempted = true;
+      await addCommentFn(apiKey, card.id, claimDeclarationMarker({ claim: cfg.claim, ownerToken: owner, declarationId }));
       await applyLabelEditFn(apiKey, claimTarget, { add: { [cfg.claim]: claimId } });
-      claimApplied = true;
-      await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Claimed for same-repo parallel ${sweep} slot ${slotIndex + 1}/${limit}.`);
       await sleepFn(CLAIM_CONFIRM_DELAY_MS);
       const fresh = await fetchCardFn(apiKey, card.id);
       const freshRoute = routingConfigured
         ? resolveCardRepoRoute({ config, card: fresh, repoPairs })
         : card.repoRoute;
-      if (!claimConfirmed(fresh, cfg, owner, cfg.states)
+      if (!claimConfirmed(fresh, cfg, { ownerToken: owner, declarationId }, cfg.states)
         || (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute))) {
         if (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute)) onRouteFailure(card, freshRoute);
-        if (hasLabel(fresh, cfg.claim) && latestHeartbeatOwner(fresh, cfg.claim) === owner) {
-          await applyLabelEditFn(apiKey, fresh, { remove: [cfg.claim] });
+        const ownership = resolveCardClaim(fresh, cfg.claim);
+        if ((ownership.status === "owned" || ownership.status === "orphan-declaration")
+            && ownership.ownerToken === owner && ownership.declarationId === declarationId) {
+          await cleanupOwnAttempt(fresh);
+        } else if (ownership.status !== "owned") {
+          throw safetyError(card, `claim confirmation is ${ownership.status} (${ownership.reason})`);
         }
         logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
         continue;
@@ -4874,44 +4942,19 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
         sweep,
         slotIndex,
         ownerToken: owner,
+        claimDeclarationId: declarationId,
         sortOrder: fresh.sortOrder,
       });
     } catch (e) {
       logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${e.message}`);
-      if (!claimApplied) continue;
+      if (e.code === "CLAIM_CLEANUP_UNVERIFIED") throw e;
+      if (!declarationAttempted) continue;
       try {
-        const latest = await fetchClaimCardFn(apiKey, card.id);
-        if (!hasLabel(latest, cfg.claim)) continue;
-        const latestOwner = latestHeartbeatOwner(latest, cfg.claim);
-        if (latestOwner === owner) {
-          await applyLabelEditFn(apiKey, latest, { remove: [cfg.claim] });
-        } else {
-          throw new Error(latestOwner
-            ? `claim remains but latest owner is ${latestOwner}`
-            : "claim remains but ownership is not provable because no heartbeat exists");
-        }
+        await cleanupOwnAttempt();
       } catch (cleanupError) {
+        if (cleanupError.code === "CLAIM_CLEANUP_UNVERIFIED") throw cleanupError;
         logFor(anchorPath, sweep, `claim-cleanup-unverified ${card.identifier}: ${cleanupError.message}`);
-        const error = new Error(`claim cleanup unverifiable for ${card.identifier}: ${cleanupError.message}`);
-        error.code = "CLAIM_CLEANUP_UNVERIFIED";
-        error.cause = cleanupError;
-        try {
-          onSafetyInvariant({
-            card,
-            evidence: {
-              type: "proven-safety-invariant",
-              occurredAt: new Date().toISOString(),
-              key: "claim-ownership-cleanup-unverified",
-              stage: sweep,
-              subsystem: "claim-admission",
-              reason: error.code,
-              summary: error.message,
-            },
-          });
-        } catch (evidenceError) {
-          error.evidenceCause = evidenceError;
-        }
-        throw error;
+        throw safetyError(card, cleanupError.message, cleanupError);
       }
     }
   }
@@ -5100,6 +5143,7 @@ export async function expandDispatchBatch(batch, {
         issueIdentifier: slot.identifier,
         slotIndex: slot.slotIndex,
         ownerToken: slot.ownerToken,
+        claimDeclarationId: slot.claimDeclarationId,
         repoRoute: slot.repoRoute,
         parentRunId,
         triggeredBy: pick.triggeredBy,
@@ -5600,6 +5644,8 @@ function writeRunRecord({ pick = {}, runtimeCfg = {}, logFile, outcome, startedA
     parentRunId: pick.parentRunId,
     cardRunId: pick.cardRunId,
     issueIdentifier: pick.issueIdentifier,
+    ownerToken: pick.ownerToken,
+    claimDeclarationId: pick.claimDeclarationId,
     sourceWorkspace: pick.childEnv?.AUTO_SWEEP_SOURCE_ANCHOR
       || canonicalAnchorIdentity(pick.sourceAnchorPath || pick.anchorPath || "."),
     projectId: pick.config?.projectId,
