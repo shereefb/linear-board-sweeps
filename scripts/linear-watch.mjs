@@ -6278,6 +6278,44 @@ export function classifyDispatchOutcome(event = {}) {
   return { kind: "exit", ...base };
 }
 
+export function classifyPostDispatchProgress(result = {}, card = {}, { resumeRecord = null } = {}) {
+  const pick = result.pick || {};
+  const cfg = SWEEP_CFG[pick.sweep];
+  const ownership = cfg ? resolveCardClaim(card, cfg.claim) : { status: "ambiguous", reason: "unknown-sweep" };
+  const ownsOpenClaim = ownership.status === "owned"
+    && ownership.ownerToken === pick.ownerToken
+    && ownership.declarationId === pick.claimDeclarationId;
+  const invalid = (kind, reason) => ({ kind, valid: false, ownsOpenClaim, reason });
+  const valid = (kind, reason) => ({ kind, valid: true, ownsOpenClaim, reason });
+
+  if (card?.commentsComplete !== true) return invalid("incomplete-history", "complete claim history is required");
+  if (ownership.status === "ambiguous") return invalid("ambiguous-history", ownership.reason || "claim history is ambiguous");
+  const closedOwnedEpoch = ownership.status === "closed"
+    && (card.comments || []).some((comment) => {
+      const marker = parseClaimMarker(comment);
+      return marker?.type === "close" && marker.claim === cfg?.claim
+        && marker.declarationId === pick.claimDeclarationId;
+    });
+  if (!ownsOpenClaim && !closedOwnedEpoch) return invalid("ownership-mismatch", "post-run claim history does not match the dispatched epoch");
+
+  if (["dependency-deferred", "repo-routing-deferred"].includes(result.kind)) {
+    return valid(result.kind, "verified child preflight deferred material work");
+  }
+  const matchingResume = resumeRecord
+    && resumeRecord.sweep === pick.sweep
+    && resumeRecord.ownerToken === pick.ownerToken
+    && resumeRecord.claimDeclarationId === pick.claimDeclarationId;
+  if (matchingResume && ownsOpenClaim) return valid("resume-needed", "verified resume metadata preserves the open epoch");
+  if (result.kind !== "success") return invalid("dispatch-failed", "child did not exit successfully");
+  if (closedOwnedEpoch && blockingLabelsForIssue(card.labelNames).length) {
+    return valid("blocked", "closed epoch has an observable blocker");
+  }
+  if (closedOwnedEpoch && !cfg.states.includes(card.stateName)) {
+    return valid("advanced", "closed epoch reached a downstream state");
+  }
+  return invalid("successful-no-op", "child exited successfully without an observable terminal outcome");
+}
+
 function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {

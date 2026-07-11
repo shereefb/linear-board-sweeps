@@ -32,7 +32,7 @@ import {
   retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
   fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards, fetchCompleteMigrationCard, claimMigrationStatusReport, resetClaimMigration,
@@ -65,6 +65,68 @@ import {
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
+
+const postDispatchResult = (sweep = "ship", kind = "success") => ({
+  kind,
+  pick: { sweep, ownerToken: "owner", claimDeclarationId: "decl" },
+});
+const postDispatchCard = (stateName = "Ship", { close = false, labels = [], complete = true, comments = null } = {}) => ({
+  stateName,
+  labelNames: [...labels, ...(close ? [] : ["ship:in-progress"])],
+  commentsComplete: complete,
+  comments: comments || [
+    { id: "decl", body: claimDeclarationMarker({ claim: "ship:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: "2026-07-11T00:00:01.000Z" },
+    ...(close ? [{ id: "close", body: claimCloseMarker({ claim: "ship:in-progress", declarationId: "decl", reason: "terminal" }), createdAt: "2026-07-11T00:00:02.000Z" }] : []),
+  ],
+});
+
+test("classifyPostDispatchProgress rejects exit-zero unchanged owned epochs", () => {
+  assert.deepEqual(classifyPostDispatchProgress(postDispatchResult(), postDispatchCard()), {
+    kind: "successful-no-op", valid: false, ownsOpenClaim: true,
+    reason: "child exited successfully without an observable terminal outcome",
+  });
+});
+
+test("classifyPostDispatchProgress accepts downstream state with a closed epoch", () => {
+  assert.equal(classifyPostDispatchProgress(postDispatchResult(), postDispatchCard("Done", { close: true })).kind, "advanced");
+});
+
+test("classifyPostDispatchProgress accepts a legitimate blocker with a closed epoch", () => {
+  const value = classifyPostDispatchProgress(postDispatchResult(), postDispatchCard("Ship", { close: true, labels: ["blocked:needs-user"] }));
+  assert.equal(value.kind, "blocked");
+  assert.equal(value.valid, true);
+});
+
+test("classifyPostDispatchProgress accepts dependency and route deferrals", () => {
+  for (const kind of ["dependency-deferred", "repo-routing-deferred"]) {
+    assert.equal(classifyPostDispatchProgress(postDispatchResult("ship", kind), postDispatchCard()).kind, kind);
+  }
+});
+
+test("classifyPostDispatchProgress accepts verified resume metadata", () => {
+  const result = postDispatchResult();
+  const resumeRecord = { sweep: "ship", ownerToken: "owner", claimDeclarationId: "decl" };
+  assert.equal(classifyPostDispatchProgress(result, postDispatchCard(), { resumeRecord }).kind, "resume-needed");
+});
+
+test("classifyPostDispatchProgress rejects mismatched ownership", () => {
+  const result = postDispatchResult();
+  result.pick.ownerToken = "other";
+  const value = classifyPostDispatchProgress(result, postDispatchCard());
+  assert.equal(value.kind, "ownership-mismatch");
+  assert.equal(value.valid, false);
+  assert.equal(value.ownsOpenClaim, false);
+});
+
+test("classifyPostDispatchProgress rejects incomplete and ambiguous history", () => {
+  const incomplete = classifyPostDispatchProgress(postDispatchResult(), postDispatchCard("Ship", { complete: false }));
+  assert.equal(incomplete.kind, "incomplete-history");
+  const ambiguousCard = postDispatchCard();
+  ambiguousCard.comments.push({ id: "bad", body: "[auto-sweep-claim v1 claim=ship:in-progress broken]", createdAt: "2026-07-11T00:00:03.000Z" });
+  const ambiguous = classifyPostDispatchProgress(postDispatchResult(), ambiguousCard);
+  assert.equal(ambiguous.kind, "ambiguous-history");
+  assert.equal(ambiguous.valid, false);
+});
 
 const claimIso = (second) => `2026-07-11T00:00:${String(second).padStart(2, "0")}.000Z`;
 const completeUnclaimedCard = (card) => ({ ...card, commentsComplete: true, comments: [] });
