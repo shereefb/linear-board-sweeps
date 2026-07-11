@@ -4488,15 +4488,27 @@ export async function resetStaleClaimBoundary(apiKey, card, claim, target, stale
 
 // Execute a reap/escalate decision: reset the exact stale epoch, then drop the
 // claim label (+ optionally add blocked:needs-user) and post the audit comment.
-async function executeReap(apiKey, card, decision, labelMap, sweep, now = Date.now()) {
-  const reset = await resetStaleClaimBoundary(apiKey, card, decision.releaseClaim, decision.target, decision.staleMin, now);
+export async function executeReap(apiKey, card, decision, labelMap, sweep, now = Date.now(), {
+  fetchClaimCardFn = fetchClaimCard,
+  addCommentFn = addComment,
+  applyLabelEditFn = applyLabelEdit,
+  addAuditCommentFn = addComment,
+} = {}) {
+  const reset = await resetStaleClaimBoundary(apiKey, card, decision.releaseClaim, decision.target, decision.staleMin, now, {
+    fetchClaimCardFn,
+    addCommentFn,
+  });
   if (!reset) return false;
   if (decision.action === "escalate-crash" && labelMap["blocked:needs-user"]) {
-    await applyLabelEdit(apiKey, reset, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
-    await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` and set **blocked:needs-user** — the ${sweep} sweep has stranded this card ${decision.count}× (the runtime likely keeps dying on it). Needs a human before it retries.`);
+    await applyLabelEditFn(apiKey, reset, { remove: [decision.releaseClaim], add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
+    card.labelIds = { ...reset.labelIds };
+    card.labelNames = [...reset.labelNames];
+    await addAuditCommentFn(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` and set **blocked:needs-user** — the ${sweep} sweep has stranded this card ${decision.count}× (the runtime likely keeps dying on it). Needs a human before it retries.`);
   } else {
-    await applyLabelEdit(apiKey, reset, { remove: [decision.releaseClaim] });
-    await addComment(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
+    await applyLabelEditFn(apiKey, reset, { remove: [decision.releaseClaim] });
+    card.labelIds = { ...reset.labelIds };
+    card.labelNames = [...reset.labelNames];
+    await addAuditCommentFn(apiKey, card.id, `${REAPER_TAG} Auto-released stale \`${decision.releaseClaim}\` claim (heartbeat idle > ${SWEEP_CFG[sweep].staleMin}m; the prior run likely froze or failed). Will retry.`);
   }
   return true;
 }
@@ -4957,10 +4969,13 @@ export async function recordConfirmedOrphanEvidence({ apiKey, sourceAnchorPath, 
   });
 }
 
-async function executeBounce(apiKey, card, labelMap) {
+export async function executeBounce(apiKey, card, labelMap, {
+  applyLabelEditFn = applyLabelEdit,
+  addCommentFn = addComment,
+} = {}) {
   if (!labelMap["blocked:needs-user"]) return;
-  await applyLabelEdit(apiKey, card, { add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
-  await addComment(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
+  await applyLabelEditFn(apiKey, card, { add: { "blocked:needs-user": labelMap["blocked:needs-user"] } });
+  await addCommentFn(apiKey, card.id, `${PARK_TAG} Set **blocked:needs-user** — this card has bounced backward ${BOUNCE_ESCALATE_AFTER}+ times; two sweeps can't agree on it. Needs a human decision.`);
 }
 
 export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, { parentRunId, limit, labelMap, now, repoPairs = [] }, {

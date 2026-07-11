@@ -3979,6 +3979,43 @@ test("administrative reset: a stranded label after an exact close is cleaned thr
   assert.ok(reset);
   assert.equal(resolveClaimOwnership({ comments: reset.comments, complete: true, claim: "qa:in-progress", labelPresent: true }).status, "legacy-unowned");
 });
+
+test("executeReap: synchronizes the scheduler card before a same-tick bounce full-label write", async () => {
+  assert.equal(typeof watchModule.executeReap, "function");
+  assert.equal(typeof watchModule.executeBounce, "function");
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) },
+  ];
+  const original = { id: "reap-bounce", identifier: "COD-171", updatedAt: minsAgo(300), labelIds: { "dev:in-progress": "dev-label", feature: "feature-label" }, labelNames: ["dev:in-progress", "feature"], commentsComplete: true, comments: [...comments] };
+  const linearLabelWrites = [];
+  const applyLabelEditFn = async (_key, card, edit) => {
+    for (const claim of edit.remove || []) delete card.labelIds[claim];
+    for (const [name, id] of Object.entries(edit.add || {})) card.labelIds[name] = id;
+    card.labelNames = Object.keys(card.labelIds);
+    linearLabelWrites.push(Object.values(card.labelIds).sort());
+  };
+  const fetched = () => ({ ...original, labelIds: { "dev:in-progress": "dev-label", feature: "feature-label" }, labelNames: ["dev:in-progress", "feature"], commentsComplete: true, comments: [...comments] });
+  assert.equal(await watchModule.executeReap("key", original, {
+    action: "reap", releaseClaim: "dev:in-progress", target: "decl", staleMin: 45,
+  }, { "blocked:needs-user": "blocked-label" }, "dev", NOW, {
+    fetchClaimCardFn: async () => fetched(),
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `reset-${comments.length}`, body, createdAt: minsAgo(1) }),
+    applyLabelEditFn,
+    addAuditCommentFn: async () => {},
+  }), true);
+  assert.deepEqual(original.labelIds, { feature: "feature-label" });
+  assert.deepEqual(original.labelNames, ["feature"]);
+  await watchModule.executeBounce("key", original, { "blocked:needs-user": "blocked-label" }, {
+    applyLabelEditFn,
+    addCommentFn: async () => {},
+  });
+  assert.deepEqual(linearLabelWrites, [
+    ["feature-label"],
+    ["blocked-label", "feature-label"],
+  ]);
+  assert.deepEqual(original.labelIds, { feature: "feature-label", "blocked:needs-user": "blocked-label" });
+  assert.deepEqual(original.labelNames, ["feature", "blocked:needs-user"]);
+});
 test("releaseOwnedDispatchClaim: successful completion only releases a claim while the card remains in the completed sweep", async () => {
   const edits = [];
   const comments = [{ id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner-141", declarationId: "decl-141" }), createdAt: claimIso(1) }];
