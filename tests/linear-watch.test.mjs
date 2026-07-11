@@ -3311,8 +3311,8 @@ test("expandDispatchBatch: Ship route-label races fail before child expansion", 
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
     labelMap: { "ship:in-progress": "ship-claim-id" },
-    claimCardSlotsFn: async () => {
-      failures.push({ message: "repository route changed before claim" });
+    claimCardSlotsFn: async (_apiKey, _anchorPath, _config, _sweep, cards, _options, deps) => {
+      deps.onRouteFailure(cards[0], { message: "repository route changed before claim" });
       return [];
     },
     onRouteFailure: (_pick, failure) => failures.push(failure),
