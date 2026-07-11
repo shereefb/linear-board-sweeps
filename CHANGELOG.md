@@ -2,6 +2,18 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.9] - 2026-07-11
+
+### Changed
+
+- Carry versioned, risk-linked verification obligations from behavior-changing specs into executable plan proofs, Dev proof execution, and ID-linked QA evidence.
+- Preserve every independent `review/test-gap` finding as structured Factory Learning evidence while distinguishing missing implementation from missing design.
+
+### Fixed
+
+- Fail closed when a required post-rollout verification contract is absent or incomparable, preserve proven legacy artifacts, and reuse one rollout-boundary rule with the correctness contract.
+- Propagate the updated Spec, Dev, and QA skill bytes under the new sweep marker.
+
 ## [1.2.0.8] - 2026-07-11
 
 ### Changed

@@ -12,7 +12,7 @@ Material specs carry a versioned scope-closure inventory whose stable surface ID
 
 **Planned (COD-155):** behavior-changing specs will carry a versioned correctness contract whose invariant IDs remain traceable through implementation proofs and QA evidence. Existing review findings remain structured Factory Learning evidence; the contract strengthens prevention without bypassing review, QA, Signoff, or the human Ship gate.
 
-**Planned (COD-157):** material acceptance behaviors and risks will carry a versioned verification contract from Spec through executable Plan proofs, Dev execution, and ID-linked QA evidence. Independent reviewers will continue emitting every material `review/test-gap` finding so Factory Learning measures prevention honestly without weakening review, QA, Signoff, or the human Ship gate.
+Material acceptance behaviors and risks carry a versioned verification contract from Spec through executable Plan proofs, Dev execution, and ID-linked QA evidence. Independent reviewers continue emitting every material `review/test-gap` finding so Factory Learning measures prevention honestly without weakening review, QA, Signoff, or the human Ship gate.
 
 **COD-158:** materially performance-sensitive specs carry a versioned performance contract whose stable budget IDs remain traceable through implementation tasks, kind-specific commit-bound proof, and QA. Applicability follows the actual performance surface rather than labels alone; stale proof after an affected-path QA change is invalidated, while engineering review, code review, QA, Signoff, and the human Ship gate remain intact.
 
