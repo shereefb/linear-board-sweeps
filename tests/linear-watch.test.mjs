@@ -64,6 +64,7 @@ import {
   createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown, resumeResolutionNoticeNeeded,
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
+  recordSuccessfulNoOpTelemetry,
 } from "../scripts/linear-watch.mjs";
 
 const postDispatchResult = (sweep = "ship", kind = "success") => ({
@@ -89,6 +90,29 @@ test("classifyPostDispatchProgress rejects exit-zero unchanged owned epochs", ()
 
 test("classifyPostDispatchProgress accepts downstream state with a closed epoch", () => {
   assert.equal(classifyPostDispatchProgress(postDispatchResult(), postDispatchCard("Done", { close: true })).kind, "advanced");
+});
+
+test("legacy child progress infers advancement without an outcome record", () => {
+  const result = postDispatchResult();
+  assert.equal(result.outcomeRecord, undefined);
+  assert.deepEqual(classifyPostDispatchProgress(result, postDispatchCard("Done", { close: true })), {
+    kind: "advanced",
+    valid: true,
+    ownsOpenClaim: false,
+    reason: "closed epoch reached a downstream state",
+  });
+});
+
+test("successful no-op telemetry keeps only a count and latest issue identity", () => {
+  const first = recordSuccessfulNoOpTelemetry({ capacityHighWater: 2 }, "COD-178");
+  const second = recordSuccessfulNoOpTelemetry(first, "COD-179", {
+    comments: ["secret"], ownerToken: "owner", claimDeclarationId: "decl",
+  });
+  assert.deepEqual(second, {
+    capacityHighWater: 2,
+    successfulNoOpCount: 2,
+    latestSuccessfulNoOpIssue: "COD-179",
+  });
 });
 
 test("classifyPostDispatchProgress accepts a legitimate blocker with a closed epoch", () => {

@@ -6383,6 +6383,14 @@ export function applyDispatchProgressReconciliation(result, reconciliation) {
   return result;
 }
 
+export function recordSuccessfulNoOpTelemetry(telemetry = {}, issueIdentifier) {
+  return {
+    ...telemetry,
+    successfulNoOpCount: (Number.isSafeInteger(telemetry.successfulNoOpCount) ? telemetry.successfulNoOpCount : 0) + 1,
+    latestSuccessfulNoOpIssue: String(issueIdentifier),
+  };
+}
+
 function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {
@@ -6971,6 +6979,13 @@ async function tick({ dryRun = false } = {}) {
         const reconciliation = await reconcileDispatchProgress(active.apiKey, result, runtime, { resumeStore });
         applyDispatchProgressReconciliation(result, reconciliation);
         if (!reconciliation.success) {
+          if (reconciliation.progress?.kind === "successful-no-op") {
+            tickState = {
+              ...tickState,
+              telemetry: recordSuccessfulNoOpTelemetry(tickState.telemetry, pick.issueIdentifier),
+            };
+            writeCurrentTick();
+          }
           logFor(pick.anchorPath, pick.sweep, `dispatch progress rejected ${pick.issueIdentifier}: ${reconciliation.progress?.reason || "post-run reconciliation failed"}`);
           if (reconciliation.failure) {
             recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", pick.issueIdentifier, reconciliation.failure.message);
@@ -7266,6 +7281,7 @@ async function tick({ dryRun = false } = {}) {
         kit: reg.kitPath ? kitMarker(reg.kitPath) : null,
         failures: [...localFailures],
         telemetry: {
+          ...(tickState.telemetry || {}),
           ...resourceMetrics,
           capacityHighWater: resourceMetrics.capacityHighWater || 0,
           dependencyDeferredCount: dependencyDeferredKeys.size,
