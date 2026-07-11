@@ -104,6 +104,42 @@ test("spec sweep requires the v1 trust-boundary contract without hiding findings
   }
 });
 
+test("dev sweep proves trust-boundary artifact contracts before mutation and review", () => {
+  for (const root of ["../.claude/skills", "../skills"]) {
+    const file = `${root}/dev-sweep/SKILL.md`;
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+
+    assert.match(text, /Trust-boundary artifact gate.*after preflight.*before.*claim|after preflight.*before.*mutation/is, file);
+    assert.match(text, /CONTRACT_REPO_ROOT=.*git rev-parse --show-toplevel/, file);
+    assert.match(text, /TARGET_REF=.*HEAD/, file);
+    assert.match(text, /origin\/main.*trusted.*rollout.*R|trusted.*origin\/main.*rollout.*R/is, file);
+    assert.match(text, /original.*marker.*1\.2\.0\.6|1\.2\.0\.6.*original.*marker/is, file);
+    assert.match(text, /git merge-base --is-ancestor "\$R" "\$TARGET_REF"/, file);
+    assert.match(text, /fixed target snapshot|target blobs|not.*worktree/is, file);
+    assert.match(text, /AUTO_SWEEP_KIT_PATH.*artifact-contract\.mjs/, file);
+    assert.match(text, /R:\.claude\/skills\/_shared\/artifact-contract\.mjs/, file);
+    assert.match(text, /hash.*verify|verify.*hash/is, file);
+    assert.match(text, /read-only/, file);
+    assert.match(text, /Never execute.*worktree helper|never execute.*worktree helper/i, file);
+    assert.match(text, /clean.*scratch|scratch.*clean/is, file);
+    assert.match(text, /classify[\s\\\n]+"\$CONTRACT_REPO_ROOT" "\$SPEC_PATH" "1\.2\.0\.6" "\$TARGET_REF" origin\/main/, file);
+    assert.match(text, /classify[\s\\\n]+"\$CONTRACT_REPO_ROOT" "\$PLAN_PATH" "1\.2\.0\.6" "\$TARGET_REF" origin\/main/, file);
+    assert.match(text, /both.*status:\\?"legacy"|both.*legacy/is, file);
+    assert.match(text, /current.*incomparable.*malformed.*mismatched/is, file);
+    assert.match(text, /bounded.*classifier evidence/i, file);
+    assert.match(text, /bounce missing-design/, file);
+    assert.match(text, /\[auto-sweep-bounce Dev→Spec\]/, file);
+    assert.match(text, /terminal blocked/, file);
+    assert.match(text, /remove.*dev:in-progress/, file);
+    assert.match(text, /bottom of "Spec"/, file);
+    assert.match(text, /Do not add `blocked:needs-user` for this contract failure/, file);
+    assert.match(text, /every mapped accept\/reject proof.*before.*full suite.*review/is, file);
+    assert.match(text, /proof map.*QA handoff/i, file);
+    assert.match(text, /review\/security/, file);
+    assert.match(text, /fast-path.*(?:preserve|unchanged|existing)/i, file);
+  }
+});
+
 test("canonical sweep skill headings contain no patch artifacts", () => {
   for (const sweep of ["spec", "dev", "qa", "ship"]) {
     const text = fs.readFileSync(new URL(`../skills/${sweep}-sweep/SKILL.md`, import.meta.url), "utf8");
