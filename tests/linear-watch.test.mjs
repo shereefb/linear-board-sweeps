@@ -32,7 +32,7 @@ import {
   retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, reconcileDispatchProgress, applyDispatchProgressReconciliation, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, reconcileDispatchProgress, applyDispatchProgressReconciliation, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchDeadlineMs, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
   fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards, fetchCompleteMigrationCard, claimMigrationStatusReport, resetClaimMigration,
@@ -6300,6 +6300,85 @@ test("dispatch abort context: SIGTERM interrupts active child once and records t
   context.dispose();
   assert.equal(processLike.listenerCount("SIGINT"), 0);
   assert.equal(processLike.listenerCount("SIGTERM"), 0);
+});
+test("dispatchDeadlineMs derives finite stage deadlines", () => {
+  for (const sweep of ["spec", "dev", "qa", "ship"]) {
+    assert.equal(dispatchDeadlineMs(sweep), SWEEP_CFG[sweep].staleMin * 60_000);
+  }
+  assert.throws(() => dispatchDeadlineMs("unknown"), /unknown sweep/i);
+});
+
+function dispatchWithFakeClock({ sweep = "ship", deadlineMs = 100, graceMs = 25, closeOnSignal = null, abortAfterTerm = false } = {}) {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-timeout-"));
+  const timers = [];
+  const signals = [];
+  const controller = new AbortController();
+  const child = new EventEmitter();
+  child.pid = 456;
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGTERM" && abortAfterTerm) controller.abort("SIGINT");
+    if (signal === closeOnSignal) queueMicrotask(() => child.emit("close", null, signal));
+  };
+  const setTimeoutFn = (fn, ms) => {
+    const timer = { fn, ms, cleared: false };
+    timers.push(timer);
+    return timer;
+  };
+  const clearTimeoutFn = (timer) => { timer.cleared = true; };
+  const run = dispatchAsync(anchorPath, sweep, {}, {
+    issueIdentifier: "COD-timeout",
+    logDir: path.join(anchorPath, "logs"),
+    runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: () => child, signal: controller.signal, deadlineMs, graceMs, setTimeoutFn, clearTimeoutFn });
+  const fireNext = () => {
+    const timer = timers.find((candidate) => !candidate.cleared);
+    assert.ok(timer, "expected an armed timer");
+    timer.cleared = true;
+    timer.fn();
+  };
+  return { run, signals, timers, fireNext, child };
+}
+
+test("dispatchAsync force-terminates an expired child after grace", async () => {
+  const clock = dispatchWithFakeClock();
+  clock.fireNext();
+  clock.fireNext();
+  clock.child.emit("close", null, "SIGKILL");
+  assert.deepEqual(clock.signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal((await clock.run).kind, "timeout-forced");
+  assert.ok(clock.timers.every((timer) => timer.cleared));
+});
+
+test("dispatchAsync reports graceful timeout when the child closes after SIGTERM", async () => {
+  const clock = dispatchWithFakeClock({ closeOnSignal: "SIGTERM" });
+  clock.fireNext();
+  assert.equal((await clock.run).kind, "timeout-graceful");
+  assert.deepEqual(clock.signals, ["SIGTERM"]);
+  assert.ok(clock.timers.every((timer) => timer.cleared));
+});
+
+test("dispatchAsync does not arm a grace timer after a synchronous SIGTERM close", async () => {
+  const clock = dispatchWithFakeClock();
+  clock.child.kill = (signal) => {
+    clock.signals.push(signal);
+    clock.child.emit("close", null, signal);
+  };
+  clock.fireNext();
+  assert.equal((await clock.run).kind, "timeout-graceful");
+  assert.equal(clock.timers.length, 1);
+  assert.ok(clock.timers.every((timer) => timer.cleared));
+});
+
+test("dispatch abort takes precedence over an expired child", async () => {
+  const clock = dispatchWithFakeClock({ abortAfterTerm: true });
+  clock.fireNext();
+  clock.child.emit("close", null, "SIGTERM");
+  const result = await clock.run;
+  assert.equal(result.kind, "interrupted");
+  assert.equal(result.signal, "SIGINT");
+  assert.deepEqual(clock.signals, ["SIGTERM"]);
+  assert.ok(clock.timers.every((timer) => timer.cleared));
 });
 test("capacity ledger: dispatch attaches the live child PID immediately after spawn", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-pid-"));

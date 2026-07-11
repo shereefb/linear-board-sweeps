@@ -162,6 +162,7 @@ export const DEFAULT_SAME_REPO_CARD_LIMITS = { spec: 4, dev: 4, qa: 1, ship: 1 }
 export const DEFAULT_MAX_HANDOFF_TRIGGER_HOPS = 2;
 export const SAME_REPO_PORT_BASE = 47000;
 export const CLAIM_CONFIRM_DELAY_MS = 1500;
+export const DISPATCH_TIMEOUT_GRACE_MS = 10_000;
 
 // Per-sweep config. staleMin is the heartbeat-age backstop; it must exceed the
 // longest NORMAL single-card run for that sweep. ship = merge + deploy + canary
@@ -192,6 +193,12 @@ export const LEGACY_CLEANUP_STATES = [WORKFLOW_STATES.legacyInProgress];
 export const CLAIM_CLEANUP_STATES = [...HOLDING_STATES, ...LEGACY_CLEANUP_STATES];
 export const ALL_CLAIMS = SWEEPS.map((s) => SWEEP_CFG[s].claim);
 export const MAX_STALE_MIN = Math.max(...SWEEPS.map((s) => SWEEP_CFG[s].staleMin));
+
+export function dispatchDeadlineMs(sweep) {
+  const staleMin = SWEEP_CFG[sweep]?.staleMin;
+  if (!Number.isFinite(staleMin)) throw new Error(`unknown sweep: ${sweep}`);
+  return staleMin * 60_000;
+}
 
 const AUTO_SWEEP_LABEL = "auto-sweep";
 
@@ -6699,18 +6706,27 @@ function runDispatchAttempt({
   classifyCodexStdout = createCodexUsageEvidenceCollector,
   classifyClaudeStderr = createClaudeUsageEvidenceCollector,
   writeChunkFn = fs.writeSync,
+  deadlineMs,
+  graceMs,
+  setTimeoutFn,
+  clearTimeoutFn,
 }) {
   return new Promise((resolve) => {
     let child;
     let settled = false;
     let capacityAttachFailed = false;
     let logWriteFailed = false;
+    let deadlineTimer = null;
+    let graceTimer = null;
+    let timeoutPhase = null;
     const collector = runtimeCfg.runtime === "codex"
       ? classifyCodexStdout()
       : runtimeCfg.runtime === "claude" ? classifyClaudeStderr() : null;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
+      if (deadlineTimer !== null) clearTimeoutFn(deadlineTimer);
+      if (graceTimer !== null) clearTimeoutFn(graceTimer);
       resolve({ outcome, runtimeCfg, executable, usageExhausted: !logWriteFailed && Boolean(collector?.exhausted()) });
     };
     const ioFailure = () => {
@@ -6735,6 +6751,17 @@ function runDispatchAttempt({
     }
     child.stdout?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "codex"));
     child.stderr?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "claude"));
+    deadlineTimer = setTimeoutFn(() => {
+      if (settled || signal?.aborted) return;
+      timeoutPhase = "graceful";
+      try { child.kill?.("SIGTERM"); } catch { /* close remains authoritative */ }
+      if (settled || signal?.aborted) return;
+      graceTimer = setTimeoutFn(() => {
+        if (settled || signal?.aborted) return;
+        timeoutPhase = "forced";
+        try { child.kill?.("SIGKILL"); } catch { /* close remains authoritative */ }
+      }, graceMs);
+    }, deadlineMs);
     child.on("error", (error) => {
       if (capacityAttachFailed || logWriteFailed || settled) return;
       const interrupted = error.code === "ABORT_ERR" || signal?.aborted;
@@ -6754,9 +6781,13 @@ function runDispatchAttempt({
         return;
       }
       collector?.finish();
-      finish(signal?.aborted
-        ? classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd })
-        : classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }));
+      if (signal?.aborted) {
+        finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal, childSignal), path: executable, cwd }));
+      } else if (timeoutPhase) {
+        finish({ kind: `timeout-${timeoutPhase}`, code: null, exitCode, signal: childSignal, path: executable, cwd });
+      } else {
+        finish(classifyDispatchOutcome({ type: "close", exitCode, signal: childSignal, path: executable, cwd }));
+      }
     });
     if (!onSpawn) return;
     try {
@@ -6776,6 +6807,10 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   onSpawn = null,
   resolveRuntimeExecutableFn = resolveRuntimeExecutable,
   writeChunkFn = fs.writeSync,
+  deadlineMs = dispatchDeadlineMs(sweep),
+  graceMs = DISPATCH_TIMEOUT_GRACE_MS,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
 } = {}) {
   const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
   const command = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
@@ -6817,7 +6852,8 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     return result;
   };
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
-  const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn });
+  const timerOptions = { deadlineMs, graceMs, setTimeoutFn, clearTimeoutFn };
+  const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn, ...timerOptions });
   const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome, primary.usageExhausted);
   const deferred = childDeferredOutcomeForPick(pick);
   if (deferred) return finish(deferred, primaryMeta, [primaryAttempt]);
@@ -6857,6 +6893,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     spawnFn,
     onSpawn,
     writeChunkFn,
+    ...timerOptions,
   });
   const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome, fallback.usageExhausted);
   return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
