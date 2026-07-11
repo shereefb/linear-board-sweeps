@@ -1434,8 +1434,7 @@ export function retryCooldown(card, cfg, now = Date.now()) {
     const declarationId = match[3];
     const atMarker = resolveClaimOwnership({ comments: comments.slice(0, index + 1), complete: true,
       claim: cfg.claim, labelPresent: true });
-    if (atMarker.status !== "owned" || atMarker.ownerToken !== owner || atMarker.declarationId !== declarationId
-        || timestamp < Date.parse(atMarker.livenessAt)) return null;
+    if (atMarker.status !== "owned" || atMarker.ownerToken !== owner || atMarker.declarationId !== declarationId) return null;
     const laterClose = comments.slice(index + 1).some((candidate) => {
       const marker = parseClaimMarker(candidate);
       return marker?.type === "close" && marker.claim === cfg.claim && marker.declarationId === declarationId;
@@ -2453,6 +2452,12 @@ export function rediscoveredResumeRecordForCard({ sourceWorkspace, anchorPath, s
     repoEntry: card.repoRoute.repoEntry, reason: "rediscovered dirty worktree",
     nextEligibleAt: new Date(now).toISOString(), attempts: 0,
   };
+}
+
+export function resumeResolutionNoticeNeeded(card, cfg, decision) {
+  if (!cfg?.claim || !decision?.ownerToken || !decision?.claimDeclarationId) return false;
+  const marker = `[auto-sweep-resume-resolution v1 claim=${cfg.claim} owner=${decision.ownerToken} declaration=${decision.claimDeclarationId}]`;
+  return !(card?.comments || []).some((comment) => String(comment.body || "").startsWith(marker));
 }
 
 export function classifyCapacityOutcome(outcome, logTail = "") {
@@ -5652,6 +5657,7 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   addCommentFn = addComment,
   updateCommentFn = updateComment,
   now = Date.now,
+  preserveTerminalClaim = false,
 } = {}) {
   const pick = result?.pick || {};
   const cfg = SWEEP_CFG[pick.sweep];
@@ -5664,6 +5670,9 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const terminalFailure = result.kind === "exit" || result.kind === "signal";
   if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
     return { attempted: false, released: false, reasonKind: null };
+  }
+  if (terminalFailure && preserveTerminalClaim) {
+    return { attempted: true, released: false, reasonKind: "terminal recovery retained" };
   }
   if (terminalFailure) {
     const released = await releaseFailedDispatchClaimFn(apiKey, pick, result, runtime);
@@ -6939,7 +6948,10 @@ async function tick({ dryRun = false } = {}) {
       }
       if (pick.issueIdentifier) {
         try {
-          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime, { resumeStore });
+          const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime, {
+            resumeStore,
+            preserveTerminalClaim: finalUsageExhausted || Boolean(capacityKind),
+          });
           if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `owned claim release failed ${pick.issueIdentifier}: ${e.message}`);
@@ -7467,7 +7479,9 @@ async function tick({ dryRun = false } = {}) {
                   ? "Preserved resume-needed worktree remains protected; recovery metadata needs rediscovery or explicit human resolution."
                   : "Preserved resume-needed worktree remains protected on this host.";
                 await addComment(apiKey, card.id, claimHeartbeatMarker({ claim: cfg.claim, declarationId: decision.claimDeclarationId, at: new Date(now).toISOString() }));
-                if (decision.protectionState === "needs-resolution") await addComment(apiKey, card.id, detail);
+                if (decision.protectionState === "needs-resolution" && resumeResolutionNoticeNeeded(card, cfg, decision)) {
+                  await addComment(apiKey, card.id, `[auto-sweep-resume-resolution v1 claim=${cfg.claim} owner=${decision.ownerToken} declaration=${decision.claimDeclarationId}] ${detail}`);
+                }
                 logFor(anchorPath, sweep, `protect-resume ${decision.identifier}`);
               } catch (error) { recordFailure(sweep, "resume-heartbeat", decision.identifier, error.message); }
             }

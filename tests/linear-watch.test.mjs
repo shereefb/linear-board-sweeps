@@ -61,7 +61,7 @@ import {
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
-  createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown,
+  createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown, resumeResolutionNoticeNeeded,
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
@@ -279,6 +279,15 @@ test("resume reaper protection expires and validates the deterministic tuple", (
       NOW + 25 * 3600000, { validateRecord: () => false }) });
   assert.deepEqual(decisions.map((decision) => decision.action), ["protect-resume"]);
   assert.equal(decisions[0].protectionState, "needs-resolution");
+});
+
+test("resume resolution notices are declaration-scoped and deduplicated", () => {
+  const decision = { ownerToken: "owner-149", claimDeclarationId: "decl-149" };
+  const card = { comments: [] };
+  assert.equal(resumeResolutionNoticeNeeded(card, SWEEP_CFG.dev, decision), true);
+  card.comments.push({ body: "[auto-sweep-resume-resolution v1 claim=dev:in-progress owner=owner-149 declaration=decl-149]" });
+  assert.equal(resumeResolutionNoticeNeeded(card, SWEEP_CFG.dev, decision), false);
+  assert.equal(resumeResolutionNoticeNeeded(card, SWEEP_CFG.dev, { ...decision, claimDeclarationId: "decl-150" }), true);
 });
 
 test("resume rediscovery: routed cards preserve their routed worktree and repo identity", () => {
@@ -2038,6 +2047,19 @@ test("retryCooldown requires complete declaration, retry, and close provenance",
   assert.equal(retryCooldown(card, SWEEP_CFG.spec, NOW), null);
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
   assert.equal(retryCooldown({ ...card, commentsComplete: false }, SWEEP_CFG.dev, NOW), null);
+});
+
+test("retryCooldown uses Linear comment order when a client heartbeat clock is ahead", () => {
+  const owner = "owner-skew";
+  const declarationId = "decl-skew";
+  const comments = [
+    { id: "decl", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: owner, declarationId }), createdAt: minsAgo(4) },
+    { id: "beat", body: claimHeartbeatMarker({ claim: "dev:in-progress", declarationId, at: new Date(NOW + 5 * 60_000).toISOString() }), createdAt: minsAgo(3) },
+    { id: "retry", body: `${RETRY_TAG} v1 claim=dev:in-progress owner=${owner} declaration=${declarationId}]`, createdAt: minsAgo(2) },
+    { id: "close", body: claimCloseMarker({ claim: "dev:in-progress", declarationId, reason: "terminal" }), createdAt: minsAgo(1) },
+  ];
+  const card = dependencyReadyCard({ id: "clock-skew", labelNames: [], commentsComplete: true, comments });
+  assert.equal(retryCooldown(card, SWEEP_CFG.dev, NOW)?.active, true);
 });
 
 test("retryCooldown rejects malformed, mismatched, stale, future, and superseded epochs", () => {
@@ -4743,6 +4765,19 @@ test("reconcileOwnedDispatchClaim: successful child completion invokes state-sco
     releaseFailedDispatchClaimFn: async (...args) => { failureCalls.push(args); return true; },
   }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" });
   assert.equal(failureCalls.length, 1);
+});
+
+test("reconcileOwnedDispatchClaim preserves exact claims retained for provider or capacity recovery", async () => {
+  let releases = 0;
+  const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "exit",
+    pick: { sweep: "dev", issueId: "issue-144", issueIdentifier: "COD-144", ownerToken: "owner-144", claimDeclarationId: "decl-144" },
+  }, "codex", {
+    preserveTerminalClaim: true,
+    releaseFailedDispatchClaimFn: async () => { releases += 1; return true; },
+  });
+  assert.deepEqual(result, { attempted: true, released: false, reasonKind: "terminal recovery retained" });
+  assert.equal(releases, 0);
 });
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
