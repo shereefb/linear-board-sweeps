@@ -6,7 +6,7 @@
   "projectId": "81455eb7-1ead-474d-a0c1-54efe75f821e",
   "issuePrefix": "COD",
   "repos": ["linear-board-sweeps"],
-  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
+  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. Each scheduled stage may declare one singular, optional Claude fallback: it runs only after positively classified Codex personal/model usage exhaustion. Workspace credits/spend caps and every generic failure fail closed. Claude must be installed and authenticated on the runner. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
   "runtime": "codex",
   "models": {
     "spec": { "model": "gpt-5.6-sol", "effort": "high" },
@@ -15,11 +15,11 @@
     "ship": { "model": "gpt-5.6-terra", "effort": "medium" }
   },
   "runtimes": {
-    "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
-    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
+    "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-fable-5" } },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "high" } },
     "review": { "runtime": "claude", "model": "claude-opus-4-8" },
-    "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
-    "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
+    "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-opus-4-8" } },
+    "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "medium" } }
   },
   "$comment_parallel": "Bounded workspace parallelism, same-repo per-card fan-out, mid-batch same-repo refill, and bounded drain-after-dispatch. maxNonShipDispatches counts selected non-Ship workspace/sweep candidates and caps follow-up handoff dispatches per parent tick; Ship is one child per source workspace and may coexist with every stage. sameRepoCardLimits counts active child slots inside each selected non-Ship candidate; maxSameRepoRefillDispatches clamps 0..20 and caps same-repo child slots backfilled after successful child completion. maxHandoffTriggerHops controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses is clamped to 1..5. Ship is never handoff-triggered.",
   "parallel": {

@@ -623,21 +623,48 @@ test("fallbackRuntimeConfigForSweep: rejects malformed, unsupported, and incompl
     runtime: "claude", model: "claude-sonnet-5", effort: undefined,
   });
 });
-test("default configs use the stage-specific GPT-5.6 models", () => {
+test("default configs retain Codex primaries and declare the four Claude usage fallbacks", () => {
   const expected = {
     spec: { runtime: "codex", model: "gpt-5.6-sol", effort: "high" },
     dev: { runtime: "codex", model: "gpt-5.6-terra", effort: "high" },
     qa: { runtime: "codex", model: "gpt-5.6-sol", effort: "medium" },
     ship: { runtime: "codex", model: "gpt-5.6-terra", effort: "medium" },
   };
+  const expectedFallbacks = {
+    spec: { runtime: "claude", model: "claude-fable-5" },
+    dev: { runtime: "claude", model: "claude-sonnet-5", effort: "high" },
+    qa: { runtime: "claude", model: "claude-opus-4-8" },
+    ship: { runtime: "claude", model: "claude-sonnet-5", effort: "medium" },
+  };
   for (const file of ["templates/linear-sweep.json", ".claude/linear-sweep.json"]) {
     const config = JSON.parse(fs.readFileSync(file, "utf8"));
     for (const sweep of SWEEPS) {
       assert.deepEqual(runtimeConfigForSweep(config, sweep), expected[sweep], `${file} ${sweep}`);
       assert.deepEqual({ runtime: config.runtime, ...config.models[sweep] }, expected[sweep], `${file} legacy ${sweep}`);
+      assert.deepEqual(config.runtimes[sweep].fallback, expectedFallbacks[sweep], `${file} fallback ${sweep}`);
+      assert.deepEqual(fallbackRuntimeConfigForSweep(config, sweep), {
+        ...expectedFallbacks[sweep], effort: expectedFallbacks[sweep].effort,
+      }, `${file} resolved fallback ${sweep}`);
     }
     assert.deepEqual(config.runtimes.review, { runtime: "claude", model: "claude-opus-4-8" }, `${file} review`);
   }
+});
+
+test("operator docs explain Claude usage fallback configuration and limits", () => {
+  const readme = fs.readFileSync("README.md", "utf8");
+  assert.doesNotMatch(readme, /Claude usage fallback \(planned, COD-144\)/);
+  assert.match(readme, /one capacity reservation[^\n]*at most two sequential attempts/i);
+  assert.match(readme, /auth, model, network, overload, signal, and transient rate-limit failures[^\n]*fail closed/i);
+  assert.match(readme, /normalized run-record `attempts`/i);
+
+  const setup = fs.readFileSync("SETUP.md", "utf8");
+  for (const stage of SWEEPS) assert.match(setup, new RegExp(`"${stage}"\\s*:\\s*\\{[^\\n]*"fallback"`), `SETUP ${stage} fallback`);
+  assert.match(setup, /claude --version/);
+  assert.match(setup, /attended `claude` login verification/i);
+  assert.match(setup, /Codex JSONL[^\n]*source\/version compatibility/i);
+  assert.match(setup, /remove `fallback`[^\n]*disable/i);
+  assert.match(setup, /dry-run[^\n]*cannot synthesize a real exhaustion event/i);
+  assert.match(setup, /node --test --test-name-pattern='default configs\|operator docs\|runtime' tests\/linear-watch\.test\.mjs tests\/agents-snippet\.test\.mjs/);
 });
 
 test("SWEEP_CFG fetches concise board states", () => {
