@@ -163,6 +163,59 @@ test("reports a spec verification ID missing from the plan", () => {
   assert.ok(diagnosticCodes(result).includes("missing-plan-mapping"));
 });
 
+test("reads required plan IDs only from verification traceability", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, requiredSpec());
+  fs.writeFileSync(planPath, [
+    "Verification contract: verification-contract/v1 — required — behavior changes",
+    "",
+    "## Copied verification obligations",
+    table(verificationHeaders, [["V1", "C1", "copied", "copied", "copied", "copied"]]),
+    "",
+    "## Verification traceability",
+    table(traceabilityHeaders, [["V2", "Task 2", "test", "red", "green", "qa", "none"]]),
+  ].join("\n"));
+
+  const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
+  assert.equal(result.ok, false);
+  assert.ok(diagnosticCodes(result).includes("missing-plan-mapping"));
+});
+
+test("reads required spec IDs only from verification obligations", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, [
+    requiredSpec([
+      ["V1", "C1", "a", "b", "c", "d"],
+      ["V2", "", "e", "f", "g", "h"],
+    ]),
+    "",
+    "## Copied verification traceability",
+    table(traceabilityHeaders, [["V1", "Task 2", "test", "red", "green", "qa", "none"]]),
+  ].join("\n"));
+  fs.writeFileSync(planPath, requiredPlan());
+
+  const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
+  assert.equal(result.ok, false);
+  assert.ok(diagnosticCodes(result).includes("missing-plan-mapping"));
+});
+
+test("rejects arbitrary and nonsequential required verification IDs", () => {
+  for (const rows of [
+    [["proof-1", "C1", "a", "b", "c", "d"]],
+    [
+      ["V1", "C1", "a", "b", "c", "d"],
+      ["V3", "", "e", "f", "g", "h"],
+    ],
+  ]) {
+    const result = validator.parseVerificationArtifact(requiredSpec(rows));
+    assert.ok(diagnosticCodes(result).includes("invalid-verification-id"));
+  }
+});
+
 test("rejects required contracts with no verification obligations", () => {
   const root = tempDirectory();
   const specPath = path.join(root, "spec.md");
@@ -300,4 +353,22 @@ test("CLI exits zero only for valid contracts and two for malformed input", () =
   fs.writeFileSync(planPath, "# missing\n");
   const invalid = spawnSync(process.execPath, [validatorPath, "validate", "--spec", specPath, "--plan", planPath], { encoding: "utf8" });
   assert.equal(invalid.status, 2, invalid.stderr);
+});
+
+test("CLI rejects unknown, extra, and malformed arguments", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, requiredSpec());
+  fs.writeFileSync(planPath, requiredPlan());
+
+  for (const args of [
+    ["validate", "--spec", specPath, "--plan", planPath, "--unknown"],
+    ["validate", "--spec", specPath, "--plan", planPath, "extra"],
+    ["validate", "--spec", specPath, "--spec", specPath, "--plan", planPath],
+    ["validate", "--spec", "--plan", planPath],
+  ]) {
+    const result = spawnSync(process.execPath, [validatorPath, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 2, `${args.join(" ")}\n${result.stderr}`);
+  }
 });

@@ -72,6 +72,10 @@ function unique(values) {
   return [...new Set(values)];
 }
 
+function hasStableVerificationIds(ids) {
+  return ids.every((id, index) => id === `V${index + 1}`);
+}
+
 export function parseVerificationArtifact(markdown) {
   const diagnostics = [];
   const declaration = markdown.match(/verification contract\s*:\s*verification-contract\/v1\s*[—-]\s*(required|not required)\b/i);
@@ -81,10 +85,13 @@ export function parseVerificationArtifact(markdown) {
   const tables = markdownTables(markdown);
   const obligationTable = tableWithHeaders(tables, verificationHeaders);
   const traceabilityTable = tableWithHeaders(tables, traceabilityHeaders);
-  const table = obligationTable ?? traceabilityTable;
-  const verificationIds = table ? table.rows.map((row) => row[0].trim().toUpperCase()).filter(Boolean) : [];
+  const idsFromTable = (table) => table ? table.rows.map((row) => row[0].trim().toUpperCase()).filter(Boolean) : [];
+  const obligationIds = idsFromTable(obligationTable);
+  const traceabilityIds = idsFromTable(traceabilityTable);
+  const verificationIds = obligationTable ? obligationIds : traceabilityIds;
   const duplicateIds = verificationIds.filter((id, index) => verificationIds.indexOf(id) !== index);
   if (duplicateIds.length) diagnostics.push(diagnostic("duplicate-verification-id"));
+  if (applicability === "required" && !hasStableVerificationIds(verificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
 
   const correctnessTable = tableWithHeaders(tables, correctnessHeaders);
   const correctnessIds = unique((correctnessTable?.rows ?? []).map((row) => row[0].trim().toUpperCase()).filter((id) => /^C\d+$/.test(id)));
@@ -111,7 +118,9 @@ export function parseVerificationArtifact(markdown) {
     diagnostics,
     hasObligationTable: Boolean(obligationTable),
     hasTraceabilityTable: Boolean(traceabilityTable),
+    obligationIds,
     traceabilityRows: traceabilityTable?.rows ?? [],
+    traceabilityIds,
     sourcesByVerificationId,
   };
 }
@@ -183,9 +192,12 @@ export function validateVerificationContract({ specPath, planPath, repoRoot = pr
     diagnostics.push(diagnostic("not-required-has-obligations"));
   }
   if (spec.applicability === "required") {
-    if (!spec.verificationIds.length) diagnostics.push(diagnostic("missing-verification-obligation"));
-    for (const id of spec.verificationIds) {
-      if (!plan.verificationIds.includes(id)) diagnostics.push(diagnostic("missing-plan-mapping"));
+    const specVerificationIds = spec.obligationIds;
+    const planVerificationIds = plan.traceabilityIds;
+    if (!specVerificationIds.length) diagnostics.push(diagnostic("missing-verification-obligation"));
+    if (!hasStableVerificationIds(specVerificationIds) || !hasStableVerificationIds(planVerificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
+    for (const id of specVerificationIds) {
+      if (!planVerificationIds.includes(id)) diagnostics.push(diagnostic("missing-plan-mapping"));
     }
     if (!spec.hasObligationTable) diagnostics.push(diagnostic("missing-obligation-table"));
     if (!plan.hasTraceabilityTable) diagnostics.push(diagnostic("missing-plan-mapping"));
@@ -199,7 +211,7 @@ export function validateVerificationContract({ specPath, planPath, repoRoot = pr
     ok: normalizedDiagnostics.length === 0,
     applicability: spec.applicability,
     legacy: false,
-    verificationIds: spec.verificationIds,
+    verificationIds: spec.applicability === "required" ? spec.obligationIds : spec.verificationIds,
     diagnostics: normalizedDiagnostics,
   };
 }
@@ -209,11 +221,10 @@ function uniqueDiagnostics(diagnostics) {
 }
 
 function parseCli(args) {
-  if (args[0] !== "validate") return null;
-  const specIndex = args.indexOf("--spec");
-  const planIndex = args.indexOf("--plan");
-  if (specIndex === -1 || planIndex === -1 || !args[specIndex + 1] || !args[planIndex + 1]) return null;
-  return { specPath: args[specIndex + 1], planPath: args[planIndex + 1] };
+  if (args.length !== 5 || args[0] !== "validate" || args[1] !== "--spec" || args[3] !== "--plan") return null;
+  const [, , specPath, , planPath] = args;
+  if (!specPath || !planPath || specPath.startsWith("--") || planPath.startsWith("--")) return null;
+  return { specPath, planPath };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
