@@ -4,7 +4,6 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { resolveClaimOwnership } from "./claim-ownership.mjs";
 //
 // Usage:
 //   node linear.mjs whoami
@@ -201,7 +200,8 @@ const COMPLETE_ISSUE_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(
 
 export async function fetchCompleteIssueComments(issueId, { gqlFn = gql } = {}) {
   const comments = [];
-  const seen = new Set();
+  const seenCursors = new Set();
+  const seenCommentIds = new Set();
   let cursor = null;
   while (true) {
     const data = await gqlFn(COMPLETE_ISSUE_COMMENTS_QUERY, { id: issueId, cursor });
@@ -209,11 +209,20 @@ export async function fetchCompleteIssueComments(issueId, { gqlFn = gql } = {}) 
     if (!Array.isArray(page?.nodes) || typeof page?.pageInfo?.hasNextPage !== "boolean") {
       throw new Error("claim comments unreadable");
     }
+    for (const comment of page.nodes) {
+      if (typeof comment?.id !== "string" || !comment.id
+          || typeof comment.body !== "string"
+          || typeof comment.createdAt !== "string" || !Number.isFinite(Date.parse(comment.createdAt))) {
+        throw new Error("claim comments unreadable");
+      }
+      if (seenCommentIds.has(comment.id)) throw new Error(`duplicate comment id: ${comment.id}`);
+      seenCommentIds.add(comment.id);
+    }
     comments.push(...page.nodes);
     if (!page.pageInfo.hasNextPage) break;
     cursor = page.pageInfo.endCursor;
-    if (!cursor || seen.has(cursor)) throw new Error("claim comments pagination incomplete");
-    seen.add(cursor);
+    if (!cursor || seenCursors.has(cursor)) throw new Error("claim comments pagination incomplete");
+    seenCursors.add(cursor);
   }
   return comments.sort((a, b) => Date.parse(a?.createdAt) - Date.parse(b?.createdAt)
     || (String(a?.id || "") < String(b?.id || "") ? -1 : String(a?.id || "") > String(b?.id || "") ? 1 : 0));
@@ -551,6 +560,12 @@ export async function moveCardBottomIfCurrent(
   const destination = (await destinationCardsWith(gqlFn, issue.project.id, destinationState))
     .filter((card) => card.id !== issue.id);
 
+  let comments;
+  try {
+    comments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`, { cause });
+  }
   const current = await gqlFn(
     `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } } }`,
     { id: issue.id },
@@ -562,18 +577,7 @@ export async function moveCardBottomIfCurrent(
       || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
     throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
   }
-  let comments;
-  try {
-    comments = await fetchCompleteIssueComments(issue.id, { gqlFn });
-  } catch (cause) {
-    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`, { cause });
-  }
-  const ownership = resolveClaimOwnership({
-    comments,
-    complete: true,
-    claim: ownedClaim,
-    labelPresent: labels.some((label) => label.name === ownedClaim),
-  });
+  const heartbeat = latestClaimHeartbeat(comments, ownedClaim);
   const decision = guardedTerminalMoveDecision({
     stateName: finalIssue.state.name,
     expectedState,
@@ -581,8 +585,8 @@ export async function moveCardBottomIfCurrent(
     labelNames: labels.map((label) => label.name),
     ownedClaim,
     ownerToken,
-    heartbeatOwner: ownership.status === "owned" ? ownership.ownerToken : null,
-    heartbeatMalformed: ownership.status === "ambiguous",
+    heartbeatOwner: heartbeat.owner,
+    heartbeatMalformed: heartbeat.malformed,
   });
   if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
   const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;

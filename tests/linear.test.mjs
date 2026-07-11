@@ -34,6 +34,26 @@ test("fetchCompleteIssueComments paginates claim history and rejects cursor cycl
   } } }) }), /pagination incomplete/);
 });
 
+test("fetchCompleteIssueComments rejects malformed nodes and duplicate ids across pages", async () => {
+  for (const node of [
+    { id: "", body: "body", createdAt: "2026-07-11T00:00:01.000Z" },
+    { id: "c1", createdAt: "2026-07-11T00:00:01.000Z" },
+    { id: "c1", body: "body", createdAt: "not-a-date" },
+  ]) {
+    await assert.rejects(fetchCompleteIssueComments("issue", {
+      gqlFn: async () => ({ issue: { comments: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } } } }),
+    }), /comments unreadable/);
+  }
+  let call = 0;
+  const pages = [
+    { nodes: [{ id: "duplicate", body: "one", createdAt: "2026-07-11T00:00:01.000Z" }], pageInfo: { hasNextPage: true, endCursor: "next" } },
+    { nodes: [{ id: "duplicate", body: "two", createdAt: "2026-07-11T00:00:02.000Z" }], pageInfo: { hasNextPage: false, endCursor: null } },
+  ];
+  await assert.rejects(fetchCompleteIssueComments("issue", {
+    gqlFn: async () => ({ issue: { comments: pages[call++] } }),
+  }), /duplicate comment id/);
+});
+
 const QA_HANDOFF_BASE = Object.freeze({
   fastPathEnabled: true,
   requireShipApproval: false,
@@ -236,7 +256,7 @@ test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUp
     } };
     if (query.includes("comments(first:100")) return { issue: {
       comments: { pageInfo: { hasNextPage: false }, nodes: [
-        { id: "claim-declaration", body: "[auto-sweep-claim v1 claim=qa:in-progress owner=owner-142 declaration=d-142]", createdAt: "2026-07-10T10:05:00.000Z" },
+        { id: "legacy-heartbeat", body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
       ] },
     } };
     if (query.includes("issues(first:100")) return {
@@ -251,8 +271,10 @@ test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUp
   const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
   assert.equal(result.moved, true);
   const destinationIndex = calls.findIndex((call) => call.query.includes("issues(first:100"));
-  const guardIndex = calls.findIndex((call) => call.query.includes("comments(first:100"));
-  assert.ok(destinationIndex >= 0 && guardIndex > destinationIndex, "destination pagination must precede the final guard read");
+  const commentsIndex = calls.findIndex((call) => call.query.includes("comments(first:100"));
+  const finalFactsIndex = calls.findIndex((call) => call.query.includes("labels(first:250"));
+  assert.ok(destinationIndex >= 0 && commentsIndex > destinationIndex, "destination pagination must precede claim-history pagination");
+  assert.ok(finalFactsIndex > commentsIndex, "the final state/labels guard must follow claim-history pagination");
   assert.deepEqual(calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{
     id: "issue-142",
     input: { stateId: "ship-state", sortOrder: -9, removedLabelIds: ["claim"] },
@@ -278,7 +300,7 @@ for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["d
       } };
       if (query.includes("comments(first:100")) return { issue: {
         comments: { pageInfo: { hasNextPage: false }, nodes: [
-          { id: "claim-declaration", body: "[auto-sweep-claim v1 claim=qa:in-progress owner=owner-142 declaration=d-142]", createdAt: "2026-07-10T10:05:00.000Z" },
+          { id: "legacy-heartbeat", body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
         ] },
       } };
       throw new Error(`unexpected query: ${query}`);
@@ -290,6 +312,40 @@ for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["d
     assert.equal(calls.some((query) => query.includes("issueUpdate")), false);
   });
 }
+
+test("moveCardBottomIfCurrent denies a blocker added while claim history paginates", async () => {
+  const calls = [];
+  let commentPage = 0;
+  const gqlFn = async (query) => {
+    calls.push(query);
+    if (query.includes("project { id }")) return { issue: {
+      id: "issue-142", identifier: "COD-142", project: { id: "project" },
+      team: { states: { nodes: [{ id: "ship-state", name: "Ship" }] } },
+    } };
+    if (query.includes("issues(first:100")) return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
+    if (query.includes("comments(first:100")) return { issue: { comments: [
+      { pageInfo: { hasNextPage: true, endCursor: "next" }, nodes: [
+        { id: "old", body: "ordinary", createdAt: "2026-07-10T10:00:00.000Z" },
+      ] },
+      { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+        { id: "heartbeat", body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+      ] },
+    ][commentPage++] } };
+    if (query.includes("labels(first:250)")) return { issue: {
+      id: "issue-142", identifier: "COD-142", state: { name: "QA" },
+      labels: { pageInfo: { hasNextPage: false }, nodes: [
+        { id: "claim", name: "qa:in-progress" }, { id: "blocker", name: "blocked:needs-user" },
+      ] },
+    } };
+    throw new Error(`unexpected query: ${query}`);
+  };
+
+  const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
+  assert.deepEqual(result, { moved: false, issue: "COD-142", reason: "blocking-label" });
+  assert.ok(calls.findIndex((query) => query.includes("comments(first:100"))
+    < calls.findIndex((query) => query.includes("labels(first:250)")));
+  assert.equal(calls.some((query) => query.includes("issueUpdate")), false);
+});
 
 test("required setup taxonomy includes the exact learning provenance label", () => {
   assert.equal(REQUIRED_LABELS.filter((label) => label.name === "factory:learning-generated").length, 1);
@@ -417,7 +473,7 @@ function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in
     labels: { pageInfo: { hasNextPage: false }, nodes: labelNames.map((name, index) => ({ id: `label-${index}`, name })) },
   };
   const finalComments = unreadable ? null : { pageInfo: { hasNextPage: !commentsComplete, endCursor: null }, nodes: [
-    { id: "claim-declaration", body: `[auto-sweep-claim v1 claim=qa:in-progress owner=${heartbeatOwner} declaration=d-142]`, createdAt: "2026-07-10T10:05:00.000Z" },
+    { id: "legacy-heartbeat", body: `[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=${heartbeatOwner} claim=qa:in-progress]`, createdAt: "2026-07-10T10:05:00.000Z" },
   ] };
   const preloadSource = `globalThis.fetch = async (_url, options) => {
     const { query } = JSON.parse(options.body);

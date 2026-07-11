@@ -61,7 +61,8 @@ function compareClaimComments(a, b) {
 
 export async function fetchCompleteClaimComments(apiKey, issueId, { gqlFn = gql } = {}) {
   const comments = [];
-  const seen = new Set();
+  const seenCursors = new Set();
+  const seenCommentIds = new Set();
   let cursor = null;
   while (true) {
     const result = await gqlFn(CLAIM_COMMENTS_QUERY, { id: issueId, cursor }, apiKey);
@@ -70,11 +71,20 @@ export async function fetchCompleteClaimComments(apiKey, issueId, { gqlFn = gql 
     if (!Array.isArray(page?.nodes) || typeof page?.pageInfo?.hasNextPage !== "boolean") {
       throw new Error("claim comments unreadable");
     }
+    for (const comment of page.nodes) {
+      if (typeof comment?.id !== "string" || !comment.id
+          || typeof comment.body !== "string"
+          || typeof comment.createdAt !== "string" || !Number.isFinite(Date.parse(comment.createdAt))) {
+        throw new Error("claim comments unreadable");
+      }
+      if (seenCommentIds.has(comment.id)) throw new Error(`duplicate comment id: ${comment.id}`);
+      seenCommentIds.add(comment.id);
+    }
     comments.push(...page.nodes);
     if (!page.pageInfo.hasNextPage) break;
     cursor = page.pageInfo.endCursor;
-    if (!cursor || seen.has(cursor)) throw new Error("claim comments pagination incomplete");
-    seen.add(cursor);
+    if (!cursor || seenCursors.has(cursor)) throw new Error("claim comments pagination incomplete");
+    seenCursors.add(cursor);
   }
   return comments.sort(compareClaimComments);
 }

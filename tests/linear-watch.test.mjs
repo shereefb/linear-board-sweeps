@@ -93,6 +93,22 @@ test("fetchCompleteClaimComments rejects cursor cycles and unreadable pages", as
   }), /comments unreadable/);
 });
 
+test("fetchCompleteClaimComments rejects malformed nodes and duplicate ids across pages", async () => {
+  for (const node of [
+    { id: "", body: "body", createdAt: claimIso(1) },
+    { id: "c1", createdAt: claimIso(1) },
+    { id: "c1", body: "body", createdAt: "not-a-date" },
+  ]) {
+    await assert.rejects(fetchCompleteClaimComments("key", "issue", {
+      gqlFn: async () => ({ issue: { comments: { nodes: [node], pageInfo: { hasNextPage: false, endCursor: null } } } }),
+    }), /comments unreadable/);
+  }
+  await assert.rejects(fetchCompleteClaimComments("key", "issue", { gqlFn: claimCommentPages([
+    { nodes: [{ id: "duplicate", body: "one", createdAt: claimIso(1) }], hasNextPage: true, endCursor: "next" },
+    { nodes: [{ id: "duplicate", body: "two", createdAt: claimIso(2) }], hasNextPage: false, endCursor: null },
+  ]) }), /duplicate comment id/);
+});
+
 test("scheduled snapshots are never complete ownership evidence", () => {
   const snapshotNode = {
     id: "issue", identifier: "COD-169", updatedAt: claimIso(1), sortOrder: 1,
