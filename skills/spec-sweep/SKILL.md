@@ -15,6 +15,10 @@ Autonomously turn this repo's Linear "Spec" cards into review-hardened specs + i
 
 ## 0. Preflight (fail fast, cleanly)
 
+### Direct manual handoff
+
+When `MANUAL_SWEEP_STAGE=spec`, process only `MANUAL_SWEEP_ISSUE` in its expected Spec state. It is the interactive canonical Spec path: perform brainstorming and prose review decisions, then claim/heartbeat only that card, validate route and dependencies before mutation, write/reuse `[manual-sweep-handoff spec <id>]`, and release only the owned claim. Scheduled selection still skips `sweep:manual-only`.
+
 - **Load workspace config.** In scheduled mode, read `$AUTO_SWEEP_ANCHOR/.claude/linear-sweep.json`; otherwise read `.claude/linear-sweep.json` from the current repo root. The routed primary repo may be a sibling and is not required to carry a duplicate config. It provides `teamName`, `teamKey`, `project`, `projectId`, `issuePrefix`, `repos`, `specsDir`, `plansDir`, `canonicalDocs`, `deploy`, `credentialsNote`. Every SafeTaper-style hardcode below is replaced by these values. If the file is missing, exit with a one-line error telling the user to create it.
 - **Require `LINEAR_API_KEY`.** Load it from the environment or the repo's gitignored `.env` (`set -a && . ./.env && set +a`). If unset, exit immediately with a clear one-line error — do not attempt to recover a key from transcripts. Confirm git push credentials and any other credentials named in `config.credentialsNote` if a card needs live data.
 - **Scope:** team = `config.teamName` (key `config.teamKey`); operate only within the `config.project` project. Repos to touch: `config.repos`.
