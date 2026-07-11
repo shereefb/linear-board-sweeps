@@ -13,7 +13,9 @@ Read `.claude/linear-sweep.json`. For a description, create its project card in 
 
 ## Canonical handoffs
 
-Invoke exactly one named canonical skill at a time with `MANUAL_SWEEP_ISSUE`, `MANUAL_SWEEP_STAGE`, `MANUAL_SWEEP_EXPECTED_STATE`, and a unique `MANUAL_SWEEP_HANDOFF_ID`. The target skill must validate its stage, card state, dependencies, route, and foreign claims; claim only that card; write `[manual-sweep-handoff <stage> <id>]`; heartbeat; and release only its own claim. It must never process another card. Scheduled runs never honor this contract.
+Invoke exactly one named canonical skill at a time with `MANUAL_SWEEP_ISSUE`, `MANUAL_SWEEP_STAGE`, `MANUAL_SWEEP_EXPECTED_STATE`, and a unique `MANUAL_SWEEP_HANDOFF_ID`. For each attended stage, create separate random `AUTO_SWEEP_OWNER_TOKEN` and `AUTO_SWEEP_CLAIM_DECLARATION` values. The target skill must validate its stage, card state, dependencies, route, and foreign claims; post `[auto-sweep-claim v1 claim=<stage:in-progress> owner=<owner> declaration=<declaration>]` before adding the claim label; complete-read history and accept only the first-declaration-wins epoch; and write `[manual-sweep-handoff <stage> <id>]`. It must never process another card. Scheduled runs never honor this contract.
+
+During the handoff, `[auto-sweep-heartbeat v1 claim=<stage:in-progress> declaration=<declaration> at=<ISO8601>]` is liveness only, never ownership. Before every claim-affecting exit, the target must re-read complete history, verify both exact tokens, post and verify `[auto-sweep-claim-close v1 claim=<stage:in-progress> declaration=<declaration> reason=<released|terminal|blocked|failed>]`, then remove the label or mutate state. Never manufacture a declaration for an existing legacy label.
 
 First invoke direct `spec`; canonical Spec owns the interactive brainstorming, prose review decisions, and committed spec/plan. After Spec succeeds, ask once whether to fast-track. On no, stop in the normal manual-only flow.
 

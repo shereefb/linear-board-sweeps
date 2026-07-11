@@ -4,13 +4,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { claimCloseMarker, parseClaimMarker, resolveClaimOwnership } from "./claim-ownership.mjs";
 //
 // Usage:
 //   node linear.mjs whoami
 //   node linear.mjs setup-team "<Team name or key>"        # create missing sweep statuses + labels (idempotent)
 //   node linear.mjs ensure-project "<Team>" "<Project>"    # find or create a project; prints its id
 //   node linear.mjs create-card "<projectId>" "<State>" "<Title>" "<Description>" "Label1,Label2"
-//   node linear.mjs move-card-bottom-if-current "<Issue>" "<ExpectedState>" "<DestinationState>" "<OwnedClaim>" "<OwnerToken>"
+//   node linear.mjs move-card-bottom-if-current "<Issue>" "<ExpectedState>" "<DestinationState>" "<OwnedClaim>" "<OwnerToken>" "<DeclarationId>"
 //   node linear.mjs retire-state "<projectId>" "In Progress" "Dev"
 //   node linear.mjs rename-states "<projectId>"            # rename legacy board states in place
 //   node linear.mjs dependency-status "<Issue>"             # JSON; exits 0 ready, 3 blocked, 2 unreadable
@@ -193,26 +194,37 @@ const TERMINAL_MOVE_CLAIM_BY_STATE = Object.freeze({
   [WORKFLOW_STATES.qa]: "qa:in-progress",
   [WORKFLOW_STATES.ship]: "ship:in-progress",
 });
-const CLAIM_HEARTBEAT_PREFIX = "[auto-sweep-heartbeat";
-const CLAIM_HEARTBEAT = /^\[auto-sweep-heartbeat\s+\S+\s+owner=([^\]\s]+)\s+claim=([^\]\s]+)\]/;
 
-export function latestClaimHeartbeat(comments, ownedClaim, { complete = true } = {}) {
-  if (!complete) throw new Error("comments incomplete");
-  if (!Array.isArray(comments)) throw new Error("comments unreadable");
-  const relevant = comments
-    .filter((comment) => typeof comment?.body === "string"
-      && comment.body.includes(CLAIM_HEARTBEAT_PREFIX)
-      && comment.body.includes(`claim=${ownedClaim}`))
-    .map((comment) => {
-      const createdAt = Date.parse(comment.createdAt);
-      if (Number.isNaN(createdAt)) throw new Error("heartbeat comment timestamp unreadable");
-      return { body: comment.body, createdAt };
-    })
-    .sort((a, b) => b.createdAt - a.createdAt);
-  if (!relevant.length) return { owner: null, malformed: false };
-  const match = relevant[0].body.match(CLAIM_HEARTBEAT);
-  if (!match || match[2] !== ownedClaim) return { owner: null, malformed: true };
-  return { owner: match[1], malformed: false };
+const COMPLETE_ISSUE_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`;
+
+export async function fetchCompleteIssueComments(issueId, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seenCursors = new Set();
+  const seenCommentIds = new Set();
+  let cursor = null;
+  while (true) {
+    const data = await gqlFn(COMPLETE_ISSUE_COMMENTS_QUERY, { id: issueId, cursor });
+    const page = data?.issue?.comments;
+    if (!Array.isArray(page?.nodes) || typeof page?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("claim comments unreadable");
+    }
+    for (const comment of page.nodes) {
+      if (typeof comment?.id !== "string" || !comment.id
+          || typeof comment.body !== "string"
+          || typeof comment.createdAt !== "string" || !Number.isFinite(Date.parse(comment.createdAt))) {
+        throw new Error("claim comments unreadable");
+      }
+      if (seenCommentIds.has(comment.id)) throw new Error(`duplicate comment id: ${comment.id}`);
+      seenCommentIds.add(comment.id);
+    }
+    comments.push(...page.nodes);
+    if (!page.pageInfo.hasNextPage) break;
+    cursor = page.pageInfo.endCursor;
+    if (!cursor || seenCursors.has(cursor)) throw new Error("claim comments pagination incomplete");
+    seenCursors.add(cursor);
+  }
+  return comments.sort((a, b) => Date.parse(a?.createdAt) - Date.parse(b?.createdAt)
+    || (String(a?.id || "") < String(b?.id || "") ? -1 : String(a?.id || "") > String(b?.id || "") ? 1 : 0));
 }
 
 export function guardedTerminalMoveDecision(input = {}) {
@@ -232,9 +244,6 @@ export function guardedTerminalMoveDecision(input = {}) {
     && labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
   if ([...labels].some((label) => label.endsWith(":in-progress") && label !== facts.ownedClaim)) return deny("foreign-claim");
   if (typeof facts.ownerToken !== "string" || !facts.ownerToken) return deny("missing-owner-token");
-  if (facts.heartbeatMalformed === true) return deny("malformed-heartbeat");
-  if (typeof facts.heartbeatOwner !== "string" || !facts.heartbeatOwner) return deny("missing-owner-heartbeat");
-  if (facts.heartbeatOwner !== facts.ownerToken) return deny("owner-mismatch");
   return { eligible: true, reason: "ready" };
 }
 
@@ -509,10 +518,12 @@ export async function moveCardBottomIfCurrent(
   destinationState,
   ownedClaim,
   ownerToken,
+  declarationId,
   { gqlFn = gql, log = console.log } = {},
 ) {
-  if (![issueIdentifier, expectedState, destinationState, ownedClaim, ownerToken].every((value) => typeof value === "string" && value)) {
-    throw new Error("usage: move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken>");
+  if (![issueIdentifier, expectedState, destinationState, ownedClaim, ownerToken, declarationId]
+    .every((value) => typeof value === "string" && value)) {
+    throw new Error("usage: move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> <DeclarationId>");
   }
   const metadata = await gqlFn(
     `query($id:String!){ issue(id:$id){ id identifier project { id } team { states(first:100){ nodes { id name } } } } }`,
@@ -528,42 +539,111 @@ export async function moveCardBottomIfCurrent(
   const destination = (await destinationCardsWith(gqlFn, issue.project.id, destinationState))
     .filter((card) => card.id !== issue.id);
 
-  const current = await gqlFn(
-    `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } comments(first:250){ pageInfo { hasNextPage } nodes { body createdAt } } } }`,
-    { id: issue.id },
-  );
-  const finalIssue = current?.issue;
-  const labels = finalIssue?.labels?.nodes;
-  const comments = finalIssue?.comments?.nodes;
-  if (!finalIssue?.id || !finalIssue?.identifier || typeof finalIssue?.state?.name !== "string"
-      || !Array.isArray(labels) || finalIssue.labels?.pageInfo?.hasNextPage !== false
-      || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
-    throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
-  }
-  if (!Array.isArray(comments) || finalIssue.comments?.pageInfo?.hasNextPage !== false) {
-    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`);
-  }
-  const heartbeat = latestClaimHeartbeat(comments, ownedClaim);
-  const decision = guardedTerminalMoveDecision({
-    stateName: finalIssue.state.name,
+  const readCurrentFacts = async () => {
+    const current = await gqlFn(
+      `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } } }`,
+      { id: issue.id },
+    );
+    const currentIssue = current?.issue;
+    const currentLabels = currentIssue?.labels?.nodes;
+    if (currentIssue?.id !== issue.id || currentIssue?.identifier !== issue.identifier
+        || typeof currentIssue?.state?.name !== "string"
+        || !Array.isArray(currentLabels) || currentIssue.labels?.pageInfo?.hasNextPage !== false
+        || currentLabels.some((label) => !label?.id || typeof label?.name !== "string")) {
+      throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
+    }
+    return { issue: currentIssue, labels: currentLabels };
+  };
+  const terminalDecision = (currentIssue, currentLabels) => guardedTerminalMoveDecision({
+    stateName: currentIssue.state.name,
     expectedState,
     destinationState,
-    labelNames: labels.map((label) => label.name),
+    labelNames: currentLabels.map((label) => label.name),
     ownedClaim,
     ownerToken,
-    heartbeatOwner: heartbeat.owner,
-    heartbeatMalformed: heartbeat.malformed,
   });
+
+  let comments;
+  try {
+    comments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`, { cause });
+  }
+  const { issue: finalIssue, labels } = await readCurrentFacts();
+  const decision = terminalDecision(finalIssue, labels);
   if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
-  const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;
+  const ownership = resolveClaimOwnership({ comments, complete: true, claim: ownedClaim, labelPresent: true });
+  if (ownership.status !== "owned" || ownership.ownerToken !== ownerToken || ownership.declarationId !== declarationId) {
+    return { moved: false, issue: finalIssue.identifier, reason: "owner-mismatch" };
+  }
+  const closeBody = claimCloseMarker({ claim: ownedClaim, declarationId, reason: "terminal" });
+  const closeResult = await gqlFn(
+    `mutation($id:String!,$b:String!){ commentCreate(input:{ issueId:$id, body:$b }){ success comment { id body createdAt } } }`,
+    { id: issue.id, b: closeBody },
+  );
+  const createdClose = closeResult?.commentCreate?.comment;
+  const createdMarker = parseClaimMarker(createdClose);
+  if (closeResult?.commentCreate?.success !== true || !createdClose?.id
+      || createdClose.body !== closeBody || typeof createdClose.createdAt !== "string"
+      || !Number.isFinite(Date.parse(createdClose.createdAt))
+      || createdMarker?.type !== "close" || createdMarker.claim !== ownedClaim
+      || createdMarker.declarationId !== declarationId || createdMarker.reason !== "terminal") {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close failed.`);
+  }
+  let closedComments;
+  try {
+    closedComments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close unverified.`, { cause });
+  }
+  const closedOwnership = resolveClaimOwnership({
+    comments: closedComments,
+    complete: true,
+    claim: ownedClaim,
+    labelPresent: true,
+  });
+  const rereadClose = closedComments.find((comment) => comment.id === createdClose.id);
+  const rereadMarker = parseClaimMarker(rereadClose);
+  if (closedOwnership.status !== "legacy-unowned"
+      || closedOwnership.boundaryCommentId !== createdClose.id
+      || rereadMarker?.type !== "close" || rereadMarker.claim !== ownedClaim
+      || rereadMarker.declarationId !== declarationId || rereadMarker.reason !== "terminal") {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close unverified.`);
+  }
+  const { issue: postCloseIssue, labels: postCloseLabels } = await readCurrentFacts();
+  const postCloseDecision = terminalDecision(postCloseIssue, postCloseLabels);
+  if (!postCloseDecision.eligible) {
+    return { moved: false, issue: postCloseIssue.identifier, reason: postCloseDecision.reason };
+  }
+  const ownedClaimId = postCloseLabels.find((label) => label.name === ownedClaim)?.id;
   if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
+  let preMutationComments;
+  try {
+    preMutationComments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close lost authority.`, { cause });
+  }
+  const preMutationOwnership = resolveClaimOwnership({
+    comments: preMutationComments,
+    complete: true,
+    claim: ownedClaim,
+    labelPresent: true,
+  });
+  if (preMutationOwnership.status !== "legacy-unowned"
+      || preMutationOwnership.boundaryCommentId !== createdClose.id) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close lost authority.`);
+  }
   const input = guardedTerminalMoveInput(destinationStateId, destination, ownedClaimId);
   const result = await gqlFn(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
     { id: issue.id, input },
   );
   const moved = result?.issueUpdate?.issue;
-  if (result?.issueUpdate?.success !== true || !moved) throw new Error(`Issue "${issueIdentifier}" guarded move failed.`);
+  if (result?.issueUpdate?.success !== true || moved?.identifier !== issue.identifier
+      || moved?.state?.name !== destinationState || moved?.sortOrder !== input.sortOrder
+      || typeof moved?.url !== "string" || !moved.url) {
+    throw new Error(`Issue "${issueIdentifier}" guarded move response unreadable.`);
+  }
   log(`${moved.identifier} -> ${moved.state.name} bottom (sortOrder=${moved.sortOrder})\n  ${moved.url}`);
   return { moved: true, issue: moved.identifier, destination: moved.state.name, sortOrder: moved.sortOrder, url: moved.url };
 }
@@ -682,7 +762,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     "move-card-bottom": () => moveCardBottom(args[0], args[1]),
     "move-card-bottom-if-current": async () => {
       try {
-        const result = await moveCardBottomIfCurrent(args[0], args[1], args[2], args[3], args[4], { log: () => {} });
+        const result = await moveCardBottomIfCurrent(args[0], args[1], args[2], args[3], args[4], args[5], { log: () => {} });
         console.log(JSON.stringify(result));
         process.exitCode = result.moved ? 0 : 3;
       } catch (error) {
@@ -770,7 +850,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     query: () => gql(args[0]).then((d) => console.log(JSON.stringify(d, null, 2))),
   };
   if (!run[cmd]) {
-    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
+    console.error("Commands: whoami | setup-team <team> | ensure-project <team> <project> | create-card <projectId> <state> <title> <desc> [labels] | move-card-bottom <Issue> <State> | move-card-bottom-if-current <Issue> <ExpectedState> <DestinationState> <OwnedClaim> <OwnerToken> <DeclarationId> | retire-state <projectId> <FromState> <ToState> | rename-states <projectId> | repo-status <Issue> <Label> <Repo> | dependency-status <Issue> | query <graphql>");
     process.exit(1);
   }
   run[cmd]().catch((e) => { console.error(String(e.message || e)); process.exit(1); });
