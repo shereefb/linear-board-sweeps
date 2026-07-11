@@ -16,6 +16,8 @@ test("Spec declares a risk-proportional performance contract", () => {
 });
 
 test("Plan traceability keeps proof kinds closed", () => {
+  assert.match(skill.spec, /Every P ID must select exactly one proof kind: `?measured`? \| `?deterministic-bound`?/i);
+  assert.match(skill.spec, /(missing|multiple|other)[^]*proof kind[^]*(reject|invalid|fail closed)/i);
   assert.match(skill.spec, /Performance traceability[^]*Proof kind[^]*Implementing task[^]*Proof command \/ fixture[^]*Expected evidence and pass condition[^]*QA observation[^]*Residual risk/i);
   assert.match(skill.spec, /measured[^]*environment[^]*baseline[^]*candidate[^]*statistic[^]*threshold[^]*result/i);
   assert.match(skill.spec, /deterministic-bound[^]*declared bound[^]*assertion command[^]*observed maximum[^]*pass\/fail/i);
@@ -39,11 +41,15 @@ test("QA validates identity and invalidates stale proof", () => {
 
 test("one shared legacy boundary composes in either order", () => {
   const joined = `${skill.spec}\n${skill.dev}`;
+  assert.match(joined, /Versioned contract boundary: versioned-contract-boundary\/v1/i);
   assert.match(joined, /(one|single) shared/i);
   assert.match(joined, /artifact[^]*first introduced[^]*\.sweep-version/i);
+  assert.match(joined, /git log[^]*--diff-filter=A[^]*\.sweep-version/i);
+  assert.match(joined, /git merge-base --is-ancestor/i);
   assert.match(joined, /(performance.*first|COD-158.*first)[^]*(install|create)[^]*shared/i);
   assert.match(joined, /(correctness.*present|COD-155.*first)[^]*(reuse|extend)[^]*shared/i);
   assert.match(joined, /missing or incomparable[^]*fail closed/i);
+  assert.match(skill.dev, /versioned-contract-boundary\/v1[^]*missing or incomparable[^]*fail closed/i);
 });
 
 test("canonical and installed skills are exact bytes", () => {
