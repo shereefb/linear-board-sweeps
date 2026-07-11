@@ -4577,8 +4577,8 @@ test("SWEEP_CFG.ship exists and the derived lists include it", () => {
 test("SWEEP_CFG: every scheduled sweep treats manual-only cards as blocked", () => {
   for (const sweep of SWEEPS) assert.ok(SWEEP_CFG[sweep].blocked.includes("sweep:manual-only"), `${sweep} missing manual-only blocker`);
 });
-test("manual unblock skill propagates but is never scheduled", () => {
-  assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep"]);
+test("manual operator skills propagate but are never scheduled", () => {
+  assert.deepEqual(MANUAL_SKILL_DIRS, ["unblock-sweep", "manual-sweep"]);
   assert.ok(PROPAGATED_SKILL_DIRS.includes("unblock-sweep"));
   assert.ok(!SWEEPS.includes("unblock"));
   assert.ok(!SKILL_DIRS.includes("unblock-sweep"));
