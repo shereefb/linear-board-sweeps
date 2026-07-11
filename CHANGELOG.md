@@ -2,6 +2,24 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.0] - 2026-07-11
+
+### Added
+
+- Give every scheduled claim an immutable declaration ID before its in-progress label is applied, so concurrent launchers deterministically agree on one owner without treating heartbeats as authority.
+- Add complete, paginated claim-history reads plus attended migration diagnostics and exact reset tooling for legacy labels and orphan declarations.
+
+### Changed
+
+- Require the paired owner token and declaration ID across child environments, resume records, stage handoffs, Ship refills, terminal commands, and all canonical sweep contracts.
+- Treat declaration-scoped heartbeats as liveness only and preserve exact claims for bounded provider or capacity recovery.
+
+### Fixed
+
+- Close or reset the exact claim epoch and revalidate its authoritative boundary before removing labels, moving cards, or escalating blockers.
+- Keep terminal retry cooldowns bound to the failed declaration, fail closed on incomplete or ambiguous history, and prevent older cooldowns from blocking a newer epoch.
+- Deduplicate long-lived resume-resolution notices and protect preserved work without allowing stale or mismatched recovery records to dispatch.
+
 ## [1.2.0.8] - 2026-07-11
 
 ### Changed
