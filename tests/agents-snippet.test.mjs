@@ -153,6 +153,58 @@ test("dev sweep proves trust-boundary artifact contracts before mutation and rev
   }
 });
 
+test("qa sweep proves trust-boundary artifacts before environment startup and returns design defects to Spec", () => {
+  for (const root of ["../.claude/skills", "../skills"]) {
+    const file = `${root}/qa-sweep/SKILL.md`;
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+    const gate = text.indexOf("### Trust-boundary artifact gate");
+    const environment = text.indexOf("**Stand up a dev environment:**");
+    const userTesting = text.indexOf("**Exercise the feature as a user");
+    const labelCreation = text.indexOf("Ensure labels exist");
+
+    assert.ok(gate >= 0, `${file}: missing trust-boundary gate`);
+    assert.ok(gate < environment, `${file}: gate must precede environment startup`);
+    assert.ok(gate < userTesting, `${file}: gate must precede user testing`);
+    assert.ok(labelCreation > gate, `${file}: gate must precede label creation`);
+    assert.doesNotMatch(text.slice(0, gate), /Ensure labels exist/, `${file}: pre-gate path must not create labels`);
+    assert.match(text, /CONTRACT_REPO_ROOT=.*git rev-parse --show-toplevel/, file);
+    assert.match(text, /TARGET_REF=.*HEAD/, file);
+    assert.match(text, /fixed target snapshot|target blobs|not.*worktree/is, file);
+    assert.match(text, /regular blob.*spec.*plan|spec.*plan.*regular blob/is, file);
+    assert.match(text, /feature branch.*(?:scripts|_shared).*(?:does not|must not|cannot).*helper|(?:scripts|_shared).*feature branch.*(?:does not|must not|cannot).*helper/is, file);
+    assert.match(text, /origin\/main.*trusted.*rollout.*R|trusted.*origin\/main.*rollout.*R/is, file);
+    assert.match(text, /missing.*restored.*marker history.*gate failure/is, file);
+    assert.match(text, /marker.*away.*restore|away.*marker.*restore/is, file);
+    assert.match(text, /symlink.*gitlink|gitlink.*symlink/i, file);
+    assert.match(text, /dirty (?:working )?tree.*(?:does not|must not|cannot).*affect|(?:does not|must not|cannot).*dirty (?:working )?tree.*affect/is, file);
+    assert.match(text, /missing.*origin\/main.*gate failure|origin\/main.*missing.*gate failure/is, file);
+    assert.match(text, /advance of `origin\/main`.*must not block.*long-lived target/is, file);
+    assert.match(text, /divergent.*origin\/main.*must not block.*long-lived target|origin\/main.*divergent.*must not block.*long-lived target/is, file);
+    assert.match(text, /AUTO_SWEEP_KIT_PATH.*artifact-contract\.mjs/, file);
+    assert.match(text, /R:\.claude\/skills\/_shared\/artifact-contract\.mjs/, file);
+    assert.match(text, /hash.*verify|verify.*hash/is, file);
+    assert.match(text, /helper hash mismatch.*gate failure/i, file);
+    assert.match(text, /read-only/, file);
+    assert.match(text, /Never execute.*worktree helper|never execute.*worktree helper/i, file);
+    assert.match(text, /clean.*scratch|scratch.*clean/is, file);
+    assert.match(text, /classify[\s\\\n]+"\$CONTRACT_REPO_ROOT" "\$SPEC_PATH" "1\.2\.0\.6" "\$TARGET_REF" origin\/main/, file);
+    assert.match(text, /classify[\s\\\n]+"\$CONTRACT_REPO_ROOT" "\$PLAN_PATH" "1\.2\.0\.6" "\$TARGET_REF" origin\/main/, file);
+    assert.match(text, /both.*status:?"legacy"|both.*legacy/is, file);
+    assert.match(text, /mixed.*artifact.*gate failure/i, file);
+    assert.match(text, /target-blob plan.*QA observation.*primary test input/is, file);
+    assert.match(text, /unsafe.*lower-level proof|lower-level proof.*unsafe/is, file);
+    assert.match(text, /inert.*sanitized evidence|sanitized.*inert evidence/is, file);
+    assert.match(text, /bounded.*classifier evidence/i, file);
+    assert.match(text, /bounce missing-design/, file);
+    assert.match(text, /\[auto-sweep-bounce QA→Spec\]/, file);
+    assert.match(text, /terminal blocked/, file);
+    assert.match(text, /remove.*qa:in-progress/, file);
+    assert.match(text, /bottom of "Spec"/, file);
+    assert.match(text, /Do not add `qa:needs-changes` or `blocked:needs-user` for this contract failure/, file);
+    assert.match(text, /Gate classification is read-only.*Only after classification.*bounce mutations/is, file);
+  }
+});
+
 test("canonical sweep skill headings contain no patch artifacts", () => {
   for (const sweep of ["spec", "dev", "qa", "ship"]) {
     const text = fs.readFileSync(new URL(`../skills/${sweep}-sweep/SKILL.md`, import.meta.url), "utf8");
