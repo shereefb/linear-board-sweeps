@@ -7408,6 +7408,41 @@ test("child liveness telemetry retains only secret-free lifecycle summaries", ()
   assert.doesNotMatch(JSON.stringify(telemetry.children), /owner-secret|declaration-secret|secret comment|secret prompt|secret-key/);
 });
 
+test("child liveness telemetry projects unsafe fields from every retained summary", () => {
+  const unsafe = {
+    ownerToken: "owner-secret",
+    claimDeclarationId: "declaration-secret",
+    comments: [{ body: "secret comment" }],
+    prompt: "secret prompt",
+    env: { LINEAR_API_KEY: "secret-key" },
+  };
+  const telemetry = recordChildLivenessTelemetry({ children: [
+    {
+      issue: "COD-match", sweep: "dev", workspace: "/matching", startedAt: "2026-07-11T12:00:00.000Z",
+      lastLivenessAt: "2026-07-11T12:00:00.000Z", state: "active", outcomeKind: null, ...unsafe,
+    },
+    {
+      issue: "COD-active", sweep: "qa", workspace: "/active", startedAt: "2026-07-11T12:00:00.000Z",
+      lastLivenessAt: "2026-07-11T12:00:00.000Z", state: "active", outcomeKind: null, ...unsafe,
+    },
+    {
+      issue: "COD-terminal", sweep: "ship", workspace: "/terminal", startedAt: "2026-07-11T11:00:00.000Z",
+      lastLivenessAt: "2026-07-11T11:05:00.000Z", state: "terminal", outcomeKind: "advanced", ...unsafe,
+    },
+  ] }, {
+    issueIdentifier: "COD-match", sweep: "dev", anchorPath: "/matching",
+  }, "liveness", "2026-07-11T12:00:01.000Z");
+
+  assert.equal(telemetry.children.length, 3);
+  for (const child of telemetry.children) {
+    assert.deepEqual(Object.keys(child).sort(), [
+      "issue", "lastLivenessAt", "outcomeKind", "startedAt", "state", "sweep", "workspace",
+    ]);
+  }
+  assert.doesNotMatch(JSON.stringify(telemetry.children), /owner-secret|declaration-secret|secret comment|secret prompt|secret-key/);
+  assert.equal(telemetry.children.find((child) => child.issue === "COD-match").lastLivenessAt, "2026-07-11T12:00:01.000Z");
+});
+
 test("child liveness telemetry keeps active children and caps recent terminal summaries", () => {
   let telemetry = {};
   for (let index = 0; index < MAX_RECENT_TERMINAL_CHILDREN + 2; index += 1) {

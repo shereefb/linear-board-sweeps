@@ -2149,7 +2149,15 @@ export function recordChildLivenessTelemetry(telemetry = {}, pick = {}, event, a
   };
   if (!identity.issue || !identity.sweep || !identity.workspace) return telemetry;
   const matches = (child) => child.issue === identity.issue && child.sweep === identity.sweep && child.workspace === identity.workspace;
-  const children = Array.isArray(telemetry.children) ? telemetry.children : [];
+  const children = Array.isArray(telemetry.children) ? telemetry.children.map((child) => ({
+    issue: child.issue,
+    sweep: child.sweep,
+    workspace: child.workspace,
+    startedAt: child.startedAt,
+    lastLivenessAt: child.lastLivenessAt,
+    state: child.state,
+    outcomeKind: child.outcomeKind ?? null,
+  })) : [];
   const existing = children.find(matches);
   let next;
   if (event === "start") {
