@@ -5875,6 +5875,7 @@ export async function expandDispatchBatch(batch, {
 
 export async function buildSameRepoRefillDispatches({
   result,
+  reconciliation,
   activeByAnchor,
   activeSameRepo,
   refillBudget,
@@ -5890,6 +5891,11 @@ export async function buildSameRepoRefillDispatches({
   const logFn = deps.logFor || logFor;
   const empty = (reason) => ({ dispatches: [], reason });
   if (!result?.success || !pick.issueIdentifier) return empty("ineligible");
+  if (sweep === "ship" && !(
+    reconciliation?.success === true
+    && reconciliation?.terminal === true
+    && ["advanced", "blocked"].includes(reconciliation.progress?.kind)
+  )) return empty("ineligible");
   if (refillBudget?.disabled) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: disabled`);
     return empty("disabled");
@@ -7057,6 +7063,7 @@ async function tick({ dryRun = false } = {}) {
       const dispatchScope = result.dispatchScope;
       if (result.kind === "success" && pick.issueIdentifier) {
         const reconciliation = await reconcileDispatchProgress(active.apiKey, result, runtime, { resumeStore });
+        result.reconciliation = reconciliation;
         applyDispatchProgressReconciliation(result, reconciliation);
         if (!reconciliation.success) {
           if (reconciliation.progress?.kind === "successful-no-op") {
@@ -7927,6 +7934,7 @@ async function tick({ dryRun = false } = {}) {
             }
             const refill = await buildSameRepoRefillDispatches({
               result,
+              reconciliation: result.reconciliation,
               activeByAnchor,
               activeSameRepo,
               refillBudget,

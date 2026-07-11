@@ -5294,6 +5294,7 @@ test("buildSameRepoRefillDispatches: completed Ship immediately offers the next 
         repoRoute: repoPairs[0],
       },
     },
+    reconciliation: { success: true, terminal: true, progress: { kind: "blocked", valid: true } },
     activeByAnchor: new Map([["/managed/safe", { apiKey: "lin", repoPairs }]]),
     activeSameRepo: createSameRepoActiveCounts(),
     refillBudget,
@@ -5320,6 +5321,61 @@ test("buildSameRepoRefillDispatches: completed Ship immediately offers the next 
   assert.equal(result.dispatches[0].repoRoute.managedRepoPath, "/managed/guide");
   assert.equal(refillBudget.remaining, 2);
 });
+test("Ship refill after reconciled advanced completion is admitted while unrelated work is still running", async () => {
+  const result = await buildSameRepoRefillDispatches({
+    result: {
+      success: true,
+      issueIdentifier: "SAF-200",
+      pick: {
+        anchorPath: "/managed/safe",
+        sourceAnchorPath: "/source/safe",
+        sweep: "ship",
+        issueIdentifier: "SAF-200",
+        config: { teamKey: "SAF", projectId: "project-safe", repos: ["safe"] },
+      },
+    },
+    reconciliation: { success: true, terminal: true, progress: { kind: "advanced", valid: true } },
+    activeByAnchor: new Map([["/managed/safe", { apiKey: "lin" }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget: { remaining: 1 },
+    parentRunId: "run-id",
+    childIndexAllocator: createChildIndexAllocator(),
+    deferClaim: true,
+    now: NOW,
+    deps: {
+      labeledProjectIds: async () => new Set(["project-safe"]),
+      checkoutDispatchBlockers: () => [],
+      fetchCards: async () => [dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", stateName: "Ship", sortOrder: 50, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
+      logFor: () => {},
+    },
+  });
+
+  assert.equal(result.reason, "triggered");
+  assert.deepEqual(result.dispatches.map((dispatch) => dispatch.issueIdentifier), ["SAF-207"]);
+});
+
+test("Ship refill rejects no-op, timeout, ambiguous cleanup, and unresolved resume", async () => {
+  const base = {
+    result: {
+      success: true,
+      issueIdentifier: "SAF-200",
+      pick: { anchorPath: "/managed/safe", sourceAnchorPath: "/source/safe", sweep: "ship", issueIdentifier: "SAF-200", config: { projectId: "project-safe" } },
+    },
+    activeByAnchor: new Map([["/managed/safe", { apiKey: "lin" }]]),
+    activeSameRepo: createSameRepoActiveCounts(),
+    refillBudget: { remaining: 4 },
+    deps: { logFor: () => {} },
+  };
+  for (const reconciliation of [
+    { success: false, terminal: false, progress: { kind: "successful-no-op" } },
+    { success: false, terminal: false, progress: { kind: "timeout" } },
+    { success: false, terminal: false, progress: { kind: "ambiguous-history" } },
+    { success: true, terminal: false, progress: { kind: "resume-needed" } },
+  ]) {
+    assert.equal((await buildSameRepoRefillDispatches({ ...base, reconciliation })).reason, "ineligible", reconciliation.progress.kind);
+  }
+  assert.equal(base.refillBudget.remaining, 4);
+});
 test("buildSameRepoRefillDispatches: Ship refill claims then atomically exports both identities", async () => {
   const refillBudget = { remaining: 1 };
   const card = dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", stateName: "Ship", sortOrder: 50, updatedAt: minsAgo(1), labelNames: [] });
@@ -5336,6 +5392,7 @@ test("buildSameRepoRefillDispatches: Ship refill claims then atomically exports 
         config: { teamKey: "SAF", projectId: "project-safe", repos: ["repo"] },
       },
     },
+    reconciliation: { success: true, terminal: true, progress: { kind: "advanced", valid: true } },
     activeByAnchor: new Map([["/managed/safe", { apiKey: "lin", repoPairs: [] }]]),
     activeSameRepo: createSameRepoActiveCounts(),
     refillBudget,
