@@ -17,7 +17,9 @@ test("spec-sweep emits a versioned, risk-proportional correctness contract", () 
 
 test("dev-sweep executes declared proofs without replacing or hiding review", () => {
   assert.match(dev, /correctness-contract\/v1/i);
-  assert.match(dev, /artifact[^]*first introduced[^]*\.sweep-version[^]*rollout boundary/i);
+  assert.match(dev, /rollout boundary[^]*\.sweep-version/i);
+  assert.match(dev, /commit that first introduced the artifact/i);
+  assert.match(dev, /1\.2\.0\.6[^]*correctness-boundary\.mjs/i);
   assert.match(dev, /missing or incomparable[^]*fail closed[^]*missing-design/i);
   assert.match(dev, /not required[^]*approved plan[^]*Before code review[^]*actual diff[^]*missing-design/i);
   assert.match(dev, /execute[^]*declared[^]*proof/i);
