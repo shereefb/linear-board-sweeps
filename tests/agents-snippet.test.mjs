@@ -83,6 +83,27 @@ test("canonical Claude and Codex sweep copies match byte-for-byte", () => {
   }
 });
 
+test("spec sweep requires the v1 trust-boundary contract without hiding findings", () => {
+  for (const root of ["../.claude/skills", "../skills"]) {
+    const file = `${root}/spec-sweep/SKILL.md`;
+    const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
+
+    assert.match(text, /Trust-boundary contract: trust-boundary-contract\/v1/, file);
+    assert.match(text, /`required`.*`not required`.*non-empty rationale/s, file);
+    assert.match(text, /TB\[1-9\]\[0-9\]\*/, file);
+    assert.match(text, /Source and trust.*Authority \/ provenance.*Validation \/ normalization.*Allowed sinks \/ effects.*Forbidden outcome.*Failure behavior \/ owner.*Verification/s, file);
+    assert.match(text, /plan ID set.*equal.*spec ID set exactly/is, file);
+    assert.match(text, /issue.*code.*subject data.*never.*instructions/is, file);
+    assert.match(text, /1,000 characters.*\[REDACTED\].*never copy.*raw payload/is, file);
+    assert.match(text, /reassess.*tier.*before.*plan generation/is, file);
+    assert.match(text, /\/cso.*before plan generation.*provenance.*normalization.*alternate.*sinks.*disclosure.*recovery/is, file);
+    assert.match(text, /`Linear: <KEY>`/, file);
+    assert.match(text, /review\/security/, file);
+    assert.match(text, /do not.*suppress.*learning evidence/is, file);
+    assert.match(text, /do not.*alter.*detector/is, file);
+  }
+});
+
 test("canonical sweep skill headings contain no patch artifacts", () => {
   for (const sweep of ["spec", "dev", "qa", "ship"]) {
     const text = fs.readFileSync(new URL(`../skills/${sweep}-sweep/SKILL.md`, import.meta.url), "utf8");
