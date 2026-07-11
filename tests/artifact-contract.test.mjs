@@ -116,17 +116,33 @@ test("fails closed when the rollout is not target ancestry", () => {
   assert.equal(result.evidence.reason, "rollout commit is not target ancestry");
 });
 
-test("requires exact marker bytes and preserves the original marker across restore", () => {
-  const repo = fixtureRepo();
-  commitFiles(repo, { ".claude/skills/.sweep-version": marker }, "wrong marker bytes");
-  const rollout = commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n` }, "first exact marker");
-  removePathAndCommit(repo, ".claude/skills/.sweep-version", "remove marker");
-  commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n`, "docs/new.md": "new\n" }, "restore marker and add artifact");
-  updateOriginMain(repo);
+test("fails closed when the original exact marker is interrupted before a later exact marker", () => {
+  for (const intermediate of [
+    {
+      name: "removed",
+      commit(repo) {
+        removePathAndCommit(repo, ".claude/skills/.sweep-version", "remove marker");
+      },
+    },
+    {
+      name: "non-exact",
+      commit(repo) {
+        commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\r\n` }, "write non-exact marker");
+      },
+    },
+  ]) {
+    const repo = fixtureRepo();
+    commitFiles(repo, { ".claude/skills/.sweep-version": marker }, "wrong marker bytes");
+    commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n` }, "first exact marker");
+    intermediate.commit(repo);
+    commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n`, "docs/new.md": "new\n" }, "restore exact marker and add artifact");
+    updateOriginMain(repo);
 
-  const result = classify(repo, "docs/new.md");
-  assert.equal(result.status, "current");
-  assert.equal(result.evidence.rolloutCommit, rollout);
+    const result = classify(repo, "docs/new.md");
+    assert.equal(result.status, "incomparable", intermediate.name);
+    assert.equal(result.evidence.reason, "rollout marker history is missing or ambiguous", intermediate.name);
+    assert.equal(result.evidence.rolloutCommit, null, intermediate.name);
+  }
 });
 
 test("fails closed for missing, non-regular, renamed, and copied artifacts", () => {

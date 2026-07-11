@@ -121,16 +121,21 @@ function isAncestor(runGit, repoRoot, older, newer) {
   return null;
 }
 
-function findOriginalMarkerCommit(runGit, repoRoot, trustedCommit, expectedMarker) {
+function verifyFirstParentMarkerHistory(runGit, repoRoot, trustedCommit, expectedMarker) {
   const revisions = run(runGit, repoRoot, ["rev-list", "--first-parent", "--reverse", trustedCommit]);
   const commits = revisions.ok ? parseCommitLines(revisions.stdout) : null;
   if (!commits) return { ok: false, status: revisions.status };
+  let originalCommit = null;
   for (const commit of commits) {
     const marker = hasExactMarker(runGit, repoRoot, commit, expectedMarker);
     if (!marker.ok) return { ok: false, status: marker.status };
-    if (marker.matches) return { ok: true, commit };
+    if (!originalCommit && marker.matches) {
+      originalCommit = commit;
+      continue;
+    }
+    if (originalCommit && !marker.matches) return { ok: false, status: null };
   }
-  return { ok: true, commit: null };
+  return { ok: true, commit: originalCommit };
 }
 
 function allExactMarkerCandidatesDescendFrom(runGit, repoRoot, trustedCommit, originalCommit, expectedMarker) {
@@ -197,7 +202,7 @@ export function classifyArtifactContract({
   if (!object.ok) return incomparable(object.reason, { targetCommit: target.commit, gitExitCode: object.status });
 
   const expectedMarker = `${rolloutMarker}\n`;
-  const rollout = findOriginalMarkerCommit(runGit, repoRoot, trusted.commit, expectedMarker);
+  const rollout = verifyFirstParentMarkerHistory(runGit, repoRoot, trusted.commit, expectedMarker);
   const markerCandidates = rollout.ok && rollout.commit
     ? allExactMarkerCandidatesDescendFrom(runGit, repoRoot, trusted.commit, rollout.commit, expectedMarker)
     : { ok: false, status: rollout.status };

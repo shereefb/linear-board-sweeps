@@ -109,11 +109,16 @@ test("dev sweep proves trust-boundary artifact contracts before mutation and rev
     const file = `${root}/dev-sweep/SKILL.md`;
     const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
     const gate = text.indexOf("### Trust-boundary artifact gate");
+    const selection = text.indexOf("## 1. Select cards");
     const labelCreation = text.indexOf("Ensure labels exist");
 
-    assert.match(text, /Trust-boundary artifact gate.*after preflight.*before.*claim|after preflight.*before.*mutation/is, file);
+    assert.match(text, /Trust-boundary artifact gate.*after.*read-only.*candidate.*selection.*before.*claim|after.*read-only.*candidate.*selection.*before.*mutation/is, file);
     assert.ok(gate >= 0, `${file}: missing trust-boundary gate`);
+    assert.ok(selection >= 0 && selection < gate, `${file}: read-only selection must precede the trust-boundary gate`);
     assert.ok(labelCreation > gate, `${file}: trust-boundary gate must precede label creation`);
+    const preGateSelection = text.slice(selection, gate);
+    assert.match(preGateSelection, /read-only candidate selection/i, `${file}: selection must be explicitly read-only`);
+    assert.doesNotMatch(preGateSelection, /Reclaim a stale claim|comment \+ skip|move it to the bottom|add `sweep:manual-only`|\*\*Claim\*\*/i, `${file}: selection must not mutate before the gate`);
     assert.doesNotMatch(text.slice(0, gate), /Ensure labels exist/, `${file}: pre-gate path must not create labels`);
     assert.match(text, /Before this gate succeeds.*read-only.*Do not ensure or create any Linear labels/is, file);
     assert.match(text, /CONTRACT_REPO_ROOT=.*git rev-parse --show-toplevel/, file);
@@ -158,14 +163,19 @@ test("qa sweep proves trust-boundary artifacts before environment startup and re
     const file = `${root}/qa-sweep/SKILL.md`;
     const text = fs.readFileSync(new URL(file, import.meta.url), "utf8");
     const gate = text.indexOf("### Trust-boundary artifact gate");
+    const selection = text.indexOf("## 1. Select cards");
     const environment = text.indexOf("**Stand up a dev environment:**");
     const userTesting = text.indexOf("**Exercise the feature as a user");
     const labelCreation = text.indexOf("Ensure labels exist");
 
     assert.ok(gate >= 0, `${file}: missing trust-boundary gate`);
+    assert.ok(selection >= 0 && selection < gate, `${file}: read-only selection must precede the trust-boundary gate`);
     assert.ok(gate < environment, `${file}: gate must precede environment startup`);
     assert.ok(gate < userTesting, `${file}: gate must precede user testing`);
     assert.ok(labelCreation > gate, `${file}: gate must precede label creation`);
+    const preGateSelection = text.slice(selection, gate);
+    assert.match(preGateSelection, /read-only candidate selection/i, `${file}: selection must be explicitly read-only`);
+    assert.doesNotMatch(preGateSelection, /Reclaim a stale claim|comment and skip|\*\*Claim\*\*/i, `${file}: selection must not mutate before the gate`);
     assert.doesNotMatch(text.slice(0, gate), /Ensure labels exist/, `${file}: pre-gate path must not create labels`);
     assert.match(text, /CONTRACT_REPO_ROOT=.*git rev-parse --show-toplevel/, file);
     assert.match(text, /TARGET_REF=.*HEAD/, file);
