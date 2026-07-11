@@ -4959,6 +4959,67 @@ test("reconcileOwnedDispatchClaim preserves exact claims retained for provider o
   assert.deepEqual(result, { attempted: true, released: false, reasonKind: "terminal recovery retained" });
   assert.equal(releases, 0);
 });
+
+test("timeout reconciliation releases a clean pushed exact epoch into cooldown", async () => {
+  const releases = [];
+  const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "timeout-graceful", elapsedMs: 120_000,
+    pick: { sweep: "dev", issueId: "issue-179", issueIdentifier: "COD-179", ownerToken: "owner-179", claimDeclarationId: "decl-179", worktreePath: "/wt", branch: "COD-179" },
+  }, "codex", {
+    fetchClaimCardFn: async () => ({ stateName: "Dev", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
+      { id: "decl", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner-179", declarationId: "decl-179" }), createdAt: claimIso(1) },
+    ] }),
+    recoveryDecisionFn: () => ({ kind: "release", reason: "clean worktree and pushed branch" }),
+    releaseFailedDispatchClaimFn: async (_key, _pick, failure) => { releases.push(failure); return true; },
+  });
+  assert.deepEqual(result, { attempted: true, released: true, reasonKind: "terminal failure cooldown" });
+  assert.equal(releases[0].kind, "timeout-graceful");
+  assert.equal(releases[0].elapsedMs, 120_000);
+  assert.equal(releases[0].issueIdentifier, "COD-179");
+  assert.equal(JSON.stringify(releases[0]).includes("owner-179"), false);
+  assert.equal(JSON.stringify(releases[0]).includes("decl-179"), false);
+});
+
+test("timeout reconciliation preserves dirty or unpushed exact work in a matching resume record", async () => {
+  for (const [kind, reason] of [["timeout-graceful", "worktree has uncommitted changes"], ["timeout-forced", "branch is not proven pushed to origin"]]) {
+    const records = [];
+    const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+      kind, elapsedMs: 180_000,
+      pick: { sourceAnchorPath: "/source", sweep: "dev", issueId: "issue-179", issueIdentifier: "COD-179", ownerToken: "owner-179", claimDeclarationId: "decl-179", worktreePath: "/wt", branch: "COD-179", repoRoute: { repoEntry: "." } },
+    }, "codex", {
+      fetchClaimCardFn: async () => ({ id: "issue-179", stateName: "Dev", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
+        { id: "decl", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner-179", declarationId: "decl-179" }), createdAt: claimIso(1) },
+      ] }),
+      recoveryDecisionFn: () => ({ kind: "resume-needed", reason, branch: "COD-179" }),
+      resumeStore: { upsert: (record) => { records.push(record); return record; }, clear: () => assert.fail("must not clear preserved work") },
+      addCommentFn: async () => {},
+    });
+    assert.equal(result.reasonKind, "resume-needed");
+    assert.equal(records[0].issueIdentifier, "COD-179");
+    assert.match(records[0].reason, new RegExp(`${kind} after 180000ms.*${reason}`));
+  }
+});
+
+test("timeout reconciliation never mutates changed or ambiguous ownership", async () => {
+  for (const card of [
+    { stateName: "Dev", labelNames: [], commentsComplete: true, comments: [] },
+    { stateName: "Dev", labelNames: ["dev:in-progress"], commentsComplete: true, comments: [{ id: "bad", body: "[auto-sweep-claim v1 broken]", createdAt: claimIso(1) }] },
+  ]) {
+    let mutations = 0;
+    const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+      kind: "timeout-forced", elapsedMs: 240_000,
+      pick: { sweep: "dev", issueId: "issue-179", issueIdentifier: "COD-179", ownerToken: "owner-179", claimDeclarationId: "decl-179", worktreePath: "/wt", branch: "COD-179" },
+    }, "codex", {
+      fetchClaimCardFn: async () => card,
+      recoveryDecisionFn: successfulSameStateRecoveryDecision,
+      resumeStore: { upsert: () => { mutations += 1; }, clear: () => { mutations += 1; } },
+      releaseFailedDispatchClaimFn: async () => { mutations += 1; return true; },
+      addCommentFn: async () => { mutations += 1; },
+    });
+    assert.equal(result.reasonKind, "ownership changed");
+    assert.equal(mutations, 0);
+  }
+});
 test("expandDispatchBatch: shared child-index allocator prevents refill/handoff path collisions", async () => {
   const childIndexAllocator = createChildIndexAllocator();
   const base = {

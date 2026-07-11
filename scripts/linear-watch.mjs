@@ -5675,7 +5675,8 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const successfulCompletion = result.kind === "success";
   const interrupted = result.kind === "interrupted";
   const terminalFailure = result.kind === "exit" || result.kind === "signal";
-  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
+  const timeoutFailure = result.kind === "timeout-graceful" || result.kind === "timeout-forced";
+  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure && !timeoutFailure) {
     return { attempted: false, released: false, reasonKind: null };
   }
   if (terminalFailure && preserveTerminalClaim) {
@@ -5684,6 +5685,46 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   if (terminalFailure) {
     const released = await releaseFailedDispatchClaimFn(apiKey, pick, result, runtime);
     return { attempted: true, released, reasonKind: "terminal failure cooldown" };
+  }
+  if (timeoutFailure) {
+    const fresh = await fetchClaimCardFn(apiKey, pick.issueId);
+    const recovery = recoveryDecisionFn(pick, fresh);
+    if (recovery.kind === "preserve") {
+      return { attempted: true, released: false, reasonKind: "ownership changed" };
+    }
+    const elapsedMs = Math.max(0, Number(result.elapsedMs) || 0);
+    const timeoutSummary = `${result.kind} after ${elapsedMs}ms for ${pick.issueIdentifier}`;
+    if (recovery.kind === "release") {
+      const released = await releaseFailedDispatchClaimFn(apiKey, pick, {
+        kind: result.kind,
+        elapsedMs,
+        issueIdentifier: pick.issueIdentifier,
+      }, runtime);
+      return { attempted: true, released, reasonKind: "terminal failure cooldown" };
+    }
+    if (!resumeStore) return { attempted: true, released: false, reasonKind: "resume-store-unavailable" };
+    const eligible = new Date(now()).toISOString();
+    const record = resumeStore.upsert({
+      sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+      sweep: pick.sweep,
+      issueIdentifier: pick.issueIdentifier,
+      issueId: pick.issueId,
+      ownerToken: pick.ownerToken,
+      claimDeclarationId: pick.claimDeclarationId,
+      worktreePath: pick.worktreePath,
+      branch: recovery.branch || pick.issueIdentifier,
+      repoEntry: pick.repoRoute?.repoEntry || ".",
+      reason: sanitizeFailureMessage(`${timeoutSummary}: ${recovery.reason}`),
+      nextEligibleAt: eligible,
+      attempts: 0,
+    });
+    if (!record) return { attempted: true, released: false, reasonKind: "resume-store-unavailable" };
+    const markerPrefix = `${RESUME_NEEDED_TAG} owner=${pick.ownerToken} claim=${cfg.claim} declaration=${pick.claimDeclarationId}]`;
+    const marker = `${markerPrefix} Preserved local worktree for ${pick.issueIdentifier}; ${record.reason}. Resume eligible ${eligible}.`;
+    const prior = (fresh.comments || []).find((comment) => (comment.body || "").includes(markerPrefix));
+    if (prior?.id) await updateCommentFn(apiKey, prior.id, marker);
+    else if (!prior) await addCommentFn(apiKey, fresh.id, marker);
+    return { attempted: true, released: false, reasonKind: "resume-needed", record };
   }
   const reasonKind = successfulCompletion
     ? "successful same-state completion"
@@ -6824,10 +6865,12 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
   const startedAt = new Date().toISOString();
+  const startedAtMs = Date.now();
   const primaryMeta = runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata: true });
   const finish = (outcome, finalMeta, attempts, fallbackUsed = false) => {
     const result = {
       ...outcome,
+      elapsedMs: Math.max(0, Date.now() - startedAtMs),
       finalRuntimeConfig: finalMeta.runtimeCfg,
       finalRuntimeExecutable: finalMeta.executable,
       finalRuntimeLaneKey: finalMeta.laneKey,
@@ -7060,6 +7103,9 @@ async function tick({ dryRun = false } = {}) {
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
+        ...(result.kind === "timeout-graceful" || result.kind === "timeout-forced"
+          ? { timeoutKind: result.kind, elapsedMs: result.elapsedMs }
+          : {}),
         worktreePath: pick.worktreePath,
         logDir: pick.logDir,
         fallbackFailure,
@@ -7095,7 +7141,7 @@ async function tick({ dryRun = false } = {}) {
           `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${result.kind === "timeout-graceful" || result.kind === "timeout-forced" ? ` after ${result.elapsedMs}ms` : detail === null ? "" : ` (${detail})`}`),
         ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
