@@ -32,10 +32,12 @@ import {
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
+  rediscoveredResumeRecordForCard,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
   OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS, MAX_DEPENDENCY_DEFERRED_ISSUES,
+  RESUME_STATE_VERSION,
   DEFAULT_MAX_SAME_REPO_REFILL_DISPATCHES, MAX_SAME_REPO_REFILL_DISPATCHES,
   DEFAULT_SAME_REPO_CARD_LIMITS, SAME_REPO_PORT_BASE,
   foreignClaimReleases, SWEEPS, SWEEP_ORDER, SKILL_DIRS, HOLDING_STATES,
@@ -78,6 +80,17 @@ test("resume store: persists only a valid exact record and protects its matching
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("resume store: a valid rediscovery repairs malformed persisted state", () => {
+  let persisted = { version: RESUME_STATE_VERSION, entries: { broken: { ownerToken: "partial" } } };
+  const store = createResumeStore({ now: () => NOW, readJsonFn: () => persisted,
+    writeJsonFn: (_path, value) => { persisted = value; } });
+  const record = { sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-149", issueId: "issue-149",
+    ownerToken: "owner-149", worktreePath: "/managed/app/.worktrees/COD-149", branch: "COD-149", repoEntry: "app",
+    reason: "rediscovered dirty worktree", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  assert.equal(store.upsert(record)?.issueIdentifier, "COD-149");
+  assert.equal(store.get(record)?.ownerToken, "owner-149");
+});
+
 test("same-state recovery: dirty and unpushed work preserves the claim, only clean pushed work releases", () => {
   const pick = { sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: "/wt", branch: "SAF-210" };
   const card = { stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
@@ -90,10 +103,48 @@ test("same-state recovery: dirty and unpushed work preserves the claim, only cle
 });
 
 test("resume admission: only an exact due claimed record can bypass ordinary dirty blocking", () => {
-  const pick = { anchorPath: "/managed", config: { repos: ["."] }, sweep: "dev", issueIdentifier: "SAF-210", issueId: "id", ownerToken: "owner", worktreePath: "/managed/.worktrees/SAF-210", repoRoute: { repoEntry: "." } };
+  const pick = { anchorPath: "/managed", config: { repos: ["managed"] }, sweep: "dev", issueIdentifier: "SAF-210", issueId: "id", ownerToken: "owner", worktreePath: "/managed/.worktrees/SAF-210", branch: "SAF-210", repoRoute: { repoEntry: ".", managedRepoPath: "/managed" } };
   const card = { ...pick, stateName: "Dev", labelNames: ["dev:in-progress"], comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner claim=dev:in-progress]`, createdAt: minsAgo(1) }] };
-  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: pick.worktreePath, repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "resume");
-  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other", worktreePath: pick.worktreePath, repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: pick.worktreePath, branch: "SAF-210", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "resume");
+  assert.equal(resumeAdmissionDecision(pick, card, { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "other", worktreePath: pick.worktreePath, branch: "SAF-210", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+  assert.equal(resumeAdmissionDecision({ ...pick, worktreePath: "/tmp/arbitrary", branch: "other" }, card,
+    { sourceWorkspace: "/managed", sweep: "dev", issueIdentifier: "SAF-210", ownerToken: "owner", worktreePath: "/tmp/arbitrary", branch: "other", repoEntry: ".", nextEligibleAt: new Date(NOW).toISOString() }, NOW).kind, "preserve");
+});
+
+test("resume reaper protection expires and validates the deterministic tuple", () => {
+  let persisted = null;
+  const store = createResumeStore({ now: () => NOW, readJsonFn: () => persisted,
+    writeJsonFn: (_path, value) => { persisted = value; } });
+  const record = { sourceWorkspace: "/source/app", sweep: "dev", issueIdentifier: "COD-149", issueId: "issue-149",
+    ownerToken: "owner-149", worktreePath: "/managed/app/.worktrees/COD-149", branch: "COD-149", repoEntry: "app",
+    reason: "dirty", nextEligibleAt: new Date(NOW).toISOString(), attempts: 0 };
+  store.upsert(record);
+  const card = { identifier: "COD-149", labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(100)} owner=owner-149 claim=dev:in-progress]`, createdAt: minsAgo(100) }] };
+  assert.ok(store.protectedClaim(card, SWEEP_CFG.dev, NOW, { validateRecord: () => true }));
+  assert.equal(store.protectedClaim(card, SWEEP_CFG.dev, NOW + 25 * 3600000,
+    { validateRecord: () => true }).protectionState, "needs-resolution");
+  assert.equal(store.protectedClaim(card, SWEEP_CFG.dev, NOW,
+    { validateRecord: () => false }).protectionState, "needs-resolution");
+  const decisions = reapDecisions([{ ...card, id: "issue-149", updatedAt: minsAgo(100) }], SWEEP_CFG.dev,
+    NOW + 25 * 3600000, { protectedClaim: (candidate) => store.protectedClaim(candidate, SWEEP_CFG.dev,
+      NOW + 25 * 3600000, { validateRecord: () => false }) });
+  assert.deepEqual(decisions.map((decision) => decision.action), ["protect-resume"]);
+  assert.equal(decisions[0].protectionState, "needs-resolution");
+});
+
+test("resume rediscovery: routed cards preserve their routed worktree and repo identity", () => {
+  const card = {
+    id: "issue-210", identifier: "SAF-210", stateName: "Dev", labelNames: ["dev:in-progress"],
+    comments: [{ body: `${HEARTBEAT_TAG} ${minsAgo(1)} owner=owner-210 claim=dev:in-progress]`, createdAt: minsAgo(1) }],
+    repoRoute: { ok: true, repoEntry: "safetaper-guide", managedRepoPath: "/managed/guide" },
+  };
+  const record = rediscoveredResumeRecordForCard({
+    sourceWorkspace: "/source/coach", anchorPath: "/managed/coach", sweep: "dev", card,
+  }, NOW);
+  assert.equal(record.repoEntry, "safetaper-guide");
+  assert.equal(record.worktreePath, "/managed/guide/.worktrees/SAF-210");
+  assert.equal(record.ownerToken, "owner-210");
 });
 
 test("capacity outcome: recognized quota failures defer with bounded retry and configured fallback", () => {

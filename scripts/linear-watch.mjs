@@ -75,6 +75,7 @@ export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
 export const RESUME_STATE_VERSION = 1;
 export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
+export const RESUME_PROTECTION_MAX_AGE_MS = 24 * 3600000;
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
 export const MAX_DEPENDENCY_DEFERRED_ISSUES = 50;
 
@@ -629,7 +630,8 @@ export function reapDecisions(cards, cfg, now, { protectedClaim = () => null } =
     if (heartbeatAgeMin(card, now) <= cfg.staleMin) continue; // fresh/alive
     const preserved = protectedClaim(card);
     if (preserved) {
-      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim, ownerToken: preserved.ownerToken });
+      out.push({ id: card.id, identifier: card.identifier, action: "protect-resume", claim: cfg.claim,
+        ownerToken: preserved.ownerToken, protectionState: preserved.protectionState });
       continue;
     }
     const priorReaps = countMarkers(card, REAPER_TAG, now);
@@ -2060,7 +2062,8 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
   const get = (pick) => { const state = read(); return state.healthy ? state.entries[resumeKey(pick)] || null : null; };
   const upsert = (record) => {
     if (!validResumeRecord(record)) return null;
-    const state = read(); if (!state.healthy) return null;
+    const prior = read();
+    const state = prior.healthy ? prior : { healthy: true, entries: {} };
     const key = resumeKey(record); const timestamp = new Date(now()).toISOString();
     state.entries[key] = { ...state.entries[key], ...record, createdAt: state.entries[key]?.createdAt || record.createdAt || timestamp, updatedAt: timestamp };
     persist(state); return structuredClone(state.entries[key]);
@@ -2071,13 +2074,19 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
     delete state.entries[key]; persist(state); return true;
   };
   const due = (pick) => { const entry = get(pick); return entry && Date.parse(entry.nextEligibleAt) <= now() ? entry : null; };
-  const protectedClaim = (card, cfg, at = now()) => {
+  const protectedClaim = (card, cfg, at = now(), { validateRecord = () => true } = {}) => {
     const state = read();
     const sweep = cfg && Object.keys(SWEEP_CFG).find((s) => SWEEP_CFG[s] === cfg);
     const scoped = card?.sourceWorkspace || card?.sourceAnchorPath || card?.anchorPath;
     const entry = state.healthy ? Object.values(state.entries).find((candidate) => candidate.sweep === sweep && candidate.issueIdentifier === card?.identifier && (!scoped || candidate.sourceWorkspace === scoped)) : null;
+    const updatedAt = Date.parse(entry?.updatedAt || entry?.createdAt || "");
     if (!entry || !cfg || !hasLabel(card, cfg.claim) || latestHeartbeatOwner(card, cfg.claim) !== entry.ownerToken) return null;
-    return entry;
+    const validForResume = Number.isFinite(updatedAt) && at - updatedAt <= RESUME_PROTECTION_MAX_AGE_MS
+      && entry.attempts <= 4 && validateRecord(entry);
+    // Retry eligibility is bounded, claim safety is not. A stale or mismatched
+    // record still protects preserved WIP until rediscovery or explicit human
+    // resolution; it must never fall through to ordinary stale-claim reaping.
+    return { ...entry, protectionState: validForResume ? "resume" : "needs-resolution" };
   };
   return { resumePath, read, get, upsert, clear, due, protectedClaim };
 }
@@ -2101,12 +2110,27 @@ export function successfulSameStateRecoveryDecision(pick, card, { gitFn = git, e
 export function resumeAdmissionDecision(pick, freshCard, record, now = Date.now()) {
   const cfg = SWEEP_CFG[pick?.sweep];
   if (!cfg || !record || Date.parse(record.nextEligibleAt || "") > now) return { kind: "skip", reason: "not due" };
+  const expectedBranch = pick.issueIdentifier;
+  const expectedWorktree = cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute);
   const exact = record.sourceWorkspace === (pick.sourceAnchorPath || pick.anchorPath)
     && record.sweep === pick.sweep && record.issueIdentifier === pick.issueIdentifier && record.ownerToken === pick.ownerToken
-    && record.worktreePath === pick.worktreePath && record.repoEntry === (pick.repoRoute?.repoEntry || ".")
+    && record.branch === expectedBranch && pick.branch === expectedBranch
+    && record.worktreePath === expectedWorktree && pick.worktreePath === expectedWorktree
+    && record.repoEntry === (pick.repoRoute?.repoEntry || ".")
     && freshCard?.stateName && cfg.states.includes(freshCard.stateName) && hasLabel(freshCard, cfg.claim)
     && latestHeartbeatOwner(freshCard, cfg.claim) === record.ownerToken;
   return exact ? { kind: "resume", record } : { kind: "preserve", reason: "resume identity no longer matches claimed card" };
+}
+
+export function rediscoveredResumeRecordForCard({ sourceWorkspace, anchorPath, sweep, card }, now = Date.now()) {
+  const ownerToken = latestHeartbeatOwner(card, SWEEP_CFG[sweep]?.claim);
+  if (!ownerToken || !card?.repoRoute?.ok) return null;
+  return {
+    sourceWorkspace, sweep, issueIdentifier: card.identifier, issueId: card.id, ownerToken,
+    worktreePath: cardWorktreePath(anchorPath, {}, card.identifier, card.repoRoute), branch: card.identifier,
+    repoEntry: card.repoRoute.repoEntry, reason: "rediscovered dirty worktree",
+    nextEligibleAt: new Date(now).toISOString(), attempts: 0,
+  };
 }
 
 export function classifyCapacityOutcome(outcome, logTail = "") {
@@ -6324,7 +6348,15 @@ async function tick({ dryRun = false } = {}) {
           if (!cleanupCardsByState) continue;
           const cards = cfg.states.flatMap((state) => cleanupCardsByState.get(state) || []);
           const reapActions = reapDecisions(cards, cfg, now, {
-            protectedClaim: (card) => resumeStore.protectedClaim({ ...card, sourceWorkspace: active.sourceAnchorPath }, cfg, now),
+            protectedClaim: (card) => resumeStore.protectedClaim({ ...card, sourceWorkspace: active.sourceAnchorPath }, cfg, now, {
+              validateRecord: (record) => {
+                const routedCard = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+                if (!routedCard) return false;
+                return record.repoEntry === routedCard.repoRoute.repoEntry
+                  && record.branch === card.identifier
+                  && record.worktreePath === cardWorktreePath(anchorPath, config, card.identifier, routedCard.repoRoute);
+              },
+            }),
           });
           const protectedReaps = reapActions.filter((decision) => decision.action === "protect-resume");
           const reaps = reapActions.filter((decision) => decision.action !== "protect-resume");
@@ -6332,7 +6364,10 @@ async function tick({ dryRun = false } = {}) {
             for (const decision of protectedReaps) {
               const card = cards.find((candidate) => candidate.id === decision.id);
               try {
-                await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=${decision.ownerToken} claim=${cfg.claim}] Preserved resume-needed worktree remains protected on this host.`);
+                const detail = decision.protectionState === "needs-resolution"
+                  ? "Preserved resume-needed worktree remains protected; recovery metadata needs rediscovery or explicit human resolution."
+                  : "Preserved resume-needed worktree remains protected on this host.";
+                await addComment(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date(now).toISOString()} owner=${decision.ownerToken} claim=${cfg.claim}] ${detail}`);
                 logFor(anchorPath, sweep, `protect-resume ${decision.identifier}`);
               } catch (error) { recordFailure(sweep, "resume-heartbeat", decision.identifier, error.message); }
             }
@@ -6392,23 +6427,22 @@ async function tick({ dryRun = false } = {}) {
           // WIP is resumed in its original deterministic worktree.
           const resumes = [];
           for (const card of cards) {
+            const routedResume = routeCardsByRepo([card], config, active.repoPairs).cards[0];
+            if (!routedResume) continue;
             const resumePickKey = { sourceWorkspace: active.sourceAnchorPath, sweep, issueIdentifier: card.identifier };
             // If the atomic record was lost, recover only the conservative,
             // machine-local proof: matching live claim plus a dirty deterministic
             // worktree. Never attempt cleanup or release in this discovery path.
             if (!resumeStore.get(resumePickKey) && sweep === "dev" && hasLabel(card, cfg.claim)) {
-              const owner = latestHeartbeatOwner(card, cfg.claim);
-              const worktreePath = cardWorktreePath(anchorPath, config, card.identifier);
-              const dirty = dirtyCheckoutEvent({ sweep, worktreePath, issueIdentifier: card.identifier }, { role: "worktree", path: worktreePath });
-              if (owner && dirty?.kind === "dirty-checkout") resumeStore.upsert({
-                ...resumePickKey, issueId: card.id, ownerToken: owner, worktreePath, branch: card.identifier,
-                repoEntry: ".", reason: "rediscovered dirty worktree", nextEligibleAt: new Date(now).toISOString(), attempts: 0,
-              });
+              const rediscovered = rediscoveredResumeRecordForCard({
+                sourceWorkspace: active.sourceAnchorPath, anchorPath, sweep, card: routedResume,
+              }, now);
+              const dirty = rediscovered && dirtyCheckoutEvent({ sweep, worktreePath: rediscovered.worktreePath,
+                issueIdentifier: card.identifier }, { role: "worktree", path: rediscovered.worktreePath });
+              if (dirty?.kind === "dirty-checkout") resumeStore.upsert(rediscovered);
             }
             const record = resumeStore.due(resumePickKey);
             if (!record) continue;
-            const routedResume = routeCardsByRepo([card], config, active.repoPairs).cards[0];
-            if (!routedResume) continue;
             const resumePick = {
               anchorPath, sourceAnchorPath: active.sourceAnchorPath, config, sweep,
               issueId: card.id, issueIdentifier: card.identifier, ownerToken: record.ownerToken,
