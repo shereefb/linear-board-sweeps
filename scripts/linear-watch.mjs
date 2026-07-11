@@ -6323,6 +6323,54 @@ export function classifyPostDispatchProgress(result = {}, card = {}, { resumeRec
   return invalid("successful-no-op", "child exited successfully without an observable terminal outcome");
 }
 
+export async function reconcileDispatchProgress(apiKey, result, runtime, {
+  fetchClaimCardFn = fetchClaimCard,
+  releaseFailedDispatchClaimFn = releaseFailedDispatchClaim,
+  resumeStore = null,
+} = {}) {
+  if (result?.kind !== "success" || !result?.pick?.issueId) {
+    return { success: Boolean(result?.success), progress: null, claimResult: null, failure: null };
+  }
+  const pick = result.pick;
+  let card;
+  try {
+    card = await fetchClaimCardFn(apiKey, pick.issueId);
+  } catch (error) {
+    return {
+      success: false,
+      progress: { kind: "complete-read-failed", valid: false, ownsOpenClaim: false, reason: error.message },
+      claimResult: null,
+      failure: error,
+    };
+  }
+  const storedResume = resumeStore?.get?.({
+    sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+    sweep: pick.sweep,
+    issueIdentifier: pick.issueIdentifier,
+  });
+  const progress = classifyPostDispatchProgress(result, card, {
+    resumeRecord: storedResume ? { kind: "resume", record: storedResume } : null,
+  });
+  if (progress.valid) return { success: true, progress, claimResult: null, failure: null };
+
+  let claimResult = null;
+  let failure = null;
+  if (progress.ownsOpenClaim) {
+    try {
+      const released = await releaseFailedDispatchClaimFn(apiKey, pick, {
+        ...result,
+        kind: progress.kind,
+        code: "SUCCESSFUL_NO_OP",
+      }, runtime);
+      claimResult = { attempted: true, released };
+    } catch (error) {
+      failure = error;
+      claimResult = { attempted: true, released: false };
+    }
+  }
+  return { success: false, progress, claimResult, failure };
+}
+
 function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {
@@ -6907,6 +6955,21 @@ async function tick({ dryRun = false } = {}) {
       const runtimeCfg = result.finalRuntimeConfig || runtimeConfigForSweep(pick.config, pick.sweep);
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
+      if (result.kind === "success" && pick.issueIdentifier) {
+        const reconciliation = await reconcileDispatchProgress(active.apiKey, result, runtime, { resumeStore });
+        result.progress = reconciliation.progress;
+        result.claimResult = reconciliation.claimResult;
+        if (!reconciliation.success) {
+          result.success = false;
+          result.kind = reconciliation.progress?.kind || "successful-no-op";
+          result.code = "SUCCESSFUL_NO_OP";
+          logFor(pick.anchorPath, pick.sweep, `dispatch progress rejected ${pick.issueIdentifier}: ${reconciliation.progress?.reason || "post-run reconciliation failed"}`);
+          if (reconciliation.failure) {
+            recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "claim-release", pick.issueIdentifier, reconciliation.failure.message);
+            writeCurrentTick();
+          }
+        }
+      }
       const fallbackFailure = fallbackFailureAttribution(result);
       const exhaustedAttempts = (result.attempts || []).filter((attempt) => attempt?.usageExhausted === true);
       const providerUsageExhausted = exhaustedAttempts.length > 0;

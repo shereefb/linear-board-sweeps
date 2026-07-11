@@ -32,7 +32,7 @@ import {
   retryCooldown, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, classifyPostDispatchProgress, reconcileDispatchProgress, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
   fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards, fetchCompleteMigrationCard, claimMigrationStatusReport, resetClaimMigration,
@@ -152,6 +152,33 @@ test("classifyPostDispatchProgress rejects incomplete and ambiguous history", ()
   const ambiguous = classifyPostDispatchProgress(postDispatchResult(), ambiguousCard);
   assert.equal(ambiguous.kind, "ambiguous-history");
   assert.equal(ambiguous.valid, false);
+});
+
+test("reconcileDispatchProgress releases an unchanged owned Ship no-op", async () => {
+  const calls = [];
+  const result = { ...postDispatchResult(), success: true, pick: { ...postDispatchResult().pick, issueId: "issue", issueIdentifier: "COD-179" } };
+  const value = await reconcileDispatchProgress("key", result, "codex", {
+    fetchClaimCardFn: async () => ({ ...postDispatchCard(), id: "issue", identifier: "COD-179" }),
+    releaseFailedDispatchClaimFn: async () => { calls.push("release"); return true; },
+  });
+  assert.equal(value.success, false);
+  assert.equal(value.progress.kind, "successful-no-op");
+  assert.deepEqual(calls, ["release"]);
+});
+
+test("reconcileDispatchProgress never cleans up changed or ambiguous ownership", async () => {
+  for (const card of [
+    { ...postDispatchCard(), id: "issue", labelNames: [], comments: [] },
+    { ...postDispatchCard(), id: "issue", comments: [...postDispatchCard().comments, { id: "bad", body: "[auto-sweep-claim v1 broken]", createdAt: claimIso(3) }] },
+  ]) {
+    let releases = 0;
+    const value = await reconcileDispatchProgress("key", { ...postDispatchResult(), success: true, pick: { ...postDispatchResult().pick, issueId: "issue", issueIdentifier: "COD-179" } }, "codex", {
+      fetchClaimCardFn: async () => card,
+      releaseFailedDispatchClaimFn: async () => { releases += 1; return true; },
+    });
+    assert.equal(value.success, false);
+    assert.equal(releases, 0);
+  }
 });
 
 const claimIso = (second) => `2026-07-11T00:00:${String(second).padStart(2, "0")}.000Z`;
