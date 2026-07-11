@@ -2,6 +2,17 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.6] - 2026-07-10
+
+### Changed
+
+- Carry versioned correctness invariants from behavior-changing specs into implementation proofs and QA evidence, while keeping mechanical work exempt and preserving every existing review and human Ship gate.
+- Fail closed when a required or post-rollout correctness contract is missing, and retain material contract omissions as structured `review/correctness` evidence instead of hiding them as ordinary implementation work.
+
+### Fixed
+
+- Bump the sweep marker so installed anchors receive the Spec, Dev, and QA contract changes through the existing updater.
+
 ## [1.2.0.5] - 2026-07-10
 
 ### Added

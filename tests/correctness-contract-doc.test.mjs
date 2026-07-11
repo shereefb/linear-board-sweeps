@@ -19,6 +19,7 @@ test("dev-sweep executes declared proofs without replacing or hiding review", ()
   assert.match(dev, /correctness-contract\/v1/i);
   assert.match(dev, /artifact[^]*first introduced[^]*\.sweep-version[^]*rollout boundary/i);
   assert.match(dev, /missing or incomparable[^]*fail closed[^]*missing-design/i);
+  assert.match(dev, /not required[^]*approved plan[^]*Before code review[^]*actual diff[^]*missing-design/i);
   assert.match(dev, /execute[^]*declared[^]*proof/i);
   assert.match(dev, /material[^]*contract omission[^]*review\/correctness[^]*missing-design/i);
   assert.match(dev, /not[^]*third review|not[^]*review pass/i);
