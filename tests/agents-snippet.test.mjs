@@ -193,6 +193,8 @@ test("qa sweep proves trust-boundary artifacts before environment startup and re
     assert.match(text, /mixed.*artifact.*gate failure/i, file);
     assert.match(text, /target-blob plan.*QA observation.*primary test input/is, file);
     assert.match(text, /unsafe.*lower-level proof|lower-level proof.*unsafe/is, file);
+    assert.match(text, /unsafe observation.*exact TB ID.*target-blob plan QA-observation row.*immutable target commit\/object identity.*proof command\/test identifier.*observed result/is, file);
+    assert.match(text, /missing.*mismatched.*unsafe observation binding.*invalid.*direct QA→Spec|unsafe observation binding.*missing.*mismatched.*invalid.*direct QA→Spec/is, file);
     assert.match(text, /inert.*sanitized evidence|sanitized.*inert evidence/is, file);
     assert.match(text, /bounded.*classifier evidence/i, file);
     assert.match(text, /bounce missing-design/, file);
