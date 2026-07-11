@@ -32,6 +32,7 @@ import {
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
+  fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
   fetchScheduledPassCards, fetchScheduledQueueCards,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
@@ -58,6 +59,74 @@ import {
   createResumeStore, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
+
+const claimIso = (second) => `2026-07-11T00:00:${String(second).padStart(2, "0")}.000Z`;
+
+function claimCommentPages(pages) {
+  let call = 0;
+  return async (_query, variables) => {
+    const page = pages[call++];
+    assert.equal(variables.cursor, call === 1 ? null : pages[call - 2].endCursor);
+    return { issue: { comments: { nodes: page.nodes, pageInfo: {
+      hasNextPage: page.hasNextPage,
+      endCursor: page.endCursor,
+    } } } };
+  };
+}
+
+test("fetchCompleteClaimComments paginates oldest-to-newest with ids", async () => {
+  const comments = await fetchCompleteClaimComments("key", "issue", { gqlFn: claimCommentPages([
+    { nodes: [{ id: "c2", body: "two", createdAt: claimIso(2) }], hasNextPage: true, endCursor: "p2" },
+    { nodes: [{ id: "c1", body: "one", createdAt: claimIso(1) }], hasNextPage: false, endCursor: null },
+  ]) });
+  assert.deepEqual(comments.map(({ id }) => id), ["c1", "c2"]);
+});
+
+test("fetchCompleteClaimComments rejects cursor cycles and unreadable pages", async () => {
+  const cyclic = claimCommentPages([
+    { nodes: [], hasNextPage: true, endCursor: "same" },
+    { nodes: [], hasNextPage: true, endCursor: "same" },
+  ]);
+  await assert.rejects(fetchCompleteClaimComments("key", "issue", { gqlFn: cyclic }), /pagination incomplete/);
+  await assert.rejects(fetchCompleteClaimComments("key", "issue", {
+    gqlFn: async () => ({ issue: { comments: { nodes: [] } } }),
+  }), /comments unreadable/);
+});
+
+test("scheduled snapshots are never complete ownership evidence", () => {
+  const snapshotNode = {
+    id: "issue", identifier: "COD-169", updatedAt: claimIso(1), sortOrder: 1,
+    state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] },
+  };
+  const snapshot = normalizeRelationUnknownCard(snapshotNode);
+  assert.equal(snapshot.commentsComplete, false);
+  const hydrated = withCompleteClaimHistory(snapshot, [{ id: "c1", body: "one", createdAt: claimIso(1) }]);
+  assert.equal(hydrated.commentsComplete, true);
+  assert.equal(hydrated.comments[0].id, "c1");
+});
+
+test("scheduled claim history is hydrated only for cards carrying in-progress labels", async () => {
+  const claimed = {
+    id: "claimed", identifier: "COD-169", stateName: "Dev", labelNames: ["dev:in-progress"],
+    comments: [], commentsComplete: false,
+  };
+  const plain = {
+    id: "plain", identifier: "COD-170", stateName: "Dev", labelNames: [],
+    comments: [], commentsComplete: false,
+  };
+  const fetched = [];
+  const result = await fetchScheduledPassCards("key", "COD", "project", ["Dev"], {
+    fetchAdmissionFn: async () => new Map([["Dev", [claimed, plain]]]),
+    fetchCompleteClaimCommentsFn: async (_apiKey, issueId) => {
+      fetched.push(issueId);
+      return [{ id: "c1", body: "history", createdAt: claimIso(1) }];
+    },
+  });
+  assert.deepEqual(fetched, ["claimed"]);
+  assert.equal(result.admissionByState.get("Dev")[0].commentsComplete, true);
+  assert.equal(result.cleanupByState.get("Dev")[0].commentsComplete, true);
+  assert.equal(result.admissionByState.get("Dev")[1].commentsComplete, false);
+});
 
 const NOW = Date.parse("2026-07-08T12:00:00Z");
 const minsAgo = (m) => new Date(NOW - m * 60000).toISOString();
@@ -2908,6 +2977,7 @@ test("scheduled pass falls back to relation-free stale-claim cleanup when depend
   const cleanupQueries = [];
   const result = await fetchScheduledPassCards("lin", "COD", "project-1", ["Dev"], {
     fetchAdmissionFn: async () => { throw new Error("relation field denied"); },
+    fetchCompleteClaimCommentsFn: async () => [],
     cleanupGqlFn: async (query, variables) => {
       cleanupQueries.push({ query, variables });
       return {
@@ -2935,6 +3005,7 @@ test("scheduled pass falls back to relation-free stale-claim cleanup when depend
   assert.deepEqual(cleanupQueries[0].variables.states, ["Dev"]);
   const cleanupCard = result.cleanupByState.get("Dev")[0];
   assert.equal(cleanupCard.blockersComplete, false);
+  assert.equal(cleanupCard.commentsComplete, true);
   assert.deepEqual(actionableCards([cleanupCard], SWEEP_CFG.dev, NOW), []);
   assert.deepEqual(reapDecisions([cleanupCard], SWEEP_CFG.dev, NOW).map((decision) => decision.identifier), ["COD-9"]);
 });

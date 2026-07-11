@@ -4,6 +4,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveClaimOwnership } from "./claim-ownership.mjs";
 //
 // Usage:
 //   node linear.mjs whoami
@@ -195,6 +196,28 @@ const TERMINAL_MOVE_CLAIM_BY_STATE = Object.freeze({
 });
 const CLAIM_HEARTBEAT_PREFIX = "[auto-sweep-heartbeat";
 const CLAIM_HEARTBEAT = /^\[auto-sweep-heartbeat\s+\S+\s+owner=([^\]\s]+)\s+claim=([^\]\s]+)\]/;
+
+const COMPLETE_ISSUE_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`;
+
+export async function fetchCompleteIssueComments(issueId, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seen = new Set();
+  let cursor = null;
+  while (true) {
+    const data = await gqlFn(COMPLETE_ISSUE_COMMENTS_QUERY, { id: issueId, cursor });
+    const page = data?.issue?.comments;
+    if (!Array.isArray(page?.nodes) || typeof page?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("claim comments unreadable");
+    }
+    comments.push(...page.nodes);
+    if (!page.pageInfo.hasNextPage) break;
+    cursor = page.pageInfo.endCursor;
+    if (!cursor || seen.has(cursor)) throw new Error("claim comments pagination incomplete");
+    seen.add(cursor);
+  }
+  return comments.sort((a, b) => Date.parse(a?.createdAt) - Date.parse(b?.createdAt)
+    || (String(a?.id || "") < String(b?.id || "") ? -1 : String(a?.id || "") > String(b?.id || "") ? 1 : 0));
+}
 
 export function latestClaimHeartbeat(comments, ownedClaim, { complete = true } = {}) {
   if (!complete) throw new Error("comments incomplete");
@@ -529,21 +552,28 @@ export async function moveCardBottomIfCurrent(
     .filter((card) => card.id !== issue.id);
 
   const current = await gqlFn(
-    `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } comments(first:250){ pageInfo { hasNextPage } nodes { body createdAt } } } }`,
+    `query($id:String!){ issue(id:$id){ id identifier state { name } labels(first:250){ pageInfo { hasNextPage } nodes { id name } } } }`,
     { id: issue.id },
   );
   const finalIssue = current?.issue;
   const labels = finalIssue?.labels?.nodes;
-  const comments = finalIssue?.comments?.nodes;
   if (!finalIssue?.id || !finalIssue?.identifier || typeof finalIssue?.state?.name !== "string"
       || !Array.isArray(labels) || finalIssue.labels?.pageInfo?.hasNextPage !== false
       || labels.some((label) => !label?.id || typeof label?.name !== "string")) {
     throw new Error(`Issue "${issueIdentifier}" not found or current state/labels unreadable.`);
   }
-  if (!Array.isArray(comments) || finalIssue.comments?.pageInfo?.hasNextPage !== false) {
-    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`);
+  let comments;
+  try {
+    comments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" comments incomplete or unreadable.`, { cause });
   }
-  const heartbeat = latestClaimHeartbeat(comments, ownedClaim);
+  const ownership = resolveClaimOwnership({
+    comments,
+    complete: true,
+    claim: ownedClaim,
+    labelPresent: labels.some((label) => label.name === ownedClaim),
+  });
   const decision = guardedTerminalMoveDecision({
     stateName: finalIssue.state.name,
     expectedState,
@@ -551,8 +581,8 @@ export async function moveCardBottomIfCurrent(
     labelNames: labels.map((label) => label.name),
     ownedClaim,
     ownerToken,
-    heartbeatOwner: heartbeat.owner,
-    heartbeatMalformed: heartbeat.malformed,
+    heartbeatOwner: ownership.status === "owned" ? ownership.ownerToken : null,
+    heartbeatMalformed: ownership.status === "ambiguous",
   });
   if (!decision.eligible) return { moved: false, issue: finalIssue.identifier, reason: decision.reason };
   const ownedClaimId = labels.find((label) => label.name === ownedClaim)?.id;

@@ -13,8 +13,26 @@ import {
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
   repoRouteEligibility, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
-  guardedTerminalMoveInput, latestClaimHeartbeat, moveCardBottomIfCurrent,
+  guardedTerminalMoveInput, latestClaimHeartbeat, fetchCompleteIssueComments, moveCardBottomIfCurrent,
 } from "../scripts/linear.mjs";
+
+test("fetchCompleteIssueComments paginates claim history and rejects cursor cycles", async () => {
+  const pages = [
+    { nodes: [{ id: "c2", body: "two", createdAt: "2026-07-11T00:00:02.000Z" }], pageInfo: { hasNextPage: true, endCursor: "next" } },
+    { nodes: [{ id: "c1", body: "one", createdAt: "2026-07-11T00:00:01.000Z" }], pageInfo: { hasNextPage: false, endCursor: null } },
+  ];
+  let call = 0;
+  const comments = await fetchCompleteIssueComments("issue", { gqlFn: async (_query, variables) => {
+    assert.equal(variables.cursor, call === 0 ? null : "next");
+    return { issue: { comments: pages[call++] } };
+  } });
+  assert.deepEqual(comments.map(({ id }) => id), ["c1", "c2"]);
+
+  let cycleCall = 0;
+  await assert.rejects(fetchCompleteIssueComments("issue", { gqlFn: async () => ({ issue: { comments: {
+    nodes: [], pageInfo: { hasNextPage: true, endCursor: cycleCall++ ? "same" : "same" },
+  } } }) }), /pagination incomplete/);
+});
 
 const QA_HANDOFF_BASE = Object.freeze({
   fastPathEnabled: true,
@@ -206,17 +224,19 @@ test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUp
   const calls = [];
   const gqlFn = async (query, variables) => {
     calls.push({ query, variables });
-    if (query.includes("issue(id:$id)") && !query.includes("comments(first:250)")) return { issue: {
+    if (query.includes("project { id }")) return { issue: {
       id: "issue-142", identifier: "COD-142", project: { id: "project" },
       team: { states: { nodes: [{ id: "qa-state", name: "QA" }, { id: "ship-state", name: "Ship" }] } },
     } };
-    if (query.includes("comments(first:250)")) return { issue: {
+    if (query.includes("labels(first:250)")) return { issue: {
       id: "issue-142", identifier: "COD-142", state: { name: "QA" },
       labels: { pageInfo: { hasNextPage: false }, nodes: [
         { id: "passed", name: "qa:passed" }, { id: "claim", name: "qa:in-progress" }, { id: "product", name: "frontend" },
       ] },
+    } };
+    if (query.includes("comments(first:100")) return { issue: {
       comments: { pageInfo: { hasNextPage: false }, nodes: [
-        { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+        { id: "claim-declaration", body: "[auto-sweep-claim v1 claim=qa:in-progress owner=owner-142 declaration=d-142]", createdAt: "2026-07-10T10:05:00.000Z" },
       ] },
     } };
     if (query.includes("issues(first:100")) return {
@@ -231,7 +251,7 @@ test("moveCardBottomIfCurrent fresh-reads facts and performs one guarded issueUp
   const result = await moveCardBottomIfCurrent("COD-142", "QA", "Ship", "qa:in-progress", "owner-142", { gqlFn, log: () => {} });
   assert.equal(result.moved, true);
   const destinationIndex = calls.findIndex((call) => call.query.includes("issues(first:100"));
-  const guardIndex = calls.findIndex((call) => call.query.includes("comments(first:250)"));
+  const guardIndex = calls.findIndex((call) => call.query.includes("comments(first:100"));
   assert.ok(destinationIndex >= 0 && guardIndex > destinationIndex, "destination pagination must precede the final guard read");
   assert.deepEqual(calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{
     id: "issue-142",
@@ -245,18 +265,20 @@ for (const [lateLabel, reason] of [["blocked:needs-user", "blocking-label"], ["d
     const calls = [];
     const gqlFn = async (query) => {
       calls.push(query);
-      if (query.includes("issue(id:$id)") && !query.includes("comments(first:250)")) return { issue: {
+      if (query.includes("project { id }")) return { issue: {
         id: "issue-142", identifier: "COD-142", project: { id: "project" },
         team: { states: { nodes: [{ id: "ship-state", name: "Ship" }] } },
       } };
       if (query.includes("issues(first:100")) return { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
-      if (query.includes("comments(first:250)")) return { issue: {
+      if (query.includes("labels(first:250)")) return { issue: {
         id: "issue-142", identifier: "COD-142", state: { name: "QA" },
         labels: { pageInfo: { hasNextPage: false }, nodes: [
           { id: "claim", name: "qa:in-progress" }, { id: "late", name: lateLabel },
         ] },
+      } };
+      if (query.includes("comments(first:100")) return { issue: {
         comments: { pageInfo: { hasNextPage: false }, nodes: [
-          { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
+          { id: "claim-declaration", body: "[auto-sweep-claim v1 claim=qa:in-progress owner=owner-142 declaration=d-142]", createdAt: "2026-07-10T10:05:00.000Z" },
         ] },
       } };
       throw new Error(`unexpected query: ${query}`);
@@ -393,14 +415,15 @@ function runGuardedMoveCli({ stateName = "QA", labelNames = ["qa:passed", "qa:in
   const finalIssue = unreadable ? null : {
     id: "issue-142", identifier: "COD-142", state: { name: stateName },
     labels: { pageInfo: { hasNextPage: false }, nodes: labelNames.map((name, index) => ({ id: `label-${index}`, name })) },
-    comments: { pageInfo: { hasNextPage: !commentsComplete }, nodes: [
-      { body: `[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=${heartbeatOwner} claim=qa:in-progress]`, createdAt: "2026-07-10T10:05:00.000Z" },
-    ] },
   };
+  const finalComments = unreadable ? null : { pageInfo: { hasNextPage: !commentsComplete, endCursor: null }, nodes: [
+    { id: "claim-declaration", body: `[auto-sweep-claim v1 claim=qa:in-progress owner=${heartbeatOwner} declaration=d-142]`, createdAt: "2026-07-10T10:05:00.000Z" },
+  ] };
   const preloadSource = `globalThis.fetch = async (_url, options) => {
     const { query } = JSON.parse(options.body);
     let data;
-    if (query.includes("comments(first:250)")) data = { issue: ${JSON.stringify(finalIssue)} };
+    if (query.includes("comments(first:100")) data = { issue: { comments: ${JSON.stringify(finalComments)} } };
+    else if (query.includes("labels(first:250)")) data = { issue: ${JSON.stringify(finalIssue)} };
     else if (query.includes("issue(id:$id)")) data = { issue: ${JSON.stringify(metadataIssue)} };
     else if (query.includes("issues(first:100")) data = { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } };
     else if (query.includes("issueUpdate")) data = { issueUpdate: { success: true, issue: { identifier: "COD-142", state: { name: "Ship" }, sortOrder: 0, url: "https://linear/COD-142" } } };

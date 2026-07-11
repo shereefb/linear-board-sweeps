@@ -52,6 +52,38 @@ import {
   runLearningDetectors,
 } from "./learning.mjs";
 
+const CLAIM_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`;
+
+function compareClaimComments(a, b) {
+  return Date.parse(a?.createdAt) - Date.parse(b?.createdAt)
+    || (String(a?.id || "") < String(b?.id || "") ? -1 : String(a?.id || "") > String(b?.id || "") ? 1 : 0);
+}
+
+export async function fetchCompleteClaimComments(apiKey, issueId, { gqlFn = gql } = {}) {
+  const comments = [];
+  const seen = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(CLAIM_COMMENTS_QUERY, { id: issueId, cursor }, apiKey);
+    const data = unwrapGraphQlData(result, "claim comments");
+    const page = data?.issue?.comments;
+    if (!Array.isArray(page?.nodes) || typeof page?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("claim comments unreadable");
+    }
+    comments.push(...page.nodes);
+    if (!page.pageInfo.hasNextPage) break;
+    cursor = page.pageInfo.endCursor;
+    if (!cursor || seen.has(cursor)) throw new Error("claim comments pagination incomplete");
+    seen.add(cursor);
+  }
+  return comments.sort(compareClaimComments);
+}
+
+export function withCompleteClaimHistory(card, comments) {
+  if (!Array.isArray(comments)) throw new Error("claim comments unreadable");
+  return { ...card, comments, commentsComplete: true };
+}
+
 // The kit root = two levels up from this script (KIT/scripts/linear-watch.mjs).
 const KIT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -3734,10 +3766,11 @@ function normalizeCardFields(node) {
     labelNames: node.labels.nodes.map((label) => label.name),
     labelIds: Object.fromEntries(node.labels.nodes.map((label) => [label.name, label.id])),
     comments: node.comments.nodes,
+    commentsComplete: false,
   };
 }
 
-function normalizeRelationUnknownCard(node) {
+export function normalizeRelationUnknownCard(node) {
   const blockers = [];
   const blockersComplete = false;
   return {
@@ -3824,7 +3857,7 @@ export async function fetchScheduledQueueCards(apiKey, teamKey, projectId, state
          nodes{ id identifier updatedAt sortOrder
            state{ name }
            labels{ nodes{ id name } }
-           comments(last:100){ nodes{ body createdAt } }
+           comments(last:100){ nodes{ id body createdAt } }
            inverseRelations(first:50){
              pageInfo{ hasNextPage endCursor }
              nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3870,7 +3903,7 @@ export async function fetchScheduledCleanupCards(apiKey, teamKey, projectId, sta
          pageInfo{ hasNextPage endCursor }
          nodes{ id identifier updatedAt sortOrder state{ name }
            labels{ nodes{ id name } }
-           comments(last:100){ nodes{ body createdAt } } } } }`,
+           comments(last:100){ nodes{ id body createdAt } } } } }`,
       { c: cursor, states: requestedStates, teamKey, pid: projectId },
       apiKey,
     );
@@ -3892,22 +3925,48 @@ export async function fetchScheduledCleanupCards(apiKey, teamKey, projectId, sta
   }
 }
 
+async function withMaterialClaimHistories(byState, apiKey, { gqlFn, fetchCompleteClaimCommentsFn }) {
+  const hydrated = new Map();
+  for (const [state, cards] of byState) {
+    const stateCards = [];
+    for (const card of cards) {
+      if (ALL_CLAIMS.some((claim) => hasLabel(card, claim))) {
+        const comments = await fetchCompleteClaimCommentsFn(apiKey, card.id, { gqlFn });
+        stateCards.push(withCompleteClaimHistory(card, comments));
+      } else {
+        stateCards.push(card);
+      }
+    }
+    hydrated.set(state, stateCards);
+  }
+  return hydrated;
+}
+
 export async function fetchScheduledPassCards(apiKey, teamKey, projectId, states, {
   fetchAdmissionFn = fetchScheduledQueueCards,
   fetchCleanupFn = fetchScheduledCleanupCards,
+  fetchCompleteClaimCommentsFn = fetchCompleteClaimComments,
   admissionGqlFn = gql,
   cleanupGqlFn = gql,
   fetchIssueDependenciesFn = fetchIssueDependencies,
 } = {}) {
   try {
-    const admissionByState = await fetchAdmissionFn(apiKey, teamKey, projectId, states, {
+    const admissionSnapshot = await fetchAdmissionFn(apiKey, teamKey, projectId, states, {
       gqlFn: admissionGqlFn,
       fetchIssueDependenciesFn,
+    });
+    const admissionByState = await withMaterialClaimHistories(admissionSnapshot, apiKey, {
+      gqlFn: admissionGqlFn,
+      fetchCompleteClaimCommentsFn,
     });
     return { admissionByState, cleanupByState: admissionByState, admissionError: null, cleanupError: null };
   } catch (admissionError) {
     try {
-      const cleanupByState = await fetchCleanupFn(apiKey, teamKey, projectId, states, { gqlFn: cleanupGqlFn });
+      const cleanupSnapshot = await fetchCleanupFn(apiKey, teamKey, projectId, states, { gqlFn: cleanupGqlFn });
+      const cleanupByState = await withMaterialClaimHistories(cleanupSnapshot, apiKey, {
+        gqlFn: cleanupGqlFn,
+        fetchCompleteClaimCommentsFn,
+      });
       return { admissionByState: null, cleanupByState, admissionError, cleanupError: null };
     } catch (cleanupError) {
       return { admissionByState: null, cleanupByState: null, admissionError, cleanupError };
@@ -3922,14 +3981,18 @@ async function fetchCards(apiKey, teamKey, projectId, states) {
 
 async function fetchClaimCleanupCards(apiKey, teamKey, projectId, states) {
   const byState = await fetchScheduledCleanupCards(apiKey, teamKey, projectId, states);
-  return [...new Set(states || [])].flatMap((state) => byState.get(state) || []);
+  const hydrated = await withMaterialClaimHistories(byState, apiKey, {
+    gqlFn: gql,
+    fetchCompleteClaimCommentsFn: fetchCompleteClaimComments,
+  });
+  return [...new Set(states || [])].flatMap((state) => hydrated.get(state) || []);
 }
 
 async function fetchCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
        labels{ nodes{ id name } }
-       comments(last:100){ nodes{ body createdAt } }
+       comments(last:100){ nodes{ id body createdAt } }
        inverseRelations(first:50){
          pageInfo{ hasNextPage endCursor }
          nodes{ id type issue{ id identifier state{ id name type } } }
@@ -3939,7 +4002,8 @@ async function fetchCard(apiKey, issueId) {
   );
   const n = d.issue;
   if (!n) throw new Error(`issue not found: ${issueId}`);
-  return normalizeQueueCard(n, apiKey, { gqlFn: gql, fetchIssueDependenciesFn: fetchIssueDependencies });
+  const card = await normalizeQueueCard(n, apiKey, { gqlFn: gql, fetchIssueDependenciesFn: fetchIssueDependencies });
+  return withCompleteClaimHistory(card, await fetchCompleteClaimComments(apiKey, n.id));
 }
 
 async function fetchClaimCard(apiKey, issueId) {
@@ -3951,7 +4015,9 @@ async function fetchClaimCard(apiKey, issueId) {
     apiKey,
   );
   if (!d.issue) throw new Error(`issue not found: ${issueId}`);
-  return normalizeRelationUnknownCard(d.issue);
+  const card = normalizeRelationUnknownCard(d.issue);
+  if (!ALL_CLAIMS.some((claim) => hasLabel(card, claim))) return card;
+  return withCompleteClaimHistory(card, await fetchCompleteClaimComments(apiKey, d.issue.id));
 }
 
 async function fetchBlockedIssues(apiKey, teamKey, projectId) {
