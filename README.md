@@ -8,6 +8,8 @@ Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human
 
 **Planned (COD-155):** behavior-changing specs will carry a versioned correctness contract whose invariant IDs remain traceable through implementation proofs and QA evidence. Existing review findings remain structured Factory Learning evidence; the contract strengthens prevention without bypassing review, QA, Signoff, or the human Ship gate.
 
+**Planned (COD-157):** material acceptance behaviors and risks will carry a versioned verification contract from Spec through executable Plan proofs, Dev execution, and ID-linked QA evidence. Independent reviewers will continue emitting every material `review/test-gap` finding so Factory Learning measures prevention honestly without weakening review, QA, Signoff, or the human Ship gate.
+
 A portable kit that installs a **Linear-driven, cross-runtime (Claude Code + Codex) feature workflow** into any repo. Four autonomous "board sweeps" carry work across a Linear board, with a human gate before anything ships:
 
 ```
