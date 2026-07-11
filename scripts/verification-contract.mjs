@@ -105,6 +105,9 @@ export function parseVerificationArtifact(markdown, { role } = {}) {
   }
 
   if (applicability === "required" && role !== "plan") {
+    if (obligationTable?.rows.some((row) => row.length !== verificationHeaders.length || row.some((value) => !value.trim()))) {
+      diagnostics.push(diagnostic("incomplete-verification-obligation"));
+    }
     for (const correctnessId of correctnessIds) {
       const count = [...sourcesByVerificationId.values()].flat().filter((id) => id === correctnessId).length;
       if (count === 0) diagnostics.push(diagnostic("missing-correctness-source"));
@@ -172,6 +175,15 @@ export function validateVerificationContract({ specPath, planPath, repoRoot = pr
   const diagnostics = [...spec.diagnostics, ...plan.diagnostics];
 
   if (!spec.applicability || !plan.applicability) {
+    if (spec.applicability || plan.applicability) {
+      return {
+        ok: false,
+        applicability: spec.applicability ?? plan.applicability,
+        legacy: false,
+        verificationIds: [],
+        diagnostics: uniqueDiagnostics(diagnostics),
+      };
+    }
     const histories = [
       classifyRolloutHistory({ repoRoot, artifactPath: path.relative(repoRoot, specPath) }),
       classifyRolloutHistory({ repoRoot, artifactPath: path.relative(repoRoot, planPath) }),

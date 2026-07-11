@@ -272,6 +272,18 @@ test("rejects a plan verification row without its executable proof fields", () =
   assert.ok(diagnosticCodes(result).includes("incomplete-plan-mapping"));
 });
 
+test("rejects a required spec obligation without its executable proof fields", () => {
+  const root = tempDirectory();
+  const specPath = path.join(root, "spec.md");
+  const planPath = path.join(root, "plan.md");
+  fs.writeFileSync(specPath, requiredSpec([["V1", "C1", "", "", "", ""]]));
+  fs.writeFileSync(planPath, requiredPlan());
+
+  const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
+  assert.equal(result.ok, false);
+  assert.ok(diagnosticCodes(result).includes("incomplete-verification-obligation"));
+});
+
 test("reports a required correctness source absent from every verification row", () => {
   const result = validator.parseVerificationArtifact(requiredSpec([["V1", "", "a", "b", "c", "d"]]));
   assert.ok(diagnosticCodes(result).includes("missing-correctness-source"));
@@ -324,6 +336,23 @@ test("rejects a post-rollout artifact without a declaration", () => {
 
   const result = validator.validateVerificationContract({ specPath, planPath, repoRoot: root });
   assert.ok(diagnosticCodes(result).includes("post-rollout-missing-contract"));
+});
+
+test("rejects a declaration-free plan paired with a required legacy spec", () => {
+  const root = createGitRepository();
+  commit(root, "add legacy artifacts", {
+    "docs/spec.md": requiredSpec(),
+    "docs/plan.md": "# missing declaration\n",
+  });
+  addRollout(root);
+
+  const result = validator.validateVerificationContract({
+    specPath: path.join(root, "docs/spec.md"),
+    planPath: path.join(root, "docs/plan.md"),
+    repoRoot: root,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(diagnosticCodes(result).includes("missing-declaration"));
 });
 
 test("fails closed when artifact and rollout commits diverge", () => {
