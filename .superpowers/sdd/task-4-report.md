@@ -91,6 +91,22 @@ git diff --check
 clean
 ```
 
+Repository-wide verification on commit `bf32e2c`:
+
+```text
+$ node --test tests/*.test.mjs
+ℹ tests 556
+ℹ suites 0
+ℹ pass 556
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2187.928917
+```
+
+The suite exited `0`. Its normal fixture output included simulated `origin/main` fetch failures exercised by updater tests; those updater tests passed.
+
 ## Files changed
 
 - `scripts/linear-watch.mjs`
