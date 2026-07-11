@@ -95,7 +95,10 @@ test("allows a long-lived feature target when the original rollout is its ancest
   commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n` }, "rollout");
   updateOriginMain(repo);
   git(repo, ["branch", "feature"]);
-  commitFiles(repo, { "main-only.md": "main advanced\n" }, "main advances");
+  commitFiles(repo, {
+    ".claude/skills/.sweep-version": "1.2.0.7\n",
+    "main-only.md": "main advanced\n",
+  }, "main advances to the next marker");
   updateOriginMain(repo);
   git(repo, ["switch", "feature"]);
   commitFiles(repo, { "docs/feature.md": "feature work\n" }, "feature artifact");

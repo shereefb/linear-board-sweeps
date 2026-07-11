@@ -126,6 +126,7 @@ function verifyFirstParentMarkerHistory(runGit, repoRoot, trustedCommit, expecte
   const commits = revisions.ok ? parseCommitLines(revisions.stdout) : null;
   if (!commits) return { ok: false, status: revisions.status };
   let originalCommit = null;
+  let markerWasInterrupted = false;
   for (const commit of commits) {
     const marker = hasExactMarker(runGit, repoRoot, commit, expectedMarker);
     if (!marker.ok) return { ok: false, status: marker.status };
@@ -133,7 +134,8 @@ function verifyFirstParentMarkerHistory(runGit, repoRoot, trustedCommit, expecte
       originalCommit = commit;
       continue;
     }
-    if (originalCommit && !marker.matches) return { ok: false, status: null };
+    if (originalCommit && marker.matches && markerWasInterrupted) return { ok: false, status: null };
+    if (originalCommit && !marker.matches) markerWasInterrupted = true;
   }
   return { ok: true, commit: originalCommit };
 }
