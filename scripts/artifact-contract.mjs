@@ -90,10 +90,11 @@ function treeEntry(runGit, repoRoot, commit, artifactPath) {
   const response = run(runGit, repoRoot, ["ls-tree", "-z", commit, "--", `:(literal)${artifactPath}`]);
   if (!response.ok) return { ok: false, status: response.status };
   const entries = response.stdout.split("\0").filter(Boolean);
+  if (entries.length === 0) return { ok: true, present: false };
   if (entries.length !== 1) return { ok: false, status: response.status };
   const match = /^([0-7]{6}) ([a-z]+) ([0-9a-f]{40,64})\t(.+)$/i.exec(entries[0]);
   if (!match || match[4] !== artifactPath) return { ok: false, status: response.status };
-  return { ok: true, mode: match[1], type: match[2], object: match[3] };
+  return { ok: true, present: true, mode: match[1], type: match[2], object: match[3] };
 }
 
 function requireRegularBlob(runGit, repoRoot, commit, artifactPath) {
@@ -106,7 +107,8 @@ function requireRegularBlob(runGit, repoRoot, commit, artifactPath) {
 
 function hasExactMarker(runGit, repoRoot, commit, expectedMarker) {
   const entry = treeEntry(runGit, repoRoot, commit, MARKER_PATH);
-  if (!entry.ok || entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) return { ok: true, matches: false };
+  if (!entry.ok) return { ok: false, status: entry.status };
+  if (!entry.present || entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) return { ok: true, matches: false };
   const response = run(runGit, repoRoot, ["show", `${commit}:${MARKER_PATH}`]);
   if (!response.ok) return { ok: false, status: response.status };
   return { ok: true, matches: response.stdout === expectedMarker };
@@ -134,13 +136,13 @@ function findOriginalMarkerCommit(runGit, repoRoot, trustedCommit, expectedMarke
 function allExactMarkerCandidatesDescendFrom(runGit, repoRoot, trustedCommit, originalCommit, expectedMarker) {
   const revisions = run(runGit, repoRoot, ["rev-list", trustedCommit]);
   const commits = revisions.ok ? parseCommitLines(revisions.stdout) : null;
-  if (!commits) return false;
+  if (!commits) return { ok: false, status: revisions.status };
   for (const commit of commits) {
     const marker = hasExactMarker(runGit, repoRoot, commit, expectedMarker);
-    if (!marker.ok) return false;
-    if (marker.matches && isAncestor(runGit, repoRoot, originalCommit, commit) !== true) return false;
+    if (!marker.ok) return { ok: false, status: marker.status };
+    if (marker.matches && isAncestor(runGit, repoRoot, originalCommit, commit) !== true) return { ok: false, status: null };
   }
-  return true;
+  return { ok: true, status: null };
 }
 
 function renameOrCopyTouchesArtifact(stdout, artifactPath) {
@@ -196,8 +198,11 @@ export function classifyArtifactContract({
 
   const expectedMarker = `${rolloutMarker}\n`;
   const rollout = findOriginalMarkerCommit(runGit, repoRoot, trusted.commit, expectedMarker);
-  if (!rollout.ok || !rollout.commit || !allExactMarkerCandidatesDescendFrom(runGit, repoRoot, trusted.commit, rollout.commit, expectedMarker)) {
-    return incomparable("rollout marker history is missing or ambiguous", { targetCommit: target.commit, gitExitCode: rollout.status });
+  const markerCandidates = rollout.ok && rollout.commit
+    ? allExactMarkerCandidatesDescendFrom(runGit, repoRoot, trusted.commit, rollout.commit, expectedMarker)
+    : { ok: false, status: rollout.status };
+  if (!rollout.ok || !rollout.commit || !markerCandidates.ok) {
+    return incomparable("rollout marker history is missing or ambiguous", { targetCommit: target.commit, gitExitCode: rollout.status ?? markerCandidates.status });
   }
   if (isAncestor(runGit, repoRoot, rollout.commit, target.commit) !== true) {
     return incomparable("rollout commit is not target ancestry", { targetCommit: target.commit, rolloutCommit: rollout.commit });

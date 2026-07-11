@@ -181,6 +181,38 @@ test("fails closed for divergent marker candidates and shallow history", () => {
   assert.equal(shallow.evidence.reason, "repository history is shallow");
 });
 
+test("fails closed for failed or malformed marker tree reads without leaking Git output", () => {
+  for (const injectedResponse of [
+    { status: 77, stdout: "https://token@example.invalid/marker-read" },
+    { status: 0, stdout: "malformed marker entry with secret token" },
+  ]) {
+    const repo = fixtureRepo();
+    commitFiles(repo, { "docs/spec.md": "legacy\n" }, "legacy artifact");
+    const originalMarker = commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n` }, "first marker");
+    removePathAndCommit(repo, ".claude/skills/.sweep-version", "remove marker");
+    commitFiles(repo, { ".claude/skills/.sweep-version": `${marker}\n` }, "restore marker");
+    updateOriginMain(repo);
+
+    const result = classifyArtifactContract({
+      repoRoot: repo,
+      artifactPath: "docs/spec.md",
+      rolloutMarker: marker,
+      runGit: (root, args) => {
+        if (args[0] === "ls-tree" && args[2] === originalMarker && args.at(-1) === ":(literal).claude/skills/.sweep-version") {
+          return { ...injectedResponse, stderr: "another secret" };
+        }
+        const response = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+        return { status: response.status, stdout: response.stdout, stderr: response.stderr };
+      },
+    });
+
+    assert.equal(result.status, "incomparable");
+    assert.equal(result.evidence.reason, "rollout marker history is missing or ambiguous");
+    assert.equal(JSON.stringify(result).includes("secret"), false);
+    assert.equal(JSON.stringify(result).includes("token"), false);
+  }
+});
+
 test("rejects path, object, snapshot, and failed Git probe attacks without leaking Git output", () => {
   const repo = fixtureRepo();
   commitFiles(repo, { "docs/spec.md": "artifact\n", ".claude/skills/.sweep-version": `${marker}\n` }, "rollout");
