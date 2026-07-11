@@ -194,8 +194,6 @@ const TERMINAL_MOVE_CLAIM_BY_STATE = Object.freeze({
   [WORKFLOW_STATES.qa]: "qa:in-progress",
   [WORKFLOW_STATES.ship]: "ship:in-progress",
 });
-const CLAIM_HEARTBEAT_PREFIX = "[auto-sweep-heartbeat";
-const CLAIM_HEARTBEAT = /^\[auto-sweep-heartbeat\s+\S+\s+owner=([^\]\s]+)\s+claim=([^\]\s]+)\]/;
 
 const COMPLETE_ISSUE_COMMENTS_QUERY = `query($id:String!,$cursor:String){ issue(id:$id){ comments(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor } nodes{ id body createdAt } } } }`;
 
@@ -229,25 +227,6 @@ export async function fetchCompleteIssueComments(issueId, { gqlFn = gql } = {}) 
     || (String(a?.id || "") < String(b?.id || "") ? -1 : String(a?.id || "") > String(b?.id || "") ? 1 : 0));
 }
 
-export function latestClaimHeartbeat(comments, ownedClaim, { complete = true } = {}) {
-  if (!complete) throw new Error("comments incomplete");
-  if (!Array.isArray(comments)) throw new Error("comments unreadable");
-  const relevant = comments
-    .filter((comment) => typeof comment?.body === "string"
-      && comment.body.includes(CLAIM_HEARTBEAT_PREFIX)
-      && comment.body.includes(`claim=${ownedClaim}`))
-    .map((comment) => {
-      const createdAt = Date.parse(comment.createdAt);
-      if (Number.isNaN(createdAt)) throw new Error("heartbeat comment timestamp unreadable");
-      return { body: comment.body, createdAt };
-    })
-    .sort((a, b) => b.createdAt - a.createdAt);
-  if (!relevant.length) return { owner: null, malformed: false };
-  const match = relevant[0].body.match(CLAIM_HEARTBEAT);
-  if (!match || match[2] !== ownedClaim) return { owner: null, malformed: true };
-  return { owner: match[1], malformed: false };
-}
-
 export function guardedTerminalMoveDecision(input = {}) {
   const facts = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   const labels = new Set(Array.isArray(facts.labelNames) ? facts.labelNames : []);
@@ -265,9 +244,6 @@ export function guardedTerminalMoveDecision(input = {}) {
     && labels.has("factory:learning-generated")) return deny("factory-learning-requires-signoff");
   if ([...labels].some((label) => label.endsWith(":in-progress") && label !== facts.ownedClaim)) return deny("foreign-claim");
   if (typeof facts.ownerToken !== "string" || !facts.ownerToken) return deny("missing-owner-token");
-  if (facts.heartbeatMalformed === true) return deny("malformed-heartbeat");
-  if (typeof facts.heartbeatOwner !== "string" || !facts.heartbeatOwner) return deny("missing-owner-heartbeat");
-  if (facts.heartbeatOwner !== facts.ownerToken) return deny("owner-mismatch");
   return { eligible: true, reason: "ready" };
 }
 
@@ -585,8 +561,6 @@ export async function moveCardBottomIfCurrent(
     labelNames: currentLabels.map((label) => label.name),
     ownedClaim,
     ownerToken,
-    heartbeatOwner: ownerToken,
-    heartbeatMalformed: false,
   });
 
   let comments;

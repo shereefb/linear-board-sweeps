@@ -4196,29 +4196,48 @@ export async function resetClaimMigration(apiKey, issueId, claim, target, {
   if (!ALL_CLAIMS.includes(claim)) throw new Error(`unsupported claim: ${claim}`);
   const before = await fetchClaimCardFn(apiKey, issueId);
   const ownership = resolveCardClaim(before, claim);
+  const exactResetBoundary = (card, resolved = resolveCardClaim(card, claim)) => {
+    if (!resolved.boundaryCommentId) return null;
+    const comment = (card.comments || []).find((item) => item.id === resolved.boundaryCommentId);
+    const marker = parseClaimMarker(comment);
+    const expectedReason = target === "legacy" ? "legacy" : "orphan-declaration";
+    if (marker?.type !== "reset" || marker.claim !== claim || marker.target !== target
+        || marker.reason !== expectedReason) return null;
+    const validStatus = target === "legacy"
+      ? ["legacy-unowned", "closed"].includes(resolved.status)
+      : resolved.status === "closed";
+    return validStatus ? { comment } : null;
+  };
+  const existingBoundary = exactResetBoundary(before, ownership);
   const legacy = ownership.status === "legacy-unowned" && target === "legacy";
   const orphan = ownership.status === "orphan-declaration" && ownership.declarationId === target;
-  if (!legacy && !orphan) throw new Error(`claim migration target is not resettable (${ownership.status}/${ownership.reason})`);
+  if (!existingBoundary && !legacy && !orphan) throw new Error(`claim migration target is not resettable (${ownership.status}/${ownership.reason})`);
 
-  const beforeIds = new Set((before.comments || []).map((comment) => comment.id));
-  const reason = legacy ? "legacy" : "orphan-declaration";
-  const body = claimResetMarker({ claim, target, reason });
-  await addCommentFn(apiKey, before.id, body);
-  const reset = await fetchClaimCardFn(apiKey, before.id);
-  const created = (reset.comments || []).filter((comment) => !beforeIds.has(comment.id)
-    && comment.body === body && parseClaimMarker(comment)?.type === "reset");
-  const afterReset = resolveCardClaim(reset, claim);
-  if (reset.commentsComplete !== true || created.length !== 1
-      || afterReset.boundaryCommentId !== created[0].id
-      || (legacy ? afterReset.status !== "legacy-unowned" : afterReset.status !== "closed")) {
-    throw new Error("claim migration reset comment is not authoritative");
+  let authoritative = existingBoundary;
+  if (!authoritative) {
+    const reason = legacy ? "legacy" : "orphan-declaration";
+    const body = claimResetMarker({ claim, target, reason });
+    let writeError = null;
+    try {
+      await addCommentFn(apiKey, before.id, body);
+    } catch (error) {
+      writeError = error;
+    }
+    const reset = await fetchClaimCardFn(apiKey, before.id);
+    authoritative = exactResetBoundary(reset);
+    const newlyAuthoritative = authoritative && authoritative.comment.id !== ownership.boundaryCommentId;
+    if (!newlyAuthoritative) {
+      if (writeError) throw writeError;
+      throw new Error("claim migration reset comment is not authoritative");
+    }
   }
 
-  if (!legacy) return { identifier: reset.identifier, claim, target, resetCommentId: created[0].id, labelRemoved: false };
+  const resetCommentId = authoritative.comment.id;
+  if (target !== "legacy") return { identifier: before.identifier, claim, target, resetCommentId, labelRemoved: false };
   const final = await fetchClaimCardFn(apiKey, before.id);
   const finalOwnership = resolveCardClaim(final, claim);
-  if (final.commentsComplete !== true || finalOwnership.boundaryCommentId !== created[0].id
-      || !["legacy-unowned", "closed"].includes(finalOwnership.status)) {
+  const finalBoundary = exactResetBoundary(final, finalOwnership);
+  if (final.commentsComplete !== true || finalBoundary?.comment.id !== resetCommentId) {
     throw new Error("claim migration reset lost authority before label cleanup");
   }
   let labelRemoved = false;
@@ -4229,10 +4248,10 @@ export async function resetClaimMigration(apiKey, issueId, claim, target, {
   const verified = await fetchClaimCardFn(apiKey, before.id);
   const verifiedOwnership = resolveCardClaim(verified, claim);
   if (hasLabel(verified, claim) || verifiedOwnership.status !== "closed"
-      || verifiedOwnership.boundaryCommentId !== created[0].id) {
+      || exactResetBoundary(verified, verifiedOwnership)?.comment.id !== resetCommentId) {
     throw new Error("claim migration legacy label cleanup unverified");
   }
-  return { identifier: verified.identifier, claim, target, resetCommentId: created[0].id, labelRemoved };
+  return { identifier: verified.identifier, claim, target, resetCommentId, labelRemoved };
 }
 
 async function fetchCard(apiKey, issueId) {

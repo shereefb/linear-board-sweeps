@@ -1574,6 +1574,67 @@ test("attended claim migration reset proves an exact legacy reset before removin
   assert.deepEqual(reads, [true, true, true, false]);
 });
 
+test("attended legacy reset resumes cleanup after a crash without posting a duplicate boundary", async () => {
+  const claim = "dev:in-progress";
+  const reset = { id: "reset-id", body: claimResetMarker({ claim, target: "legacy", reason: "legacy" }), createdAt: "2026-07-11T00:01:00.000Z" };
+  let labelPresent = true;
+  let commentsPosted = 0;
+  const fetch = async () => ({ id: "i1", identifier: "COD-1", labelNames: labelPresent ? [claim] : [], labelIds: labelPresent ? { [claim]: "label-id" } : {}, commentsComplete: true, comments: [reset] });
+  const result = await resetClaimMigration("key", "COD-1", claim, "legacy", {
+    fetchClaimCardFn: fetch,
+    addCommentFn: async () => { commentsPosted += 1; },
+    applyLabelEditFn: async () => { labelPresent = false; },
+  });
+  assert.equal(commentsPosted, 0);
+  assert.equal(result.resetCommentId, "reset-id");
+  assert.equal(result.labelRemoved, true);
+});
+
+test("attended legacy reset recovers an ambiguous comment-create success and rejects a true write failure", async () => {
+  const claim = "dev:in-progress";
+  const comments = [];
+  let labelPresent = true;
+  const fetch = async () => ({ id: "i1", identifier: "COD-1", labelNames: labelPresent ? [claim] : [], labelIds: labelPresent ? { [claim]: "label-id" } : {}, commentsComplete: true, comments: [...comments] });
+  const recovered = await resetClaimMigration("key", "COD-1", claim, "legacy", {
+    fetchClaimCardFn: fetch,
+    addCommentFn: async (_key, _id, body) => {
+      comments.push({ id: "reset-after-timeout", body, createdAt: "2026-07-11T00:01:00.000Z" });
+      throw new Error("network timeout");
+    },
+    applyLabelEditFn: async () => { labelPresent = false; },
+  });
+  assert.equal(recovered.resetCommentId, "reset-after-timeout");
+
+  let removals = 0;
+  await assert.rejects(resetClaimMigration("key", "COD-2", claim, "legacy", {
+    fetchClaimCardFn: async () => ({ id: "i2", identifier: "COD-2", labelNames: [claim], labelIds: { [claim]: "label-id" }, commentsComplete: true, comments: [] }),
+    addCommentFn: async () => { throw new Error("definite write failure"); },
+    applyLabelEditFn: async () => { removals += 1; },
+  }), /definite write failure/);
+  assert.equal(removals, 0);
+});
+
+test("attended reset refuses a newer epoch after an old reset and idempotently accepts an exact closed orphan", async () => {
+  const claim = "qa:in-progress";
+  const legacyReset = { id: "legacy-reset", body: claimResetMarker({ claim, target: "legacy", reason: "legacy" }), createdAt: "2026-07-11T00:00:00.000Z" };
+  const newer = { id: "newer", body: claimDeclarationMarker({ claim, ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: "2026-07-11T00:01:00.000Z" };
+  let posts = 0;
+  await assert.rejects(resetClaimMigration("key", "COD-2", claim, "legacy", {
+    fetchClaimCardFn: async () => ({ id: "i2", identifier: "COD-2", labelNames: [claim], labelIds: { [claim]: "label-id" }, commentsComplete: true, comments: [legacyReset, newer] }),
+    addCommentFn: async () => { posts += 1; },
+  }), /not resettable/i);
+  assert.equal(posts, 0);
+
+  const orphanDeclaration = { id: "decl", body: claimDeclarationMarker({ claim, ownerToken: "old-owner", declarationId: "old-decl" }), createdAt: "2026-07-11T00:00:00.000Z" };
+  const orphanReset = { id: "orphan-reset", body: claimResetMarker({ claim, target: "old-decl", reason: "orphan-declaration" }), createdAt: "2026-07-11T00:01:00.000Z" };
+  const result = await resetClaimMigration("key", "COD-3", claim, "old-decl", {
+    fetchClaimCardFn: async () => ({ id: "i3", identifier: "COD-3", labelNames: [], labelIds: {}, commentsComplete: true, comments: [orphanDeclaration, orphanReset] }),
+    addCommentFn: async () => { posts += 1; },
+  });
+  assert.equal(result.resetCommentId, "orphan-reset");
+  assert.equal(posts, 0);
+});
+
 test("attended migration reader complete-hydrates unlabeled orphan declarations", async () => {
   const comments = [{ id: "old", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: "2026-01-01T00:00:00.000Z" }];
   const card = await fetchCompleteMigrationCard("key", "COD-2", {
@@ -1597,13 +1658,14 @@ test("attended claim migration reset accepts only the exact orphan declaration a
   await assert.rejects(resetClaimMigration("key", "COD-2", claim, "wrong", { fetchClaimCardFn: async () => ({ ...(await fetch()), comments: [declaration] }) }), /not resettable|target/i);
 
   const raced = [declaration];
-  await assert.rejects(resetClaimMigration("key", "COD-2", claim, "decl-id", {
+  const converged = await resetClaimMigration("key", "COD-2", claim, "decl-id", {
     fetchClaimCardFn: async () => ({ id: "i2", identifier: "COD-2", stateName: "QA", labelNames: [], labelIds: {}, commentsComplete: true, comments: [...raced] }),
     addCommentFn: async (_key, _id, body) => {
       raced.push({ id: "foreign-reset", body, createdAt: "2026-07-11T00:00:30.000Z" });
       raced.push({ id: "our-reset", body, createdAt: "2026-07-11T00:01:00.000Z" });
     },
-  }), /authoritative/i);
+  });
+  assert.equal(converged.resetCommentId, "foreign-reset");
 });
 
 test("attended claim migration reset refuses owned, closed, unclaimed, and ambiguous histories", async () => {

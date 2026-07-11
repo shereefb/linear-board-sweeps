@@ -14,7 +14,7 @@ import {
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
   repoRouteEligibility, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
-  guardedTerminalMoveInput, latestClaimHeartbeat, fetchCompleteIssueComments, moveCardBottomIfCurrent,
+  guardedTerminalMoveInput, fetchCompleteIssueComments, moveCardBottomIfCurrent,
 } from "../scripts/linear.mjs";
 
 test("fetchCompleteIssueComments paginates claim history and rejects cursor cycles", async () => {
@@ -175,8 +175,6 @@ const GUARDED_MOVE_BASE = Object.freeze({
   labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress"],
   ownedClaim: "qa:in-progress",
   ownerToken: "owner-142",
-  heartbeatOwner: "owner-142",
-  heartbeatMalformed: false,
 });
 
 test("guarded terminal move allows only a current source card with its owned claim", () => {
@@ -195,9 +193,6 @@ for (const [override, reason] of [
   [{ labelNames: ["qa:passed", "qa:in-progress", "dev:in-progress"] }, "foreign-claim"],
   [{ ownedClaim: "fast-path:eligible" }, "invalid-owned-claim"],
   [{ ownerToken: "" }, "missing-owner-token"],
-  [{ heartbeatOwner: null }, "missing-owner-heartbeat"],
-  [{ heartbeatOwner: "newer-owner" }, "owner-mismatch"],
-  [{ heartbeatOwner: null, heartbeatMalformed: true }, "malformed-heartbeat"],
   [{ labelNames: ["qa:passed", "fast-path:eligible", "qa:in-progress", "factory:learning-generated"] }, "factory-learning-requires-signoff"],
 ]) {
   test(`guarded terminal move denies ${reason}`, () => {
@@ -211,22 +206,6 @@ test("guarded terminal move allows a generated learning card to move from QA to 
     destinationState: "Signoff",
     labelNames: [...GUARDED_MOVE_BASE.labelNames, "factory:learning-generated"],
   }), { eligible: true, reason: "ready" });
-});
-
-test("latestClaimHeartbeat selects the newest exact-claim owner", () => {
-  assert.deepEqual(latestClaimHeartbeat([
-    { body: "[auto-sweep-heartbeat 2026-07-10T10:00:00.000Z owner=older claim=qa:in-progress]", createdAt: "2026-07-10T10:00:00.000Z" },
-    { body: "[auto-sweep-heartbeat 2026-07-10T10:05:00.000Z owner=owner-142 claim=qa:in-progress] still working", createdAt: "2026-07-10T10:05:00.000Z" },
-    { body: "[auto-sweep-heartbeat 2026-07-10T10:06:00.000Z owner=dev-owner claim=dev:in-progress]", createdAt: "2026-07-10T10:06:00.000Z" },
-  ], "qa:in-progress"), { owner: "owner-142", malformed: false });
-});
-
-test("latestClaimHeartbeat fails ownership closed for a newer malformed exact-claim comment", () => {
-  assert.deepEqual(latestClaimHeartbeat([
-    { body: "[auto-sweep-heartbeat 2026-07-10T10:00:00.000Z owner=owner-142 claim=qa:in-progress]", createdAt: "2026-07-10T10:00:00.000Z" },
-    { body: "[auto-sweep-heartbeat malformed claim=qa:in-progress]", createdAt: "2026-07-10T10:05:00.000Z" },
-  ], "qa:in-progress"), { owner: null, malformed: true });
-  assert.throws(() => latestClaimHeartbeat([], "qa:in-progress", { complete: false }), /comments incomplete/);
 });
 
 test("guarded terminal move input removes only the owned claim", () => {
