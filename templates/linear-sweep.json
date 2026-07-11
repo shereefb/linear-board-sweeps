@@ -1,6 +1,6 @@
 {
   "$comment": "Repo-local config for the spec/dev/qa board sweeps. Copy to <target-repo>/.claude/linear-sweep.json and fill in. Nothing in the skills is hardcoded — they read this file.",
-  "$comment_claims": "Immutable claim v1 requires separate AUTO_SWEEP_OWNER_TOKEN and AUTO_SWEEP_CLAIM_DECLARATION values, first-declaration-wins complete-history reads, declaration heartbeats for liveness only, and verified close-before-mutation. Run claim-migration-status --json before rollout; drain/reset legacy, orphan, or ambiguous epochs before upgrade or rollback.",
+  "$comment_claims": "Immutable claim v1 requires separate owner/declaration values, first-declaration-wins complete-history reads, liveness-only heartbeats, and close-before-mutation. Run claim-migration-status --json before rollout. claim-migration-reset accepts only legacy-unowned target legacy or orphan-declaration exact declaration ID. For ambiguous history, inspect and remove/correct the malformed or conflicting marker, then rerun status; reset never repairs ambiguity.",
   "teamName": "<Linear team name, e.g. Codex>",
   "teamKey": "<Linear team key, e.g. COD>",
   "project": "<Linear project name, e.g. My App>",

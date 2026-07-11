@@ -102,6 +102,22 @@ test("operator claim docs preserve declaration handoff semantics", () => {
   }
 });
 
+test("operator claim migration docs distinguish exact resets from ambiguous-history correction", () => {
+  for (const path of ["AGENTS.md", "README.md", "SETUP.md", "docs/linear-rules.md", "templates/AGENTS.snippet.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /claim-migration-reset/, `${path}: attended exact reset command missing`);
+    assert.match(body, /legacy-unowned[^\n]*target[^\n]*legacy/i, `${path}: legacy target contract missing`);
+    assert.match(body, /orphan-declaration[^\n]*exact[^\n]*declaration/i, `${path}: orphan target contract missing`);
+    assert.match(body, /ambiguous[^\n]*(?:inspect|inspection)[^\n]*(?:malformed|conflicting)[^\n]*marker/i, `${path}: ambiguous history correction missing`);
+    assert.match(body, /rerun[^\n]*claim-migration-status/i, `${path}: rerun gate missing`);
+  }
+  for (const path of [".claude/linear-sweep.json", "templates/linear-sweep.json"]) {
+    const config = JSON.parse(fs.readFileSync(path, "utf8"));
+    assert.match(config.$comment_claims, /claim-migration-reset/);
+    assert.match(config.$comment_claims, /ambiguous[^.]*malformed|conflicting/i);
+  }
+});
+
 test("operator docs explain automatic commit-bound routing without expanding QA production scope", () => {
   for (const path of operatorDocs) {
     const body = fs.readFileSync(path, "utf8");

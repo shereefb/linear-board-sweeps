@@ -1386,6 +1386,7 @@ function claimNamesForMigration(card) {
   const names = new Set(ALL_CLAIMS.filter((claim) => hasLabel(card, claim)));
   for (const comment of card?.comments || []) {
     const marker = parseClaimMarker(comment);
+    if (marker?.type === "malformed" && marker.claim === undefined) return [...ALL_CLAIMS];
     if (marker?.claim && ALL_CLAIMS.includes(marker.claim)) names.add(marker.claim);
   }
   return [...names];
@@ -4111,8 +4112,8 @@ export async function fetchClaimMigrationCards(apiKey, teamKey, projectId, {
       `query($c:String,$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
          team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } } }){
          pageInfo{ hasNextPage endCursor }
-         nodes{ id identifier updatedAt state{ name } labels{ nodes{ id name } }
-           comments(last:100){ nodes{ id body createdAt } } } } }`,
+         nodes{ id identifier updatedAt state{ name }
+           labels(first:250){ pageInfo{ hasNextPage } nodes{ id name } } } } }`,
       { c: cursor, teamKey, pid: projectId },
       apiKey,
     );
@@ -4122,10 +4123,11 @@ export async function fetchClaimMigrationCards(apiKey, teamKey, projectId, {
       throw new Error("claim migration snapshot is missing issues data or pageInfo");
     }
     for (const node of connection.nodes) {
-      const card = normalizeRelationUnknownCard(node);
-      const hasClaimLabel = ALL_CLAIMS.some((claim) => hasLabel(card, claim));
-      const hasClaimMarker = (card.comments || []).some((comment) => parseClaimMarker(comment)?.claim);
-      if (!hasClaimLabel && !hasClaimMarker) continue;
+      if (node?.labels?.pageInfo?.hasNextPage !== false || !Array.isArray(node?.labels?.nodes)
+          || node.labels.nodes.some((label) => !label?.id || typeof label?.name !== "string")) {
+        throw new Error(`claim migration labels incomplete for ${node?.identifier || node?.id || "unknown issue"}`);
+      }
+      const card = normalizeRelationUnknownCard({ ...node, comments: { nodes: [] } });
       const comments = await fetchCompleteClaimCommentsFn(apiKey, card.id, { gqlFn });
       candidates.push(withCompleteClaimHistory(card, comments));
     }
@@ -4146,6 +4148,7 @@ export async function claimMigrationStatusReport({
 } = {}) {
   const workspaces = [];
   const findings = [];
+  let omittedFindings = 0;
   const seen = new Set();
   for (const source of registry.repos || []) {
     const sourceAnchorPath = canonicalFn(source);
@@ -4164,13 +4167,14 @@ export async function claimMigrationStatusReport({
           if (["owned", "closed", "unclaimed"].includes(result.status)) continue;
           if (findings.length < MAX_CLAIM_MIGRATION_FINDINGS) {
             findings.push({ sourceAnchorPath, identifier: card.identifier, claim, status: result.status, reason: result.reason });
-          }
+          } else omittedFindings += 1;
         }
       }
     } catch (error) {
       const reason = sanitizeFailureMessage(error?.message || error);
-      workspaces.push({ sourceAnchorPath, ready: false, error: reason });
+      workspaces.push({ sourceAnchorPath, active: 0, legacyUnowned: 0, orphanDeclarations: 0, ambiguous: 1, ready: false, error: reason });
       if (findings.length < MAX_CLAIM_MIGRATION_FINDINGS) findings.push({ sourceAnchorPath, status: "ambiguous", reason });
+      else omittedFindings += 1;
     }
   }
   const totals = claimMigrationSummary([]);
@@ -4181,7 +4185,54 @@ export async function claimMigrationStatusReport({
     totals.ambiguous += workspace.ambiguous || 0;
   }
   totals.ready = workspaces.every((workspace) => workspace.ready === true);
-  return { ...totals, workspaces, findings, findingsTruncated: findings.length === MAX_CLAIM_MIGRATION_FINDINGS };
+  return { ...totals, workspaces, findings, findingsTruncated: omittedFindings > 0 };
+}
+
+export async function resetClaimMigration(apiKey, issueId, claim, target, {
+  fetchClaimCardFn = fetchCompleteMigrationCard,
+  addCommentFn = addComment,
+  applyLabelEditFn = applyLabelEdit,
+} = {}) {
+  if (!ALL_CLAIMS.includes(claim)) throw new Error(`unsupported claim: ${claim}`);
+  const before = await fetchClaimCardFn(apiKey, issueId);
+  const ownership = resolveCardClaim(before, claim);
+  const legacy = ownership.status === "legacy-unowned" && target === "legacy";
+  const orphan = ownership.status === "orphan-declaration" && ownership.declarationId === target;
+  if (!legacy && !orphan) throw new Error(`claim migration target is not resettable (${ownership.status}/${ownership.reason})`);
+
+  const beforeIds = new Set((before.comments || []).map((comment) => comment.id));
+  const reason = legacy ? "legacy" : "orphan-declaration";
+  const body = claimResetMarker({ claim, target, reason });
+  await addCommentFn(apiKey, before.id, body);
+  const reset = await fetchClaimCardFn(apiKey, before.id);
+  const created = (reset.comments || []).filter((comment) => !beforeIds.has(comment.id)
+    && comment.body === body && parseClaimMarker(comment)?.type === "reset");
+  const afterReset = resolveCardClaim(reset, claim);
+  if (reset.commentsComplete !== true || created.length !== 1
+      || afterReset.boundaryCommentId !== created[0].id
+      || (legacy ? afterReset.status !== "legacy-unowned" : afterReset.status !== "closed")) {
+    throw new Error("claim migration reset comment is not authoritative");
+  }
+
+  if (!legacy) return { identifier: reset.identifier, claim, target, resetCommentId: created[0].id, labelRemoved: false };
+  const final = await fetchClaimCardFn(apiKey, before.id);
+  const finalOwnership = resolveCardClaim(final, claim);
+  if (final.commentsComplete !== true || finalOwnership.boundaryCommentId !== created[0].id
+      || !["legacy-unowned", "closed"].includes(finalOwnership.status)) {
+    throw new Error("claim migration reset lost authority before label cleanup");
+  }
+  let labelRemoved = false;
+  if (hasLabel(final, claim)) {
+    await applyLabelEditFn(apiKey, final, { remove: [claim] });
+    labelRemoved = true;
+  }
+  const verified = await fetchClaimCardFn(apiKey, before.id);
+  const verifiedOwnership = resolveCardClaim(verified, claim);
+  if (hasLabel(verified, claim) || verifiedOwnership.status !== "closed"
+      || verifiedOwnership.boundaryCommentId !== created[0].id) {
+    throw new Error("claim migration legacy label cleanup unverified");
+  }
+  return { identifier: verified.identifier, claim, target, resetCommentId: created[0].id, labelRemoved };
 }
 
 async function fetchCard(apiKey, issueId) {
@@ -4214,6 +4265,34 @@ async function fetchClaimCard(apiKey, issueId) {
   const card = normalizeRelationUnknownCard(d.issue);
   if (!ALL_CLAIMS.some((claim) => hasLabel(card, claim))) return card;
   return withCompleteClaimHistory(card, await fetchCompleteClaimComments(apiKey, d.issue.id));
+}
+
+export async function fetchCompleteMigrationCard(apiKey, issueId, {
+  fetchClaimCardFn = null,
+  fetchCompleteClaimCommentsFn = fetchCompleteClaimComments,
+  gqlFn = gql,
+} = {}) {
+  let card;
+  if (fetchClaimCardFn) {
+    card = await fetchClaimCardFn(apiKey, issueId);
+  } else {
+    const data = await gqlFn(
+      `query($id:String!){ issue(id:$id){ id identifier updatedAt state{ name }
+         labels(first:250){ pageInfo{ hasNextPage } nodes{ id name } } } }`,
+      { id: issueId },
+      apiKey,
+    );
+    const issue = unwrapGraphQlData(data, "claim migration issue")?.issue;
+    if (!issue) throw new Error(`issue not found: ${issueId}`);
+    if (issue.labels?.pageInfo?.hasNextPage !== false || !Array.isArray(issue.labels?.nodes)
+        || issue.labels.nodes.some((label) => !label?.id || typeof label?.name !== "string")) {
+      throw new Error(`claim migration labels incomplete for ${issue.identifier || issue.id}`);
+    }
+    card = normalizeRelationUnknownCard({ ...issue, comments: { nodes: [] } });
+  }
+  if (card.commentsComplete === true) return card;
+  const comments = await fetchCompleteClaimCommentsFn(apiKey, card.id, { gqlFn });
+  return withCompleteClaimHistory(card, comments);
 }
 
 async function fetchBlockedIssues(apiKey, teamKey, projectId) {
@@ -7215,6 +7294,23 @@ async function cmdClaimMigrationStatus(args = []) {
   if (!report.ready) process.exitCode = 1;
 }
 
+async function cmdClaimMigrationReset(args = []) {
+  const [anchorPath, issueId, claim, target] = args;
+  if (args.length !== 4 || !anchorPath || !issueId || !claim || !target) {
+    throw new Error("usage: claim-migration-reset <anchor> <Issue> <Claim> <Target>");
+  }
+  const abs = path.resolve(anchorPath);
+  const config = anchorConfig(abs);
+  const apiKey = anchorKey(abs);
+  if (!apiKey) throw new Error(`no LINEAR_API_KEY in ${abs}/.env`);
+  const issue = await fetchIssueLabels(apiKey, issueId);
+  if (issue.teamKey !== config.teamKey || issue.projectId !== config.projectId) {
+    throw new Error(`${issue.identifier} is outside the configured team/project`);
+  }
+  const result = await resetClaimMigration(apiKey, issue.id, claim, target);
+  console.log(JSON.stringify(result, null, 2));
+}
+
 export function learningStatusReport({ registry = readRegistry(), now = new Date().toISOString() } = {}) {
   const resolved = resolveRegisteredLearningWorkspaces(registry);
   const indexed = readLearningRunIndex(LEARNING_RUNS_DIR, { capturedThrough: now });
@@ -7339,11 +7435,12 @@ async function main() {
     case "health": return cmdHealth();
     case "doctor": return cmdDoctor(args);
     case "claim-migration-status": return cmdClaimMigrationStatus(args);
+    case "claim-migration-reset": return cmdClaimMigrationReset(args);
     case "learning-event": return cmdLearningEvent(args);
     case "learning-status": return cmdLearningStatus(args);
     case "learning-run": return cmdLearningRun(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | claim-migration-reset <anchor> <Issue> <Claim> <Target> | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }

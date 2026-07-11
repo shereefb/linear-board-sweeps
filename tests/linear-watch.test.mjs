@@ -34,7 +34,7 @@ import {
   sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   fetchCompleteClaimComments, withCompleteClaimHistory, normalizeRelationUnknownCard,
-  fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards,
+  fetchScheduledPassCards, fetchScheduledQueueCards, fetchClaimMigrationCards, fetchCompleteMigrationCard, claimMigrationStatusReport, resetClaimMigration,
   SWEEP_CFG, DEFAULT_MAX_NON_SHIP_DISPATCHES, DEFAULT_MAX_DRAIN_PASSES, MAX_DRAIN_PASSES,
   DEFAULT_MAX_ACTIVE_CHILDREN, MAX_ACTIVE_CHILDREN,
   OBSERVATION_STATE_VERSION, OBSERVATION_RETENTION_MS, MAX_DEPENDENCY_DEFERRED_ISSUES,
@@ -1506,19 +1506,121 @@ test("claim migration status reports legacy, orphan, active, and ambiguous claim
     ready: false,
   });
 });
-test("claim migration scan complete-hydrates only claim-bearing cards", async () => {
+test("claim migration scan complete-hydrates every project card before selecting claim history", async () => {
   const full = [{ id: "full-1", createdAt: "2026-07-11T00:01:00.000Z", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }) }];
   const hydrated = [];
   const cards = await fetchClaimMigrationCards("key", "COD", "project", {
     gqlFn: async () => ({ issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
-      { id: "i1", identifier: "COD-1", updatedAt: NOW, state: { name: "Dev" }, labels: { nodes: [{ id: "l1", name: "dev:in-progress" }] }, comments: { nodes: [] } },
-      { id: "i2", identifier: "COD-2", updatedAt: NOW, state: { name: "Dev" }, labels: { nodes: [] }, comments: { nodes: [] } },
+      { id: "i1", identifier: "COD-1", updatedAt: NOW, state: { name: "Dev" }, labels: { pageInfo: { hasNextPage: false }, nodes: [{ id: "l1", name: "dev:in-progress" }] } },
+      { id: "i2", identifier: "COD-2", updatedAt: NOW, state: { name: "Dev" }, labels: { pageInfo: { hasNextPage: false }, nodes: [] } },
+      { id: "i3", identifier: "COD-3", updatedAt: NOW, state: { name: "Dev" }, labels: { pageInfo: { hasNextPage: false }, nodes: [] } },
     ] } }),
-    fetchCompleteClaimCommentsFn: async (_key, id) => { hydrated.push(id); return full; },
+    fetchCompleteClaimCommentsFn: async (_key, id) => {
+      hydrated.push(id);
+      if (id === "i2") return full;
+      if (id === "i3") return [{ id: "old-malformed", createdAt: "2026-01-01T00:00:00.000Z", body: "[auto-sweep-claim v1 broken]" }];
+      return [];
+    },
   });
-  assert.deepEqual(hydrated, ["i1"]);
-  assert.equal(cards[0].commentsComplete, true);
-  assert.deepEqual(cards[0].comments, full);
+  assert.deepEqual(hydrated, ["i1", "i2", "i3"]);
+  assert.deepEqual(cards.map((card) => card.identifier), ["COD-1", "COD-2", "COD-3"]);
+  assert.ok(cards.every((card) => card.commentsComplete === true));
+  assert.equal(claimMigrationSummary(cards).orphanDeclarations, 1);
+  assert.equal(claimMigrationSummary(cards).ambiguous, 4);
+});
+
+test("claim migration scan rejects incomplete issue-label pages", async () => {
+  await assert.rejects(fetchClaimMigrationCards("key", "COD", "project", {
+    gqlFn: async () => ({ issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+      { id: "i1", identifier: "COD-1", updatedAt: NOW, state: { name: "Dev" }, labels: { pageInfo: { hasNextPage: true }, nodes: [] } },
+    ] } }),
+  }), /labels.*incomplete/i);
+});
+
+test("claim migration findings truncate only after a 101st omission and unreadable workspaces count ambiguous", async () => {
+  const legacy = (n) => ({ identifier: `COD-${n}`, labelNames: ["dev:in-progress"], commentsComplete: true, comments: [] });
+  const report100 = await claimMigrationStatusReport({
+    registry: { repos: ["/a"] }, canonicalFn: (v) => v, configFn: () => ({ teamKey: "COD", projectId: "p" }), keyFn: () => "key",
+    fetchCardsFn: async () => Array.from({ length: 100 }, (_, i) => legacy(i)),
+  });
+  assert.equal(report100.findings.length, 100);
+  assert.equal(report100.findingsTruncated, false);
+  const report101 = await claimMigrationStatusReport({
+    registry: { repos: ["/a"] }, canonicalFn: (v) => v, configFn: () => ({ teamKey: "COD", projectId: "p" }), keyFn: () => "key",
+    fetchCardsFn: async () => Array.from({ length: 101 }, (_, i) => legacy(i)),
+  });
+  assert.equal(report101.findings.length, 100);
+  assert.equal(report101.findingsTruncated, true);
+  const unreadable = await claimMigrationStatusReport({
+    registry: { repos: ["/a"] }, canonicalFn: (v) => v, configFn: () => { throw new Error("bad config"); }, keyFn: () => "key",
+  });
+  assert.equal(unreadable.ambiguous, 1);
+  assert.equal(unreadable.findings[0].status, "ambiguous");
+});
+
+test("attended claim migration reset proves an exact legacy reset before removing its label", async () => {
+  const claim = "dev:in-progress";
+  const comments = [];
+  const reads = [];
+  const card = (labelPresent) => ({ id: "i1", identifier: "COD-1", stateName: "Dev", labelNames: labelPresent ? [claim] : [], labelIds: labelPresent ? { [claim]: "label-id" } : {}, commentsComplete: true, comments: [...comments] });
+  let labelPresent = true;
+  const result = await resetClaimMigration("key", "COD-1", claim, "legacy", {
+    fetchClaimCardFn: async () => { reads.push(labelPresent); return card(labelPresent); },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "reset-id", body, createdAt: "2026-07-11T00:01:00.000Z" }),
+    applyLabelEditFn: async (_key, _card, edit) => { assert.deepEqual(edit, { remove: [claim] }); labelPresent = false; },
+  });
+  assert.equal(result.resetCommentId, "reset-id");
+  assert.equal(result.labelRemoved, true);
+  assert.deepEqual(reads, [true, true, true, false]);
+});
+
+test("attended migration reader complete-hydrates unlabeled orphan declarations", async () => {
+  const comments = [{ id: "old", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: "2026-01-01T00:00:00.000Z" }];
+  const card = await fetchCompleteMigrationCard("key", "COD-2", {
+    fetchClaimCardFn: async () => ({ id: "i2", identifier: "COD-2", labelNames: [], comments: [], commentsComplete: false }),
+    fetchCompleteClaimCommentsFn: async () => comments,
+  });
+  assert.equal(card.commentsComplete, true);
+  assert.deepEqual(card.comments, comments);
+});
+
+test("attended claim migration reset accepts only the exact orphan declaration and authoritative reset id", async () => {
+  const claim = "qa:in-progress";
+  const declaration = { id: "decl-comment", body: claimDeclarationMarker({ claim, ownerToken: "owner", declarationId: "decl-id" }), createdAt: "2026-07-11T00:00:00.000Z" };
+  const comments = [declaration];
+  const fetch = async () => ({ id: "i2", identifier: "COD-2", stateName: "QA", labelNames: [], labelIds: {}, commentsComplete: true, comments: [...comments] });
+  const result = await resetClaimMigration("key", "COD-2", claim, "decl-id", {
+    fetchClaimCardFn: fetch,
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "our-reset", body, createdAt: "2026-07-11T00:01:00.000Z" }),
+  });
+  assert.equal(result.resetCommentId, "our-reset");
+  await assert.rejects(resetClaimMigration("key", "COD-2", claim, "wrong", { fetchClaimCardFn: async () => ({ ...(await fetch()), comments: [declaration] }) }), /not resettable|target/i);
+
+  const raced = [declaration];
+  await assert.rejects(resetClaimMigration("key", "COD-2", claim, "decl-id", {
+    fetchClaimCardFn: async () => ({ id: "i2", identifier: "COD-2", stateName: "QA", labelNames: [], labelIds: {}, commentsComplete: true, comments: [...raced] }),
+    addCommentFn: async (_key, _id, body) => {
+      raced.push({ id: "foreign-reset", body, createdAt: "2026-07-11T00:00:30.000Z" });
+      raced.push({ id: "our-reset", body, createdAt: "2026-07-11T00:01:00.000Z" });
+    },
+  }), /authoritative/i);
+});
+
+test("attended claim migration reset refuses owned, closed, unclaimed, and ambiguous histories", async () => {
+  const claim = "ship:in-progress";
+  const declaration = { id: "decl", body: claimDeclarationMarker({ claim, ownerToken: "owner", declarationId: "decl-id" }), createdAt: "2026-07-11T00:00:00.000Z" };
+  const close = { id: "close", body: claimCloseMarker({ claim, declarationId: "decl-id", reason: "released" }), createdAt: "2026-07-11T00:01:00.000Z" };
+  const cases = [
+    { labels: [claim], comments: [declaration], target: "decl-id" },
+    { labels: [], comments: [declaration, close], target: "decl-id" },
+    { labels: [], comments: [], target: "legacy" },
+    { labels: [claim], comments: [{ id: "bad", body: `[auto-sweep-claim v1 claim=${claim} broken]`, createdAt: "2026-07-11T00:00:00.000Z" }], target: "legacy" },
+  ];
+  for (const value of cases) {
+    await assert.rejects(resetClaimMigration("key", "COD-3", claim, value.target, {
+      fetchClaimCardFn: async () => ({ id: "i3", identifier: "COD-3", labelNames: value.labels, labelIds: {}, commentsComplete: true, comments: value.comments }),
+    }), /not resettable/i);
+  }
 });
 test("countMarkers: only counts markers inside the rolling window", () => {
   const card = { comments: [
