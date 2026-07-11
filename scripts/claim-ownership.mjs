@@ -206,8 +206,12 @@ export function resolveClaimOwnership({ comments, complete, claim, labelPresent 
   const epoch = foldEpoch(events.value);
   if (epoch.error) return ambiguous(epoch.error);
   if (!epoch.declaration) {
-    if (labelPresent) return frozen({ status: "legacy-unowned", reason: "label-without-declaration" });
-    if (epoch.boundary) return frozen({ status: "closed", reason: "epoch-closed", boundaryCommentId: epoch.boundary.commentId });
+    const boundary = epoch.boundary ? {
+      boundaryCommentId: epoch.boundary.commentId,
+      boundaryCreatedAt: epoch.boundary.createdAt,
+    } : {};
+    if (labelPresent) return frozen({ status: "legacy-unowned", reason: "label-without-declaration", ...boundary });
+    if (epoch.boundary) return frozen({ status: "closed", reason: "epoch-closed", ...boundary });
     return frozen({ status: "unclaimed", reason: "no-claim" });
   }
 

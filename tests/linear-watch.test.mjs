@@ -1468,6 +1468,14 @@ test("heartbeatAgeMin: stranded closed label ages from its boundary and ignores 
   ] };
   assert.ok(Math.abs(heartbeatAgeMin(card, NOW, "qa:in-progress") - 200) < 0.5);
 });
+test("heartbeatAgeMin: delayed duplicate boundary is a no-op for stranded-label age", () => {
+  const card = { updatedAt: minsAgo(1), labelNames: ["qa:in-progress"], commentsComplete: true, comments: [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: minsAgo(300) },
+    { id: "c2", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "released" }), createdAt: minsAgo(200) },
+    { id: "c3", body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "failed" }), createdAt: minsAgo(1) },
+  ] };
+  assert.ok(Math.abs(heartbeatAgeMin(card, NOW, "qa:in-progress") - 200) < 0.5);
+});
 test("heartbeatAgeMin: ambiguous declared history fails closed as live", () => {
   const card = dependencyReadyCard({ id: "bad", stateName: "Dev", updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], commentsComplete: true, comments: [
     { id: "c1", body: "[auto-sweep-claim v1 claim=dev:in-progress broken]", createdAt: minsAgo(300) },
@@ -5138,6 +5146,76 @@ test("foreignClaimReleases: a stale stranded label after an exact close is clean
   ] };
   const [decision] = foreignClaimReleases([card], NOW);
   assert.deepEqual(decision.releases, [{ claim: "qa:in-progress", target: "legacy", staleMin: 120 }]);
+});
+
+test("executeOrphanReap: a newer declaration during a multi-claim reset removes no labels", async () => {
+  assert.equal(typeof watchModule.executeOrphanReap, "function");
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "qa-old", declarationId: "qa-old-decl" }), createdAt: minsAgo(300) },
+    { id: "c2", body: claimDeclarationMarker({ claim: "ship:in-progress", ownerToken: "ship-old", declarationId: "ship-old-decl" }), createdAt: minsAgo(300) },
+  ];
+  const original = { id: "race", identifier: "COD-169", updatedAt: minsAgo(300), labelIds: { "qa:in-progress": "qa-label", "ship:in-progress": "ship-label" }, labelNames: ["qa:in-progress", "ship:in-progress"], commentsComplete: true, comments: [...comments] };
+  let reads = 0;
+  let removals = 0;
+  const fetched = () => ({ ...original, labelIds: { ...original.labelIds }, labelNames: [...original.labelNames], commentsComplete: true, comments: [...comments] });
+  const released = await watchModule.executeOrphanReap("key", original, {
+    releaseClaims: ["qa:in-progress", "ship:in-progress"],
+    releases: [
+      { claim: "qa:in-progress", target: "qa-old-decl", staleMin: 120 },
+      { claim: "ship:in-progress", target: "ship-old-decl", staleMin: 120 },
+    ],
+  }, NOW, {
+    fetchClaimCardFn: async () => {
+      reads += 1;
+      if (reads === 5) comments.push({ id: "c-new", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "qa-new", declarationId: "qa-new-decl" }), createdAt: minsAgo(0) });
+      return fetched();
+    },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `reset-${comments.length}`, body, createdAt: minsAgo(1) }),
+    applyLabelEditFn: async () => { removals += 1; },
+    addAuditCommentFn: async () => {},
+  });
+  assert.equal(released, false);
+  assert.equal(removals, 0);
+  assert.deepEqual(original.labelNames, ["qa:in-progress", "ship:in-progress"]);
+});
+
+test("executeOrphanReap: confirmed cleanup synchronizes the scheduler card before same-tick claim admission", async () => {
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "qa-old", declarationId: "qa-old-decl" }), createdAt: minsAgo(300) },
+  ];
+  const original = dependencyReadyCard({ id: "sync", identifier: "COD-170", stateName: "Dev", updatedAt: minsAgo(300), sortOrder: 1, labelIds: { "qa:in-progress": "qa-label", "feature": "feature-label" }, labelNames: ["qa:in-progress", "feature"], commentsComplete: true, comments: [...comments] });
+  const fetched = () => ({ ...original, labelIds: { "qa:in-progress": "qa-label", "feature": "feature-label" }, labelNames: ["qa:in-progress", "feature"], commentsComplete: true, comments: [...comments] });
+  const released = await watchModule.executeOrphanReap("key", original, {
+    releaseClaims: ["qa:in-progress"], releases: [{ claim: "qa:in-progress", target: "qa-old-decl", staleMin: 120 }],
+  }, NOW, {
+    fetchClaimCardFn: async () => fetched(),
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `reset-${comments.length}`, body, createdAt: minsAgo(1) }),
+    applyLabelEditFn: async (_key, card, edit) => {
+      for (const claim of edit.remove) delete card.labelIds[claim];
+      card.labelNames = Object.keys(card.labelIds);
+    },
+    addAuditCommentFn: async () => {},
+  });
+  assert.equal(released, true);
+  assert.deepEqual(original.labelIds, { feature: "feature-label" });
+  assert.deepEqual(original.labelNames, ["feature"]);
+  let claimedLabelIds = [];
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [original], {
+    parentRunId: "same-tick", limit: 1, labelMap: { "dev:in-progress": "dev-label" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "dev-decl",
+    addCommentFn: async (_key, _id, body) => comments.push({ id: `claim-${comments.length}`, body, createdAt: minsAgo(0) }),
+    applyLabelEditFn: async (_key, card, edit) => {
+      for (const claim of edit.remove || []) delete card.labelIds[claim];
+      for (const [name, id] of Object.entries(edit.add || {})) card.labelIds[name] = id;
+      card.labelNames = Object.keys(card.labelIds);
+      if (edit.add) claimedLabelIds = Object.values(card.labelIds).sort();
+    },
+    sleepFn: async () => {},
+    fetchCardFn: async () => ({ ...original, labelIds: { ...original.labelIds }, labelNames: [...original.labelNames], commentsComplete: true, comments: [...comments] }),
+  });
+  assert.equal(claimed.length, 1);
+  assert.deepEqual(claimedLabelIds, ["dev-label", "feature-label"]);
 });
 
 // ── env parsing ──────────────────────────────────────────────────────────────

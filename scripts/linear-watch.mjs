@@ -644,13 +644,8 @@ export function heartbeatAgeMin(card, now, claim = null) {
     const ownership = resolveCardClaim(card, claim);
     if (ownership.status === "owned") return (now - Date.parse(ownership.livenessAt)) / 60000;
     if (ownership.status === "ambiguous") return Number.NEGATIVE_INFINITY;
-    if (ownership.status === "legacy-unowned") {
-      const boundaries = (card.comments || []).flatMap((comment) => {
-        const marker = parseClaimMarker(comment);
-        return (marker?.type === "close" || marker?.type === "reset") && marker.claim === claim
-          ? [Date.parse(marker.createdAt)] : [];
-      });
-      if (boundaries.length) return (now - Math.max(...boundaries)) / 60000;
+    if (ownership.status === "legacy-unowned" && ownership.boundaryCreatedAt) {
+      return (now - Date.parse(ownership.boundaryCreatedAt)) / 60000;
     }
     if (ownership.status !== "legacy-unowned") return Number.POSITIVE_INFINITY;
   }
@@ -4480,11 +4475,15 @@ export async function resetStaleClaimBoundary(apiKey, card, claim, target, stale
   const reason = target === "legacy" ? "legacy" : "orphan-declaration";
   await addCommentFn(apiKey, card.id, claimResetMarker({ claim, target, reason }));
   const reset = await fetchClaimCardFn(apiKey, card.id);
-  if (!exactBoundaryVisible(reset, claim, { type: "reset", target }, beforeCommentIds)) throw new Error("claim reset unverified");
+  const boundary = (reset.comments || []).map((comment) => ({ comment, marker: parseClaimMarker(comment) }))
+    .find(({ comment, marker }) => !beforeCommentIds.has(comment.id) && marker?.type === "reset"
+      && marker.claim === claim && marker.target === target);
+  if (!boundary || reset.commentsComplete !== true) throw new Error("claim reset unverified");
   const after = resolveCardClaim(reset, claim);
   if (after.status === "owned") return null;
-  if (after.status !== "legacy-unowned" && after.status !== "closed") throw new Error("claim reset unverified");
-  return reset;
+  if ((after.status !== "legacy-unowned" && after.status !== "closed")
+      || after.boundaryCommentId !== boundary.comment.id) throw new Error("claim reset unverified");
+  return { ...reset, claimResetProof: { claim, target, boundaryCommentId: boundary.comment.id } };
 }
 
 // Execute a reap/escalate decision: reset the exact stale epoch, then drop the
@@ -4895,15 +4894,38 @@ export function formatDoctorReport(report) {
 // Release orphaned/foreign claims (all of a card's, in one write) — no escalation;
 // the card advanced and the owning sweep just crashed before dropping its claim.
 // Uses ORPHAN_TAG (not REAPER_TAG) so it does not inflate the crash-escalation count.
-async function executeOrphanReap(apiKey, card, decision, now = Date.now()) {
+export async function executeOrphanReap(apiKey, card, decision, now = Date.now(), {
+  fetchClaimCardFn = fetchClaimCard,
+  addCommentFn = addComment,
+  applyLabelEditFn = applyLabelEdit,
+  addAuditCommentFn = addComment,
+} = {}) {
   let reset = card;
+  const proofs = [];
   for (const release of decision.releases || []) {
-    reset = await resetStaleClaimBoundary(apiKey, reset, release.claim, release.target, release.staleMin, now);
+    reset = await resetStaleClaimBoundary(apiKey, reset, release.claim, release.target, release.staleMin, now, {
+      fetchClaimCardFn,
+      addCommentFn,
+    });
     if (!reset) return false;
+    proofs.push(reset.claimResetProof);
   }
-  await applyLabelEdit(apiKey, reset, { remove: decision.releaseClaims });
+  const final = await fetchClaimCardFn(apiKey, card.id);
+  const allClosed = final.commentsComplete === true && proofs.length === (decision.releases || []).length
+    && proofs.every((proof) => {
+      const marker = (final.comments || []).find((comment) => comment.id === proof.boundaryCommentId);
+      const parsed = parseClaimMarker(marker);
+      if (parsed?.type !== "reset" || parsed.claim !== proof.claim || parsed.target !== proof.target) return false;
+      const ownership = resolveCardClaim(final, proof.claim);
+      return (ownership.status === "legacy-unowned" || ownership.status === "closed")
+        && ownership.boundaryCommentId === proof.boundaryCommentId;
+    });
+  if (!allClosed) return false;
+  await applyLabelEditFn(apiKey, final, { remove: decision.releaseClaims });
+  card.labelIds = { ...final.labelIds };
+  card.labelNames = [...final.labelNames];
   const list = decision.releaseClaims.map((c) => `\`${c}\``).join(", ");
-  await addComment(apiKey, card.id, `${ORPHAN_TAG} Auto-released orphaned claim(s) ${list} — stale heartbeat in a state their owning sweep does not run; the prior run likely crashed after advancing the card but before dropping its claim.`);
+  await addAuditCommentFn(apiKey, card.id, `${ORPHAN_TAG} Auto-released orphaned claim(s) ${list} — stale heartbeat in a state their owning sweep does not run; the prior run likely crashed after advancing the card but before dropping its claim.`);
   return true;
 }
 

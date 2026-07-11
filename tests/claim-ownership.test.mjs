@@ -56,7 +56,7 @@ test("first declaration owns the epoch and later declarations never promote", ()
     comment("c3", claimCloseMarker({ claim: "dev:in-progress", declarationId: "decl-a", reason: "released" }), 2),
   ];
   assert.deepEqual(resolveClaimOwnership({ comments, complete: true, claim: "dev:in-progress", labelPresent: false }), {
-    status: "closed", reason: "epoch-closed", boundaryCommentId: "c3",
+    status: "closed", reason: "epoch-closed", boundaryCommentId: "c3", boundaryCreatedAt: iso(2),
   });
 });
 
@@ -126,7 +126,7 @@ for (const reason of ["released", "reaped", "orphaned", "terminal", "blocked", "
       comment("c2", claimCloseMarker({ claim: "ship:in-progress", declarationId: "decl", reason }), 1),
     ];
     assert.deepEqual(resolveClaimOwnership({ comments, complete: true, claim: "ship:in-progress", labelPresent: false }), {
-      status: "closed", reason: "epoch-closed", boundaryCommentId: "c2",
+      status: "closed", reason: "epoch-closed", boundaryCommentId: "c2", boundaryCreatedAt: iso(1),
     });
   });
 }
@@ -146,7 +146,7 @@ test("a legacy reset is a boundary before the first declaration", () => {
     comment("c2", claimResetMarker({ claim: "dev:in-progress", target: "legacy", reason: "legacy" }), 1),
   ];
   assert.deepEqual(resolveClaimOwnership({ comments, complete: true, claim: "dev:in-progress", labelPresent: false }), {
-    status: "closed", reason: "epoch-closed", boundaryCommentId: "c2",
+    status: "closed", reason: "epoch-closed", boundaryCommentId: "c2", boundaryCreatedAt: iso(1),
   });
 });
 
@@ -160,6 +160,16 @@ test("duplicate and delayed closes for an already-closed winner are no-ops", () 
   assert.equal(resolveClaimOwnership({ comments, complete: true, claim: "qa:in-progress", labelPresent: true }).declarationId, "new-decl");
 });
 
+test("a delayed duplicate close does not change the authoritative boundary time", () => {
+  const result = resolveClaimOwnership({ comments: [
+    comment("c1", claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), 0),
+    comment("c2", claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "released" }), 1),
+    comment("c3", claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl", reason: "failed" }), 30),
+  ], complete: true, claim: "qa:in-progress", labelPresent: true });
+  assert.equal(result.boundaryCommentId, "c2");
+  assert.equal(result.boundaryCreatedAt, iso(1));
+});
+
 test("duplicate and delayed resets for an already-reset target are no-ops", () => {
   const comments = [
     comment("c1", claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "old", declarationId: "old-decl" }), 0),
@@ -168,6 +178,16 @@ test("duplicate and delayed resets for an already-reset target are no-ops", () =
     comment("c4", claimResetMarker({ claim: "qa:in-progress", target: "old-decl", reason: "orphan-declaration" }), 3),
   ];
   assert.equal(resolveClaimOwnership({ comments, complete: true, claim: "qa:in-progress", labelPresent: true }).declarationId, "new-decl");
+});
+
+test("a delayed duplicate reset does not change the authoritative boundary time", () => {
+  const result = resolveClaimOwnership({ comments: [
+    comment("c1", claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), 0),
+    comment("c2", claimResetMarker({ claim: "qa:in-progress", target: "decl", reason: "orphan-declaration" }), 1),
+    comment("c3", claimResetMarker({ claim: "qa:in-progress", target: "decl", reason: "orphan-declaration" }), 30),
+  ], complete: true, claim: "qa:in-progress", labelPresent: true });
+  assert.equal(result.boundaryCommentId, "c2");
+  assert.equal(result.boundaryCreatedAt, iso(1));
 });
 
 test("a delayed reset for an exactly closed winner is a no-op", () => {
