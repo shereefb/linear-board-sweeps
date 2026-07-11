@@ -14,7 +14,7 @@
       "app:api": "<api repo entry from repos>"
     }
   },
-  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
+  "$comment_runtime": "Scheduled sweep runtime selection. Each scheduled stage may declare one optional Claude fallback. Confirmed usage exhaustion cools that runtime host-wide for one hour; the launcher uses a healthy configured lane, or quietly preserves work with no Linear Todo/comment when every lane is cooling. Auth, configuration, and generic failures remain actionable. Claude must be installed and authenticated. The review entry is a reviewer role preference, not a scheduled stage.",
   "runtime": "codex",
   "models": {
     "spec": { "model": "gpt-5.6-sol", "effort": "high" },
@@ -23,11 +23,11 @@
     "ship": { "model": "gpt-5.6-terra", "effort": "medium" }
   },
   "runtimes": {
-    "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
-    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
+    "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-fable-5" } },
+    "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "high" } },
     "review": { "runtime": "claude", "model": "claude-opus-4-8" },
-    "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
-    "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
+    "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-opus-4-8" } },
+    "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "medium" } }
   },
   "$comment_parallel": "Optional repo-local demand limits beneath the host ceiling. maxNonShipDispatches defaults to 2, counts selected non-Ship workspace/sweep candidates, and caps follow-up handoff dispatches per parent tick. Ship is one child per source workspace, may coexist with every stage, and refills its workspace slot after completion without bypassing the human Ship gate. sameRepoCardLimits defaults to spec/dev=4, qa=1 and counts active child slots inside each selected non-Ship candidate. maxSameRepoRefillDispatches defaults to 8, clamps 0..20, and caps child slots backfilled after successful completion; 0 disables refill. maxHandoffTriggerHops defaults to 2 and controls immediate spec->dev/dev->qa follow-ups for the same card; 0 disables. maxDrainPasses defaults to 5 and is clamped to 1..5, so a tick can re-check queues up to four times after dispatched passes. Set maxNonShipDispatches, maxSameRepoRefillDispatches, or maxDrainPasses to 1 for stricter bounded mode; Ship is never handoff-triggered.",
   "$comment_host_capacity": "The launcher registry, not this repo-local file, owns host-wide capacity.maxActiveChildren (default 10, clamp 1..32). It caps initial, refill, and handoff top-level scheduled children across all registered anchors and launcher restarts. Reviewer subagents inside a scheduled child are not counted; parallel settings below only shape demand beneath that ceiling.",
@@ -43,7 +43,7 @@
       "ship": 1
     }
   },
-  "$comment_learning": "Factory Learning is disabled by default per workspace. When enabled, the single registry-pinned learning runner observes this workspace even if delivery auto-sweeps are paused. Reliability, quality/rework, and throughput/cost lenses use bounded structured evidence; medium/high findings create or update factory:learning-generated cards at the bottom of Spec. Generated cards always require QA -> Signoff and a human move to Ship.",
+  "$comment_learning": "Factory Learning is disabled by default per workspace. When enabled, the single registry-pinned learning runner observes this workspace even if delivery auto-sweeps are paused. Reliability, quality/rework, and throughput/cost lenses use bounded structured evidence; medium/high findings create or update factory:learning-generated cards at the bottom of Spec. Generated cards always require QA -> Signoff and a human move to Ship and never use the auto-ship marker.",
   "learning": {
     "enabled": false,
     "lenses": {
@@ -60,9 +60,9 @@
     "perf":     { "labels": ["performance"] },
     "research": { "labels": ["integration", "research"] }
   },
-  "$comment_requireShipApproval": "Optional (default false). When true, ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge — a second deliberate act that hardens against an accidental bulk-drag. (The single-runner ship pin lives in the launcher registry: `node scripts/linear-watch.mjs ship-runner on`.)",
+  "$comment_requireShipApproval": "Optional (default false). When true, qa-sweep always preserves Signoff and ship-sweep requires a human-applied `ship:approved` label in addition to the card being in 'Ship' before it will merge — a second deliberate act that hardens against an accidental bulk-drag. (The single-runner ship pin lives in the launcher registry: `node scripts/linear-watch.mjs ship-runner on`.)",
   "requireShipApproval": false,
-  "$comment_fastPath": "Enabled by default. Dev-sweep may mark tiny, high-confidence, low-risk changes with `fast-path:eligible`; a human can then move the card from QA directly to Ship to skip Signoff. Set enabled to false to require normal Signoff for every card. ship-sweep still merges only from human-moved Ship.",
+  "$comment_fastPath": "Enabled by default. Dev-sweep may mark a tiny, high-confidence, low-risk change only after its pushed full origin SHA matches the reviewed final commit. Commit-bound QA-to-Ship automatic routing occurs after full QA only when that SHA is unchanged and requireShipApproval is false. factory:learning-generated cards never use the auto-ship marker and always preserve Signoff for the human Ship move. Normal denials, enabled false, and requireShipApproval true preserve Signoff. qa-sweep never merges or deploys, no immediate QA-to-Ship launcher handoff is added, and ship-sweep remains single-runner.",
   "fastPath": {
     "enabled": true,
     "maxChangedFiles": 2,
