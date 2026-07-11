@@ -6,6 +6,8 @@ Factory Learning observes bounded structured evidence through three lenses: reli
 
 Generated cards follow Spec -> Dev -> QA -> Signoff and always require the human Ship move. They are never fast-path eligible, and Ship requires `qa:passed`. After Done, the loop measures the declared acceptance metric over a fixed window and records verified improvement, no measurable change, regression, or inconclusive evidence. Only no-change/regression plus fresh qualifying evidence may recur; automatic recurrence stops after generation three for `blocked:needs-user` review.
 
+**Planned (COD-155):** behavior-changing specs will carry a versioned correctness contract whose invariant IDs remain traceable through implementation proofs and QA evidence. Existing review findings remain structured Factory Learning evidence; the contract strengthens prevention without bypassing review, QA, Signoff, or the human Ship gate.
+
 A portable kit that installs a **Linear-driven, cross-runtime (Claude Code + Codex) feature workflow** into any repo. Four autonomous "board sweeps" carry work across a Linear board, with a human gate before anything ships:
 
 ```
