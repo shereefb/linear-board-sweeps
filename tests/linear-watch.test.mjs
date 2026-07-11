@@ -1797,6 +1797,39 @@ test("capacity admission: one sampler spans first admitted child through last re
   await Promise.all(runs);
   assert.deepEqual(lifecycle, ["start", "stop"]);
 });
+test("capacity admission retains a proven live orphan until child death is observed", async () => {
+  let stored = null;
+  let childAlive = true;
+  let beforeReleaseCalls = 0;
+  let executions = 0;
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 1,
+    parentPid: 41,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: (pid) => pid === 41 || (pid === 99 && childAlive),
+    randomUUID: () => "orphan-token",
+  });
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (_demand, reservation) => {
+      executions += 1;
+      reservation.attachChildPid(99);
+      return { kind: "timeout-termination-failed", retainReservation: true, cleanupUncertain: true };
+    },
+    beforeRelease: async () => { beforeReleaseCalls += 1; },
+  });
+  const result = await admitDemand({ stage: "dev", trigger: "initial", issueIdentifier: "COD-179", workspace: "/managed" }, { queue });
+  await queue.whenIdle();
+  assert.equal(result.retainReservation, true);
+  assert.equal(beforeReleaseCalls, 0);
+  assert.equal(executions, 1);
+  assert.equal(ledger.inspect().entries[0].retainedOrphan, true);
+  assert.equal(ledger.reserve({ stage: "qa", trigger: "initial", issueIdentifier: "COD-180", workspace: "/managed" }), null);
+  childAlive = false;
+  assert.equal(ledger.reconcile().active, 0);
+  assert.ok(ledger.reserve({ stage: "qa", trigger: "initial", issueIdentifier: "COD-180", workspace: "/managed" }));
+});
 test("capacity admission: same-stage handoff discovered under the held token runs before queued initial work", async () => {
   let stored = null;
   const order = [];
@@ -5080,6 +5113,24 @@ test("reconcileOwnedDispatchClaim preserves exact claims retained for provider o
   assert.equal(releases, 0);
 });
 
+test("unconfirmed forced termination preserves the exact epoch with cleanup uncertainty", async () => {
+  let releases = 0;
+  let fetches = 0;
+  const result = await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "timeout-termination-failed", cleanupUncertain: true,
+    pick: { sweep: "dev", issueId: "issue-179", issueIdentifier: "COD-179", ownerToken: "owner-179", claimDeclarationId: "decl-179" },
+  }, "codex", {
+    fetchClaimCardFn: async () => { fetches += 1; },
+    releaseFailedDispatchClaimFn: async () => { releases += 1; return true; },
+  });
+  assert.deepEqual(result, {
+    attempted: true, released: false, reasonKind: "termination unconfirmed",
+    cleanupUncertain: true, strandedClassification: "termination-unconfirmed",
+  });
+  assert.equal(fetches, 0);
+  assert.equal(releases, 0);
+});
+
 test("timeout reconciliation releases a clean pushed exact epoch into cooldown", async () => {
   const releases = [];
   const result = await watchModule.reconcileOwnedDispatchClaim("key", {
@@ -6591,6 +6642,10 @@ test("dispatchAsync force-terminates an expired child after grace", async () => 
 
 test("dispatchAsync bounds a forced child that never reports termination", async () => {
   const clock = dispatchWithFakeClock();
+  clock.child.stdout = new PassThrough();
+  clock.child.stderr = new PassThrough();
+  let unrefs = 0;
+  clock.child.unref = () => { unrefs += 1; };
   clock.child.kill = (signal) => { clock.signals.push(signal); return false; };
   clock.fireNext();
   clock.fireNext();
@@ -6599,6 +6654,10 @@ test("dispatchAsync bounds a forced child that never reports termination", async
   assert.equal(result.kind, "timeout-termination-failed");
   assert.equal(result.code, "CHILD_TERMINATION_UNCONFIRMED");
   assert.equal(result.cleanupUncertain, true);
+  assert.equal(result.retainReservation, true);
+  assert.equal(unrefs, 1);
+  assert.equal(clock.child.stdout.destroyed, true);
+  assert.equal(clock.child.stderr.destroyed, true);
   assert.deepEqual(clock.signals, ["SIGTERM", "SIGKILL"]);
   assert.ok(clock.timers.every((timer) => timer.cleared));
 });

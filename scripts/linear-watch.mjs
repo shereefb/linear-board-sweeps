@@ -2685,6 +2685,7 @@ function capacityEntryError(entry) {
   if (typeof entry.issueIdentifier !== "string" || !entry.issueIdentifier) return `entry ${entry.token} has invalid issueIdentifier`;
   if (typeof entry.workspace !== "string" || !entry.workspace) return `entry ${entry.token} has invalid workspace`;
   if (entry.managedWorkspace !== undefined && (typeof entry.managedWorkspace !== "string" || !entry.managedWorkspace)) return `entry ${entry.token} has invalid managedWorkspace`;
+  if (entry.retainedOrphan !== undefined && entry.retainedOrphan !== true) return `entry ${entry.token} has invalid retainedOrphan`;
   const deliveryPair = SWEEPS.includes(entry.stage) && ["initial", "refill", "handoff"].includes(entry.trigger);
   const learningPair = entry.stage === LEARNING_STAGE && entry.trigger === LEARNING_TRIGGER;
   if (!deliveryPair && !learningPair) return `entry ${entry.token} has invalid stage/trigger pair`;
@@ -2711,6 +2712,9 @@ function capacityStaleError(entry, parentAlive, childAlive) {
   }
   if (entry.childPid !== null && parentAlive === false && childAlive === false) {
     return `stale entry ${entry.token}: parent PID ${entry.parentPid} and child PID ${entry.childPid} are dead`;
+  }
+  if (entry.retainedOrphan === true && entry.childPid !== null && childAlive === false) {
+    return `stale retained orphan ${entry.token}: child PID ${entry.childPid} is dead`;
   }
   return null;
 }
@@ -2885,7 +2889,9 @@ export function createCapacityLedger({
         kept.push(entry);
         continue;
       }
-      const stale = entry.childPid === null ? !parentAlive : !parentAlive && !childAlive;
+      const stale = entry.childPid === null
+        ? !parentAlive
+        : entry.retainedOrphan === true ? !childAlive : !parentAlive && !childAlive;
       if (!stale) kept.push(entry);
     }
     if (errors.length) return { ...state, entries: kept, active: kept.length, healthy: false, errors };
@@ -2930,6 +2936,16 @@ export function createCapacityLedger({
     });
   };
 
+  const retainOrphan = (token) => mutate(() => {
+    const state = read();
+    if (!state.healthy || state.opaque) throw new Error(`capacity ledger unhealthy: ${state.errors.join("; ")}`);
+    const entry = state.entries.find((candidate) => candidate.token === token);
+    if (!entry || !Number.isInteger(entry.childPid) || entry.childPid <= 0) return false;
+    entry.retainedOrphan = true;
+    writeJsonFn(ledgerPath, { version: CAPACITY_LEDGER_VERSION, entries: state.entries });
+    return true;
+  });
+
   const reserve = (demand = {}) => {
     try {
       return mutate(() => {
@@ -2970,6 +2986,7 @@ export function createCapacityLedger({
           token,
           entry,
           attachChildPid: (pid) => attachChildPid(token, pid),
+          retain: () => retainOrphan(token),
           release: () => release(token),
         };
       });
@@ -2979,7 +2996,7 @@ export function createCapacityLedger({
     }
   };
 
-  return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, release };
+  return { ledgerPath, maxActiveChildren: max, inspect, reconcile, reserve, attachChildPid, retainOrphan, release };
 }
 
 export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = null, sampler = null, onCapacityDeferred = null, onCapacityFailure = null, onUnconfirmedDemand = null } = {}) {
@@ -3021,16 +3038,20 @@ export function createAdmissionQueue({ ledger, executeDemand, beforeRelease = nu
     if (localActive === 1) sampler?.start?.();
     (async () => {
       let confirmed = false;
+      let retainedReservation = false;
       try {
         const result = await executeDemand(item.demand, reservation);
         confirmed = Boolean(result);
-        if (result && beforeRelease) await beforeRelease(result, item.demand, { admitDemand: enqueue });
+        if (result?.retainReservation === true) {
+          retainedReservation = reservation.retain?.() === true;
+          if (!retainedReservation) throw new Error("failed to retain orphaned child capacity reservation");
+        } else if (result && beforeRelease) await beforeRelease(result, item.demand, { admitDemand: enqueue });
         return result;
       } finally {
         if (!confirmed && onUnconfirmedDemand) {
           try { await onUnconfirmedDemand(item.demand); } catch { /* telemetry cleanup must not change admission outcome */ }
         }
-        reservation.release();
+        if (!retainedReservation) reservation.release();
       }
     })().then(item.resolve, item.reject).finally(() => {
       localActive -= 1;
@@ -5795,8 +5816,18 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const interrupted = result.kind === "interrupted";
   const terminalFailure = result.kind === "exit" || result.kind === "signal";
   const timeoutFailure = result.kind === "timeout-graceful" || result.kind === "timeout-forced";
-  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure && !timeoutFailure) {
+  const terminationUnconfirmed = result.kind === "timeout-termination-failed";
+  if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure && !timeoutFailure && !terminationUnconfirmed) {
     return { attempted: false, released: false, reasonKind: null };
+  }
+  if (terminationUnconfirmed) {
+    return {
+      attempted: true,
+      released: false,
+      reasonKind: "termination unconfirmed",
+      cleanupUncertain: true,
+      strandedClassification: "termination-unconfirmed",
+    };
   }
   if (terminalFailure && preserveTerminalClaim) {
     return { attempted: true, released: false, reasonKind: "terminal recovery retained" };
@@ -6568,7 +6599,7 @@ export function recordSuccessfulNoOpTelemetry(telemetry = {}, issueIdentifier) {
 }
 
 const MAX_STRANDED_CLAIM_COUNT = 1_000_000;
-const STRANDED_CLAIM_CLASSIFICATIONS = ["claim-release-failed", "owned-claim-unreleased"];
+const STRANDED_CLAIM_CLASSIFICATIONS = ["claim-release-failed", "owned-claim-unreleased", "termination-unconfirmed"];
 
 function boundedStrandedClaims(value = {}) {
   return Object.fromEntries(STRANDED_CLAIM_CLASSIFICATIONS
@@ -6578,12 +6609,15 @@ function boundedStrandedClaims(value = {}) {
 }
 
 export function recordStrandedClaimTelemetry(telemetry = {}, reconciliation = {}) {
-  if (reconciliation.success === true || reconciliation.progress?.ownsOpenClaim !== true) return telemetry;
-  let classification = null;
-  if (reconciliation.claimResult?.attempted === true) {
+  if (reconciliation.success === true) return telemetry;
+  let classification = STRANDED_CLAIM_CLASSIFICATIONS.includes(reconciliation.strandedClassification)
+    ? reconciliation.strandedClassification
+    : null;
+  if (!classification && reconciliation.progress?.ownsOpenClaim !== true) return telemetry;
+  if (!classification && reconciliation.claimResult?.attempted === true) {
     if (reconciliation.claimResult.released === true) return telemetry;
     classification = "claim-release-failed";
-  } else {
+  } else if (!classification) {
     classification = "owned-claim-unreleased";
   }
   if (!classification) return telemetry;
@@ -6970,6 +7004,12 @@ function runDispatchAttempt({
             finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }));
             return;
           }
+          // The OS has not confirmed death. Persisted capacity remains the
+          // authority; detach only this launcher's referenced handles so the
+          // parent tick can settle without pretending the child is gone.
+          try { child.stdout?.destroy?.(); } catch { /* preserve timeout evidence */ }
+          try { child.stderr?.destroy?.(); } catch { /* preserve timeout evidence */ }
+          try { child.unref?.(); } catch { /* persisted PID remains authoritative */ }
           finish({
             kind: "timeout-termination-failed",
             code: "CHILD_TERMINATION_UNCONFIRMED",
@@ -6978,6 +7018,7 @@ function runDispatchAttempt({
             path: executable,
             cwd,
             cleanupUncertain: true,
+            retainReservation: true,
           });
         }, graceMs);
       }, graceMs);
@@ -7354,6 +7395,13 @@ async function tick({ dryRun = false } = {}) {
             resumeStore,
             preserveTerminalClaim: finalUsageExhausted || Boolean(capacityKind),
           });
+          if (claimResult.strandedClassification) {
+            tickState = {
+              ...tickState,
+              telemetry: recordStrandedClaimTelemetry(tickState.telemetry, claimResult),
+            };
+            writeCurrentTick();
+          }
           if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
           logFor(pick.anchorPath, pick.sweep, `owned claim release failed ${pick.issueIdentifier}: ${e.message}`);

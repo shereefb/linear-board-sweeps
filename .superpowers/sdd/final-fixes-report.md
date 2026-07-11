@@ -63,3 +63,41 @@ git diff --check
 ```
 
 Result: clean.
+
+## Critical orphan-containment follow-up
+
+The final review identified that an unconfirmed SIGKILL was typed but still flowed through ordinary admission cleanup. The follow-up adds a persisted `retainedOrphan` capacity state and makes `timeout-termination-failed` explicitly retain both the capacity reservation and exact Linear claim epoch. Refill, retry, handoff, and completion discovery are skipped. The launcher destroys its own stdout/stderr pipe handles and unrefs the child only after preserving the timeout evidence; the child PID remains the persisted authority.
+
+RED:
+
+```text
+node --test --test-name-pattern='retains a proven live orphan|unconfirmed forced termination preserves|bounds a forced child' tests/linear-watch.test.mjs
+```
+
+Result: 3 failed at the intended seams: admission released capacity and called downstream discovery, claim reconciliation ignored the outcome, and dispatch did not mark/detach the orphan.
+
+GREEN:
+
+```text
+node --test --test-name-pattern='retains a proven live orphan|unconfirmed forced termination preserves|bounds a forced child' tests/linear-watch.test.mjs
+```
+
+Result: 3 passed, 0 failed.
+
+Launcher regression after containment:
+
+```text
+node --test tests/linear-watch.test.mjs
+```
+
+Result: 445 passed, 0 failed.
+
+The fidelity test proves the admission promise/tick settles, no `beforeRelease` refill/handoff hook runs, the live orphan keeps the only capacity slot occupied, and reconciliation frees it only after the child PID is proven dead. The ledger's explicit token release remains the attended recovery seam.
+
+Final full-suite result after this follow-up:
+
+```text
+node --test tests/*.test.mjs
+```
+
+Result: 689 passed, 0 failed, 0 skipped/cancelled/todo.
