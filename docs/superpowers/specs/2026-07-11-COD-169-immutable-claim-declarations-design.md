@@ -52,7 +52,7 @@ All ownership markers are versioned and single-line. Values are bounded, whitesp
 [auto-sweep-claim v1 claim=<stage:in-progress> owner=<owner-token> declaration=<uuid>]
 [auto-sweep-heartbeat v1 claim=<stage:in-progress> declaration=<uuid> at=<ISO8601>]
 [auto-sweep-claim-close v1 claim=<stage:in-progress> declaration=<uuid> reason=<released|reaped|orphaned|terminal|blocked|failed>]
-[auto-sweep-claim-reset v1 claim=<stage:in-progress> reason=<legacy|orphan-declaration>]
+[auto-sweep-claim-reset v1 claim=<stage:in-progress> target=<declaration-id|legacy> reason=<legacy|orphan-declaration>]
 ```
 
 Linear’s comment `createdAt` and comment ID define deterministic order; the body timestamp is evidence only. Sort by `createdAt` ascending, then comment ID ascending. A marker prefix that targets the relevant claim but does not parse exactly is an ambiguity and fails resolution closed.
@@ -69,10 +69,13 @@ For one stage claim label:
 4. The earliest valid declaration is the sole owner of the open epoch.
 5. Later declarations in that epoch are losing race attempts and never become owner.
 6. A valid close must reference the current declaration. It closes the whole epoch, including all losing declarations posted before it.
-7. A new owner requires a declaration created after the close boundary.
-8. The claim is actionable only when the expected stage claim label is present and the open declaration is valid.
+7. A duplicate or delayed close for a declaration that already won and closed its epoch is a harmless no-op. It cannot affect a later epoch.
+8. A reset targets one exact orphan declaration or the explicit legacy epoch. A delayed reset whose target is already closed is a harmless no-op.
+9. A close for an unknown or losing declaration, or a reset whose target never owned the resettable epoch, is ambiguous and fails closed.
+10. A new owner requires a declaration created after the close boundary.
+11. The claim is actionable only when the expected stage claim label is present and the open declaration is valid.
 
-Invalid close references, duplicate declaration IDs with different facts, unreadable timestamps, incomplete pages, and malformed relevant markers return an explicit unreadable/ambiguous result. Callers must not mutate Linear in that state.
+Unknown/losing close references, invalid reset targets, duplicate declaration IDs with different facts, unreadable timestamps, incomplete pages, and malformed relevant markers return an explicit unreadable/ambiguous result. Callers must not mutate Linear in that state. Duplicate closes and resets for an already-closed exact target are intentionally idempotent.
 
 This “first declaration wins” rule is the key safety property. If two launchers race, the deterministic first declaration owns the epoch. If the loser or an old child posts later, it cannot displace the winner. When the winner closes, every declaration from that epoch is retired; a losing declaration cannot become owner later.
 
@@ -166,7 +169,10 @@ This may temporarily pause a legacy card, but it cannot assign ownership to the 
 - Pagination cursor cycle: unreadable, no mutation.
 - Malformed relevant marker: ambiguous, no mutation.
 - Conflicting duplicate declaration ID: ambiguous, no mutation.
-- Close references a non-current declaration: ambiguous, no mutation.
+- Close references an unknown or losing declaration: ambiguous, no mutation.
+- Duplicate/delayed close references an already-closed winning declaration: ignore as an idempotent no-op.
+- Reset target is unknown or never owned the resettable epoch: ambiguous, no mutation.
+- Duplicate/delayed reset references an already-reset exact target: ignore as an idempotent no-op.
 - Label present with no open declaration: stranded/legacy, no dispatch.
 - Open declaration without label: orphan declaration, preserve until bounded reset.
 - Owner or declaration mismatch: lost ownership, stop without label removal.
@@ -183,7 +189,8 @@ Diagnostics expose stable reason codes and bounded identifiers, never secrets or
 - losing declaration never promoted after winner closes;
 - delayed old heartbeat after a close and new epoch;
 - heartbeat for unknown or losing declaration;
-- malformed marker, timestamp, duplicate ID, invalid close, incomplete pages, and cursor cycles;
+- malformed marker, timestamp, duplicate ID, unknown/losing close, invalid reset target, incomplete pages, and cursor cycles;
+- delayed duplicate close/reset after a newer epoch remains a no-op and cannot poison or close that epoch;
 - declaration without label and label without declaration;
 - legacy heartbeat-only claim;
 - stage isolation across Spec, Dev, QA, and Ship claims.

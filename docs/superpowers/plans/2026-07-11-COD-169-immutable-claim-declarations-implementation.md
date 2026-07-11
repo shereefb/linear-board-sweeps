@@ -58,7 +58,7 @@ test("a delayed heartbeat for a closed declaration cannot affect the next epoch"
 });
 ```
 
-Also cover deterministic `createdAt,id` ordering, matching heartbeat liveness, unknown/losing heartbeats, all close reasons, reset boundaries, stage isolation, label-without-declaration, declaration-without-label, incomplete input, malformed relevant markers, unreadable timestamps, conflicting duplicate declaration IDs, and a close that references a non-current declaration.
+Also cover deterministic `createdAt,id` ordering, matching heartbeat liveness, unknown/losing heartbeats, all close reasons, exact-target reset boundaries, stage isolation, label-without-declaration, declaration-without-label, incomplete input, malformed relevant markers, unreadable timestamps, conflicting duplicate declaration IDs, unknown/losing close references, and invalid reset targets. Prove that duplicate/delayed close or reset markers for an already-closed exact target are idempotent no-ops after a newer epoch starts.
 
 - [ ] **Step 2: Run the focused suite and verify RED**
 
@@ -303,7 +303,7 @@ export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
 }
 ```
 
-Administrative reapers use the same ordering after proving stale liveness; legacy/orphan reset uses `claimResetMarker` and may remove only after the reset boundary is visible in a complete re-read.
+Administrative reapers use the same ordering after proving stale liveness; legacy/orphan reset uses `claimResetMarker({ claim, target: declarationId || "legacy", reason })` and may remove only after that exact reset boundary is visible in a complete re-read. A delayed duplicate reset for an already-reset target is a no-op against any newer epoch.
 
 - [ ] **Step 4: Replace every heartbeat-owner lifecycle check**
 
