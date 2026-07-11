@@ -78,11 +78,14 @@ node "KIT/scripts/linear-watch.mjs" tick --dry-run
 
 ## Step 6 — Install the skills
 
-Copy the sweep skill folders and manual unblock skill into the target's Claude Code skills dir:
+Copy the sweep skill folders, shared trust-boundary helper, and manual unblock skill into the target's Claude Code skills dir:
 
 ```bash
 mkdir -p "TARGET/.claude/skills"
 cp -R "KIT/skills/spec-sweep" "KIT/skills/dev-sweep" "KIT/skills/qa-sweep" "KIT/skills/ship-sweep" "KIT/skills/unblock-sweep" "TARGET/.claude/skills/"
+mkdir -p "TARGET/.claude/skills/_shared"
+cp "KIT/scripts/artifact-contract.mjs" "TARGET/.claude/skills/_shared/artifact-contract.mjs"
+cmp "KIT/scripts/artifact-contract.mjs" "TARGET/.claude/skills/_shared/artifact-contract.mjs"
 ```
 
 Claude Code discovers these natively. (For Codex, Step 8 wires them via AGENTS.md.)
@@ -259,9 +262,12 @@ for SWEEP in spec dev qa ship unblock; do
   cp "$KIT/skills/$SWEEP-sweep/SKILL.md" "$ANCHOR/.claude/skills/$SWEEP-sweep/SKILL.md"
   cmp "$KIT/skills/$SWEEP-sweep/SKILL.md" "$ANCHOR/.claude/skills/$SWEEP-sweep/SKILL.md"
 done
+mkdir -p "$ANCHOR/.claude/skills/_shared"
+cp "$KIT/scripts/artifact-contract.mjs" "$ANCHOR/.claude/skills/_shared/artifact-contract.mjs"
+cmp "$KIT/scripts/artifact-contract.mjs" "$ANCHOR/.claude/skills/_shared/artifact-contract.mjs"
 ```
 
-Verify the anchor's existing `AGENTS.md` contains the exact-`Done` dependency preflight and relation-only label rule; edit only that managed Board sweeps section and preserve unrelated user instructions. Review, commit, and push those exact skill/AGENTS changes in each anchor before resuming its schedule. Re-run `KIT/scripts/install-watch.sh` once on the host to migrate the registry to `capacity.maxActiveChildren: 10` without dropping existing settings.
+Verify the anchor's existing `AGENTS.md` contains the exact-`Done` dependency preflight, relation-only label rule, and `trust-boundary-contract/v1` guidance. The installed helper must be byte-identical to `KIT/scripts/artifact-contract.mjs`; scheduled runs use the trusted kit copy while manual runs materialize and hash-verify the regular helper blob from rollout `R`, never a worktree or later-main helper. Current/mixed/malformed/incomparable artifact classifications bounce Dev/QA directly to Spec; only paired legacy artifacts may omit the declaration. Keep sink prose as a documented residual-risk review policy, preserve Factory Learning events and the human Ship gate, and use inert local fixtures rather than production attack testing. Edit only that managed Board sweeps section and preserve unrelated user instructions. Review, commit, and push those exact skill/AGENTS changes in each anchor before resuming its schedule. Re-run `KIT/scripts/install-watch.sh` once on the host to migrate the registry to `capacity.maxActiveChildren: 10` without dropping existing settings.
 
 Before restarting launchd, run `doctor`, `doctor --json`, and `tick --dry-run` from the updated kit. `health` uses `current-tick.json`, so a live process with systemic current tick failures remains red. The resource and queue metrics are evidence only: the launcher does not auto-throttle. Keep the ten-minute interval and default capacity for a 24-hour observation before tuning the ceiling or repo-local slots.
 
@@ -277,6 +283,6 @@ Perform a one-time dry-run audit for each project returned by `list`: in Linear,
 
 - `git -C TARGET check-ignore .env` prints `.env` (key is safe).
 - `TARGET/.claude/linear-sweep.json` has a real `projectId` and no `<placeholders>`.
-- `TARGET/.claude/skills/{spec,dev,qa,ship}-sweep/SKILL.md` and `TARGET/.claude/skills/unblock-sweep/SKILL.md` exist.
+- `TARGET/.claude/skills/{spec,dev,qa,ship}-sweep/SKILL.md`, `TARGET/.claude/skills/unblock-sweep/SKILL.md`, and `TARGET/.claude/skills/_shared/artifact-contract.mjs` exist; the shared helper is byte-identical to `KIT/scripts/artifact-contract.mjs`.
 - `TARGET/AGENTS.md` contains the "Board sweeps" section with real values and the `andrej-karpathy-skill` coding workflow guardrail.
 - `node KIT/scripts/linear.mjs whoami` succeeds with the target's `.env` loaded.

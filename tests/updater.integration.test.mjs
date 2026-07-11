@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { refreshAnchorSkills, runUpdate } from "../scripts/linear-watch.mjs";
@@ -17,6 +18,97 @@ const g = (cwd, ...args) => {
   if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
   return r.stdout.trim();
 };
+
+function gitBlob(cwd, revisionAndPath) {
+  const result = spawnSync("git", ["show", revisionAndPath], { cwd, encoding: null });
+  if (result.status !== 0) throw new Error(`git show ${revisionAndPath}: ${result.stderr?.toString() || "failed"}`);
+  return result.stdout;
+}
+
+function runContractHelper(helper, repo, artifactPath, targetRef = "HEAD") {
+  const result = spawnSync("node", [helper, "classify", repo, artifactPath, "1.2.0.6", targetRef, "origin/main"], {
+    cwd: repo,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test("refreshAnchorSkills: installs the pinned helper for scheduled and manual trust-contract classification", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-contract-rollout-"));
+  try {
+    const origin = path.join(root, "origin.git");
+    const anchor = path.join(root, "anchor");
+    const publisher = path.join(root, "publisher");
+    const scratch = fs.mkdtempSync(path.join(root, "contract-helper-"));
+    const helperPath = ".claude/skills/_shared/artifact-contract.mjs";
+    const scheduledHelper = path.join(KIT, helperPath);
+    const manualHelper = path.join(scratch, "artifact-contract.mjs");
+    const canonicalHelper = fs.readFileSync(path.join(KIT, "scripts", "artifact-contract.mjs"));
+
+    assert.equal(fs.readFileSync(path.join(KIT, "VERSION"), "utf8"), "1.2.0.6\n");
+    assert.deepEqual(fs.readFileSync(scheduledHelper), canonicalHelper);
+
+    g(root, "init", "--bare", "-b", "main", origin);
+    g(root, "clone", origin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.mkdirSync(path.join(anchor, "docs"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), "1.2.0.5\n");
+    fs.writeFileSync(path.join(anchor, "docs", "legacy.md"), "legacy\n");
+    fs.writeFileSync(path.join(anchor, "docs", "incomparable.md"), "before rollout\n");
+    g(anchor, "add", "-A");
+    g(anchor, "commit", "-m", "pre-rollout");
+    g(anchor, "push", "origin", "main");
+    g(anchor, "branch", "pre-rollout");
+
+    const refresh = refreshAnchorSkills(anchor, KIT, "1.2.0.6");
+    assert.equal(refresh.ok, true, refresh.reason);
+    const rollout = g(anchor, "rev-parse", "main");
+    const installedHelper = gitBlob(anchor, `${rollout}:${helperPath}`);
+    assert.deepEqual(installedHelper, canonicalHelper);
+    assert.equal(
+      crypto.createHash("sha256").update(installedHelper).digest("hex"),
+      crypto.createHash("sha256").update(canonicalHelper).digest("hex"),
+    );
+
+    // The card branch begins at R. Its untrusted helper shadows must never be used.
+    g(anchor, "checkout", "-b", "COD-159-feature");
+    fs.writeFileSync(path.join(anchor, "docs", "current.md"), "after rollout\n");
+    g(anchor, "add", "docs/current.md");
+    g(anchor, "commit", "-m", "current artifact");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills", "_shared"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, helperPath), 'process.stdout.write("{\\"status\\":\\"current\\"}\\n")\n');
+    fs.writeFileSync(path.join(anchor, "scripts-shadow.txt"), "leave this worktree alone\n");
+
+    // A later origin/main helper is deliberately incompatible; R remains authority.
+    g(root, "clone", origin, publisher);
+    g(publisher, "config", "user.email", "t@t.t");
+    g(publisher, "config", "user.name", "t");
+    fs.writeFileSync(path.join(publisher, helperPath), "future helper must not execute\n");
+    fs.writeFileSync(path.join(publisher, "future-main.md"), "unrelated main advance\n");
+    g(publisher, "add", "-A");
+    g(publisher, "commit", "-m", "future main advance");
+    g(publisher, "push", "origin", "main");
+    g(anchor, "fetch", "origin", "main");
+
+    fs.writeFileSync(manualHelper, installedHelper, { mode: 0o400 });
+    assert.equal(
+      crypto.createHash("sha256").update(fs.readFileSync(manualHelper)).digest("hex"),
+      crypto.createHash("sha256").update(installedHelper).digest("hex"),
+    );
+    assert.equal(runContractHelper(scheduledHelper, anchor, "docs/legacy.md", "COD-159-feature").status, "legacy");
+    assert.equal(runContractHelper(manualHelper, anchor, "docs/current.md", "COD-159-feature").status, "current");
+    assert.equal(runContractHelper(manualHelper, anchor, "docs/incomparable.md", "pre-rollout").status, "incomparable");
+
+    assert.equal(g(anchor, "symbolic-ref", "--short", "HEAD"), "COD-159-feature");
+    assert.equal(fs.readFileSync(path.join(anchor, helperPath), "utf8"), 'process.stdout.write("{\\"status\\":\\"current\\"}\\n")\n');
+    assert.equal(fs.readFileSync(path.join(anchor, "scripts-shadow.txt"), "utf8"), "leave this worktree alone\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("refreshAnchorSkills: commits to main even when a feature branch is checked out", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-updater-"));

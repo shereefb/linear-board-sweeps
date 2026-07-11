@@ -2,6 +2,17 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.6] - 2026-07-10
+
+### Added
+
+- Carry a versioned trust-boundary contract from security-sensitive specs through Dev proof and QA evidence.
+- Classify missing declarations from deterministic Git ancestry as legacy, current, or incomparable.
+
+### Changed
+
+- Fail closed on invalid trust-boundary artifacts while preserving every security-review learning event and the human Ship gate.
+
 ## [1.2.0.5] - 2026-07-10
 
 ### Added

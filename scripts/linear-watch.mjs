@@ -5009,6 +5009,9 @@ function copySkillsInto(root, kit, marker) {
   for (const s of PROPAGATED_SKILL_DIRS) {
     fs.cpSync(path.join(kit, "skills", s), path.join(root, ".claude", "skills", s), { recursive: true });
   }
+  const sharedSkills = path.join(root, ".claude", "skills", "_shared");
+  fs.mkdirSync(sharedSkills, { recursive: true });
+  fs.copyFileSync(path.join(kit, "scripts", "artifact-contract.mjs"), path.join(sharedSkills, "artifact-contract.mjs"));
   fs.writeFileSync(path.join(root, ".claude", "skills", ".sweep-version"), marker + "\n");
 }
 
