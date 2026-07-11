@@ -163,7 +163,10 @@ function foldEpoch(events) {
     }
 
     if (event.type === "heartbeat") {
-      if (declaration?.declarationId === event.declarationId) heartbeatAt = event.at;
+      if (declaration?.declarationId === event.declarationId) {
+        const livenessAt = heartbeatAt ?? declaration.createdAt;
+        if (Date.parse(event.at) > Date.parse(livenessAt)) heartbeatAt = event.at;
+      }
       continue;
     }
 

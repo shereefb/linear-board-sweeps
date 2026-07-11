@@ -98,6 +98,27 @@ test("only matching heartbeats extend active-declaration liveness", () => {
   });
 });
 
+test("a matching heartbeat timestamp before declaration cannot reduce liveness", () => {
+  const comments = [
+    comment("c1", claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), 5),
+    comment("c2", claimHeartbeatMarker({ claim: "qa:in-progress", declarationId: "decl", at: iso(1) }), 6),
+  ];
+  const result = resolveClaimOwnership({ comments, complete: true, claim: "qa:in-progress", labelPresent: true });
+  assert.equal(result.heartbeatAt, null);
+  assert.equal(result.livenessAt, iso(5));
+});
+
+test("a later matching heartbeat comment cannot replace a newer accepted timestamp", () => {
+  const comments = [
+    comment("c1", claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner", declarationId: "decl" }), 0),
+    comment("c2", claimHeartbeatMarker({ claim: "qa:in-progress", declarationId: "decl", at: iso(10) }), 1),
+    comment("c3", claimHeartbeatMarker({ claim: "qa:in-progress", declarationId: "decl", at: iso(5) }), 2),
+  ];
+  const result = resolveClaimOwnership({ comments, complete: true, claim: "qa:in-progress", labelPresent: true });
+  assert.equal(result.heartbeatAt, iso(10));
+  assert.equal(result.livenessAt, iso(10));
+});
+
 for (const reason of ["released", "reaped", "orphaned", "terminal", "blocked", "failed"]) {
   test(`close reason ${reason} closes the winning epoch`, () => {
     const comments = [
