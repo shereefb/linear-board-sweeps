@@ -2,6 +2,17 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.7] - 2026-07-10
+
+### Changed
+
+- Require material Spec cards to carry an auditable `scope-closure/v1` inventory whose stable surface IDs map into implementation tasks, proofs, rollout evidence, and owners before handoff.
+- Compose scope closure with correctness and adaptive review depth without adding a review pass or weakening safety gates.
+
+### Fixed
+
+- Preserve material self-check omissions as `review/scope-gap` evidence, and prove the VERSION-triggered updater installs the changed canonical skill bytes.
+
 ## [1.2.0.5] - 2026-07-10
 
 ### Added
