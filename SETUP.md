@@ -152,11 +152,11 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "ship": { "model": "gpt-5.6-terra", "effort": "medium" }
    },
    "runtimes": {
-     "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high" },
-     "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high" },
+     "spec":   { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-fable-5" } },
+     "dev":    { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "high", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "high" } },
      "review": { "runtime": "claude", "model": "claude-opus-4-8" },
-     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
-     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium" }
+     "qa":     { "runtime": "codex",  "model": "gpt-5.6-sol", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-opus-4-8" } },
+     "ship":   { "runtime": "codex",  "model": "gpt-5.6-terra", "effort": "medium", "fallback": { "runtime": "claude", "model": "claude-sonnet-5", "effort": "medium" } }
    },
    "parallel": {
      "maxNonShipDispatches": 2,
@@ -179,7 +179,14 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
      "requireReviewerConfidence": "high"
    }
    ```
-   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. The default scheduled sweeps use Codex so unattended launchd ticks do not depend on a separate Claude login; only switch a scheduled sweep to Claude after confirming that `claude` is installed, logged in, and usable non-interactively. Use explicit supported best-model overrides so scheduled sweeps do not silently drift with runtime defaults. `runtimes.review` is a reviewer role preference for the sweep instructions, not a scheduled stage.
+   The launcher resolves `runtimes.<sweep>` first, then legacy `runtime` + `models.<sweep>`, then Codex defaults. Each scheduled Codex entry above has one optional Claude `fallback`. Confirmed usage exhaustion cools that runtime host-wide for one hour. The launcher uses a healthy configured lane; when every lane is cooling it quietly preserves claimed work and waits for one probe after the hour, without creating or updating a Linear Todo/comment. Success clears the cooldown and repeated exhaustion renews it. Workspace credits/spend caps, authentication, invalid configuration, and generic failures remain actionable. Remove `fallback` to disable it. `runtimes.review` is a reviewer role preference, not a scheduled stage.
+
+   Before unattended use, verify the installed Claude CLI with `claude --version`, then complete an attended `claude` login verification and confirm it can run non-interactively on the runner. The exhaustion classifier consumes Codex stdout JSONL evidence, so keep the Codex JSONL source/version compatibility under review when upgrading Codex; an unrecognized or malformed event fails closed. A `tick --dry-run` validates config and selection but cannot synthesize a real exhaustion event or prove fallback execution.
+
+   Deterministic fallback/default verification:
+   ```bash
+   node --test --test-name-pattern='default configs|operator docs|runtime' tests/linear-watch.test.mjs tests/agents-snippet.test.mjs
+   ```
    Executable preflight then resolves the matching `CODEX_BIN` or `CLAUDE_BIN` override, `PATH`, the ChatGPT.app bundled Codex, the legacy Codex.app bundle, and otherwise must fail before claim. The last two fallbacks apply to Codex; a configured Claude runtime needs its override or `PATH` entry.
    The default `parallel.maxNonShipDispatches` is `2`, giving the launcher bounded non-ship parallelism across workspace/stage candidates. Distinct Spec, Dev, and QA candidates from one registered workspace may run together; resolved repository overlap is rejected only across different registered workspaces. Ship is highest priority but does not consume this budget or suppress other stages; at most one Ship child runs per registered source workspace. `parallel.sameRepoCardLimits` controls active per-card slots inside each selected non-ship workspace/stage candidate; defaults are spec/dev `4`, QA `1`, and Ship forced to one card per workspace. `parallel.maxSameRepoRefillDispatches` defaults to `8` and is clamped to `0..20`; it caps mid-batch completion backfills, including same-primary-repo Spec/Dev/QA refill and workspace-scoped Ship refill across routed repos, and `0` disables refill. A completed Ship child can therefore admit the next eligible Ship card from its source workspace without waiting for unrelated children, whether that card arrived through human approval or valid commit-bound QA auto-promotion, while the admission queue preserves the one-Ship-per-workspace limit. `parallel.maxDrainPasses` defaults to `5` and is clamped to `1..5`, so after dispatched passes the launcher can re-check queues up to four times for cards that arrived while the sweep was running. Set `maxNonShipDispatches`, `maxSameRepoRefillDispatches`, or `maxDrainPasses` to `1` for stricter bounded mode on smaller machines.
    `parallel.maxHandoffTriggerHops` defaults to `2` and is clamped to `0..3`: successful spec→dev and dev→QA handoffs may continue immediately for the same card in the same supervised launcher run. Set it to `0` to disable immediate handoffs. A parent tick spends at most `parallel.maxNonShipDispatches` handoff dispatch slots, while completion refill has its own `parallel.maxSameRepoRefillDispatches` budget. QA can select `Signoff` or `Ship` after testing, but no immediate QA-to-Ship launcher handoff is added; Ship is never handoff-triggered.
@@ -224,7 +231,7 @@ This makes the sweeps fire on a schedule when cards land in a queue, instead of 
    node "KIT/scripts/linear-watch.mjs" doctor
    node "KIT/scripts/linear-watch.mjs" doctor --json
    ```
-   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Its learning block reports per-lens last success/due/sample/pending/error state, coverage gaps, active/due evaluations, and synthesis availability. A learning error is isolated from ordinary sweep health. Optional macOS memory-pressure percentage is shown separately from free bytes.
+   `doctor` reports the registry path, host/user, managed kit path, source and managed anchor paths, env-file presence, dirty source advisory status, dirty managed dispatch blockers, runtime resolution, host-wide runtime cooldowns and next probes, capacity active/max/high-water, current-tick failures, dependency/capacity deferred counts, load, free memory, and persistent current-backlog queue p50/p90 from `observations.json`. Its learning block reports per-lens last success/due/sample/pending/error state, coverage gaps, active/due evaluations, and synthesis availability. A learning error is isolated from ordinary sweep health. Optional macOS memory-pressure percentage is shown separately from free bytes.
 
 6. **Dry-run against the live board** (spends NO tokens — logs the dispatch it *would* make, per active workspace/sweep):
    ```bash

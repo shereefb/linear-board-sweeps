@@ -2,6 +2,23 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.7] - 2026-07-11
+
+### Added
+
+- Persist host-wide Codex and Claude usage cooldowns for one hour, route new work to a healthy configured runtime, and admit only one probe when a cooldown expires.
+- Expose cooling runtimes and next probe times in local logs and `doctor` output.
+
+### Changed
+
+- Treat daily provider usage exhaustion as quiet deferred scheduler state: preserve exact claims and worktrees without creating Linear Todos, comments, labels, or state churn when every configured runtime is cooling.
+- Replace per-card fallback-lane advancement with one shared provider-cooldown authority that survives launcher restarts.
+
+### Fixed
+
+- Count only candidate Codex error envelopes against bounded usage-evidence limits, so routine JSONL traffic cannot hide a later supported usage-limit event.
+- Recognize bounded Claude CLI usage-limit stderr separately from authentication, overload, transient rate limits, and ordinary agent failures.
+
 ## [1.2.0.6] - 2026-07-10
 
 ### Added
