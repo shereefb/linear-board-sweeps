@@ -11,6 +11,21 @@ const sweepPairs = ["dev", "qa", "ship"].map((sweep) => ({
 
 const operatorDocs = ["AGENTS.md", "README.md", "SETUP.md", "docs/linear-rules.md", "templates/AGENTS.snippet.md"];
 const configPaths = [".claude/linear-sweep.json", "templates/linear-sweep.json"];
+const claimOwningSweeps = ["spec", "dev", "qa", "ship"];
+
+test("all claim-owning sweeps separate declarations from liveness", () => {
+  for (const sweep of claimOwningSweeps) {
+    for (const root of ["skills", ".claude/skills"]) {
+      const path = `${root}/${sweep}-sweep/SKILL.md`;
+      const body = fs.readFileSync(path, "utf8");
+      assert.match(body, /AUTO_SWEEP_CLAIM_DECLARATION/, path);
+      assert.match(body, /auto-sweep-claim v1/, path);
+      assert.match(body, /heartbeats?[^\n]*liveness only/i, path);
+      assert.match(body, /auto-sweep-claim-close v1/, path);
+      assert.doesNotMatch(body, /latest exact-claim heartbeat owner|missing or changed latest owner/i, path);
+    }
+  }
+});
 
 test("sweep distributions document the commit-bound QA handoff", () => {
   for (const { canonical, distributed } of sweepPairs) {
@@ -40,9 +55,9 @@ test("sweep distributions document the commit-bound QA handoff", () => {
   assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress"/);
   assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Signoff" "qa:in-progress"/);
   assert.match(qa, /AUTO_SWEEP_OWNER_TOKEN/);
-  assert.match(qa, /owner=<token> claim=qa:in-progress/);
-  assert.match(qa, /manual QA[^\n]*nonempty[^\n]*token/i);
-  assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress" "\$AUTO_SWEEP_OWNER_TOKEN"/);
+  assert.match(qa, /claim=qa:in-progress owner=<owner> declaration=<declaration>/);
+  assert.match(qa, /manual QA[^\n]*separate random owner and declaration tokens/i);
+  assert.match(qa, /move-card-bottom-if-current <PREFIX-###> "QA" "Ship" "qa:in-progress" "\$AUTO_SWEEP_OWNER_TOKEN" "\$AUTO_SWEEP_CLAIM_DECLARATION"/);
   assert.match(qa, /`removedLabelIds`/);
   assert.doesNotMatch(qa, /full `labelIds` replacement/i);
   assert.match(qa, /one `issueUpdate` mutation/i);
@@ -77,11 +92,29 @@ test("approved COD-142 artifacts preserve raw config and commit binding through 
   }
 });
 
-test("operator claim docs preserve owner-token handoff semantics", () => {
+test("operator claim docs preserve declaration handoff semantics", () => {
   for (const path of ["AGENTS.md", "templates/AGENTS.snippet.md"]) {
     const body = fs.readFileSync(path, "utf8");
     assert.match(body, /AUTO_SWEEP_OWNER_TOKEN/, `${path}: owner token environment missing`);
-    assert.match(body, /owner=<token> claim=<claim>/, `${path}: heartbeat ownership shape missing`);
+    assert.match(body, /AUTO_SWEEP_CLAIM_DECLARATION/, `${path}: declaration environment missing`);
+    assert.match(body, /first-declaration-wins/i, `${path}: claim epoch rule missing`);
+    assert.match(body, /complete[^\n]*comment history/i, `${path}: complete-history rule missing`);
+  }
+});
+
+test("operator claim migration docs distinguish exact resets from ambiguous-history correction", () => {
+  for (const path of ["AGENTS.md", "README.md", "SETUP.md", "docs/linear-rules.md", "templates/AGENTS.snippet.md"]) {
+    const body = fs.readFileSync(path, "utf8");
+    assert.match(body, /claim-migration-reset/, `${path}: attended exact reset command missing`);
+    assert.match(body, /legacy-unowned[^\n]*target[^\n]*legacy/i, `${path}: legacy target contract missing`);
+    assert.match(body, /orphan-declaration[^\n]*exact[^\n]*declaration/i, `${path}: orphan target contract missing`);
+    assert.match(body, /ambiguous[^\n]*(?:inspect|inspection)[^\n]*(?:malformed|conflicting)[^\n]*marker/i, `${path}: ambiguous history correction missing`);
+    assert.match(body, /rerun[^\n]*claim-migration-status/i, `${path}: rerun gate missing`);
+  }
+  for (const path of [".claude/linear-sweep.json", "templates/linear-sweep.json"]) {
+    const config = JSON.parse(fs.readFileSync(path, "utf8"));
+    assert.match(config.$comment_claims, /claim-migration-reset/);
+    assert.match(config.$comment_claims, /ambiguous[^.]*malformed|conflicting/i);
   }
 });
 

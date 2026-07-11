@@ -29,6 +29,12 @@ Take cards in **"Ship"** and land them: merge to `main`, deploy to production, c
 - **Scheduled primary repo:** when `AUTO_SWEEP_REPO` is set, it is the launcher's label-routed managed repository for this card; `AUTO_SWEEP_SOURCE_REPO` is its source checkout. Treat that repo as primary and use `AUTO_SWEEP_WORKTREE` for resume/deploy work. Other entries in `config.repos` remain available only for explicitly evidenced multi-repo scope; never switch primary ownership implicitly.
 - **Repo/deploy scope is part of the ship gate.** Default expectation: one card ships one deployable repo. A multi-repo card may ship only when every touched repo is listed in `config.repos`, every implementation branch/PR is present, and `config.deploy` describes each production target and canary expectation. If QA/dev evidence points to an unconfigured sibling repo, do not merge the configured repo as a partial product ship; comment the mismatch and require a split card, a per-repo ship, or an updated multi-repo config/runbook.
 
+### Immutable claim protocol
+
+Scheduled single-card runs require both `AUTO_SWEEP_OWNER_TOKEN` and `AUTO_SWEEP_CLAIM_DECLARATION`; if either is absent, stop before material work. The launcher has already posted `[auto-sweep-claim v1 claim=ship:in-progress owner=<owner> declaration=<declaration>]` before adding the label. An attended run creates separate random owner and declaration tokens, posts that declaration before adding `ship:in-progress`, then complete-reads all claim comments and continues only if the exact declaration is the first-declaration-wins owner of the labeled epoch.
+
+While holding the claim, post `[auto-sweep-heartbeat v1 claim=ship:in-progress declaration=<declaration> at=<ISO8601>]`. Heartbeats are liveness only; never ownership. Before every claim-affecting exit or mutation, complete-read claim history and verify the exact owner plus declaration, post `[auto-sweep-claim-close v1 claim=ship:in-progress declaration=<declaration> reason=<released|reaped|orphaned|terminal|blocked|failed>]`, verify that exact close, and only then remove the label or perform the guarded terminal move. A close removes authority immediately even if the later mutation fails.
+
 ## 1. Select cards (top-of-column order, drain queue, claimed)
 
 List "Ship" cards **in `config.project`**, top-to-bottom as they appear in the Linear column. For each:
@@ -137,7 +143,7 @@ Emit:
 
 Every card must be resumable on any machine — this run, the launcher, and any other machine coordinate ONLY through origin. ship-sweep is single-runner, but a crash still has to hand off cleanly.
 
-- **Heartbeat while you hold a claim.** Roughly every 5 minutes that you own a card via `ship:in-progress`, post `[auto-sweep-heartbeat <ISO8601 now>]`. A claim idle past 120 min is treated as crashed and auto-released by the launcher — merge/deploy/canary is long, so heartbeat diligently.
+- **Heartbeat while you hold a claim.** Roughly every 5 minutes, post the declaration heartbeat from the immutable claim protocol. It is liveness only; never ownership. A claim idle past 120 min is treated as crashed and auto-released by the launcher — merge/deploy/canary is long, so heartbeat diligently.
 - **The merge commit + the deploy marker are the truth, not the branch.** §2 reconstructs where you are from `main` (merge landed?) and the `[auto-sweep-deployed]` marker (deploy landed?), never from branch existence — because §4 deletes the branch mid-flight. Always push `main` before deleting the branch, and always write the deploy marker before moving to Done.
 - **Push discipline (never force).** For every merge/push: `git fetch` → rebase/merge `origin/main` → push; retry up to 2× on non-fast-forward; if it still fails, comment and stop. Never force-push.
 - **Re-read before the terminal move.** Right before moving to "Done", re-fetch the card. If a human moved it out of "Ship" while you worked, do NOT silently override — reconcile via §2 (if your merge/deploy already landed, still record the deploy + move to Done; otherwise comment and stop).
