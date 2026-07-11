@@ -2130,7 +2130,16 @@ export function healthStatus({ currentTick = null, lastTick, lockPid = null, isA
       catch { return true; }
     });
     if (expiredChild) {
-      return { ok: false, reason: `expired child ${expiredChild.issue || "unknown"} (${expiredChild.sweep || "unknown"})` };
+      const startedAt = Date.parse(expiredChild.startedAt);
+      const lastLivenessAt = Date.parse(expiredChild.lastLivenessAt);
+      const child = {
+        issue: expiredChild.issue || "unknown",
+        sweep: expiredChild.sweep || "unknown",
+        activeAgeMs: Number.isFinite(startedAt) ? Math.max(0, now - startedAt) : null,
+        heartbeatAgeMs: Number.isFinite(lastLivenessAt) ? Math.max(0, now - lastLivenessAt) : null,
+      };
+      const age = (value) => value === null ? "unknown" : `${value}ms`;
+      return { ok: false, reason: `expired child ${child.issue} (${child.sweep}); active age ${age(child.activeAgeMs)}, heartbeat age ${age(child.heartbeatAgeMs)}`, child };
     }
     return { ok: true, reason: `tick in progress (pid ${currentTick.pid})` };
   }
@@ -2176,7 +2185,7 @@ export function recordChildLivenessTelemetry(telemetry = {}, pick = {}, event, a
   let next;
   if (event === "start") {
     next = { ...identity, startedAt: at, lastLivenessAt: at, state: "active", outcomeKind: null };
-  } else if (event === "liveness" && existing?.state === "active") {
+  } else if ((event === "liveness" || event === "heartbeat") && existing?.state === "active") {
     next = { ...existing, lastLivenessAt: at };
   } else if (event === "terminal") {
     next = {
@@ -2193,6 +2202,23 @@ export function recordChildLivenessTelemetry(telemetry = {}, pick = {}, event, a
   const active = updated.filter((child) => child.state === "active");
   const terminal = updated.filter((child) => child.state === "terminal").slice(-MAX_RECENT_TERMINAL_CHILDREN);
   return { ...telemetry, children: [...active, ...terminal] };
+}
+
+export function verifiedChildHeartbeatAt(card, pick = {}) {
+  const cfg = SWEEP_CFG[pick.sweep];
+  if (!cfg || card?.commentsComplete !== true || !pick.ownerToken || !pick.claimDeclarationId) return null;
+  const ownership = resolveCardClaim(card, cfg.claim);
+  if (ownership.status !== "owned" || ownership.ownerToken !== pick.ownerToken
+      || ownership.declarationId !== pick.claimDeclarationId) return null;
+  return ownership.heartbeatAt || null;
+}
+
+export async function observeVerifiedChildHeartbeat(apiKey, pick, {
+  fetchClaimCardFn = fetchClaimCard,
+} = {}) {
+  if (!pick?.issueId) return null;
+  const card = await fetchClaimCardFn(apiKey, pick.issueId);
+  return verifiedChildHeartbeatAt(card, pick);
 }
 
 function observationIdentity(value = {}) {
@@ -6530,10 +6556,13 @@ export function applyDispatchProgressReconciliation(result, reconciliation) {
   return result;
 }
 
+export const MAX_SUCCESSFUL_NO_OP_COUNT = 1_000_000;
+
 export function recordSuccessfulNoOpTelemetry(telemetry = {}, issueIdentifier) {
+  const prior = Number.isSafeInteger(telemetry.successfulNoOpCount) ? telemetry.successfulNoOpCount : 0;
   return {
     ...telemetry,
-    successfulNoOpCount: (Number.isSafeInteger(telemetry.successfulNoOpCount) ? telemetry.successfulNoOpCount : 0) + 1,
+    successfulNoOpCount: Math.min(MAX_SUCCESSFUL_NO_OP_COUNT, Math.max(0, prior) + 1),
     latestSuccessfulNoOpIssue: String(issueIdentifier),
   };
 }
@@ -6890,6 +6919,7 @@ function runDispatchAttempt({
     let logWriteFailed = false;
     let deadlineTimer = null;
     let graceTimer = null;
+    let forcedTimer = null;
     let timeoutPhase = null;
     const collector = runtimeCfg.runtime === "codex"
       ? classifyCodexStdout()
@@ -6899,6 +6929,7 @@ function runDispatchAttempt({
       settled = true;
       if (deadlineTimer !== null) clearTimeoutFn(deadlineTimer);
       if (graceTimer !== null) clearTimeoutFn(graceTimer);
+      if (forcedTimer !== null) clearTimeoutFn(forcedTimer);
       resolve({ outcome, runtimeCfg, executable, usageExhausted: !logWriteFailed && Boolean(collector?.exhausted()) });
     };
     const ioFailure = () => {
@@ -6932,6 +6963,23 @@ function runDispatchAttempt({
         if (settled || signal?.aborted) return;
         timeoutPhase = "forced";
         try { child.kill?.("SIGKILL"); } catch { /* close remains authoritative */ }
+        if (settled || signal?.aborted) return;
+        forcedTimer = setTimeoutFn(() => {
+          if (settled) return;
+          if (signal?.aborted) {
+            finish(classifyDispatchOutcome({ type: "interruption", signal: interruptedSignalFor(signal), path: executable, cwd }));
+            return;
+          }
+          finish({
+            kind: "timeout-termination-failed",
+            code: "CHILD_TERMINATION_UNCONFIRMED",
+            exitCode: null,
+            signal: "SIGKILL",
+            path: executable,
+            cwd,
+            cleanupUncertain: true,
+          });
+        }, graceMs);
       }, graceMs);
     }, deadlineMs);
     child.on("error", (error) => {
@@ -6983,6 +7031,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   graceMs = DISPATCH_TIMEOUT_GRACE_MS,
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
+  nowFn = Date.now,
 } = {}) {
   const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
   const command = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
@@ -6996,12 +7045,13 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   const logFile = path.join(dir, `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
   const fd = fs.openSync(logFile, "a");
   const startedAt = new Date().toISOString();
-  const startedAtMs = Date.now();
+  const startedAtMs = nowFn();
+  const stageDeadlineAt = startedAtMs + deadlineMs;
   const primaryMeta = runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMetadata: true });
   const finish = (outcome, finalMeta, attempts, fallbackUsed = false) => {
     const result = {
       ...outcome,
-      elapsedMs: Math.max(0, Date.now() - startedAtMs),
+      elapsedMs: Math.max(0, nowFn() - startedAtMs),
       finalRuntimeConfig: finalMeta.runtimeCfg,
       finalRuntimeExecutable: finalMeta.executable,
       finalRuntimeLaneKey: finalMeta.laneKey,
@@ -7026,7 +7076,8 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     return result;
   };
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
-  const timerOptions = { deadlineMs, graceMs, setTimeoutFn, clearTimeoutFn };
+  const remainingDeadlineMs = () => Math.max(0, stageDeadlineAt - nowFn());
+  const timerOptions = { deadlineMs: remainingDeadlineMs(), graceMs, setTimeoutFn, clearTimeoutFn };
   const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn, ...timerOptions });
   const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome, primary.usageExhausted);
   const deferred = childDeferredOutcomeForPick(pick);
@@ -7068,6 +7119,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     onSpawn,
     writeChunkFn,
     ...timerOptions,
+    deadlineMs: remainingDeadlineMs(),
   });
   const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome, fallback.usageExhausted);
   return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
@@ -7239,8 +7291,8 @@ async function tick({ dryRun = false } = {}) {
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
-        ...(result.kind === "timeout-graceful" || result.kind === "timeout-forced"
-          ? { timeoutKind: result.kind, elapsedMs: result.elapsedMs }
+        ...(["timeout-graceful", "timeout-forced", "timeout-termination-failed"].includes(result.kind)
+          ? { timeoutKind: result.kind, elapsedMs: result.elapsedMs, ...(result.cleanupUncertain ? { cleanupUncertain: true } : {}) }
           : {}),
         worktreePath: pick.worktreePath,
         logDir: pick.logDir,
@@ -7277,7 +7329,7 @@ async function tick({ dryRun = false } = {}) {
           `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${result.kind === "timeout-graceful" || result.kind === "timeout-forced" ? ` after ${result.elapsedMs}ms` : detail === null ? "" : ` (${detail})`}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${["timeout-graceful", "timeout-forced", "timeout-termination-failed"].includes(result.kind) ? ` after ${result.elapsedMs}ms` : detail === null ? "" : ` (${detail})`}`),
         ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
@@ -7666,17 +7718,42 @@ async function tick({ dryRun = false } = {}) {
           }
           pick.telemetry = { ...(pick.telemetry || {}), claimAt: new Date().toISOString() };
           recordChildTelemetry(pick, "start");
-          const [result] = await dispatchBatch([pick], {
-            signal: dispatchAbortContext?.signal,
-            dispatchOptions: {
-              onSpawn: (pid) => {
-                const attached = reservation.attachChildPid(pid);
-                if (attached !== false) recordChildTelemetry(pick, "liveness");
-                return attached;
+          let lastObservedHeartbeatAt = null;
+          let heartbeatObservationPending = false;
+          let heartbeatObservationActive = true;
+          const observeHeartbeat = async () => {
+            if (heartbeatObservationPending) return;
+            heartbeatObservationPending = true;
+            try {
+              const heartbeatAt = await observeVerifiedChildHeartbeat(activeByAnchor.get(pick.anchorPath)?.apiKey, pick);
+              if (heartbeatObservationActive && heartbeatAt && heartbeatAt !== lastObservedHeartbeatAt) {
+                lastObservedHeartbeatAt = heartbeatAt;
+                recordChildTelemetry(pick, "heartbeat", heartbeatAt);
+              }
+            } catch (error) {
+              logFor(pick.anchorPath, pick.sweep, `heartbeat observation unavailable ${pick.issueIdentifier}: ${error.message}`);
+            } finally {
+              heartbeatObservationPending = false;
+            }
+          };
+          const heartbeatObservationTimer = setInterval(observeHeartbeat, 60_000);
+          let result;
+          try {
+            [result] = await dispatchBatch([pick], {
+              signal: dispatchAbortContext?.signal,
+              dispatchOptions: {
+                onSpawn: (pid) => {
+                  const attached = reservation.attachChildPid(pid);
+                  if (attached !== false) recordChildTelemetry(pick, "liveness");
+                  return attached;
+                },
               },
-            },
-          });
-          if (result.kind === "timeout-graceful" || result.kind === "timeout-forced") {
+            });
+          } finally {
+            heartbeatObservationActive = false;
+            clearInterval(heartbeatObservationTimer);
+          }
+          if (["timeout-graceful", "timeout-forced", "timeout-termination-failed"].includes(result.kind)) {
             recordChildTelemetry(pick, "terminal", result.kind);
           }
           await reconcileDispatchResult(result);

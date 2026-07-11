@@ -65,7 +65,8 @@ import {
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
   recordSuccessfulNoOpTelemetry, recordStrandedClaimTelemetry,
-  recordChildLivenessTelemetry, MAX_RECENT_TERMINAL_CHILDREN,
+  recordChildLivenessTelemetry, verifiedChildHeartbeatAt, observeVerifiedChildHeartbeat, MAX_RECENT_TERMINAL_CHILDREN,
+  MAX_SUCCESSFUL_NO_OP_COUNT,
 } from "../scripts/linear-watch.mjs";
 
 const postDispatchResult = (sweep = "ship", kind = "success") => ({
@@ -6588,6 +6589,61 @@ test("dispatchAsync force-terminates an expired child after grace", async () => 
   assert.ok(clock.timers.every((timer) => timer.cleared));
 });
 
+test("dispatchAsync bounds a forced child that never reports termination", async () => {
+  const clock = dispatchWithFakeClock();
+  clock.child.kill = (signal) => { clock.signals.push(signal); return false; };
+  clock.fireNext();
+  clock.fireNext();
+  clock.fireNext();
+  const result = await clock.run;
+  assert.equal(result.kind, "timeout-termination-failed");
+  assert.equal(result.code, "CHILD_TERMINATION_UNCONFIRMED");
+  assert.equal(result.cleanupUncertain, true);
+  assert.deepEqual(clock.signals, ["SIGTERM", "SIGKILL"]);
+  assert.ok(clock.timers.every((timer) => timer.cleared));
+});
+
+test("dispatchAsync bounds forced termination when SIGKILL throws", async () => {
+  const clock = dispatchWithFakeClock();
+  clock.child.kill = (signal) => {
+    clock.signals.push(signal);
+    if (signal === "SIGKILL") throw new Error("kill denied");
+    return true;
+  };
+  clock.fireNext();
+  clock.fireNext();
+  clock.fireNext();
+  assert.equal((await clock.run).kind, "timeout-termination-failed");
+  assert.ok(clock.timers.every((timer) => timer.cleared));
+});
+
+test("dispatchAsync fallback shares the primary absolute deadline", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-deadline-"));
+  const primary = pipedDispatchChild(901);
+  const fallback = pipedDispatchChild(902);
+  const timers = [];
+  let now = 1_000;
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, {
+    issueIdentifier: "COD-deadline", logDir: path.join(anchorPath, "logs"), runtimeExecutable: "/resolved/codex",
+  }, {
+    spawnFn: queuedDispatchSpawn([primary, fallback]),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+    deadlineMs: 100,
+    nowFn: () => now,
+    setTimeoutFn: (fn, ms) => { const timer = { fn, ms, cleared: false }; timers.push(timer); return timer; },
+    clearTimeoutFn: (timer) => { timer.cleared = true; },
+  });
+  now = 1_075;
+  primary.stdout.write(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  primary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(timers.filter((timer) => !timer.cleared).at(-1).ms, 25);
+  fallback.close(0);
+  assert.equal((await run).kind, "success");
+});
+
 test("dispatchAsync reports graceful timeout when the child closes after SIGTERM", async () => {
   const clock = dispatchWithFakeClock({ closeOnSignal: "SIGTERM" });
   clock.fireNext();
@@ -7413,6 +7469,9 @@ test("healthStatus rejects a live tick with expired child evidence", () => {
   });
   assert.equal(status.ok, false);
   assert.match(status.reason, /expired child.*COD-179/i);
+  assert.equal(status.child.activeAgeMs, dispatchDeadlineMs("ship") + 1);
+  assert.equal(status.child.heartbeatAgeMs, 1_000);
+  assert.match(status.reason, /active age.*heartbeat age/i);
 });
 test("healthStatus fails closed for malformed child telemetry without throwing", () => {
   const status = healthStatus({
@@ -7481,6 +7540,53 @@ test("child liveness telemetry retains only secret-free lifecycle summaries", ()
     "issue", "lastLivenessAt", "outcomeKind", "startedAt", "state", "sweep", "workspace",
   ]);
   assert.doesNotMatch(JSON.stringify(telemetry.children), /owner-secret|declaration-secret|secret comment|secret prompt|secret-key/);
+});
+
+test("verified child heartbeat requires complete immutable-epoch ownership", () => {
+  const pick = { ownerToken: "owner", claimDeclarationId: "decl", sweep: "dev" };
+  const card = {
+    commentsComplete: true,
+    labelNames: ["dev:in-progress"],
+    comments: [
+      { id: "d", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: "2026-07-11T12:00:00.000Z" },
+      { id: "h", body: claimHeartbeatMarker({ claim: "dev:in-progress", declarationId: "decl", at: "2026-07-11T12:05:00.000Z" }), createdAt: "2026-07-11T12:05:00.000Z" },
+    ],
+  };
+  assert.equal(verifiedChildHeartbeatAt(card, pick), "2026-07-11T12:05:00.000Z");
+  assert.equal(verifiedChildHeartbeatAt({ ...card, commentsComplete: false }, pick), null);
+  assert.equal(verifiedChildHeartbeatAt(card, { ...pick, claimDeclarationId: "other" }), null);
+});
+
+test("heartbeat observation complete-reads and returns only the verified epoch timestamp", async () => {
+  const pick = { issueId: "issue-179", ownerToken: "owner", claimDeclarationId: "decl", sweep: "dev" };
+  const fetched = [];
+  const heartbeatAt = await observeVerifiedChildHeartbeat("api-key", pick, {
+    fetchClaimCardFn: async (apiKey, issueId) => {
+      fetched.push([apiKey, issueId]);
+      return {
+        commentsComplete: true,
+        labelNames: ["dev:in-progress"],
+        comments: [
+          { id: "d", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "owner", declarationId: "decl" }), createdAt: "2026-07-11T12:00:00.000Z" },
+          { id: "h", body: claimHeartbeatMarker({ claim: "dev:in-progress", declarationId: "decl", at: "2026-07-11T12:05:00.000Z" }), createdAt: "2026-07-11T12:05:00.000Z" },
+        ],
+      };
+    },
+  });
+  assert.deepEqual(fetched, [["api-key", "issue-179"]]);
+  assert.equal(heartbeatAt, "2026-07-11T12:05:00.000Z");
+});
+
+test("verified heartbeat updates child telemetry but does not change its absolute start", () => {
+  const pick = { issueIdentifier: "COD-179", sweep: "dev", anchorPath: "/workspace" };
+  let telemetry = recordChildLivenessTelemetry({}, pick, "start", "2026-07-11T12:00:00.000Z");
+  telemetry = recordChildLivenessTelemetry(telemetry, pick, "heartbeat", "2026-07-11T12:05:00.000Z");
+  assert.equal(telemetry.children[0].startedAt, "2026-07-11T12:00:00.000Z");
+  assert.equal(telemetry.children[0].lastLivenessAt, "2026-07-11T12:05:00.000Z");
+});
+
+test("successful no-op telemetry saturates at its named maximum", () => {
+  assert.equal(recordSuccessfulNoOpTelemetry({ successfulNoOpCount: MAX_SUCCESSFUL_NO_OP_COUNT }, "COD-179").successfulNoOpCount, MAX_SUCCESSFUL_NO_OP_COUNT);
 });
 
 test("child liveness telemetry projects unsafe fields from every retained summary", () => {

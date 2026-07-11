@@ -1,0 +1,65 @@
+# COD-179 final fixes
+
+## Scope
+
+- Bound the watchdog after SIGKILL and return `timeout-termination-failed` with `CHILD_TERMINATION_UNCONFIRMED` and `cleanupUncertain: true` when termination is never confirmed.
+- Bind primary and fallback dispatches to one absolute stage deadline; fallback receives only the remaining budget.
+- Complete-read Linear claim history and accept heartbeat timestamps only for the exact open owner/declaration epoch; poll those observations into secret-free child `lastLivenessAt` telemetry without changing `startedAt` or the hard runtime deadline.
+- Saturate successful no-op telemetry at named `MAX_SUCCESSFUL_NO_OP_COUNT`.
+- Include active age and heartbeat/liveness age in expired-child health and doctor data/reason text.
+
+## TDD record
+
+RED:
+
+```text
+node --test --test-name-pattern='bounds a forced|shares the primary absolute|verified child heartbeat|verified heartbeat updates|successful no-op telemetry saturates|expired child evidence' tests/linear-watch.test.mjs
+```
+
+Failed at module load because the new bounded counter export did not exist. After the initial minimal implementation, the same focused command produced two expected behavioral failures: fallback did not launch under the test's first usage fixture, and the heartbeat fixture lacked the active claim label. Correcting the fixtures proved the intended missing behaviors rather than syntax errors.
+
+GREEN:
+
+```text
+node --test --test-name-pattern='bounds a forced|shares the primary absolute|verified child heartbeat|verified heartbeat updates|successful no-op telemetry saturates|expired child evidence' tests/linear-watch.test.mjs
+```
+
+Result: 6 passed, 0 failed.
+
+Additional focused heartbeat wiring check:
+
+```text
+node --test --test-name-pattern='heartbeat observation|bounds a forced|shares the primary absolute|successful no-op telemetry saturates|expired child evidence' tests/linear-watch.test.mjs
+```
+
+Result: 5 passed, 0 failed.
+
+Launcher regression:
+
+```text
+node --test tests/linear-watch.test.mjs
+```
+
+Result: 442 passed, 0 failed (before the final observation-wiring test was added).
+
+## Design and safety notes
+
+- The existing complete-history `resolveCardClaim` authority is reused; raw or incomplete comments cannot update telemetry.
+- Child telemetry remains projected through the existing fixed allowlist and contains no owner token, declaration ID, comments, prompt, environment, or API key.
+- Heartbeats update only `lastLivenessAt`; child expiry remains based on immutable `startedAt` and `dispatchDeadlineMs(stage)`.
+- Watchdog timers and heartbeat polling timers are cleared on every settlement/finally path; a late in-flight heartbeat read is prevented from recording after dispatch completion.
+- Parent abort remains higher priority than timeout classification.
+
+## Final verification
+
+```text
+node --test tests/*.test.mjs
+```
+
+Result: 687 passed, 0 failed, 0 skipped/cancelled/todo.
+
+```text
+git diff --check
+```
+
+Result: clean.
