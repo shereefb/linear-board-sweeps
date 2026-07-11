@@ -41,7 +41,7 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 
 ## 2. Per card — smoke test as a user
 
-1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior. If the only implementation evidence is in an unconfigured sibling repo, do not mark `qa:passed` for this ship path; block or bounce with the exact split/config update needed.
+1. **Locate the work:** from the card + git, find the repo(s) from `config.repos`, branch, worktree, and/or PR for the feature. Read the card description + the linked spec/plan so you know the intended behavior. If the only implementation evidence is in an unconfigured sibling repo, do not mark `qa:passed` for this ship path; block or bounce with the exact split/config update needed. For `correctness-contract/v1 — required`, use the plan's invariant IDs and `QA observation` entries as primary test input beside the engineering-review test plan. Record each invariant ID exercised through the running product. When concurrency, atomicity, persistence integrity, or another invariant cannot be reliably observed through the public interface, cite the observed green lower-level test evidence and verify the closest user-visible outcome; never claim manual coverage of an unexercised low-level path.
 2. **Stand up a dev environment:** check out the branch/worktree; start the app with the preview tooling. Seed data if the flow needs it.
 3. **Exercise the feature as a user, in detail — use `/qa` as the test engine** (or `/qa-only` for the report form) rather than ad-hoc clicking. Walk the actual user flows the card adds — happy path AND the obvious edge cases. Click through, fill forms, trigger the states. Watch console + network + server logs for errors. Use subagents/parallel work for independent flows. If a `/plan-eng-review` test plan exists for the branch, feed it in as primary test input.
 4. **Capture screenshots** of the key states (before/after, each important screen). Save them; you'll attach them to the card.
@@ -50,7 +50,7 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 
 ## 3. Gate — pass, or send back
 
-Proceed to §4 ONLY if: the smoke test passes, the build is green (`npm run build` / tests / lint as applicable), and no unresolved errors remain. **Otherwise do NOT pass it:** post your findings + screenshots to the card, add `qa:needs-changes`, remove `qa:in-progress`, leave the card in "QA", and move on. If the blocker needs the owner, use `blocked:needs-user` and comment what's needed.
+Proceed to §4 ONLY if: the smoke test passes, the build is green (`npm run build` / tests / lint as applicable), and no unresolved errors remain. For a required correctness contract whose plan declares user-observable cases, no invariant coverage means do not grant `qa:passed`. **Otherwise do NOT pass it:** post your findings + screenshots to the card, add `qa:needs-changes`, remove `qa:in-progress`, leave the card in "QA", and move on. If the blocker needs the owner, use `blocked:needs-user` and comment what's needed.
 
 ## 4. Land at "Signoff" (no merge, no deploy)
 
