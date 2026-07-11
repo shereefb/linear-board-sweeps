@@ -1,7 +1,7 @@
 # COD-144 Claude Usage Fallback Design
 
 **Linear:** COD-144, “Claude fallback”
-**Status:** Approved for implementation
+**Status:** Revised design approved for implementation
 **Date:** 2026-07-10
 
 ## Problem
@@ -32,10 +32,26 @@ The product goal is to consume the available Codex plan first, then continue use
 ## Non-goals
 
 - No fallback from Claude to Codex or multi-provider routing graph.
-- No second fallback, retry loop, backoff scheduler, account probing, or pre-spend quota API call.
+- No external quota API, background probe daemon, or pre-spend quota call.
 - No fallback for a generic nonzero exit, transient error, unavailable model, overload, authentication failure, or missing executable.
 - No change to Linear workflow states, claim ownership, queue ordering, capacity accounting, human Ship approval, or deployment behavior.
 - No application code, migration, deployment, or release publishing in this spec sweep.
+
+## July 11 recovery revision
+
+Usage exhaustion is expected daily and is operational state, not a card failure. The launcher therefore combines the immediate one-hop fallback with a persistent, host-wide runtime cooldown:
+
+1. Positively classified Codex exhaustion cools the Codex runtime and immediately continues the same card with its configured Claude fallback.
+2. Positively classified Claude exhaustion cools Claude too. The card's exact claim, worktree, owner token, and capacity-safe resume record remain intact.
+3. While one runtime is cooling down, new work selects the configured healthy runtime before executable preflight. It does not launch a sacrificial Codex process per card.
+4. While every configured runtime is cooling down, work remains locally deferred. The launcher makes no Linear comment, Todo, label, or state mutation for the usage event.
+5. Cooldowns last 60 minutes. At expiry, normal global admission ordering permits one probe; the first new positive exhaustion renews the cooldown for another 60 minutes, while success clears it.
+6. Cooldown state is atomically persisted under launcher state and survives restarts. Its bounded record contains host, runtime, optional model scope, normalized reason, timestamps, and probe ownership only—never raw provider output.
+7. `doctor` and local logs expose cooling runtimes and next probe times. Authentication, missing executables, invalid configuration, ordinary agent errors, and malformed provider output remain distinct actionable failures.
+
+The cooldown key is host plus runtime. A model is included only when the provider's trusted error envelope explicitly identifies a model-specific allowance. This prevents unrelated workspaces sharing the same local subscription from repeatedly probing it while avoiding unnecessary provider-wide suppression for an explicitly model-scoped limit.
+
+COD-149's generic per-card capacity retry remains useful for transient service capacity, but provider usage exhaustion takes the shared cooldown path first. It must not create a failure Todo or advance a per-card fallback counter.
 
 ## Research and existing mechanism
 
