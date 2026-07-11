@@ -31,7 +31,7 @@ import {
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, isFinalProviderUsageExhaustion, shouldClearRuntimeCooldown, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   rediscoveredResumeRecordForCard,
   fetchScheduledPassCards, fetchScheduledQueueCards,
@@ -4730,6 +4730,25 @@ test("dispatchAsync cooldown route: direct Claude exhaustion is normalized witho
   assert.equal(result.attempts.length, 1);
   assert.equal(result.attempts[0].usageExhausted, true);
   assert.equal(result.fallbackUsed, false);
+  assert.equal(isFinalProviderUsageExhaustion(result), true);
+});
+
+test("provider usage reconciliation: unresolved Claude is actionable rather than final exhaustion", () => {
+  assert.equal(isFinalProviderUsageExhaustion({
+    kind: "executable-enoent",
+    finalRuntimeConfig: { runtime: "claude" },
+    attempts: [{ runtime: "codex", usageExhausted: true, outcome: { kind: "exit", exitCode: 1 } }],
+  }), false);
+  assert.equal(isFinalProviderUsageExhaustion({
+    kind: "exit",
+    finalRuntimeConfig: { runtime: "claude" },
+    attempts: [
+      { runtime: "codex", usageExhausted: true, outcome: { kind: "exit", exitCode: 1 } },
+      { runtime: "claude", outcome: { kind: "exit", exitCode: 7 } },
+    ],
+  }), false);
+  assert.equal(shouldClearRuntimeCooldown({ kind: "spawn-error", attempts: [], finalRuntimeConfig: { runtime: "codex" } }, { runtimeCooldownProbe: true }), true);
+  assert.equal(shouldClearRuntimeCooldown({ kind: "exit", attempts: [{ runtime: "codex", usageExhausted: true }], finalRuntimeConfig: { runtime: "codex" } }, { runtimeCooldownProbe: true }), false);
 });
 
 test("dispatchAsync fallback: stderr usage text is logged but never authorizes Claude", async () => {
@@ -4901,6 +4920,7 @@ test("dispatchAsync fallback: Claude resolution failure preserves the exhausted 
   assert.equal(outcome.fallbackUsed, true);
   assert.equal(outcome.attempts.length, 1);
   assert.equal(outcome.attempts[0].runtime, "codex");
+  assert.equal(isFinalProviderUsageExhaustion(outcome), false);
   assert.equal(calls.length, 1);
 
   const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));

@@ -5867,6 +5867,18 @@ function normalizedDispatchAttempt(runtimeCfg, outcome, usageExhausted = false) 
   };
 }
 
+export function isFinalProviderUsageExhaustion(result = {}) {
+  const finalAttempt = result.attempts?.at(-1);
+  const finalRuntime = result.finalRuntimeConfig?.runtime;
+  return result.kind === "exit"
+    && finalAttempt?.usageExhausted === true
+    && finalAttempt.runtime === finalRuntime;
+}
+
+export function shouldClearRuntimeCooldown(result = {}, pick = {}) {
+  return result.kind === "success" || (pick.runtimeCooldownProbe === true && !isFinalProviderUsageExhaustion(result));
+}
+
 export function fallbackFailureAttribution(result) {
   const primary = result?.attempts?.[0];
   const exhaustedPrimary = result?.fallbackUsed === true
@@ -6182,13 +6194,13 @@ async function tick({ dryRun = false } = {}) {
       const fallbackFailure = fallbackFailureAttribution(result);
       const exhaustedAttempts = (result.attempts || []).filter((attempt) => attempt?.usageExhausted === true);
       const providerUsageExhausted = exhaustedAttempts.length > 0;
-      const finalUsageExhausted = result.attempts?.at(-1)?.usageExhausted === true;
+      const finalUsageExhausted = isFinalProviderUsageExhaustion(result);
       let finalCooldown = null;
       for (const attempt of exhaustedAttempts) {
         finalCooldown = runtimeCooldownStore.markExhausted({ host: os.hostname(), runtime: attempt.runtime });
         logFor(pick.anchorPath, pick.sweep, `${attempt.runtime} usage exhausted; cooling until ${finalCooldown?.cooldownUntil || "unknown"}`);
       }
-      if (result.kind === "success") {
+      if (shouldClearRuntimeCooldown(result, pick)) {
         runtimeCooldownStore.clear({ host: os.hostname(), runtime: runtimeCfg.runtime, model: runtimeCfg.model });
       } else if (finalUsageExhausted && pick.issueIdentifier && finalCooldown) {
         resumeStore.upsert({
@@ -6272,13 +6284,15 @@ async function tick({ dryRun = false } = {}) {
           writeCurrentTick();
         }
       }
-      try {
-        await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
-      } catch (e) {
-        const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
-        logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
-        recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
-        writeCurrentTick();
+      if (!finalUsageExhausted) {
+        try {
+          await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
+        } catch (e) {
+          const kind = result.kind === "success" ? "failure-todo-recovery" : "failure-todo";
+          logFor(pick.anchorPath, "_", `FATAL failure-todo post-dispatch reconciliation failed: ${e.message}`);
+          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, kind, runtime, e.message);
+          writeCurrentTick();
+        }
       }
       if (dependencyDeferred) {
         const key = observationKey(pick);
