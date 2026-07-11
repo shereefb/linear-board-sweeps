@@ -1780,6 +1780,77 @@ test("capacity admission: same-stage handoff discovered under the held token run
   assert.deepEqual(order, ["A", "H", "B"]);
 });
 
+test("capacity admission: reconciled Ship refills before an unrelated running child releases", async () => {
+  let stored = null;
+  let releaseUnrelated;
+  let unrelatedReleased = false;
+  const starts = [];
+  const shipConcurrency = [];
+  const ledger = createCapacityLedger({
+    maxActiveChildren: 2,
+    readJsonFn: () => stored,
+    writeJsonFn: (_path, value) => { stored = structuredClone(value); },
+    isAlive: () => true,
+    randomUUID: (() => { let n = 0; return () => `ship-refill-token-${++n}`; })(),
+  });
+  const activeByAnchor = new Map([["/managed/safe", { apiKey: "lin" }]]);
+  const queue = createAdmissionQueue({
+    ledger,
+    executeDemand: async (demand) => {
+      starts.push(demand.issueIdentifier);
+      if (demand.stage === "ship") {
+        shipConcurrency.push(ledger.inspect().entries.filter((entry) => entry.stage === "ship" && entry.workspace === "/source/safe").length);
+      }
+      if (demand.issueIdentifier === "OTHER-1") {
+        await new Promise((resolve) => { releaseUnrelated = resolve; });
+        unrelatedReleased = true;
+      }
+      return demand.result || { issueIdentifier: demand.issueIdentifier };
+    },
+    beforeRelease: async (result, demand, admission) => {
+      if (demand.issueIdentifier !== "SAF-200") return;
+      const refill = await buildSameRepoRefillDispatches({
+        result,
+        reconciliation: result.reconciliation,
+        activeByAnchor,
+        activeSameRepo: createSameRepoActiveCounts(),
+        refillBudget: { remaining: 1 },
+        parentRunId: "run-id",
+        childIndexAllocator: createChildIndexAllocator(),
+        deferClaim: true,
+        now: NOW,
+        deps: {
+          labeledProjectIds: async () => new Set(["project-safe"]),
+          checkoutDispatchBlockers: () => [],
+          fetchCards: async () => [dependencyReadyCard({ id: "issue-207", identifier: "SAF-207", stateName: "Ship", sortOrder: 50, updatedAt: minsAgo(1), labelNames: [], comments: [] })],
+          logFor: () => {},
+        },
+      });
+      for (const refillDemand of refill.dispatches) admission.admitDemand(refillDemand);
+    },
+  });
+  const completedShip = {
+    success: true,
+    issueIdentifier: "SAF-200",
+    reconciliation: { success: true, terminal: true, progress: { kind: "advanced", valid: true } },
+    pick: {
+      anchorPath: "/managed/safe", sourceAnchorPath: "/source/safe", sweep: "ship", issueIdentifier: "SAF-200",
+      config: { teamKey: "SAF", projectId: "project-safe", repos: ["safe"] },
+    },
+  };
+
+  const firstShip = queue.admitDemand({ stage: "ship", trigger: "initial", workspace: "/source/safe", issueIdentifier: "SAF-200", result: completedShip });
+  const unrelated = queue.admitDemand({ stage: "dev", trigger: "initial", workspace: "/source/other", issueIdentifier: "OTHER-1" });
+  await firstShip;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(starts, ["SAF-200", "OTHER-1", "SAF-207"]);
+  assert.equal(unrelatedReleased, false);
+  assert.deepEqual(shipConcurrency, [1, 1]);
+  releaseUnrelated();
+  await unrelated;
+  await queue.whenIdle();
+});
+
 test("capacity admission: resume-needed completion cannot handoff or refill before release", async () => {
   let stored = null;
   const discoveries = [];
@@ -5367,12 +5438,13 @@ test("Ship refill rejects no-op, timeout, ambiguous cleanup, and unresolved resu
     deps: { logFor: () => {} },
   };
   for (const reconciliation of [
+    undefined,
     { success: false, terminal: false, progress: { kind: "successful-no-op" } },
     { success: false, terminal: false, progress: { kind: "timeout" } },
     { success: false, terminal: false, progress: { kind: "ambiguous-history" } },
     { success: true, terminal: false, progress: { kind: "resume-needed" } },
   ]) {
-    assert.equal((await buildSameRepoRefillDispatches({ ...base, reconciliation })).reason, "ineligible", reconciliation.progress.kind);
+    assert.equal((await buildSameRepoRefillDispatches({ ...base, reconciliation })).reason, "ineligible", reconciliation?.progress.kind || "missing reconciliation");
   }
   assert.equal(base.refillBudget.remaining, 4);
 });
