@@ -54,14 +54,25 @@ function markdownTables(markdown) {
       rows.push(splitTableRow(lines[rowIndex]));
       rowIndex += 1;
     }
-    tables.push({ headers: headers.map(normalize), rows });
+    tables.push({ headers: headers.map(normalize), rows, startLine: index });
     index = rowIndex - 1;
   }
   return tables;
 }
 
-function tableWithHeaders(tables, expected) {
-  return tables.findLast(({ headers }) => headers.length === expected.length && headers.every((header, index) => header === expected[index]));
+function contractSectionStart(markdown) {
+  return markdown.split(/\r?\n/).reduce(
+    (startLine, line, index) => /^#{1,6}\s+verification contract(?:\b|\s)/i.test(line) ? index : startLine,
+    -1,
+  );
+}
+
+function tablesWithHeaders(tables, expected, contractStart) {
+  return tables.filter(({ headers, startLine }) => (
+    (contractStart < 0 || startLine > contractStart)
+    && headers.length === expected.length
+    && headers.every((header, index) => header === expected[index])
+  ));
 }
 
 function idsFromSources(value) {
@@ -83,8 +94,12 @@ export function parseVerificationArtifact(markdown, { role } = {}) {
   if (!applicability) return { applicability: null, verificationIds: [], diagnostics: [diagnostic("missing-declaration")] };
 
   const tables = markdownTables(markdown);
-  const obligationTable = tableWithHeaders(tables, verificationHeaders);
-  const traceabilityTable = tableWithHeaders(tables, traceabilityHeaders);
+  const contractStart = contractSectionStart(markdown);
+  const obligationTables = tablesWithHeaders(tables, verificationHeaders, contractStart);
+  const traceabilityTables = tablesWithHeaders(tables, traceabilityHeaders, contractStart);
+  const obligationTable = obligationTables[0];
+  const traceabilityTable = traceabilityTables[0];
+  if (obligationTables.length > 1 || traceabilityTables.length > 1) diagnostics.push(diagnostic("duplicate-verification-table"));
   const idsFromTable = (table) => table ? table.rows.map((row) => row[0].trim().toUpperCase()).filter(Boolean) : [];
   const obligationIds = role === "plan" ? [] : idsFromTable(obligationTable);
   const traceabilityIds = idsFromTable(traceabilityTable);
@@ -93,7 +108,7 @@ export function parseVerificationArtifact(markdown, { role } = {}) {
   if (duplicateIds.length) diagnostics.push(diagnostic("duplicate-verification-id"));
   if (applicability === "required" && !hasStableVerificationIds(verificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
 
-  const correctnessTable = tableWithHeaders(tables, correctnessHeaders);
+  const correctnessTable = tablesWithHeaders(tables, correctnessHeaders, contractStart)[0];
   const correctnessIds = unique((correctnessTable?.rows ?? []).map((row) => row[0].trim().toUpperCase()).filter((id) => /^C\d+$/.test(id)));
   const sourcesByVerificationId = new Map();
   if (role !== "plan" && obligationTable) {

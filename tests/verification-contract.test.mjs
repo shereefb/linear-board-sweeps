@@ -149,6 +149,24 @@ test("validates COD-157's concrete artifacts rather than their template tables",
   assert.deepEqual(result.verificationIds, ["V1", "V2", "V3", "V4", "V5", "V6"]);
 });
 
+test("uses the authoritative contract section and rejects duplicate obligation tables", () => {
+  const markdown = [
+    "Template:",
+    table(verificationHeaders, [["V9", "C9", "template", "template", "template", "template"]]),
+    "",
+    "## Verification contract",
+    "Verification contract: verification-contract/v1 — required — behavior changes",
+    table(verificationHeaders, [["V1", "C1", "real", "real", "real", "real"]]),
+    "",
+    "## Appendix",
+    table(verificationHeaders, [["V2", "C2", "duplicate", "duplicate", "duplicate", "duplicate"]]),
+  ].join("\n");
+
+  const result = validator.parseVerificationArtifact(markdown, { role: "spec" });
+  assert.deepEqual(result.verificationIds, ["V1"]);
+  assert.ok(diagnosticCodes(result).includes("duplicate-verification-table"));
+});
+
 test("reports missing declaration", () => {
   const result = validator.parseVerificationArtifact("# no contract\n");
   assert.ok(diagnosticCodes(result).includes("missing-declaration"));
