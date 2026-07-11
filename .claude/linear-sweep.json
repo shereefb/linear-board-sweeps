@@ -6,7 +6,7 @@
   "projectId": "81455eb7-1ead-474d-a0c1-54efe75f821e",
   "issuePrefix": "COD",
   "repos": ["linear-board-sweeps"],
-  "$comment_runtime": "Scheduled sweep runtime selection. Prefer runtimes.<sweep> for per-stage dispatch. Legacy runtime + models remain as a fallback when runtimes.<sweep> is absent. Each scheduled stage may declare one singular, optional Claude fallback: it runs only after positively classified Codex personal/model usage exhaustion. Workspace credits/spend caps and every generic failure fail closed. Claude must be installed and authenticated on the runner. The review entry is a reviewer role preference for sweep instructions, not a scheduled stage.",
+  "$comment_runtime": "Scheduled sweep runtime selection. Each scheduled stage may declare one optional Claude fallback. Confirmed usage exhaustion cools that runtime host-wide for one hour; the launcher uses a healthy configured lane, or quietly preserves work with no Linear Todo/comment when every lane is cooling. Auth, configuration, and generic failures remain actionable. Claude must be installed and authenticated. The review entry is a reviewer role preference, not a scheduled stage.",
   "runtime": "codex",
   "models": {
     "spec": { "model": "gpt-5.6-sol", "effort": "high" },

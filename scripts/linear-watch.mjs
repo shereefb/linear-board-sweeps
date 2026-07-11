@@ -70,12 +70,15 @@ const LAST_TICK = path.join(STATE_DIR, "last-tick");
 const CAPACITY_LEDGER = path.join(STATE_DIR, "capacity-ledger.json");
 const OBSERVATIONS = path.join(STATE_DIR, "observations.json");
 const RESUME_NEEDED = path.join(STATE_DIR, "resume-needed.json");
+const RUNTIME_COOLDOWNS = path.join(STATE_DIR, "runtime-cooldowns.json");
 const LEARNING_RUNS_DIR = path.join(STATE_DIR, "runs");
 const LEARNING_STATE_PATH = path.join(STATE_DIR, "learning-state.json");
 export const TICK_STATE_VERSION = 1;
 export const CAPACITY_LEDGER_VERSION = 1;
 export const OBSERVATION_STATE_VERSION = 1;
 export const RESUME_STATE_VERSION = 1;
+export const RUNTIME_COOLDOWN_STATE_VERSION = 1;
+export const RUNTIME_COOLDOWN_MS = 60 * 60_000;
 export const RESUME_NEEDED_TAG = "[auto-sweep-resume-needed";
 export const RESUME_PROTECTION_MAX_AGE_MS = 24 * 3600000;
 export const OBSERVATION_RETENTION_MS = 7 * 24 * 3600000;
@@ -455,14 +458,6 @@ export function fallbackRuntimeConfigForSweep(config = {}, sweep) {
   if (primary.runtime !== "codex" || fallback?.runtime !== "claude" || !model) return null;
   if (fallback.effort !== undefined && !validEfforts.has(fallback.effort)) return null;
   return { runtime: "claude", model, effort: fallback.effort };
-}
-
-export function runtimeFallbackForAttempt(config = {}, sweep, attempts = 0) {
-  const primary = runtimeConfigForSweep(config, sweep);
-  const raw = config?.runtimes?.[sweep]?.fallbacks;
-  const fallbacks = Array.isArray(raw) ? raw.filter((lane) => lane && typeof lane.runtime === "string") : [];
-  const fallback = fallbacks[Math.max(0, Math.floor(Number(attempts) || 0) - 1)];
-  return fallback ? { ...primary, ...fallback } : primary;
 }
 
 function whichRuntime(runtime, env) {
@@ -2102,6 +2097,96 @@ export function createResumeStore({ resumePath = RESUME_NEEDED, dryRun = false, 
     return { ...entry, protectionState: validForResume ? "resume" : "needs-resolution" };
   };
   return { resumePath, read, get, upsert, clear, due, protectedClaim };
+}
+
+function runtimeCooldownKey({ host, runtime, model = null } = {}) {
+  return JSON.stringify([String(host || ""), String(runtime || ""), model ? String(model) : ""]);
+}
+
+function validRuntimeCooldown(value) {
+  return Boolean(value && typeof value === "object"
+    && typeof value.host === "string" && value.host
+    && ["codex", "claude"].includes(value.runtime)
+    && (value.model === null || value.model === undefined || typeof value.model === "string")
+    && value.reason === "usage-exhausted"
+    && Number.isFinite(Date.parse(value.cooldownUntil || ""))
+    && Number.isFinite(Date.parse(value.updatedAt || "")));
+}
+
+export function createRuntimeCooldownStore({
+  cooldownPath = RUNTIME_COOLDOWNS,
+  dryRun = false,
+  now = Date.now,
+  readJsonFn = (target) => fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : null,
+  writeJsonFn = atomicWriteJson,
+} = {}) {
+  const read = () => {
+    try {
+      const raw = readJsonFn(cooldownPath);
+      if (raw === null || raw === undefined) return { healthy: true, entries: {} };
+      if (!raw || raw.version !== RUNTIME_COOLDOWN_STATE_VERSION || !raw.entries || typeof raw.entries !== "object"
+        || Array.isArray(raw.entries) || Object.values(raw.entries).some((entry) => !validRuntimeCooldown(entry))) {
+        return { healthy: false, entries: {} };
+      }
+      return { healthy: true, entries: structuredClone(raw.entries) };
+    } catch { return { healthy: false, entries: {} }; }
+  };
+  const persist = (state) => { if (!dryRun) writeJsonFn(cooldownPath, { version: RUNTIME_COOLDOWN_STATE_VERSION, entries: state.entries }); };
+  const get = (lane) => {
+    const state = read();
+    if (!state.healthy) return null;
+    return state.entries[runtimeCooldownKey(lane)] || (lane.model ? state.entries[runtimeCooldownKey({ ...lane, model: null })] : null) || null;
+  };
+  const markExhausted = ({ host, runtime, model = null }) => {
+    if (!host || !["codex", "claude"].includes(runtime)) return null;
+    const prior = read();
+    const state = prior.healthy ? prior : { healthy: true, entries: {} };
+    const timestamp = new Date(now()).toISOString();
+    const key = runtimeCooldownKey({ host, runtime, model });
+    state.entries[key] = { host, runtime, model, reason: "usage-exhausted", cooldownUntil: new Date(now() + RUNTIME_COOLDOWN_MS).toISOString(), updatedAt: timestamp };
+    persist(state);
+    return structuredClone(state.entries[key]);
+  };
+  const clear = (lane) => {
+    const state = read();
+    if (!state.healthy) return false;
+    const keys = [runtimeCooldownKey(lane), ...(lane.model ? [runtimeCooldownKey({ ...lane, model: null })] : [])];
+    let changed = false;
+    for (const key of keys) if (state.entries[key]) { delete state.entries[key]; changed = true; }
+    if (changed) persist(state);
+    return changed;
+  };
+  const status = (lane) => {
+    const entry = get(lane);
+    if (!entry) return { kind: "ready", entry: null };
+    return { kind: Date.parse(entry.cooldownUntil) > now() ? "cooling" : "probe-due", entry };
+  };
+  const snapshot = () => read();
+  return { get, status, markExhausted, clear, snapshot };
+}
+
+export function selectRuntimeForCooldown(config, sweep, {
+  store,
+  host = os.hostname(),
+  probes = new Set(),
+} = {}) {
+  if (store?.snapshot?.().healthy === false) return { runtimeConfig: null, deferredUntil: null, probe: false, storeHealthy: false };
+  const primary = runtimeConfigForSweep(config, sweep);
+  const fallback = fallbackRuntimeConfigForSweep(config, sweep);
+  const candidates = [primary, fallback].filter(Boolean);
+  const deferred = [];
+  for (const runtimeConfig of candidates) {
+    const lane = { host, runtime: runtimeConfig.runtime, model: runtimeConfig.model };
+    const state = store?.status(lane) || { kind: "ready", entry: null };
+    if (state.kind === "ready") return { runtimeConfig, deferredUntil: null, probe: false };
+    const probeKey = runtimeCooldownKey({ host, runtime: runtimeConfig.runtime, model: state.entry?.model || null });
+    if (state.kind === "probe-due" && !probes.has(probeKey)) {
+      probes.add(probeKey);
+      return { runtimeConfig, deferredUntil: null, probe: true };
+    }
+    if (state.entry?.cooldownUntil) deferred.push(state.entry.cooldownUntil);
+  }
+  return { runtimeConfig: null, deferredUntil: deferred.sort()[0] || null, probe: false };
 }
 
 export function successfulSameStateRecoveryDecision(pick, card, { gitFn = git, existsFn = fs.existsSync } = {}) {
@@ -4473,6 +4558,8 @@ export function doctorReport({
   capacityLedgerPath = CAPACITY_LEDGER,
   observationState = null,
   observationPath = OBSERVATIONS,
+  runtimeCooldownState = null,
+  runtimeCooldownPath = RUNTIME_COOLDOWNS,
   resolveRuntimeFn = resolveRuntimeExecutable,
   runtimeEnvBySource = null,
   learningState = null,
@@ -4530,6 +4617,12 @@ export function doctorReport({
     dependency: telemetry.dependencyDeferredCount || 0,
     capacity: telemetry.capacityDeferredCount ?? waits.length,
   };
+  const cooldowns = runtimeCooldownState || createRuntimeCooldownStore({ cooldownPath: runtimeCooldownPath, now: () => now }).snapshot();
+  report.runtimeCooldowns = {
+    healthy: cooldowns.healthy !== false,
+    entries: Object.values(cooldowns.entries || {}).map((entry) => ({ ...entry, state: Date.parse(entry.cooldownUntil) > now ? "cooling" : "probe-due" })),
+  };
+  if (!report.runtimeCooldowns.healthy) report.ok = false;
   report.resources = {
     loadAverage1m: telemetry.loadAverage1m,
     freeMemoryBytes: telemetry.freeMemoryBytes,
@@ -4667,7 +4760,11 @@ export function formatDoctorReport(report) {
     `ship-runner: ${report.shipRunner ? "ON" : "off"}`,
     `kit: ${report.kit.path || "(unset)"}${report.kit.exists ? "" : " (missing)"}`,
     `capacity: ${report.capacity.active}/${report.capacity.max}${highWater}${report.capacity.healthy ? "" : " BLOCKED"}`,
+    `runtime-cooldowns: ${(report.runtimeCooldowns?.entries || []).length}`,
   ];
+  for (const entry of report.runtimeCooldowns?.entries || []) {
+    lines.push(`  ${entry.runtime}${entry.model ? `/${entry.model}` : ""}: ${entry.state} until ${entry.cooldownUntil}`);
+  }
   if (!report.capacity.healthy) {
     for (const error of report.capacity.errors || []) lines.push(`  capacity error: ${error}`);
   }
@@ -5067,6 +5164,8 @@ export async function expandDispatchBatch(batch, {
         rotationRank: pick.rotationRank,
         handoffHops: pick.handoffHops,
         runtimeExecutable: pick.runtimeExecutable,
+        runtimeOverride: pick.runtimeOverride,
+        runtimeCooldownProbe: pick.runtimeCooldownProbe,
         runtimeLaneKey: pick.runtimeLaneKey,
         runtimeScope: pick.runtimeScope,
         runtimeStableTarget: pick.runtimeStableTarget,
@@ -5389,6 +5488,7 @@ export function createCodexUsageEvidenceCollector() {
     if (classificationDisabled || !line.length) return;
     let value;
     try { value = JSON.parse(line); } catch { return; }
+    if (value?.type !== "error" && value?.type !== "turn.failed") return;
     candidateCount += 1;
     candidateBytes += lineBytes;
     if (candidateCount > CODEX_USAGE_MAX_CANDIDATES || candidateBytes > CODEX_USAGE_MAX_CANDIDATE_BYTES) {
@@ -5475,6 +5575,38 @@ export function createCodexUsageEvidenceCollector() {
     exhausted() {
       return exhausted;
     },
+  };
+}
+
+const CLAUDE_USAGE_LIMIT_PREFIXES = ["You've hit your limit", "Claude usage limit reached"];
+
+export function createClaudeUsageEvidenceCollector() {
+  const decoder = new StringDecoder("utf8");
+  let line = "";
+  let bytes = 0;
+  let exhausted = false;
+  let disabled = false;
+  let finished = false;
+  const classify = () => {
+    const text = line.trim();
+    if (CLAUDE_USAGE_LIMIT_PREFIXES.some((prefix) => text.startsWith(prefix))) exhausted = true;
+    line = "";
+    bytes = 0;
+  };
+  const append = (text) => {
+    for (const character of text) {
+      if (character === "\n") { if (!disabled) classify(); continue; }
+      if (disabled) continue;
+      const size = Buffer.byteLength(character);
+      if (bytes + size > CODEX_USAGE_MAX_LINE_BYTES) { disabled = true; exhausted = false; line = ""; continue; }
+      line += character;
+      bytes += size;
+    }
+  };
+  return {
+    push(chunk) { if (!finished && chunk != null) append(decoder.write(chunk)); },
+    finish() { if (finished) return; finished = true; append(decoder.end()); if (!disabled && line) classify(); },
+    exhausted() { return exhausted; },
   };
 }
 
@@ -5743,7 +5875,7 @@ function dispatchEnvironment(anchorPath, pick = {}) {
   };
 }
 
-function normalizedDispatchAttempt(runtimeCfg, outcome) {
+function normalizedDispatchAttempt(runtimeCfg, outcome, usageExhausted = false) {
   return {
     runtime: runtimeCfg.runtime || "codex",
     model: runtimeCfg.model,
@@ -5754,6 +5886,7 @@ function normalizedDispatchAttempt(runtimeCfg, outcome) {
       exitCode: outcome?.exitCode ?? null,
       signal: outcome?.signal ?? null,
     },
+    ...(usageExhausted ? { usageExhausted: true } : {}),
   };
 }
 
@@ -5791,6 +5924,7 @@ function runtimeMetadata(anchorPath, pick, runtimeCfg, executable, { usePickMeta
 function runDispatchAttempt({
   executable, command, cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn,
   classifyCodexStdout = createCodexUsageEvidenceCollector,
+  classifyClaudeStderr = createClaudeUsageEvidenceCollector,
   writeChunkFn = fs.writeSync,
 }) {
   return new Promise((resolve) => {
@@ -5798,7 +5932,9 @@ function runDispatchAttempt({
     let settled = false;
     let capacityAttachFailed = false;
     let logWriteFailed = false;
-    const collector = runtimeCfg.runtime === "codex" ? classifyCodexStdout() : null;
+    const collector = runtimeCfg.runtime === "codex"
+      ? classifyCodexStdout()
+      : runtimeCfg.runtime === "claude" ? classifyClaudeStderr() : null;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
@@ -5824,8 +5960,8 @@ function runDispatchAttempt({
       finish(classifyDispatchOutcome({ type: "error", error, path: executable, cwd, cwdExists: fs.existsSync(cwd), executableExists: fs.existsSync(executable) }));
       return;
     }
-    child.stdout?.on("data", (chunk) => write(chunk, true));
-    child.stderr?.on("data", (chunk) => write(chunk));
+    child.stdout?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "codex"));
+    child.stderr?.on("data", (chunk) => write(chunk, runtimeCfg.runtime === "claude"));
     child.on("error", (error) => {
       if (capacityAttachFailed || logWriteFailed || settled) return;
       const interrupted = error.code === "ABORT_ERR" || signal?.aborted;
@@ -5868,7 +6004,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   resolveRuntimeExecutableFn = resolveRuntimeExecutable,
   writeChunkFn = fs.writeSync,
 } = {}) {
-  const runtimeCfg = runtimeConfigForSweep(config, sweep);
+  const runtimeCfg = pick.runtimeOverride || runtimeConfigForSweep(config, sweep);
   const command = buildCommand({ ...runtimeCfg, sweep, anchorPath, issueIdentifier: pick.issueIdentifier });
   const executable = pick.runtimeExecutable || command.cmd;
   const env = dispatchEnvironment(anchorPath, pick);
@@ -5909,11 +6045,12 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   };
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
   const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn });
-  const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome);
+  const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome, primary.usageExhausted);
   const deferred = childDeferredOutcomeForPick(pick);
   if (deferred) return finish(deferred, primaryMeta, [primaryAttempt]);
   const fallbackCfg = fallbackRuntimeConfigForSweep(config, sweep);
-  const fallbackEligible = primary.outcome.kind === "exit"
+  const fallbackEligible = runtimeCfg.runtime === "codex"
+    && primary.outcome.kind === "exit"
     && Number.isInteger(primary.outcome.exitCode)
     && primary.outcome.exitCode !== 0
     && primary.usageExhausted
@@ -5948,7 +6085,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     onSpawn,
     writeChunkFn,
   });
-  const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome);
+  const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome, fallback.usageExhausted);
   return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
 }
 
@@ -6027,6 +6164,8 @@ async function tick({ dryRun = false } = {}) {
     const capacityLedger = createCapacityLedger({ maxActiveChildren: reg.capacity.maxActiveChildren });
     const observationStore = createObservationStore({ dryRun });
     const resumeStore = createResumeStore({ dryRun });
+    const runtimeCooldownStore = createRuntimeCooldownStore({ dryRun });
+    const runtimeCooldownProbes = new Set();
     const resourceSampler = createResourceSampler();
     const dependencyDeferredKeys = new Set();
     const dependencyDeferredIssues = new Map();
@@ -6064,6 +6203,31 @@ async function tick({ dryRun = false } = {}) {
       const runtime = runtimeSummary(runtimeCfg);
       const dispatchScope = result.dispatchScope;
       const fallbackFailure = fallbackFailureAttribution(result);
+      const exhaustedAttempts = (result.attempts || []).filter((attempt) => attempt?.usageExhausted === true);
+      const providerUsageExhausted = exhaustedAttempts.length > 0;
+      const finalUsageExhausted = result.attempts?.at(-1)?.usageExhausted === true;
+      let finalCooldown = null;
+      for (const attempt of exhaustedAttempts) {
+        finalCooldown = runtimeCooldownStore.markExhausted({ host: os.hostname(), runtime: attempt.runtime });
+        logFor(pick.anchorPath, pick.sweep, `${attempt.runtime} usage exhausted; cooling until ${finalCooldown?.cooldownUntil || "unknown"}`);
+      }
+      if (result.kind === "success") {
+        runtimeCooldownStore.clear({ host: os.hostname(), runtime: runtimeCfg.runtime, model: runtimeCfg.model });
+      } else if (finalUsageExhausted && pick.issueIdentifier && finalCooldown) {
+        resumeStore.upsert({
+          sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath,
+          sweep: pick.sweep,
+          issueIdentifier: pick.issueIdentifier,
+          issueId: pick.issueId,
+          ownerToken: pick.ownerToken,
+          worktreePath: pick.worktreePath || cardWorktreePath(pick.anchorPath, pick.config, pick.issueIdentifier, pick.repoRoute),
+          branch: pick.branch || pick.issueIdentifier,
+          repoEntry: pick.repoRoute?.repoEntry || ".",
+          reason: "provider usage exhausted",
+          nextEligibleAt: finalCooldown.cooldownUntil,
+          attempts: 0,
+        });
+      }
       const stableTarget = pick.issueIdentifier ? JSON.stringify({
         runtime,
         issueIdentifier: pick.issueIdentifier,
@@ -6075,7 +6239,7 @@ async function tick({ dryRun = false } = {}) {
       const dependencyDeferred = result.kind === "dependency-deferred";
       const routingDeferred = result.kind === "repo-routing-deferred";
       const detail = result.signal || result.code || result.exitCode;
-      const capacityKind = classifyCapacityOutcome(result, (() => {
+      const capacityKind = providerUsageExhausted ? null : classifyCapacityOutcome(result, (() => {
         try {
           const file = path.join(pick.logDir || "", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
           return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(-16_384) : "";
@@ -6092,7 +6256,7 @@ async function tick({ dryRun = false } = {}) {
         });
         logFor(pick.anchorPath, pick.sweep, `${pick.issueIdentifier} capacity deferred (${capacityKind}); retry eligible ${nextEligibleAt}`);
       }
-      const failures = capacityKind ? [] : routingDeferred
+      const failures = (capacityKind || finalUsageExhausted) ? [] : routingDeferred
         ? [failureEventFor(
           pick.anchorPath,
           pick.config,
@@ -6330,7 +6494,30 @@ async function tick({ dryRun = false } = {}) {
       atomicWriteJson(CURRENT_TICK, tickState);
     };
     const preflightCandidatesForTick = async (candidates) => {
-      const checked = preflightRuntimeCandidates(candidates, {
+      const cooldownReady = [];
+      for (const pick of candidates || []) {
+        const selected = selectRuntimeForCooldown(pick.config || {}, pick.sweep, {
+          store: runtimeCooldownStore,
+          host: os.hostname(),
+          probes: runtimeCooldownProbes,
+        });
+        if (!selected.runtimeConfig) {
+          capacityDeferredKeys.add(observationKey(pick));
+          logFor(pick.anchorPath, pick.sweep, `runtime-cooldown defer${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}; next probe ${selected.deferredUntil || "pending"}`);
+          continue;
+        }
+        cooldownReady.push({
+          ...pick,
+          runtimeOverride: selected.runtimeConfig,
+          runtimeCooldownProbe: selected.probe,
+          ...(selected.probe ? {
+            count: 1,
+            cards: [pick.topCard || pick.cards?.[0]].filter(Boolean),
+            slotLimit: 1,
+          } : {}),
+        });
+      }
+      const checked = preflightRuntimeCandidates(cooldownReady, {
         host: os.hostname(),
         cache: runtimeCache,
         envForCandidate: (pick) => dispatchEnvironment(pick.anchorPath, pick),
@@ -6706,7 +6893,7 @@ async function tick({ dryRun = false } = {}) {
               worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute,
             };
             if (resumeAdmissionDecision(resumePick, card, record, now).kind === "resume") {
-              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute, ...(record.reason === "capacity" ? { runtimeOverride: runtimeFallbackForAttempt(config, sweep, record.attempts) } : {}) });
+              resumes.push({ anchorPath, sourceAnchorPath: active.sourceAnchorPath, managedRepoPaths: active.managedRepoPaths, repoPairs: active.repoPairs, config, sweep, count: 1, topCard: routedResume, topSortOrder: card.sortOrder, cards: [routedResume], resume: true, ownerToken: record.ownerToken, worktreePath: record.worktreePath, branch: record.branch, repoRoute: routedResume.repoRoute });
             }
           }
           const actionableIds = new Set(actionable.map((card) => card.identifier));

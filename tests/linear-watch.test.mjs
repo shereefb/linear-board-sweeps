@@ -31,7 +31,7 @@ import {
   latestHeartbeatOwner, claimConfirmed, cardWorktreePath, cardRunPaths, withCardDispatchEnv,
   buildLauncherEvidenceRunRecord, appendLauncherEvidenceRun, trustedLauncherSourceRepoEntry, recordConfirmedReapEvidence, recordConfirmedOrphanEvidence,
   dryRunDispatchMessages, createChildIndexAllocator, createSameRepoActiveCounts,
-  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
+  sameRepoAvailableSlots, claimCardSlots, expandDispatchBatch, buildSameRepoRefillDispatches, classifyDispatchOutcome, runtimeDisabledByOutcome, isCodexUsageExhaustedEvent, createCodexUsageEvidenceCollector, createClaudeUsageEvidenceCollector, createDispatchAbortContext, dispatchAsync, dispatchBatch, parseEnv, pushWithRetry, checkoutDispatchBlockers,
   admissionDemandsForCandidates,
   rediscoveredResumeRecordForCard,
   fetchScheduledPassCards, fetchScheduledQueueCards,
@@ -58,7 +58,7 @@ import {
   fetchLearningIssueComments, fetchLearningIssues, learningRelationExists, executeLearningMutations, executeLearningEvaluations,
   executeLearningCycleWrites,
   buildLiveLearningDryRunPlan, learningRunExecutionDecision,
-  createResumeStore, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
+  createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown, successfulSameStateRecoveryDecision, resumeAdmissionDecision,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
 } from "../scripts/linear-watch.mjs";
 
@@ -174,6 +174,67 @@ test("capacity outcome: recognized quota failures defer with bounded retry and c
   assert.equal(classifyCapacityOutcome({ kind: "exit" }, "syntax error"), null);
   assert.equal(capacityRetryAt(NOW, 0), NOW + 60_000);
   assert.equal(capacityRetryAt(NOW, 99), NOW + 60 * 60_000);
+});
+
+test("runtime cooldown store: persists one-hour provider exhaustion and clears on success", () => {
+  let raw = null;
+  let now = NOW;
+  const store = createRuntimeCooldownStore({
+    cooldownPath: "/state/runtime-cooldowns.json",
+    now: () => now,
+    readJsonFn: () => raw,
+    writeJsonFn: (_path, value) => { raw = structuredClone(value); },
+  });
+  const marked = store.markExhausted({ host: "runner", runtime: "codex" });
+  assert.equal(Date.parse(marked.cooldownUntil), NOW + 60 * 60_000);
+  assert.equal(store.get({ host: "runner", runtime: "codex" }).reason, "usage-exhausted");
+
+  now += 30 * 60_000;
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "cooling");
+  now += 31 * 60_000;
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "probe-due");
+  assert.equal(store.clear({ host: "runner", runtime: "codex" }), true);
+  assert.equal(store.status({ host: "runner", runtime: "codex" }).kind, "ready");
+});
+
+test("runtime cooldown routing: skips a cooling primary and quietly defers when both providers cool", () => {
+  let raw = null;
+  const store = createRuntimeCooldownStore({
+    now: () => NOW,
+    readJsonFn: () => raw,
+    writeJsonFn: (_path, value) => { raw = structuredClone(value); },
+  });
+  const config = { runtimes: { dev: {
+    runtime: "codex", model: "gpt-5.6-terra",
+    fallback: { runtime: "claude", model: "claude-sonnet-5" },
+  } } };
+  store.markExhausted({ host: "runner", runtime: "codex" });
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner" }).runtimeConfig.runtime, "claude");
+  store.markExhausted({ host: "runner", runtime: "claude" });
+  const deferred = selectRuntimeForCooldown(config, "dev", { store, host: "runner" });
+  assert.equal(deferred.runtimeConfig, null);
+  assert.equal(deferred.deferredUntil, new Date(NOW + 60 * 60_000).toISOString());
+});
+
+test("runtime cooldown routing: admits only one probe for an expired runtime", () => {
+  let raw = null;
+  let now = NOW;
+  const store = createRuntimeCooldownStore({ now: () => now, readJsonFn: () => raw, writeJsonFn: (_path, value) => { raw = structuredClone(value); } });
+  const config = { runtimes: { dev: { runtime: "codex", model: "gpt", fallback: { runtime: "claude", model: "claude" } } } };
+  store.markExhausted({ host: "runner", runtime: "codex" });
+  store.markExhausted({ host: "runner", runtime: "claude" });
+  now += 60 * 60_000;
+  const probes = new Set();
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig.runtime, "codex");
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig.runtime, "claude");
+  assert.equal(selectRuntimeForCooldown(config, "dev", { store, host: "runner", probes }).runtimeConfig, null);
+});
+
+test("runtime cooldown routing: malformed persisted state fails closed", () => {
+  const store = createRuntimeCooldownStore({ readJsonFn: () => ({ version: 1, entries: { bad: { runtime: "codex" } } }) });
+  const selected = selectRuntimeForCooldown({ runtimes: { dev: { runtime: "codex" } } }, "dev", { store, host: "runner" });
+  assert.equal(selected.runtimeConfig, null);
+  assert.equal(selected.storeHealthy, false);
 });
 
 test("generated artifact cleanup: rejects repositories, worktrees, ancestors, and symlink escapes", () => {
@@ -4365,10 +4426,13 @@ test("dry-run and child expansion apply limits independently to routed sibling r
     sweep: "qa",
     count: 2,
     cards: [card("coach", "SAF-1", 2), card("guide", "SAF-2", 1)],
+    runtimeOverride: { runtime: "claude", model: "claude-sonnet-5" },
+    runtimeCooldownProbe: true,
   };
   assert.deepEqual(dryRunDispatchMessages([candidate]).slice(1).map((message) => message.body.match(/repo=([^ ]+)/)?.[1]), ["coach", "guide"]);
   const children = await expandDispatchBatch([candidate], { dryRun: true, parentRunId: "run-id", activeByAnchor: new Map(), now: NOW });
   assert.deepEqual(children.map((child) => child.issueIdentifier), ["SAF-1", "SAF-2"]);
+  assert.ok(children.every((child) => child.runtimeOverride.runtime === "claude" && child.runtimeCooldownProbe === true));
 });
 test("dispatchBatch: dispatches every selected child and returns structured results", async () => {
   const calls = [];
@@ -4517,15 +4581,21 @@ test("Codex usage evidence: fails closed on oversized, malformed, and bounded ca
   malformed.finish();
   assert.equal(malformed.exhausted(), false);
 
+  const routineTraffic = createCodexUsageEvidenceCollector();
+  routineTraffic.push(Buffer.from(`${Array.from({ length: 100 }, () => JSON.stringify({ type: "item.completed" })).join("\n")}\n`));
+  routineTraffic.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
+  routineTraffic.finish();
+  assert.equal(routineTraffic.exhausted(), true);
+
   const candidateOverflow = createCodexUsageEvidenceCollector();
   candidateOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
-  candidateOverflow.push(Buffer.from(`${Array.from({ length: 32 }, () => JSON.stringify({ type: "item.completed" })).join("\n")}\n`));
+  candidateOverflow.push(Buffer.from(`${Array.from({ length: 32 }, () => JSON.stringify({ type: "error", message: "ordinary terminal error" })).join("\n")}\n`));
   candidateOverflow.finish();
   assert.equal(candidateOverflow.exhausted(), false);
 
   const byteOverflow = createCodexUsageEvidenceCollector();
   byteOverflow.push(Buffer.from(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`));
-  byteOverflow.push(Buffer.from(`${Array.from({ length: 5 }, () => JSON.stringify({ type: "item.completed", payload: "x".repeat(14 * 1024) })).join("\n")}\n`));
+  byteOverflow.push(Buffer.from(`${Array.from({ length: 5 }, () => JSON.stringify({ type: "error", message: "x".repeat(14 * 1024) })).join("\n")}\n`));
   byteOverflow.finish();
   assert.equal(byteOverflow.exhausted(), false);
   assert.equal("events" in byteOverflow, false);
@@ -4553,6 +4623,21 @@ test("Codex usage evidence: finish parses a bounded final stdout line", () => {
   oversized.push(Buffer.from("x".repeat(16 * 1024 + 1)));
   oversized.finish();
   assert.equal(oversized.exhausted(), false);
+});
+
+test("Claude usage evidence: recognizes only bounded stderr limit lines", () => {
+  for (const message of ["You've hit your limit · resets 8pm", "Claude usage limit reached. Try again later."]) {
+    const collector = createClaudeUsageEvidenceCollector();
+    collector.push(Buffer.from(`${message}\n`));
+    collector.finish();
+    assert.equal(collector.exhausted(), true);
+  }
+  for (const message of ["Authentication required", "429 rate limit", "The service is overloaded", "agent said: You've hit your limit"]) {
+    const collector = createClaudeUsageEvidenceCollector();
+    collector.push(Buffer.from(`${message}\n`));
+    collector.finish();
+    assert.equal(collector.exhausted(), false);
+  }
 });
 
 test("dispatchAsync fallback: Codex exhaustion runs one sequential Claude attempt with the same child context", async () => {
@@ -4590,6 +4675,7 @@ test("dispatchAsync fallback: Codex exhaustion runs one sequential Claude attemp
   assert.deepEqual(outcome.finalRuntimeConfig, { runtime: "claude", model: "claude-sonnet-5", effort: "high" });
   assert.equal(outcome.finalRuntimeExecutable, "/resolved/claude");
   assert.equal(outcome.attempts.length, 2);
+  assert.equal(outcome.attempts[0].usageExhausted, true);
   assert.deepEqual(outcome.attempts.map((attempt) => attempt.runtime), ["codex", "claude"]);
   const recordFile = fs.readdirSync(path.join(anchorPath, "logs")).find((name) => name.startsWith("run-records-"));
   const record = JSON.parse(fs.readFileSync(path.join(anchorPath, "logs", recordFile), "utf8").trim());
@@ -4598,6 +4684,25 @@ test("dispatchAsync fallback: Codex exhaustion runs one sequential Claude attemp
   assert.equal(record.resolvedRuntimeExecutable, "/resolved/claude");
   assert.equal(record.fallbackUsed, true);
   assert.equal(record.attempts.length, 2);
+});
+
+test("dispatchAsync cooldown route: direct Claude exhaustion is normalized without another fallback", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-claude-exhaustion-"));
+  const child = pipedDispatchChild(803);
+  const run = dispatchAsync(anchorPath, "dev", {
+    runtimes: { dev: { runtime: "codex", model: "gpt", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, {
+    issueIdentifier: "COD-144",
+    runtimeOverride: { runtime: "claude", model: "claude-sonnet-5" },
+    runtimeExecutable: "/resolved/claude",
+  }, { spawnFn: queuedDispatchSpawn([child]) });
+  child.stderr.write("You've hit your limit · resets 8pm\n");
+  child.close(1);
+  const result = await run;
+  assert.equal(result.finalRuntimeConfig.runtime, "claude");
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0].usageExhausted, true);
+  assert.equal(result.fallbackUsed, false);
 });
 
 test("dispatchAsync fallback: stderr usage text is logged but never authorizes Claude", async () => {
