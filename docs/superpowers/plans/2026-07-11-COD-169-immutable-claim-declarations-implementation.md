@@ -62,7 +62,7 @@ Also cover deterministic `createdAt,id` ordering, matching heartbeat liveness, u
 
 - [ ] **Step 2: Run the focused suite and verify RED**
 
-Run: `node --test tests/claim-ownership.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs`
 Expected: FAIL because `scripts/claim-ownership.mjs` does not exist.
 
 - [ ] **Step 3: Implement strict marker builders, parser, ordering, and epoch fold**
@@ -91,7 +91,7 @@ export function resolveClaimOwnership({ comments, complete, claim, labelPresent 
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
-Run: `node --test tests/claim-ownership.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs`
 Expected: all claim protocol tests pass.
 
 - [ ] **Step 5: Commit the pure protocol**
@@ -132,7 +132,7 @@ test("scheduled snapshots are never complete ownership evidence", () => {
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
-Run: `node --test --test-name-pattern='CompleteClaim|claim history|scheduled snapshots' tests/linear-watch.test.mjs tests/linear.test.mjs`  
+Run: `node --test --test-name-pattern='CompleteClaim|claim history|scheduled snapshots' tests/linear-watch.test.mjs tests/linear.test.mjs`
 Expected: FAIL because the complete-history helpers are absent.
 
 - [ ] **Step 3: Implement cycle-safe pagination and authoritative hydration**
@@ -173,7 +173,7 @@ Do not change terminal eligibility yet; Task 5 wires the new declaration argumen
 
 - [ ] **Step 5: Run focused and existing Linear tests**
 
-Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass, including cursor-cycle failures.
 
 - [ ] **Step 6: Commit complete history support**
@@ -213,7 +213,7 @@ Also assert declaration-before-label call order, final complete read, malformed 
 
 - [ ] **Step 2: Run acquisition tests and verify RED**
 
-Run: `node --test --test-name-pattern='claimCardSlots|claim declaration|withCardDispatchEnv' tests/linear-watch.test.mjs`  
+Run: `node --test --test-name-pattern='claimCardSlots|claim declaration|withCardDispatchEnv' tests/linear-watch.test.mjs`
 Expected: FAIL because picks do not carry declarations and acquisition still posts a heartbeat after the label.
 
 - [ ] **Step 3: Implement declaration token generation and acquisition ordering**
@@ -245,7 +245,7 @@ Trace every object spread/copy that currently carries `ownerToken`, including sa
 
 - [ ] **Step 5: Run focused tests and the full launcher suite**
 
-Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`
 Expected: all acquisition, environment, refill, and legacy scheduler tests pass.
 
 - [ ] **Step 6: Commit declaration acquisition**
@@ -284,7 +284,7 @@ Cover liveness fallback to declaration time, delayed old heartbeat, protected re
 
 - [ ] **Step 2: Run lifecycle tests and verify RED**
 
-Run: `node --test --test-name-pattern='reap|orphan|releaseOwned|resume|same-state|declaration' tests/linear-watch.test.mjs`  
+Run: `node --test --test-name-pattern='reap|orphan|releaseOwned|resume|same-state|declaration' tests/linear-watch.test.mjs`
 Expected: FAIL because lifecycle code still trusts the latest heartbeat owner and removes before audit.
 
 - [ ] **Step 3: Implement one close-before-mutation helper**
@@ -321,7 +321,7 @@ Old v1 records remain unreadable and protect nothing; live declared cards are re
 
 - [ ] **Step 6: Run lifecycle and full launcher tests**
 
-Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass, including stale-child and stranded-label cases.
 
 - [ ] **Step 7: Commit lifecycle migration**
@@ -363,7 +363,7 @@ Retain QA-only `QA -> Signoff|Ship` destination enforcement, Factory Learning ex
 
 - [ ] **Step 2: Run focused CLI tests and verify RED**
 
-Run: `node --test --test-name-pattern='guarded terminal|move-card-bottom-if-current' tests/linear.test.mjs`  
+Run: `node --test --test-name-pattern='guarded terminal|move-card-bottom-if-current' tests/linear.test.mjs`
 Expected: FAIL because the helper accepts no declaration ID and performs no close boundary.
 
 - [ ] **Step 3: Implement final ownership read, close, close verification, and update**
@@ -381,7 +381,7 @@ await issueUpdate({ stateId: destinationStateId, sortOrder, removedLabelIds: [ow
 
 - [ ] **Step 4: Run CLI, resolver, and launcher suites**
 
-Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`  
+Run: `node --test tests/claim-ownership.test.mjs tests/linear.test.mjs tests/linear-watch.test.mjs`
 Expected: all tests pass.
 
 - [ ] **Step 5: Commit guarded terminal migration**
@@ -441,7 +441,7 @@ test("claim migration status reports legacy, orphan, active, and ambiguous claim
 
 - [ ] **Step 2: Run documentation tests and verify RED**
 
-Run: `node --test tests/qa-sweep-doc.test.mjs tests/manual-sweep-doc.test.mjs tests/agents-snippet.test.mjs tests/linear-watch.test.mjs`  
+Run: `node --test tests/qa-sweep-doc.test.mjs tests/manual-sweep-doc.test.mjs tests/agents-snippet.test.mjs tests/linear-watch.test.mjs`
 Expected: FAIL because skills and diagnostics still describe heartbeat ownership.
 
 - [ ] **Step 3: Update every sweep lifecycle contract**
@@ -502,7 +502,7 @@ git commit -m "docs(COD-169): migrate sweeps to claim declarations"
 - Consumes: all prior tasks.
 - Produces: a green branch, review evidence, Linear handoff, and no unresolved claim-lifecycle gaps.
 
-- [ ] **Step 1: Run syntax, focused, and full verification**
+- [x] **Step 1: Run syntax, focused, and full verification**
 
 ```bash
 node --check scripts/claim-ownership.mjs
@@ -516,7 +516,7 @@ git diff --check origin/main...HEAD
 
 Expected: every command exits `0`; the full suite has zero failures.
 
-- [ ] **Step 2: Run policy and surface audits**
+- [x] **Step 2: Run policy and surface audits**
 
 ```bash
 rg -n "latestHeartbeatOwner|latestClaimHeartbeat|heartbeatOwner" scripts tests skills .claude/skills
@@ -526,20 +526,22 @@ rg -n "AUTO_SWEEP_CLAIM_DECLARATION|auto-sweep-claim-close|claim-migration-statu
 
 Expected: no production ownership caller uses the removed latest-heartbeat helpers; every owner-token lifecycle surface also carries declaration identity or is explicitly non-claim metadata.
 
-- [ ] **Step 3: Request independent concurrency-focused code review**
+- [x] **Step 3: Request independent concurrency-focused code review**
 
 Review the entire `origin/main...HEAD` diff for declaration race ordering, stale-child behavior, complete-history guarantees, close-before-mutation ordering, resume/reaper correctness, malformed input, and regressions to QA auto-ship/manual/Factory Learning/Ship.
 
-- [ ] **Step 4: Fix findings with focused RED/GREEN tests**
+- [x] **Step 4: Fix findings with focused RED/GREEN tests**
 
 For each accepted finding, first add a reproducing test, run it to observe failure, apply the smallest fix, rerun the focused suite, then rerun the full suite.
 
-- [ ] **Step 5: Commit final review fixes and plan evidence**
+- [x] **Step 5: Commit final review fixes and plan evidence**
 
 ```bash
 git add <reviewed-files> docs/superpowers/plans/2026-07-11-COD-169-immutable-claim-declarations-implementation.md
 git commit -m "fix(COD-169): close claim lifecycle review gaps"
 ```
+
+Verification evidence (2026-07-11): four syntax checks passed; the final focused suite passed 485/485 and the final full suite passed 591/591. All six canonical skill mirrors matched byte-for-byte. The removed latest-heartbeat helper audit returned no matches, and every owner-token lifecycle surface carried declaration identity. Independent concurrency review found and the fix wave closed three gaps: Ship claim acquisition, close-to-mutation reentry, and unlabeled orphan recovery. Re-review approved the fixes with no remaining actionable finding. The live migration diagnostic remained intentionally non-ready with five legacy-unowned labels and no orphan or ambiguous histories; rollout stays blocked until attended migration cleanup.
 
 - [ ] **Step 6: Update COD-169**
 

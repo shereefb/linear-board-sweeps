@@ -273,7 +273,7 @@ test("guarded terminal move closes the exact declaration before issueUpdate", as
   assert.ok(destinationIndex >= 0 && commentsIndex > destinationIndex, "destination pagination must precede claim-history pagination");
   assert.ok(finalFactsIndex > commentsIndex, "the final state/labels guard must follow claim-history pagination");
   assert.deepEqual(calls.map((call) => call.kind), [
-    "metadata", "destination", "final-read", "final-facts", "close", "close-read", "final-facts", "issue-update",
+    "metadata", "destination", "final-read", "final-facts", "close", "close-read", "final-facts", "close-read", "issue-update",
   ]);
   assert.equal(calls.find((call) => call.kind === "close").variables.b,
     claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl-142", reason: "terminal" }));
@@ -297,6 +297,7 @@ function guardedMoveHarness({
   },
   commentCreateResponse,
   closedCommentPages,
+  preMutationCommentPages,
   issueUpdateResponse = { success: true, issue: {
     identifier: "COD-142", state: { name: "Ship" }, sortOrder: -1, url: "https://linear/COD-142",
   } },
@@ -308,6 +309,7 @@ function guardedMoveHarness({
   };
   const calls = [];
   let closed = false;
+  let closedReadRound = -1;
   let factRead = 0;
   const defaultClosedPages = [{
     pageInfo: { hasNextPage: false, endCursor: null },
@@ -325,8 +327,10 @@ function guardedMoveHarness({
     };
     if (query.includes("comments(first:100")) {
       if (!closed) return { issue: { comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [declaration] } } };
-      const index = variables.cursor == null ? 0 : closePages.findIndex((page) => page.cursor === variables.cursor);
-      return { issue: { comments: closePages[index] } };
+      if (variables.cursor == null) closedReadRound += 1;
+      const pages = closedReadRound > 0 && preMutationCommentPages ? preMutationCommentPages : closePages;
+      const index = variables.cursor == null ? 0 : pages.findIndex((page) => page.cursor === variables.cursor);
+      return { issue: { comments: pages[index] } };
     }
     if (query.includes("labels(first:250)")) {
       const stateName = factRead === 0 ? initialState : postCloseState;
@@ -447,6 +451,26 @@ test("guarded terminal move rejects a newer epoch after its close", async () => 
     ] }],
   });
   await assert.rejects(harness.run(), /terminal claim close unverified/);
+  assert.equal(harness.calls.some((call) => call.query.includes("issueUpdate")), false);
+});
+
+test("guarded terminal move rejects a declaration arriving after close verification", async () => {
+  const close = {
+    id: "created-close",
+    body: claimCloseMarker({ claim: "qa:in-progress", declarationId: "decl-142", reason: "terminal" }),
+    createdAt: "2026-07-10T10:06:00.000Z",
+  };
+  const declaration = { id: "declaration", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "owner-142", declarationId: "decl-142" }), createdAt: "2026-07-10T10:00:00.000Z" };
+  const harness = guardedMoveHarness({
+    createdComment: close,
+    closedCommentPages: [{ pageInfo: { hasNextPage: false, endCursor: null }, nodes: [declaration, close] }],
+    preMutationCommentPages: [{ pageInfo: { hasNextPage: false, endCursor: null }, nodes: [
+      declaration,
+      close,
+      { id: "new-declaration", body: claimDeclarationMarker({ claim: "qa:in-progress", ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: "2026-07-10T10:07:00.000Z" },
+    ] }],
+  });
+  await assert.rejects(harness.run(), /terminal claim close lost authority/);
   assert.equal(harness.calls.some((call) => call.query.includes("issueUpdate")), false);
 });
 

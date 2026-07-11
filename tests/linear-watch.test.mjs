@@ -63,6 +63,7 @@ import {
 } from "../scripts/linear-watch.mjs";
 
 const claimIso = (second) => `2026-07-11T00:00:${String(second).padStart(2, "0")}.000Z`;
+const completeUnclaimedCard = (card) => ({ ...card, commentsComplete: true, comments: [] });
 
 function claimCommentPages(pages) {
   let call = 0;
@@ -1799,6 +1800,21 @@ test("actionableCards: live dev claim in Dev is not double-dispatched", () => {
 test("actionableCards: stale dev claim in Dev becomes actionable", () => {
   const card = dependencyReadyCard({ id: "stale", state: { name: "Dev" }, updatedAt: minsAgo(300), labelNames: ["dev:in-progress"], comments: [] });
   assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW).map((c) => c.id), ["stale"]);
+});
+test("actionableCards: a closed epoch keeps its label reserved until verified cleanup", () => {
+  const card = dependencyReadyCard({
+    id: "closing",
+    state: { name: "Dev" },
+    updatedAt: minsAgo(300),
+    labelNames: ["dev:in-progress"],
+    commentsComplete: true,
+    comments: [
+      { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "old", declarationId: "old-decl" }), createdAt: minsAgo(400) },
+      { id: "c2", body: claimCloseMarker({ claim: "dev:in-progress", declarationId: "old-decl", reason: "released" }), createdAt: minsAgo(300) },
+    ],
+  });
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW), []);
+  assert.deepEqual(actionableCards([card], SWEEP_CFG.dev, NOW, new Set([card.id])).map((item) => item.id), [card.id]);
 });
 test("actionableCards: excludes cards with live foreign in-progress claims", () => {
   const card = dependencyReadyCard({
@@ -3586,7 +3602,16 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
     issueIdentifier: "COD-77",
     ownerToken: "ship-owner",
     claimDeclarationId: "ship-decl",
-  }], { dryRun: false, parentRunId: "ship-run", activeByAnchor: new Map(), now: NOW });
+  }], {
+    dryRun: false,
+    parentRunId: "ship-run",
+    activeByAnchor: new Map([[anchorPath, { apiKey: "key", repoPairs: [] }]]),
+    now: NOW,
+    labelMap: { "ship:in-progress": "ship-label" },
+    claimCardSlotsFn: async (_key, _anchor, _config, sweep, cards) => [{
+      ...cards[0], card: cards[0], sweep, slotIndex: 0, ownerToken: "ship-owner", claimDeclarationId: "ship-decl",
+    }],
+  });
   assert.equal(pick.childEnv.AUTO_SWEEP_KIT_PATH, path.resolve(fileURLToPath(new URL("..", import.meta.url))));
   assert.equal(pick.childEnv.AUTO_SWEEP_ISSUE, "COD-77");
   assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
@@ -3608,6 +3633,36 @@ test("expandDispatchBatch: Ship receives the same card env and run-record paths 
   assert.equal(JSON.parse(fs.readFileSync(path.join(pick.logDir, recordName), "utf8")).issueIdentifier, "COD-77");
   assert.equal(fs.readdirSync(globalRunsDir).some((name) => name.endsWith(".jsonl")), true);
   assert.deepEqual(snapshotProductionIndex(), productionBefore);
+});
+test("expandDispatchBatch: a normal Ship candidate acquires an immutable claim before dispatch", async () => {
+  const card = dependencyReadyCard({ id: "ship-id", identifier: "COD-77", stateName: "Ship", sortOrder: 10, labelNames: [] });
+  let claimCalls = 0;
+  const [pick] = await expandDispatchBatch([{
+    anchorPath: "/managed/repo",
+    sourceAnchorPath: "/source/repo",
+    config: { teamKey: "COD", repos: ["repo"] },
+    sweep: "ship",
+    count: 1,
+    cards: [card],
+    topCard: card,
+    issueId: card.id,
+    issueIdentifier: card.identifier,
+  }], {
+    dryRun: false,
+    parentRunId: "ship-run",
+    activeByAnchor: new Map([["/managed/repo", { apiKey: "key", repoPairs: [] }]]),
+    now: NOW,
+    labelMap: { "ship:in-progress": "ship-label" },
+    claimCardSlotsFn: async (_apiKey, _anchorPath, _config, sweep, cards) => {
+      claimCalls += 1;
+      assert.equal(sweep, "ship");
+      assert.deepEqual(cards.map((item) => item.identifier), ["COD-77"]);
+      return [{ ...card, card, sweep, slotIndex: 0, ownerToken: "ship-owner", claimDeclarationId: "ship-decl" }];
+    },
+  });
+  assert.equal(claimCalls, 1);
+  assert.equal(pick.childEnv.AUTO_SWEEP_OWNER_TOKEN, "ship-owner");
+  assert.equal(pick.childEnv.AUTO_SWEEP_CLAIM_DECLARATION, "ship-decl");
 });
 test("expandDispatchBatch: Ship route-label races fail before child expansion", async () => {
   const config = { repos: ["coach", "guide"], repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } } };
@@ -3662,6 +3717,10 @@ test("expandDispatchBatch: a stable Ship route expands the routed production wor
     activeByAnchor: new Map([["/managed/coach", { apiKey: "key", repoPairs }]]),
     now: NOW,
     fetchRouteCardFn: async () => fresh,
+    labelMap: { "ship:in-progress": "ship-label" },
+    claimCardSlotsFn: async (_key, _anchor, _config, sweep, cards) => [{
+      ...cards[0], card: cards[0], sweep, slotIndex: 0, ownerToken: "ship-owner", claimDeclarationId: "ship-decl", repoRoute,
+    }],
   });
   assert.equal(child.worktreePath, "/managed/guide/.worktrees/SAF-9");
   assert.equal(child.childEnv.AUTO_SWEEP_REPO, "/managed/guide");
@@ -3724,6 +3783,7 @@ test("claimCardSlots: a fresh route-label race fails before applying the claim",
       identifier: "SAF-207",
       stateName: "Dev",
       labelNames: ["app:coach"],
+      commentsComplete: true,
       comments: [],
     }),
   });
@@ -3761,6 +3821,7 @@ test("claimCardSlots: declaration precedes label and exact declaration reaches t
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-winner",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async (_key, _id, body) => {
       calls.push(body.startsWith("[auto-sweep-claim ") ? "declaration" : "unexpected-comment");
       comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) });
@@ -3776,6 +3837,55 @@ test("claimCardSlots: declaration precedes label and exact declaration reaches t
   assert.deepEqual(calls, ["declaration", "label", "winner-read"]);
   assert.equal(claimed[0].claimDeclarationId, "decl-winner");
 });
+test("claimCardSlots: a fresh unlabeled orphan declaration blocks every acquisition write", async () => {
+  const orphan = { id: "c0", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "crashed", declarationId: "orphan-decl" }), createdAt: minsAgo(1) };
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
+  let declarationWrites = 0;
+  let labelWrites = 0;
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    fetchClaimCardFn: async () => ({ ...card, commentsComplete: true, comments: [orphan] }),
+    addCommentFn: async () => { declarationWrites += 1; },
+    applyLabelEditFn: async () => { labelWrites += 1; },
+  });
+  assert.deepEqual(claimed, []);
+  assert.equal(declarationWrites, 0);
+  assert.equal(labelWrites, 0);
+});
+test("claimCardSlots: a stale unlabeled orphan is reset before the next declaration", async () => {
+  const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(300), sortOrder: 1 });
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: "dev:in-progress", ownerToken: "crashed", declarationId: "orphan-decl" }), createdAt: minsAgo(300) },
+  ];
+  const calls = [];
+  let labelPresent = false;
+  const snapshot = () => ({
+    ...card,
+    labelNames: labelPresent ? ["dev:in-progress"] : [],
+    commentsComplete: true,
+    comments: [...comments],
+  });
+  const claimed = await claimCardSlots("key", "/managed", {}, "dev", [card], {
+    parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
+  }, {
+    declarationTokenFn: () => "next-decl",
+    fetchClaimCardFn: async () => { calls.push("preflight-read"); return snapshot(); },
+    fetchCardFn: async () => { calls.push("winner-read"); return snapshot(); },
+    addCommentFn: async (_key, _id, body) => {
+      const kind = body.startsWith("[auto-sweep-claim-reset ") ? "reset" : "declaration";
+      calls.push(kind);
+      comments.push({ id: `c${comments.length + 1}`, body, createdAt: minsAgo(kind === "reset" ? 2 : 1) });
+    },
+    applyLabelEditFn: async (_key, _card, edit) => {
+      if (edit.add) { calls.push("label"); labelPresent = true; }
+    },
+    sleepFn: async () => {},
+  });
+  assert.equal(claimed[0].claimDeclarationId, "next-decl");
+  assert.ok(calls.indexOf("reset") < calls.indexOf("declaration"));
+  assert.ok(calls.indexOf("declaration") < calls.indexOf("label"));
+});
 test("claimCardSlots: only the first declaration wins and a loser never removes the shared label", async () => {
   const card = dependencyReadyCard({ id: "issue-id", identifier: "COD-169", stateName: "Dev", labelNames: [], comments: [], updatedAt: minsAgo(1), sortOrder: 1 });
   const removals = [];
@@ -3785,6 +3895,8 @@ test("claimCardSlots: only the first declaration wins and a loser never removes 
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-loser",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async (_key, _id, body) => {
       if (body.startsWith("[auto-sweep-claim ")) ourDeclaration = body;
       else compatibilityHeartbeats += 1;
@@ -3813,6 +3925,7 @@ test("claimCardSlots: malformed final history denies dispatch without removing t
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async () => {},
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
     sleepFn: async () => {},
@@ -3834,6 +3947,7 @@ test("claimCardSlots: legacy-unowned reread without the exact close never remove
     parentRunId: "run-id", limit: 1, labelMap: { "dev:in-progress": "claim-id" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-missing-close",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
     sleepFn: async () => {},
@@ -3872,7 +3986,7 @@ test("claimCardSlots: a post-claim route race closes then removes only this atte
     now: NOW,
     repoPairs,
   }, {
-    fetchClaimCardFn: async () => ({ ...card }),
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     applyLabelEditFn: async (_key, _card, edit) => edits.push(edit),
     declarationTokenFn: () => "decl-route",
     addCommentFn: async (_key, _id, body) => { comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }); },
@@ -3903,7 +4017,7 @@ test("claimCardSlots: a stable routed claim returns the confirmed primary repo",
     now: NOW,
     repoPairs,
   }, {
-    fetchClaimCardFn: async () => ({ ...card }),
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     applyLabelEditFn: async () => {},
     declarationTokenFn: () => "decl-stable",
     addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
@@ -3928,6 +4042,7 @@ test("claimCardSlots: an unreadable confirmation records the safety invariant an
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-88",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
     addCommentFn: async () => {},
     sleepFn: async () => {},
@@ -3947,6 +4062,7 @@ test("claimCardSlots: label-write failure closes its orphan declaration without 
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-89",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async (_key, _id, body) => comments.push({ id: `c${comments.length + 1}`, body, createdAt: claimIso(comments.length + 1) }),
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.add) throw new Error("label unavailable"); if (edit.remove) removals += 1; },
     fetchCardFn: async () => { reads += 1; return { ...card, commentsComplete: true, comments: [...comments] }; },
@@ -3964,6 +4080,7 @@ test("claimCardSlots: a declaration-write failure with no observed declaration n
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-92",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async () => { throw new Error("declaration unavailable"); },
     applyLabelEditFn: async () => { edits += 1; },
     fetchCardFn: async () => ({ ...card, commentsComplete: true, comments: [] }),
@@ -3979,6 +4096,7 @@ test("claimCardSlots: another declaration owner is preserved after an acquisitio
     parentRunId: "run", limit: 1, labelMap: { "dev:in-progress": "label-dev" }, now: NOW,
   }, {
     declarationTokenFn: () => "decl-loser",
+    fetchClaimCardFn: async () => completeUnclaimedCard(card),
     addCommentFn: async () => { throw new Error("declaration response unavailable"); },
     applyLabelEditFn: async (_key, _fresh, edit) => { if (edit.remove) removals += 1; },
     fetchCardFn: async () => ({
@@ -4028,7 +4146,7 @@ test("releaseOwnedDispatchClaim: closes and verifies the exact epoch before remo
     addAuditCommentFn: async () => calls.push("comment-audit"),
   });
   assert.equal(released, true);
-  assert.deepEqual(calls, ["fetch", "comment-close", "fetch", "label-remove", "comment-audit"]);
+  assert.deepEqual(calls, ["fetch", "comment-close", "fetch", "fetch", "label-remove", "comment-audit"]);
 });
 
 test("releaseOwnedDispatchClaim: a stale child cannot release a newer declaration", async () => {
@@ -4060,6 +4178,28 @@ test("closeOwnedClaim: close write and verification failures never mutate the la
     addCommentFn: async () => {},
     applyLabelEditFn: async () => { edits += 1; },
   }), /close unverified/);
+  assert.equal(edits, 0);
+});
+test("closeOwnedClaim: a newer declaration on the final pre-mutation read preserves the label", async () => {
+  const cfg = SWEEP_CFG.dev;
+  const identity = { ownerToken: "owner", claimDeclarationId: "decl" };
+  const comments = [
+    { id: "c1", body: claimDeclarationMarker({ claim: cfg.claim, ownerToken: identity.ownerToken, declarationId: identity.claimDeclarationId }), createdAt: claimIso(1) },
+  ];
+  let reads = 0;
+  let edits = 0;
+  const snapshot = () => ({ id: "issue", labelNames: [cfg.claim], commentsComplete: true, comments: [...comments] });
+  const released = await closeOwnedClaim("key", { id: "issue" }, cfg, identity, "released", {
+    fetchClaimCardFn: async () => {
+      reads += 1;
+      if (reads === 3) comments.push({ id: "c3", body: claimDeclarationMarker({ claim: cfg.claim, ownerToken: "new-owner", declarationId: "new-decl" }), createdAt: claimIso(3) });
+      return snapshot();
+    },
+    addCommentFn: async (_key, _id, body) => comments.push({ id: "c2", body, createdAt: claimIso(2) }),
+    applyLabelEditFn: async () => { edits += 1; },
+  });
+  assert.equal(released, false);
+  assert.equal(reads, 3);
   assert.equal(edits, 0);
 });
 
@@ -4190,7 +4330,7 @@ test("releaseOwnedDispatchClaim: same-state release rechecks state with the owne
     addAuditCommentFn: async () => {},
     applyLabelEditFn: async () => {},
   }), true);
-  assert.equal(reads, 2);
+  assert.equal(reads, 3);
 });
 test("reconcileOwnedDispatchClaim: successful child completion invokes state-scoped owned-claim cleanup", async () => {
   assert.equal(typeof watchModule.reconcileOwnedDispatchClaim, "function");
@@ -5378,11 +5518,14 @@ test("executeOrphanReap: confirmed cleanup synchronizes the scheduler card befor
     parentRunId: "same-tick", limit: 1, labelMap: { "dev:in-progress": "dev-label" }, now: NOW,
   }, {
     declarationTokenFn: () => "dev-decl",
+    fetchClaimCardFn: async () => ({ ...original, labelIds: { ...original.labelIds }, labelNames: [...original.labelNames], commentsComplete: true, comments: [...comments] }),
     addCommentFn: async (_key, _id, body) => comments.push({ id: `claim-${comments.length}`, body, createdAt: minsAgo(0) }),
     applyLabelEditFn: async (_key, card, edit) => {
       for (const claim of edit.remove || []) delete card.labelIds[claim];
       for (const [name, id] of Object.entries(edit.add || {})) card.labelIds[name] = id;
       card.labelNames = Object.keys(card.labelIds);
+      original.labelIds = { ...card.labelIds };
+      original.labelNames = [...card.labelNames];
       if (edit.add) claimedLabelIds = Object.values(card.labelIds).sort();
     },
     sleepFn: async () => {},

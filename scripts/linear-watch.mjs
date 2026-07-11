@@ -643,6 +643,7 @@ export function heartbeatAgeMin(card, now, claim = null) {
   if (claim && card?.commentsComplete === true) {
     const ownership = resolveCardClaim(card, claim);
     if (ownership.status === "owned") return (now - Date.parse(ownership.livenessAt)) / 60000;
+    if (ownership.status === "orphan-declaration") return (now - Date.parse(ownership.declaredAt)) / 60000;
     if (ownership.status === "ambiguous") return Number.NEGATIVE_INFINITY;
     if (ownership.status === "legacy-unowned" && ownership.boundaryCreatedAt) {
       return (now - Date.parse(ownership.boundaryCreatedAt)) / 60000;
@@ -674,6 +675,11 @@ function liveClaimLabel(card, now, releasedIds = new Set()) {
   if (releasedIds.has(card.id)) return null;
   return ALL_CLAIMS.find((claim) => {
     if (!hasLabel(card, claim)) return false;
+    const ownership = card?.commentsComplete === true ? resolveCardClaim(card, claim) : null;
+    // A boundary removes the old owner's authority, but the still-present label
+    // remains reserved until the verified cleanup mutation removes it. This
+    // prevents a new claimant from entering the close -> label/state window.
+    if (ownership?.status === "legacy-unowned" || ownership?.status === "ambiguous") return true;
     const owner = SWEEPS.find((s) => SWEEP_CFG[s].claim === claim);
     const staleMin = owner ? SWEEP_CFG[owner].staleMin : MAX_STALE_MIN;
     return heartbeatAgeMin(card, now, claim) <= staleMin;
@@ -1449,7 +1455,12 @@ export async function closeOwnedClaim(apiKey, card, cfg, identity, reason, {
   }
   if (ownership.status === "owned") return false;
   if (ownership.status !== "legacy-unowned" && ownership.status !== "closed") throw new Error("claim close unverified");
-  if (hasLabel(closed, cfg.claim)) await applyLabelEditFn(apiKey, closed, { remove: [cfg.claim] });
+  const final = await fetchClaimCardFn(apiKey, card.id);
+  const finalOwnership = resolveCardClaim(final, cfg.claim);
+  if (finalOwnership.status === "owned") return false;
+  if ((finalOwnership.status !== "legacy-unowned" && finalOwnership.status !== "closed")
+      || finalOwnership.boundaryCommentId !== ownership.boundaryCommentId) return false;
+  if (hasLabel(final, cfg.claim)) await applyLabelEditFn(apiKey, final, { remove: [cfg.claim] });
   return true;
 }
 
@@ -4282,7 +4293,6 @@ async function fetchClaimCard(apiKey, issueId) {
   );
   if (!d.issue) throw new Error(`issue not found: ${issueId}`);
   const card = normalizeRelationUnknownCard(d.issue);
-  if (!ALL_CLAIMS.some((claim) => hasLabel(card, claim))) return card;
   return withCompleteClaimHistory(card, await fetchCompleteClaimComments(apiKey, d.issue.id));
 }
 
@@ -4655,7 +4665,8 @@ export async function resetStaleClaimBoundary(apiKey, card, claim, target, stale
   const ownership = resolveCardClaim(before, claim);
   const exact = target === "legacy"
     ? ownership.status === "legacy-unowned"
-    : ownership.status === "owned" && ownership.declarationId === target;
+    : (ownership.status === "owned" || ownership.status === "orphan-declaration")
+      && ownership.declarationId === target;
   if (!exact || !Number.isFinite(staleMin) || heartbeatAgeMin(before, now, claim) <= staleMin) return null;
   const beforeCommentIds = new Set((before.comments || []).map((comment) => comment.id));
   const reason = target === "legacy" ? "legacy" : "orphan-declaration";
@@ -5170,6 +5181,7 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
   sleepFn = sleep,
   fetchCardFn = fetchCard,
   fetchClaimCardFn = fetchClaimCard,
+  resetStaleClaimBoundaryFn = resetStaleClaimBoundary,
   declarationTokenFn = declarationToken,
   onRouteFailure = () => {},
   onSafetyInvariant = () => {},
@@ -5234,24 +5246,49 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
       return true;
     };
     try {
-      let claimTarget = card;
-      if (routingConfigured) {
-        let freshBeforeClaim;
-        try {
-          freshBeforeClaim = await fetchClaimCardFn(apiKey, card.id);
-        } catch (error) {
+      let freshBeforeClaim;
+      try {
+        freshBeforeClaim = await fetchClaimCardFn(apiKey, card.id);
+      } catch (error) {
+        if (routingConfigured) {
           const failure = { ok: false, code: "route-read-failed", message: `could not re-read ${card.identifier} repository route before claim: ${error.message}` };
           onRouteFailure(card, failure);
           logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${failure.message}`);
+        } else {
+          logFor(anchorPath, sweep, `claim-skip ${card.identifier}: claim history unavailable before declaration: ${error.message}`);
+        }
+        continue;
+      }
+      let priorOwnership = resolveCardClaim(freshBeforeClaim, cfg.claim);
+      if (priorOwnership.status === "orphan-declaration") {
+        const reset = await resetStaleClaimBoundaryFn(
+          apiKey,
+          freshBeforeClaim,
+          cfg.claim,
+          priorOwnership.declarationId,
+          cfg.staleMin,
+          now,
+          { fetchClaimCardFn, addCommentFn },
+        );
+        if (!reset) {
+          logFor(anchorPath, sweep, `claim-skip ${card.identifier}: existing orphan declaration is still live`);
           continue;
         }
+        freshBeforeClaim = reset;
+        priorOwnership = resolveCardClaim(freshBeforeClaim, cfg.claim);
+      }
+      if (!["unclaimed", "closed"].includes(priorOwnership.status) || hasLabel(freshBeforeClaim, cfg.claim)) {
+        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: claim preflight is ${priorOwnership.status} (${priorOwnership.reason})`);
+        continue;
+      }
+      let claimTarget = freshBeforeClaim;
+      if (routingConfigured) {
         const freshRoute = resolveCardRepoRoute({ config, card: freshBeforeClaim, repoPairs });
         if (!sameCardRepoRoute(card.repoRoute, freshRoute)) {
           onRouteFailure(card, freshRoute);
           logFor(anchorPath, sweep, `claim-skip ${card.identifier}: repository route changed before claim (${freshRoute.message || freshRoute.label || "unknown"})`);
           continue;
         }
-        claimTarget = freshBeforeClaim;
       }
       declarationAttempted = true;
       await addCommentFn(apiKey, card.id, claimDeclarationMarker({ claim: cfg.claim, ownerToken: owner, declarationId }));
@@ -5435,7 +5472,39 @@ export async function expandDispatchBatch(batch, {
           continue;
         }
       }
-      expanded.push(withCardDispatchEnv(routedPick, parentRunId, childIndexAllocator.next()));
+      if (dryRun) {
+        expanded.push(withCardDispatchEnv(routedPick, parentRunId, childIndexAllocator.next()));
+        continue;
+      }
+      const active = activeByAnchor.get(pick.anchorPath);
+      if (!active) continue;
+      let labelMap;
+      try {
+        labelMap = providedLabelMap || await teamLabelMap(active.apiKey, pick.config.teamKey);
+      } catch (e) {
+        logFor(pick.anchorPath, pick.sweep, `claim label map error: ${e.message}`);
+        continue;
+      }
+      const slots = await claimCardSlotsFn(active.apiKey, pick.anchorPath, pick.config, pick.sweep, [routedPick.topCard], {
+        parentRunId,
+        limit: 1,
+        labelMap,
+        now,
+        repoPairs: active.repoPairs || pick.repoPairs || [],
+      }, {
+        onRouteFailure: (card, failure) => onRouteFailure({ ...pick, issueIdentifier: card.identifier }, failure),
+        onSafetyInvariant: ({ card, evidence }) => onSafetyInvariant({ ...pick, card, evidence }),
+      });
+      for (const slot of slots) {
+        expanded.push(withCardDispatchEnv({
+          ...routedPick,
+          ...slot,
+          card: slot.card || slot,
+          issueId: slot.id,
+          issueIdentifier: slot.identifier,
+          repoRoute: slot.repoRoute || routedPick.repoRoute,
+        }, parentRunId, childIndexAllocator.next()));
+      }
       continue;
     }
     const rawSlotLimit = pick.slotLimit;

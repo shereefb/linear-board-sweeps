@@ -1,8 +1,8 @@
 # COD-169: Immutable Claim Declarations
 
-**Status:** Approved design, awaiting written-spec review  
-**Date:** 2026-07-11  
-**Issue:** COD-169  
+**Status:** Approved design, awaiting written-spec review
+**Date:** 2026-07-11
+**Issue:** COD-169
 **Related:** COD-142
 
 ## Problem

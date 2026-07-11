@@ -617,6 +617,22 @@ export async function moveCardBottomIfCurrent(
   }
   const ownedClaimId = postCloseLabels.find((label) => label.name === ownedClaim)?.id;
   if (!ownedClaimId) throw new Error(`Issue "${issueIdentifier}" owned claim ID unreadable.`);
+  let preMutationComments;
+  try {
+    preMutationComments = await fetchCompleteIssueComments(issue.id, { gqlFn });
+  } catch (cause) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close lost authority.`, { cause });
+  }
+  const preMutationOwnership = resolveClaimOwnership({
+    comments: preMutationComments,
+    complete: true,
+    claim: ownedClaim,
+    labelPresent: true,
+  });
+  if (preMutationOwnership.status !== "legacy-unowned"
+      || preMutationOwnership.boundaryCommentId !== createdClose.id) {
+    throw new Error(`Issue "${issueIdentifier}" terminal claim close lost authority.`);
+  }
   const input = guardedTerminalMoveInput(destinationStateId, destination, ownedClaimId);
   const result = await gqlFn(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success issue { identifier state { name } sortOrder url } } }`,
