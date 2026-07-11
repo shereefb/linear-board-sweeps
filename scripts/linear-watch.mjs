@@ -1373,25 +1373,6 @@ export function declarationToken({ randomUUID = crypto.randomUUID } = {}) {
   return randomUUID();
 }
 
-export function heartbeatOwner(body) {
-  return ((body || "").match(/\bowner=([^\]\s]+)/) || [])[1] || null;
-}
-
-export function latestHeartbeatOwner(card, claim = null) {
-  const beats = (card?.comments || [])
-    .map((c) => {
-      const body = c.body || "";
-      if (!body.includes(HEARTBEAT_TAG)) return null;
-      if (claim && !body.includes(claim)) return null;
-      const owner = heartbeatOwner(body);
-      const t = Date.parse(c.createdAt);
-      return owner && !Number.isNaN(t) ? { owner, t } : null;
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.t - a.t);
-  return beats[0]?.owner || null;
-}
-
 export function resolveCardClaim(card, claim) {
   return resolveClaimOwnership({
     comments: card?.comments,
@@ -1399,6 +1380,26 @@ export function resolveCardClaim(card, claim) {
     claim,
     labelPresent: hasLabel(card, claim),
   });
+}
+
+function claimNamesForMigration(card) {
+  const names = new Set(ALL_CLAIMS.filter((claim) => hasLabel(card, claim)));
+  for (const comment of card?.comments || []) {
+    const marker = parseClaimMarker(comment);
+    if (marker?.claim && ALL_CLAIMS.includes(marker.claim)) names.add(marker.claim);
+  }
+  return [...names];
+}
+
+export function claimMigrationSummary(cards = []) {
+  const results = cards.flatMap((card) => claimNamesForMigration(card).map((claim) => resolveCardClaim(card, claim)));
+  return {
+    active: results.filter((result) => result.status === "owned").length,
+    legacyUnowned: results.filter((result) => result.status === "legacy-unowned").length,
+    orphanDeclarations: results.filter((result) => result.status === "orphan-declaration").length,
+    ambiguous: results.filter((result) => result.status === "ambiguous").length,
+    ready: results.every((result) => ["owned", "closed", "unclaimed"].includes(result.status)),
+  };
 }
 
 export function claimConfirmed(card, cfg, ownership, expectedStates = []) {
@@ -4096,6 +4097,93 @@ async function fetchClaimCleanupCards(apiKey, teamKey, projectId, states) {
   return [...new Set(states || [])].flatMap((state) => hydrated.get(state) || []);
 }
 
+const MAX_CLAIM_MIGRATION_FINDINGS = 100;
+
+export async function fetchClaimMigrationCards(apiKey, teamKey, projectId, {
+  gqlFn = gql,
+  fetchCompleteClaimCommentsFn = fetchCompleteClaimComments,
+} = {}) {
+  const candidates = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  while (true) {
+    const result = await gqlFn(
+      `query($c:String,$teamKey:String!,$pid:ID){ issues(first:100, after:$c, filter:{
+         team:{ key:{ eq:$teamKey } }, project:{ id:{ eq:$pid } } }){
+         pageInfo{ hasNextPage endCursor }
+         nodes{ id identifier updatedAt state{ name } labels{ nodes{ id name } }
+           comments(last:100){ nodes{ id body createdAt } } } } }`,
+      { c: cursor, teamKey, pid: projectId },
+      apiKey,
+    );
+    const data = unwrapGraphQlData(result, "claim migration snapshot");
+    const connection = data?.issues;
+    if (!Array.isArray(connection?.nodes) || typeof connection?.pageInfo?.hasNextPage !== "boolean") {
+      throw new Error("claim migration snapshot is missing issues data or pageInfo");
+    }
+    for (const node of connection.nodes) {
+      const card = normalizeRelationUnknownCard(node);
+      const hasClaimLabel = ALL_CLAIMS.some((claim) => hasLabel(card, claim));
+      const hasClaimMarker = (card.comments || []).some((comment) => parseClaimMarker(comment)?.claim);
+      if (!hasClaimLabel && !hasClaimMarker) continue;
+      const comments = await fetchCompleteClaimCommentsFn(apiKey, card.id, { gqlFn });
+      candidates.push(withCompleteClaimHistory(card, comments));
+    }
+    if (!connection.pageInfo.hasNextPage) return candidates;
+    const nextCursor = connection.pageInfo.endCursor;
+    if (!nextCursor || seenCursors.has(nextCursor)) throw new Error("claim migration pagination is incomplete");
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+}
+
+export async function claimMigrationStatusReport({
+  registry = readRegistry(),
+  configFn = anchorConfig,
+  keyFn = anchorKey,
+  canonicalFn = canonicalAnchorIdentity,
+  fetchCardsFn = fetchClaimMigrationCards,
+} = {}) {
+  const workspaces = [];
+  const findings = [];
+  const seen = new Set();
+  for (const source of registry.repos || []) {
+    const sourceAnchorPath = canonicalFn(source);
+    if (seen.has(sourceAnchorPath)) continue;
+    seen.add(sourceAnchorPath);
+    try {
+      const config = configFn(source);
+      const apiKey = keyFn(source);
+      if (!apiKey) throw new Error("LINEAR_API_KEY missing");
+      const cards = await fetchCardsFn(apiKey, config.teamKey, config.projectId);
+      const summary = claimMigrationSummary(cards);
+      workspaces.push({ sourceAnchorPath, projectId: config.projectId, ...summary });
+      for (const card of cards) {
+        for (const claim of claimNamesForMigration(card)) {
+          const result = resolveCardClaim(card, claim);
+          if (["owned", "closed", "unclaimed"].includes(result.status)) continue;
+          if (findings.length < MAX_CLAIM_MIGRATION_FINDINGS) {
+            findings.push({ sourceAnchorPath, identifier: card.identifier, claim, status: result.status, reason: result.reason });
+          }
+        }
+      }
+    } catch (error) {
+      const reason = sanitizeFailureMessage(error?.message || error);
+      workspaces.push({ sourceAnchorPath, ready: false, error: reason });
+      if (findings.length < MAX_CLAIM_MIGRATION_FINDINGS) findings.push({ sourceAnchorPath, status: "ambiguous", reason });
+    }
+  }
+  const totals = claimMigrationSummary([]);
+  for (const workspace of workspaces) {
+    totals.active += workspace.active || 0;
+    totals.legacyUnowned += workspace.legacyUnowned || 0;
+    totals.orphanDeclarations += workspace.orphanDeclarations || 0;
+    totals.ambiguous += workspace.ambiguous || 0;
+  }
+  totals.ready = workspaces.every((workspace) => workspace.ready === true);
+  return { ...totals, workspaces, findings, findingsTruncated: findings.length === MAX_CLAIM_MIGRATION_FINDINGS };
+}
+
 async function fetchCard(apiKey, issueId) {
   const d = await gql(
     `query($id:String!){ issue(id:$id){ id identifier updatedAt sortOrder state{ name }
@@ -5088,37 +5176,17 @@ export async function claimCardSlots(apiKey, anchorPath, config, sweep, cards, {
         logFor(anchorPath, sweep, `claim-skip ${card.identifier}: owner confirmation failed`);
         continue;
       }
-      await addCommentFn(apiKey, card.id, `${HEARTBEAT_TAG} ${new Date().toISOString()} owner=${owner} claim=${cfg.claim}] Compatibility heartbeat for declaration ${declarationId}.`);
-      await sleepFn(CLAIM_CONFIRM_DELAY_MS);
-      const fresh = await fetchCardFn(apiKey, card.id);
-      const freshRoute = routingConfigured
-        ? resolveCardRepoRoute({ config, card: fresh, repoPairs })
-        : card.repoRoute;
-      if (!claimConfirmed(fresh, cfg, { ownerToken: owner, declarationId }, cfg.states)
-          || latestHeartbeatOwner(fresh, cfg.claim) !== owner
-          || (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute))) {
-        if (routingConfigured && !sameCardRepoRoute(card.repoRoute, freshRoute)) onRouteFailure(card, freshRoute);
-        const ownership = resolveCardClaim(fresh, cfg.claim);
-        if ((ownership.status === "owned" || ownership.status === "orphan-declaration")
-            && ownership.ownerToken === owner && ownership.declarationId === declarationId) {
-          await cleanupOwnAttempt(fresh);
-        } else if (ownership.status !== "owned") {
-          throw safetyError(card, `compatibility confirmation is ${ownership.status} (${ownership.reason})`);
-        }
-        logFor(anchorPath, sweep, `claim-skip ${card.identifier}: compatibility confirmation failed`);
-        continue;
-      }
       claimed.push({
-        ...fresh,
-        repoRoute: routingConfigured ? freshRoute : card.repoRoute,
-        card: fresh,
-        id: fresh.id,
-        identifier: fresh.identifier,
+        ...winner,
+        repoRoute: routingConfigured ? winnerRoute : card.repoRoute,
+        card: winner,
+        id: winner.id,
+        identifier: winner.identifier,
         sweep,
         slotIndex,
         ownerToken: owner,
         claimDeclarationId: declarationId,
-        sortOrder: fresh.sortOrder,
+        sortOrder: winner.sortOrder,
       });
     } catch (e) {
       logFor(anchorPath, sweep, `claim-skip ${card.identifier}: ${e.message}`);
@@ -7139,6 +7207,14 @@ function cmdDoctor(args = []) {
   if (!report.ok) process.exit(1);
 }
 
+async function cmdClaimMigrationStatus(args = []) {
+  if (args.some((arg) => arg !== "--json")) throw new Error("usage: claim-migration-status [--json]");
+  const report = await claimMigrationStatusReport();
+  if (args.includes("--json")) console.log(JSON.stringify(report, null, 2));
+  else console.log(`Claim migration: ${report.ready ? "ready" : "not ready"}; active=${report.active} legacy=${report.legacyUnowned} orphan=${report.orphanDeclarations} ambiguous=${report.ambiguous}`);
+  if (!report.ready) process.exitCode = 1;
+}
+
 export function learningStatusReport({ registry = readRegistry(), now = new Date().toISOString() } = {}) {
   const resolved = resolveRegisteredLearningWorkspaces(registry);
   const indexed = readLearningRunIndex(LEARNING_RUNS_DIR, { capturedThrough: now });
@@ -7262,11 +7338,12 @@ async function main() {
     case "tick": return tick({ dryRun: args.includes("--dry-run") });
     case "health": return cmdHealth();
     case "doctor": return cmdDoctor(args);
+    case "claim-migration-status": return cmdClaimMigrationStatus(args);
     case "learning-event": return cmdLearningEvent(args);
     case "learning-status": return cmdLearningStatus(args);
     case "learning-run": return cmdLearningRun(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }
