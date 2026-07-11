@@ -61,7 +61,7 @@ function markdownTables(markdown) {
 }
 
 function tableWithHeaders(tables, expected) {
-  return tables.find(({ headers }) => headers.length === expected.length && headers.every((header, index) => header === expected[index]));
+  return tables.findLast(({ headers }) => headers.length === expected.length && headers.every((header, index) => header === expected[index]));
 }
 
 function idsFromSources(value) {

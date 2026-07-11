@@ -139,6 +139,16 @@ test("validates a required pair and an agreed not-required pair", () => {
   assert.deepEqual(notRequired.verificationIds, []);
 });
 
+test("validates COD-157's concrete artifacts rather than their template tables", () => {
+  const result = validator.validateVerificationContract({
+    specPath: path.join(repoRoot, "docs/superpowers/specs/2026-07-10-COD-157-verification-contract-design.md"),
+    planPath: path.join(repoRoot, "docs/superpowers/plans/2026-07-10-COD-157-verification-contract-implementation.md"),
+    repoRoot,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
+  assert.deepEqual(result.verificationIds, ["V1", "V2", "V3", "V4", "V5", "V6"]);
+});
+
 test("reports missing declaration", () => {
   const result = validator.parseVerificationArtifact("# no contract\n");
   assert.ok(diagnosticCodes(result).includes("missing-declaration"));
