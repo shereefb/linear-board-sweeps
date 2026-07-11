@@ -51,6 +51,7 @@ List "QA" cards **in `config.project`**, top-to-bottom as they appear in the Lin
 4. **Capture screenshots** of the key states (before/after, each important screen). Save them; you'll attach them to the card.
 5. **Design pass + fix UX/UI bugs.** For UI cards, run `/design-review` on the running feature for a structured visual audit instead of eyeballing. Fix what you find — layout, copy, broken states, missing loading/empty/error handling, a11y basics. Commit fixes on the card's branch (stage selectively; `<PREFIX>-###` in the subject). Re-test after each fix.
 6. **Update canonical docs** per `config.canonicalDocs` if the feature changed data shape or architecture and those docs are now stale.
+7. **Validate required performance proof.** For `performance-contract/v1 — required`, use every `P` ID and its `QA observation` as primary input. Re-run the proof when reproducible. Otherwise prove the cited SHA is the tested commit or an ancestor with no affected performance-path changes, cite durable evidence, explain the limitation, and exercise the nearest public outcome. A QA fix touching a `P` path invalidates proof and requires a rerun or return to Dev. Missing, stale, contradictory, or failed required `P` evidence must not receive `qa:passed`.
 
 ## 3. Gate — pass, or send back
 

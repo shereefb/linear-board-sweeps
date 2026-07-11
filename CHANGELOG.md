@@ -2,6 +2,17 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.2.0.8] - 2026-07-11
+
+### Changed
+
+- Carry versioned performance budgets from Spec into kind-specific, commit-bound Dev proof and honest QA consumption without weakening existing review or Ship gates.
+- Distinguish measured benchmarks from deterministic work bounds for pagination, retry, prefetch, latency, and resource constraints.
+
+### Fixed
+
+- Invalidate stale proof after affected-path QA changes and share one fail-closed legacy boundary with other versioned contracts in either landing order.
+- Bump the marker so installed anchors receive all three sweep skill updates.
 ## [1.2.0.7] - 2026-07-10
 
 ### Changed

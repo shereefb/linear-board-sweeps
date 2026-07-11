@@ -45,6 +45,19 @@ test("refreshAnchorSkills: commits to main even when a feature branch is checked
     // main (locally and on origin) has the new version; the feature branch does NOT.
     assert.equal(g(anchor, "show", "main:.claude/skills/.sweep-version").trim(), "9.9.9");
     assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version").trim(), "9.9.9");
+    for (const stage of ["spec", "dev", "qa"]) {
+      const shown = spawnSync(
+        "git",
+        ["show", `main:.claude/skills/${stage}-sweep/SKILL.md`],
+        { cwd: anchor, encoding: null },
+      );
+      assert.equal(shown.status, 0, shown.stderr.toString("utf8"));
+      assert.deepEqual(
+        shown.stdout,
+        fs.readFileSync(path.join(KIT, "skills", `${stage}-sweep`, "SKILL.md")),
+        `${stage}-sweep bytes were not propagated`,
+      );
+    }
     const onFeature = spawnSync("git", ["show", "COD-1-feature:.claude/skills/.sweep-version"], { cwd: anchor, encoding: "utf8" }).stdout.trim();
     assert.equal(onFeature, "0.0.1"); // feature branch untouched
     // Primary tree is still on the feature branch, and the temp worktree is gone.
