@@ -64,7 +64,7 @@ import {
   createResumeStore, createRuntimeCooldownStore, selectRuntimeForCooldown, resumeResolutionNoticeNeeded,
   successfulSameStateRecoveryDecision, resumeAdmissionDecision, closeOwnedClaim,
   classifyCapacityOutcome, capacityRetryAt, generatedArtifactCleanupTargets,
-  recordSuccessfulNoOpTelemetry,
+  recordSuccessfulNoOpTelemetry, recordStrandedClaimTelemetry,
   recordChildLivenessTelemetry, MAX_RECENT_TERMINAL_CHILDREN,
 } from "../scripts/linear-watch.mjs";
 
@@ -114,6 +114,29 @@ test("successful no-op telemetry keeps only a count and latest issue identity", 
     successfulNoOpCount: 2,
     latestSuccessfulNoOpIssue: "COD-179",
   });
+});
+
+test("stranded claim telemetry producer feeds bounded doctor classifications", async () => {
+  const result = {
+    ...postDispatchResult(),
+    success: true,
+    pick: { ...postDispatchResult().pick, issueId: "issue", issueIdentifier: "COD-179" },
+  };
+  const reconciliation = await reconcileDispatchProgress("key", result, "codex", {
+    fetchClaimCardFn: async () => postDispatchCard(),
+    releaseFailedDispatchClaimFn: async () => { throw new Error("secret release detail"); },
+  });
+  const telemetry = recordStrandedClaimTelemetry({}, reconciliation);
+  const report = doctorReport({
+    registry: { repos: [], kitPath: null },
+    currentTick: { status: "running", pid: 42, failures: [], telemetry },
+    capacityState: { healthy: true, active: 0, max: 10, errors: [], entries: [] },
+    observationState: { healthy: true, errors: [], entries: [] },
+    isAlive: () => true,
+  });
+  assert.deepEqual(telemetry, { strandedClaims: { "claim-release-failed": 1 } });
+  assert.deepEqual(report.strandedClaims, { total: 1, byClassification: { "claim-release-failed": 1 } });
+  assert.doesNotMatch(JSON.stringify(report.strandedClaims), /secret release detail/);
 });
 
 test("classifyPostDispatchProgress accepts a legitimate blocker with a closed epoch", () => {
@@ -7367,6 +7390,15 @@ test("healthStatus rejects a live tick with expired child evidence", () => {
   assert.equal(status.ok, false);
   assert.match(status.reason, /expired child.*COD-179/i);
 });
+test("healthStatus fails closed for malformed child telemetry without throwing", () => {
+  const status = healthStatus({
+    currentTick: { status: "running", pid: 42, failures: [], telemetry: { children: { issue: "COD-179" } } },
+    isAlive: () => true,
+    now: NOW,
+  });
+  assert.equal(status.ok, false);
+  assert.match(status.reason, /child telemetry.*malformed/i);
+});
 test("finalizeTickState: writes versioned last-tick before removing current-tick", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-current-tick-"));
   const currentPath = path.join(dir, "current-tick.json");
@@ -7631,7 +7663,7 @@ test("doctor telemetry exposes successfulNoOps, strandedClaims, oldest actionabl
       status: "running", pid: 42, failures: [], telemetry: {
         successfulNoOpCount: 3,
         latestSuccessfulNoOpIssue: "COD-179",
-        strandedClaims: { "successful-no-op": 2, "cleanup-failed": 1 },
+        strandedClaims: { "owned-claim-unreleased": 2, "claim-release-failed": 1 },
       },
     },
     capacityState: { healthy: true, active: 3, max: 10, errors: [], entries: [
@@ -7649,7 +7681,7 @@ test("doctor telemetry exposes successfulNoOps, strandedClaims, oldest actionabl
   });
 
   assert.deepEqual(report.successfulNoOps, { count: 3, latestIssue: "COD-179" });
-  assert.deepEqual(report.strandedClaims, { total: 3, byClassification: { "cleanup-failed": 1, "successful-no-op": 2 } });
+  assert.deepEqual(report.strandedClaims, { total: 3, byClassification: { "claim-release-failed": 1, "owned-claim-unreleased": 2 } });
   assert.deepEqual(report.oldestActionableShip, {
     issue: "COD-189", workspace: "/source/old",
     firstObservedAt: new Date(NOW - 300_000).toISOString(), waitMs: 300_000,

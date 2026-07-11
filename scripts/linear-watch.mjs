@@ -2118,7 +2118,11 @@ export function healthStatus({ currentTick = null, lastTick, lockPid = null, isA
     }
     const failures = Array.isArray(currentTick.failures) ? currentTick.failures : [];
     if (failures.length) return { ok: false, reason: `current tick has ${failures.length} systemic failure(s) (pid ${currentTick.pid})` };
-    const expiredChild = (currentTick.telemetry?.children || []).find((child) => {
+    const children = currentTick.telemetry?.children;
+    if (children !== undefined && !Array.isArray(children)) {
+      return { ok: false, reason: "child telemetry is malformed" };
+    }
+    const expiredChild = (children || []).find((child) => {
       if (child?.state !== "active") return false;
       const startedAt = Date.parse(child.startedAt);
       if (!Number.isFinite(startedAt)) return true;
@@ -5216,10 +5220,7 @@ export function doctorReport({
     count: Number.isSafeInteger(telemetry.successfulNoOpCount) ? telemetry.successfulNoOpCount : 0,
     latestIssue: typeof telemetry.latestSuccessfulNoOpIssue === "string" ? telemetry.latestSuccessfulNoOpIssue : null,
   };
-  const strandedByClassification = Object.fromEntries(Object.entries(telemetry.strandedClaims || {})
-    .filter(([classification, count]) => classification && Number.isSafeInteger(count) && count > 0)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .slice(0, 20));
+  const strandedByClassification = boundedStrandedClaims(telemetry.strandedClaims);
   report.strandedClaims = {
     total: Object.values(strandedByClassification).reduce((sum, count) => sum + count, 0),
     byClassification: strandedByClassification,
@@ -6537,6 +6538,34 @@ export function recordSuccessfulNoOpTelemetry(telemetry = {}, issueIdentifier) {
   };
 }
 
+const MAX_STRANDED_CLAIM_COUNT = 1_000_000;
+const STRANDED_CLAIM_CLASSIFICATIONS = ["claim-release-failed", "complete-read-failed", "owned-claim-unreleased"];
+
+function boundedStrandedClaims(value = {}) {
+  return Object.fromEntries(STRANDED_CLAIM_CLASSIFICATIONS
+    .map((classification) => [classification, value?.[classification]])
+    .filter(([, count]) => Number.isSafeInteger(count) && count > 0)
+    .map(([classification, count]) => [classification, Math.min(MAX_STRANDED_CLAIM_COUNT, count)]));
+}
+
+export function recordStrandedClaimTelemetry(telemetry = {}, reconciliation = {}) {
+  let classification = null;
+  if (reconciliation.progress?.kind === "complete-read-failed") classification = "complete-read-failed";
+  else if (reconciliation.claimResult?.attempted === true && reconciliation.claimResult.released !== true) classification = "claim-release-failed";
+  else if (reconciliation.progress?.ownsOpenClaim === true && reconciliation.success !== true) classification = "owned-claim-unreleased";
+  if (!classification) return telemetry;
+  const prior = Number.isSafeInteger(telemetry.strandedClaims?.[classification])
+    ? telemetry.strandedClaims[classification]
+    : 0;
+  return {
+    ...telemetry,
+    strandedClaims: {
+      ...boundedStrandedClaims(telemetry.strandedClaims),
+      [classification]: Math.min(MAX_STRANDED_CLAIM_COUNT, Math.max(0, prior) + 1),
+    },
+  };
+}
+
 function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {
@@ -7158,6 +7187,10 @@ async function tick({ dryRun = false } = {}) {
         result.reconciliation = reconciliation;
         applyDispatchProgressReconciliation(result, reconciliation);
         if (!reconciliation.success) {
+          tickState = {
+            ...tickState,
+            telemetry: recordStrandedClaimTelemetry(tickState.telemetry, reconciliation),
+          };
           if (reconciliation.progress?.kind === "successful-no-op") {
             tickState = {
               ...tickState,
