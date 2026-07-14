@@ -45,13 +45,16 @@ comments, Markdown operator/release docs.
 `Versioned contract boundary: versioned-contract-boundary/v1`
 
 COD-289's spec and plan are new post-boundary artifacts and carry every
-installed contract. Spec-sweep will replace the landing evidence below with the
-exact first-add commit before Dev transition:
+installed contract. Their exact first-add commit and the installed-boundary
+ancestry result are recorded below:
 
-- Artifact first introduced: pending Spec-sweep landing commit.
+- Artifact first introduced: `2036fd7688dd0b27bb994b72a5d81d60e4671421`
+  (both spec and plan).
 - Installed marker first-add commit: `bd467095a1ddb2451aa5271bbef9e876491a5bde`.
-- Required proof: `git merge-base --is-ancestor <marker> <artifact-commit>` exits
-  0 for both artifacts.
+- Ancestry result: `git merge-base --is-ancestor
+  bd467095a1ddb2451aa5271bbef9e876491a5bde
+  2036fd7688dd0b27bb994b72a5d81d60e4671421` exited 0; the installed marker is
+  an ancestor of the shared artifact commit.
 
 Dev complete-reads the final values. Missing, shallow, divergent, or
 incomparable history fails closed to Spec; no contract-specific legacy rule may
@@ -433,8 +436,8 @@ by the spec:
 - Every production change has a RED signal that fails on current main.
 - The plan reuses current cleanup, ownership, retry, reaper, and release paths.
 - No owner decision, threshold, sibling repo, deployment target, or historical
-  causal claim is deferred. The exact post-landing artifact hash is the only
-  evidence Spec-sweep must fill before Dev transition.
+  causal claim is deferred. The exact artifact hash and installed-boundary
+  ancestry result are recorded before Dev transition.
 
 ## GSTACK REVIEW REPORT
 
