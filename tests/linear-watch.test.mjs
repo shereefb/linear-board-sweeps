@@ -4800,6 +4800,27 @@ test("reconcileOwnedDispatchClaim: typed log I/O termination uses exact terminal
   }, "codex"), { attempted: false, released: false, reasonKind: null });
 });
 
+test("reconcileOwnedDispatchClaim: typed log I/O termination uses only each configured stage's exact claim cleanup", async () => {
+  for (const sweep of Object.keys(SWEEP_CFG)) {
+    const releases = [];
+    const pick = {
+      sweep,
+      issueId: `issue-${sweep}`,
+      issueIdentifier: `${sweep.toUpperCase()}-289`,
+      ownerToken: `owner-${sweep}`,
+      claimDeclarationId: `decl-${sweep}`,
+    };
+    assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
+      kind: "dispatch-io-error",
+      code: "LOG_WRITE_FAILED",
+      pick,
+    }, "codex", {
+      releaseFailedDispatchClaimFn: async (...args) => { releases.push(args); return true; },
+    }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" }, sweep);
+    assert.deepEqual(releases.map((args) => args[1]), [pick], sweep);
+  }
+});
+
 test("reconcileOwnedDispatchClaim preserves exact claims retained for provider or capacity recovery", async () => {
   let releases = 0;
   const result = await watchModule.reconcileOwnedDispatchClaim("key", {

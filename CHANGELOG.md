@@ -2,6 +2,13 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.2] - 2026-07-14
+
+### Fixed
+
+- Close the exact immutable claim after an observed launcher log-I/O termination, rather than leaving it for the stale-claim reaper.
+- Give direct log-I/O termination precedence over partial capacity text and child deferral files while preserving ordinary capacity and deferral recovery.
+
 ## [1.3.0.1] - 2026-07-11
 
 ### Fixed
