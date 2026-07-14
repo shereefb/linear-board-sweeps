@@ -6370,6 +6370,13 @@ function boundedOutcomeString(value) {
   return typeof value === "string" && Buffer.byteLength(value, "utf8") >= 1 && Buffer.byteLength(value, "utf8") <= 256;
 }
 
+export function childOutcomeFailureDiagnostic(result = {}, pick = {}) {
+  const reason = boundedOutcomeString(result.reason) ? result.reason : "invalid-outcome";
+  const label = boundedOutcomeString(pick?.repoRoute?.label) ? pick.repoRoute.label : "_";
+  const repoEntry = boundedOutcomeString(pick?.repoRoute?.repoEntry) ? pick.repoRoute.repoEntry : "_";
+  return `UNTRUSTED_CHILD_OUTCOME (${reason}); expected route label \`${label}\`, repo entry \`${repoEntry}\``;
+}
+
 function normalizedChildRouting(value, pick) {
   if (!hasExactKeys(value, ["reason", "expectedLabel", "expectedRepoEntry", "matches"])
       || !boundedOutcomeString(value.reason)
@@ -7130,7 +7137,10 @@ async function tick({ dryRun = false } = {}) {
           { sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath },
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
-          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
+          failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget,
+            result.kind === "child-outcome-invalid"
+              ? childOutcomeFailureDiagnostic(result, pick)
+              : `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
         ];
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";

@@ -6250,6 +6250,36 @@ test("child outcome protocol: invalid outcomes cannot enter handoff or same-repo
   assert.equal(watchModule.isSameRepoRefillEligibleResult(invalidResult), false);
 });
 
+test("child outcome protocol: failure Todo diagnostics retain only the bounded validator reason and trusted route identity", () => {
+  const secret = "untrusted-child-outcome-secret";
+  const result = {
+    kind: "child-outcome-invalid",
+    code: "UNTRUSTED_CHILD_OUTCOME",
+    reason: "invalid-routing",
+    rawOutcome: { secret, expectedLabel: "repo:attacker", expectedRepoEntry: "attacker" },
+  };
+  const pick = {
+    repoRoute: { label: "repo:kit", repoEntry: "." },
+  };
+  const event = failureEvent({
+    kind: "dispatch-exit",
+    message: watchModule.childOutcomeFailureDiagnostic(result, pick),
+  });
+  const fingerprint = failureFingerprint(event);
+  const diagnostics = [
+    failureTodoBody(event, fingerprint),
+    failureTodoBody(event, fingerprint, { firstSeen: "2026-07-14T00:00:00Z" }),
+  ];
+
+  for (const diagnostic of diagnostics) {
+    assert.match(diagnostic, /UNTRUSTED_CHILD_OUTCOME \(invalid-routing\)/);
+    assert.match(diagnostic, /expected route label `repo:kit`, repo entry `\.`/);
+    assert.equal(diagnostic.includes(secret), false);
+    assert.equal(diagnostic.includes("repo:attacker"), false);
+    assert.equal(diagnostic.includes("attacker"), false);
+  }
+});
+
 test("child outcome protocol: an absent outcome file preserves a successful child exit", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-absent-route-outcome-"));
   const child = new EventEmitter();
