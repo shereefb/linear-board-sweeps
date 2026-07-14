@@ -5841,7 +5841,7 @@ export async function buildSameRepoRefillDispatches({
   const sweep = pick.sweep;
   const logFn = deps.logFor || logFor;
   const empty = (reason) => ({ dispatches: [], reason });
-  if (!result?.success || !pick.issueIdentifier) return empty("ineligible");
+  if (!isSameRepoRefillEligibleResult(result) || !pick.issueIdentifier) return empty("ineligible");
   if (refillBudget?.disabled) {
     logFn(pick.anchorPath, sweep, `refill-skip ${sweep}: disabled`);
     return empty("disabled");
@@ -6276,6 +6276,18 @@ export function classifyDispatchOutcome(event = {}) {
   if (base.signal) return { kind: "signal", ...base };
   if (base.exitCode === 0) return { kind: "success", ...base };
   return { kind: "exit", ...base };
+}
+
+export function isFollowupEligibleResult(result) {
+  return result?.success === true && result?.kind !== "child-outcome-invalid";
+}
+
+export function isHandoffEligibleResult(result) {
+  return isFollowupEligibleResult(result);
+}
+
+export function isSameRepoRefillEligibleResult(result) {
+  return isFollowupEligibleResult(result);
 }
 
 const AUTO_SWEEP_OUTCOME_MAX_BYTES = 64 * 1024;
@@ -7120,7 +7132,7 @@ async function tick({ dryRun = false } = {}) {
         logFor(current.pick.anchorPath, current.pick.sweep, `handoff-skip ${current.pick.issueIdentifier}: hop-limit`);
         return [];
       }
-      if (current?.success && current.pick?.issueIdentifier) {
+      if (isHandoffEligibleResult(current) && current.pick?.issueIdentifier) {
         const pick = current.pick;
         const active = activeByAnchor.get(pick.anchorPath);
         if (!active) return;

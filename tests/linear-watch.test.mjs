@@ -6117,6 +6117,10 @@ test("child outcome protocol: every present malformed or untrusted route file fa
     ["oversized match string", route({ matches: [{ label: "repo:other", repoEntry: "x".repeat(257) }] })],
     ["duplicate matches", route({ reason: "ambiguous-route-label", matches: [{ label: "repo:kit", repoEntry: "." }, { label: "repo:kit", repoEntry: "." }] })],
     ["unconfigured match", route({ matches: [{ label: "repo:unconfigured", repoEntry: "elsewhere" }] })],
+    ["missing route exit", (() => { const value = route(); delete value.routeExitCode; return value; })()],
+    ["string route exit", route({ routeExitCode: "3" })],
+    ["route exit 1", route({ routeExitCode: 1 })],
+    ["route exit 4", route({ routeExitCode: 4 })],
     ["exit 2 with exit 3 reason", route({ routeExitCode: 2 })],
     ["exit 3 with exit 2 reason", route({ reason: "unreadable" })],
     ["unreadable with matches", route({ routeExitCode: 2, reason: "unreadable", matches: [{ label: "repo:other", repoEntry: "other" }] })],
@@ -6124,6 +6128,10 @@ test("child outcome protocol: every present malformed or untrusted route file fa
     ["ambiguous with one match", route({ reason: "ambiguous-route-label" })],
     ["changed without a match", route({ matches: [] })],
     ["non-regular path", null, routedPick, (outcomePath) => fs.mkdirSync(outcomePath)],
+    ["open failure", null, routedPick, (outcomePath) => {
+      fs.writeFileSync(outcomePath, JSON.stringify(route()));
+      fs.chmodSync(outcomePath, 0);
+    }],
   ];
 
   for (const [name, value, pick = routedPick, writeOutcome] of cases) {
@@ -6139,8 +6147,10 @@ test("child outcome protocol: every present malformed or untrusted route file fa
     else fs.writeFileSync(outcomePath, typeof value === "string" ? value : JSON.stringify(value));
     child.emit("close", 0, null);
     const outcome = await run;
+    if (name === "open failure") fs.chmodSync(outcomePath, 0o600);
     assert.equal(outcome.kind, "child-outcome-invalid", name);
     assert.equal(outcome.code, "UNTRUSTED_CHILD_OUTCOME", name);
+    if (name === "open failure") assert.equal(outcome.reason, "outcome-unreadable");
     assert.notEqual(outcome.kind, "success", name);
     const [batchResult] = await dispatchBatch([{ anchorPath, sweep: "dev", config: pick.config, issueIdentifier: pick.issueIdentifier }], {
       dispatchFn: async () => outcome,
@@ -6149,6 +6159,18 @@ test("child outcome protocol: every present malformed or untrusted route file fa
     const recordName = fs.readdirSync(logDir).find((file) => file.startsWith("run-records-"));
     assert.equal(fs.readFileSync(path.join(logDir, recordName), "utf8").includes("untrusted-route-secret"), false, name);
   }
+});
+
+test("child outcome protocol: invalid outcomes cannot enter handoff or same-repo refill predicates", () => {
+  const invalidResult = {
+    kind: "child-outcome-invalid",
+    code: "UNTRUSTED_CHILD_OUTCOME",
+    success: true,
+    pick: { issueIdentifier: "COD-291" },
+  };
+
+  assert.equal(watchModule.isHandoffEligibleResult(invalidResult), false);
+  assert.equal(watchModule.isSameRepoRefillEligibleResult(invalidResult), false);
 });
 
 test("child outcome protocol: an absent outcome file preserves a successful child exit", async () => {
