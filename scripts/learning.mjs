@@ -776,7 +776,7 @@ export function learningDueDecisions({ state = emptyLearningState(), snapshot = 
     const afterCursor = (timestamp) => Number.isNaN(since) || Date.parse(timestamp || "") > since;
     if (lens === "reliability") {
       const evidence = [
-        ...events.filter((event) => afterCursor(event.occurredAt) && (event.kind === "canary" || (event.kind === "terminal" && event.category === "failed"))),
+        ...events.filter((event) => afterCursor(event.occurredAt) && event.kind === "canary"),
         ...observations.filter((item) => afterCursor(item.occurredAt || item.at) && ["dispatch-failure", "stale-claim", "failure-recovery", "safety-invariant", "poison-card"].includes(item.signal)),
       ];
       const due = evidence.length > 0 && elapsedMs(lensState.lastSuccessfulCapturedThrough, nowMs) >= 24 * 3600000;

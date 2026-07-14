@@ -201,7 +201,7 @@ test("learning due decisions preserve pending work and enforce independent caden
   const snapshot = {
     capturedThrough: "2026-07-10T12:00:00.000Z",
     events: [
-      { occurredAt: "2026-07-10T10:00:00.000Z", kind: "terminal", category: "failed" },
+      { occurredAt: "2026-07-10T10:00:00.000Z", kind: "canary", category: "red" },
       ...Array.from({ length: 5 }, (_, index) => ({
         occurredAt: `2026-07-10T10:0${index}:00.000Z`, kind: "bounce", category: "implementation-incomplete",
       })),
@@ -248,6 +248,24 @@ test("learning due decisions stay idle without new evidence and support quality 
   assert.equal(volume.lenses.quality.due, true);
   assert.equal(volume.lenses.quality.reason, "volume-threshold");
   assert.equal(volume.lenses.reliability.due, false);
+});
+
+test("child terminal failures remain audit evidence but cannot schedule reliability learning", () => {
+  const state = emptyLearningState();
+  state.lenses.reliability.lastSuccessfulCapturedThrough = "2026-07-10T10:00:00.000Z";
+  const decisions = learningDueDecisions({
+    state,
+    snapshot: {
+      capturedThrough: "2026-07-12T12:00:00.000Z",
+      events: [{ occurredAt: "2026-07-10T11:00:00.000Z", kind: "terminal", category: "failed" }],
+      observations: [],
+      runRecords: [],
+    },
+    now: "2026-07-12T12:00:00.000Z",
+  });
+  assert.equal(decisions.lenses.reliability.due, false);
+  assert.equal(decisions.lenses.reliability.reason, "no-new-evidence");
+  assert.equal(decisions.lenses.quality.due, true);
 });
 
 test("learning events accept every closed taxonomy pair and reject every unknown", () => {
@@ -1321,7 +1339,7 @@ test("learning due decisions enforce cadence, sample floors, pending resumes, an
   state.evaluations.root = { status: "active", windowEndsAt: "2026-07-10T11:00:00.000Z" };
   const snapshot = {
     capturedThrough: "2026-07-10T12:00:00.000Z",
-    events: [buildLearningEvent({ kind: "terminal", category: "failed", summary: "failed" }, TRUSTED_ENV, { now: () => "2026-07-10T11:00:00.000Z" })],
+    events: [buildLearningEvent({ kind: "canary", category: "red", summary: "failed" }, TRUSTED_ENV, { now: () => "2026-07-10T11:00:00.000Z" })],
     observations: repeat("review-finding", 5),
     runRecords: Array.from({ length: 20 }, (_, i) => ({ cardRunId: `r${i}`, endedAt: "2026-07-10T11:00:00.000Z" })),
   };

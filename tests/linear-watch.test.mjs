@@ -51,7 +51,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   claimMigrationSummary,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
-  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage, dispatchLearningKey, dispatchLearningEvidenceDecision,
+  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage, dispatchLearningKey, dispatchLearningEvidenceDecision, persistDispatchLearningEvidence,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, reconcileFailureTodos, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
@@ -6646,6 +6646,47 @@ test("dispatch learning admission accepts only parent-classified operational fai
   assert.equal(dispatchLearningEvidenceDecision({ ...base, outcome: { kind: "exit", exitCode: 7 }, capacityDeferred: true }), null);
   assert.equal(dispatchLearningEvidenceDecision({ ...base, outcome: { kind: "exit", exitCode: 7 }, providerExhausted: true }), null);
 });
+
+test("dispatch reconciliation persists classified evidence before independent claim and Todo handling", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-learning-evidence-"));
+  const pick = {
+    anchorPath: "/managed/app", sourceAnchorPath: "/source/app", issueIdentifier: "COD-288", sweep: "dev",
+    config: { projectId: "project-1", repos: ["app"] }, repoRoute: { repoEntry: "app" },
+  };
+  const active = { sourceAnchorPath: "/source/app", repoPairs: [{ repoEntry: "app", sourceRepoPath: "/source/app", managedRepoPath: "/managed/app" }], envValues: ["unrelated-secret"] };
+  const result = persistDispatchLearningEvidence({
+    pick, active, runtimeCfg: { runtime: "codex", model: "gpt-5" }, result: { kind: "exit", exitCode: 7, completedAt: "2026-07-14T12:00:00.000Z" },
+    capacityDeferred: false, providerExhausted: false, dispatchScope: "dev:dispatch", stableTarget: "COD-288",
+  }, {
+    appendEvidenceFn: (input) => appendLauncherEvidenceRun(input, { runsDir: dir }),
+  });
+  assert.equal(result.appended, true);
+  assert.equal(result.evidence?.type, "dispatch-failure");
+  const [persisted] = fs.readFileSync(path.join(dir, "20260714.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(persisted.issueIdentifier, "COD-288");
+  assert.equal(persisted.launcherEvidence[0].reason, "dispatch-exit");
+
+  const localFailures = [];
+  const failed = persistDispatchLearningEvidence({
+    pick, active: { ...active, envValues: ["append-secret"] }, runtimeCfg: { runtime: "codex", model: "gpt-5" },
+    result: { kind: "exit", exitCode: 7, completedAt: "2026-07-14T12:00:00.000Z" }, capacityDeferred: false,
+    providerExhausted: false, dispatchScope: "dev:dispatch", stableTarget: "COD-288",
+  }, {
+    appendEvidenceFn: () => { throw new Error("append-secret unavailable"); },
+    onAppendFailure: ({ error, envValues }) => localFailures.push(sanitizeFailureMessage(error?.message || error, envValues)),
+  });
+  assert.equal(failed.appended, false);
+  assert.deepEqual(localFailures, ["[REDACTED] unavailable"]);
+
+  assert.doesNotThrow(() => persistDispatchLearningEvidence({
+    pick, active, runtimeCfg: { runtime: "codex", model: "gpt-5" },
+    result: { kind: "exit", exitCode: 7 }, capacityDeferred: false,
+    providerExhausted: false, dispatchScope: "dev:dispatch", stableTarget: "COD-288",
+  }, {
+    appendEvidenceFn: () => { throw new Error("disk unavailable"); },
+    onAppendFailure: () => { throw new Error("diagnostic persistence unavailable"); },
+  }));
+});
 test("sanitizeFailureMessage: strips credentials embedded in Git remote URLs", () => {
   const githubSecret = ["ghp", "supersecret"].join("_");
   const credentialedHttpUrl = "https://oauth2" + ":" + githubSecret + "@" + "github.com/acme/repo.git";
@@ -7115,7 +7156,7 @@ test("doctor learning diagnostics expose due lenses, WAL, evaluations, coverage,
   };
   const snapshot = {
     capturedThrough: now,
-    events: [{ occurredAt: "2026-07-10T10:00:00.000Z", kind: "terminal", category: "failed" }],
+    events: [{ occurredAt: "2026-07-10T10:00:00.000Z", kind: "canary", category: "red" }],
     observations: [],
     runRecords: Array.from({ length: 20 }, (_, index) => ({ endedAt: `2026-07-10T10:${String(index).padStart(2, "0")}:00.000Z` })),
     coverage: { complete: false, gaps: [{ source: "runs", reason: "one malformed line" }] },

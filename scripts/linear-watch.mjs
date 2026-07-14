@@ -2013,6 +2013,51 @@ export function dispatchLearningEvidenceDecision({
   };
 }
 
+// This intentionally runs before claim release and Todo reconciliation. Evidence
+// persistence is best-effort: an append error is recorded locally and cannot
+// prevent the existing operational recovery paths from running.
+export function persistDispatchLearningEvidence({
+  pick = {}, active = {}, runtimeCfg = {}, result = {}, capacityDeferred = false,
+  providerExhausted = false, dispatchScope, stableTarget,
+} = {}, {
+  appendEvidenceFn = appendLauncherEvidenceRun,
+  onAppendFailure = () => {},
+  now = () => new Date().toISOString(),
+} = {}) {
+  const evidence = dispatchLearningEvidenceDecision({
+    sourceWorkspace: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
+    projectId: pick.config?.projectId,
+    repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
+    sweep: pick.sweep,
+    runtime: runtimeCfg.runtime || "codex",
+    model: runtimeCfg.model,
+    outcome: result,
+    capacityDeferred,
+    providerExhausted,
+  });
+  if (!evidence) return { evidence: null, appended: false };
+  try {
+    const record = appendEvidenceFn({
+      sourceAnchorPath: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
+      config: pick.config,
+      repoPairs: active.repoPairs,
+      card: { identifier: pick.issueIdentifier },
+      repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
+      sweep: pick.sweep,
+      evidence,
+      occurredAt: result.completedAt || now(),
+    });
+    return { evidence, record, appended: true };
+  } catch (error) {
+    try {
+      onAppendFailure({ error, pick, active, dispatchScope, stableTarget, envValues: active.envValues || [] });
+    } catch {
+      // The diagnostic route is also best-effort; claim/Todo recovery must continue.
+    }
+    return { evidence, appended: false };
+  }
+}
+
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -6975,33 +7020,15 @@ async function tick({ dryRun = false } = {}) {
         : (result.kind === "success" || dependencyDeferred) ? [] : [
           failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
         ];
-      const learningEvidence = dispatchLearningEvidenceDecision({
-        sourceWorkspace: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
-        projectId: pick.config?.projectId,
-        repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
-        sweep: pick.sweep,
-        runtime: runtimeCfg.runtime || "codex",
-        model: runtimeCfg.model,
-        outcome: result,
-        capacityDeferred: Boolean(capacityKind),
-        providerExhausted: finalUsageExhausted,
+      persistDispatchLearningEvidence({
+        pick, active, runtimeCfg, result, capacityDeferred: Boolean(capacityKind),
+        providerExhausted: finalUsageExhausted, dispatchScope, stableTarget,
+      }, {
+        onAppendFailure: ({ error }) => recordLocalFailure(
+          pick.anchorPath, pick.config, dispatchScope, "learning-evidence-append",
+          stableTarget, error?.message || error, active.envValues,
+        ),
       });
-      if (learningEvidence) {
-        try {
-          appendLauncherEvidenceRun({
-            sourceAnchorPath: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
-            config: pick.config,
-            repoPairs: active.repoPairs,
-            card: { identifier: pick.issueIdentifier },
-            repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
-            sweep: pick.sweep,
-            evidence: learningEvidence,
-            occurredAt: result.completedAt || new Date().toISOString(),
-          });
-        } catch (error) {
-          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "learning-evidence-append", stableTarget, error?.message || error, active.envValues);
-        }
-      }
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
         const key = result.finalRuntimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
