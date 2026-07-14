@@ -314,6 +314,20 @@ test("capacity outcome: recognized quota failures defer with bounded retry and c
   assert.equal(capacityRetryAt(NOW, 99), NOW + 60 * 60_000);
 });
 
+test("capacity outcome: a typed log I/O termination cannot retain a claim from partial capacity text", () => {
+  assert.equal(classifyCapacityOutcome({ kind: "dispatch-io-error" }, "429 quota exceeded"), null);
+  assert.equal(classifyCapacityOutcome({ kind: "dispatch-io-error" }, "model capacity exceeded"), null);
+});
+
+test("dispatch claim recovery policy gives a direct log I/O termination precedence over partial capacity text", () => {
+  assert.deepEqual(watchModule.dispatchClaimRecoveryPolicy({ kind: "dispatch-io-error" }, {
+    logTail: "429 quota exceeded",
+  }), { capacityKind: null, preserveTerminalClaim: false });
+  assert.deepEqual(watchModule.dispatchClaimRecoveryPolicy({ kind: "exit" }, {
+    logTail: "model capacity exceeded",
+  }), { capacityKind: "model-capacity", preserveTerminalClaim: true });
+});
+
 test("runtime cooldown store: persists one-hour provider exhaustion and clears on success", () => {
   let raw = null;
   let now = NOW;
@@ -4767,6 +4781,25 @@ test("reconcileOwnedDispatchClaim: successful child completion invokes state-sco
   assert.equal(failureCalls.length, 1);
 });
 
+test("reconcileOwnedDispatchClaim: typed log I/O termination uses exact terminal cleanup while unknown outcomes stay untouched", async () => {
+  const released = [];
+  const ioResult = {
+    kind: "dispatch-io-error",
+    code: "LOG_WRITE_FAILED",
+    pick: { sweep: "dev", issueId: "issue-289", issueIdentifier: "COD-289", ownerToken: "owner-289", claimDeclarationId: "decl-289" },
+  };
+  assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", ioResult, "codex", {
+    releaseFailedDispatchClaimFn: async (...args) => { released.push(args); return true; },
+  }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" });
+  assert.equal(released.length, 1);
+  assert.equal(released[0][1], ioResult.pick);
+
+  assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
+    kind: "future-unknown",
+    pick: ioResult.pick,
+  }, "codex"), { attempted: false, released: false, reasonKind: null });
+});
+
 test("reconcileOwnedDispatchClaim preserves exact claims retained for provider or capacity recovery", async () => {
   let releases = 0;
   const result = await watchModule.reconcileOwnedDispatchClaim("key", {
@@ -5992,6 +6025,46 @@ test("dispatchAsync fallback: stdout and stderr log write failures kill and awai
     assert.equal(outcome.code, "LOG_WRITE_FAILED", stream);
     assert.equal(outcome.attempts.length, 1, stream);
   }
+});
+
+test("dispatchAsync: a child deferral file cannot replace a direct primary or fallback log I/O outcome", async () => {
+  const primaryAnchor = fs.mkdtempSync(path.join(os.tmpdir(), "linear-primary-io-deferral-"));
+  const primaryOutcomePath = path.join(primaryAnchor, "outcome.json");
+  const primary = pipedDispatchChild(880);
+  const primaryRun = dispatchAsync(primaryAnchor, "dev", {}, {
+    issueIdentifier: "COD-289", logDir: path.join(primaryAnchor, "logs"), outcomePath: primaryOutcomePath, runtimeExecutable: "/resolved/codex",
+  }, {
+    spawnFn: () => primary,
+    writeChunkFn: () => { throw new Error("primary log write failed"); },
+  });
+  fs.writeFileSync(primaryOutcomePath, JSON.stringify({ version: 1, kind: "dependency-deferred", issueIdentifier: "COD-289", dependencyExitCode: 3 }));
+  primary.stdout.write("partial output");
+  await new Promise((resolve) => setImmediate(resolve));
+  primary.close(1);
+  assert.equal((await primaryRun).kind, "dispatch-io-error");
+
+  const fallbackAnchor = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-io-deferral-"));
+  const fallbackOutcomePath = path.join(fallbackAnchor, "outcome.json");
+  const fallbackPrimary = pipedDispatchChild(881);
+  const fallback = pipedDispatchChild(882);
+  let writes = 0;
+  const fallbackRun = dispatchAsync(fallbackAnchor, "dev", {
+    runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
+  }, {
+    issueIdentifier: "COD-289", logDir: path.join(fallbackAnchor, "logs"), outcomePath: fallbackOutcomePath, runtimeExecutable: "/resolved/codex",
+  }, {
+    spawnFn: queuedDispatchSpawn([fallbackPrimary, fallback]),
+    resolveRuntimeExecutableFn: () => ({ ok: true, path: "/resolved/claude" }),
+    writeChunkFn: () => { writes += 1; if (writes > 1) throw new Error("fallback log write failed"); },
+  });
+  fallbackPrimary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
+  fallbackPrimary.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  fs.writeFileSync(fallbackOutcomePath, JSON.stringify({ version: 1, kind: "repo-routing-deferred", issueIdentifier: "COD-289", routeExitCode: 3 }));
+  fallback.stdout.write("partial fallback output");
+  await new Promise((resolve) => setImmediate(resolve));
+  fallback.close(1);
+  assert.equal((await fallbackRun).kind, "dispatch-io-error");
 });
 
 test("dispatchAsync: child dependency outcome channel overrides a superficially successful runtime exit", async () => {

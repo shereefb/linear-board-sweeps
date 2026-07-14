@@ -2462,10 +2462,27 @@ export function resumeResolutionNoticeNeeded(card, cfg, decision) {
 
 export function classifyCapacityOutcome(outcome, logTail = "") {
   if (!outcome || ["success", "dependency-deferred", "repo-routing-deferred"].includes(outcome.kind)) return null;
+  if (outcome.kind === "dispatch-io-error") return null;
   const text = String(logTail).slice(-16_384).toLowerCase();
   if (/\b(429|quota|rate limit|too many requests)\b/.test(text)) return "quota";
   if (/model.{0,32}(capacity|overloaded|unavailable)|capacity exceeded|server overloaded/.test(text)) return "model-capacity";
   return null;
+}
+
+export function isObservedTerminalFailure(result) {
+  return ["exit", "signal", "dispatch-io-error"].includes(result?.kind);
+}
+
+export function dispatchClaimRecoveryPolicy(result, {
+  providerUsageExhausted = false,
+  finalUsageExhausted = false,
+  logTail = "",
+} = {}) {
+  const capacityKind = providerUsageExhausted ? null : classifyCapacityOutcome(result, logTail);
+  return {
+    capacityKind,
+    preserveTerminalClaim: finalUsageExhausted || Boolean(capacityKind),
+  };
 }
 export function capacityRetryAt(now, attempts = 0) {
   const delays = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000];
@@ -5667,7 +5684,7 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const routingDeferred = result.kind === "repo-routing-deferred";
   const successfulCompletion = result.kind === "success";
   const interrupted = result.kind === "interrupted";
-  const terminalFailure = result.kind === "exit" || result.kind === "signal";
+  const terminalFailure = isObservedTerminalFailure(result);
   if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
     return { attempted: false, released: false, reasonKind: null };
   }
@@ -6315,6 +6332,10 @@ function childDeferredOutcomeForPick(pick = {}) {
   }
 }
 
+function outcomeAfterChildDeferral(result, pick) {
+  return result?.kind === "dispatch-io-error" ? result : childDeferredOutcomeForPick(pick) || result;
+}
+
 export function runtimeDisabledByOutcome(outcome) {
   return outcome?.kind === "executable-enoent";
 }
@@ -6706,8 +6727,8 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
   logFor(anchorPath, sweep, `dispatch${pick.issueIdentifier ? ` ${pick.issueIdentifier}` : ""}: ${runtimeSummary(runtimeCfg)} → ${executable} ${command.args.slice(0, 3).join(" ")} …`);
   const primary = await runDispatchAttempt({ executable, command, cwd: command.cwd, env, fd, runtimeCfg, signal, spawnFn, onSpawn, writeChunkFn });
   const primaryAttempt = normalizedDispatchAttempt(runtimeCfg, primary.outcome, primary.usageExhausted);
-  const deferred = childDeferredOutcomeForPick(pick);
-  if (deferred) return finish(deferred, primaryMeta, [primaryAttempt]);
+  const primaryResult = outcomeAfterChildDeferral(primary.outcome, pick);
+  if (primaryResult !== primary.outcome) return finish(primaryResult, primaryMeta, [primaryAttempt]);
   const fallbackCfg = fallbackRuntimeConfigForSweep(config, sweep);
   const fallbackEligible = runtimeCfg.runtime === "codex"
     && primary.outcome.kind === "exit"
@@ -6746,7 +6767,7 @@ export async function dispatchAsync(anchorPath, sweep, config, pick = {}, {
     writeChunkFn,
   });
   const fallbackAttempt = normalizedDispatchAttempt(fallbackCfg, fallback.outcome, fallback.usageExhausted);
-  return finish(childDeferredOutcomeForPick(pick) || fallback.outcome, runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
+  return finish(outcomeAfterChildDeferral(fallback.outcome, pick), runtimeMetadata(anchorPath, pick, fallbackCfg, resolution.path), [primaryAttempt, fallbackAttempt], true);
 }
 
 export function attachUpdateFailuresToAnchors(anchors, updateFailures, {
@@ -6900,12 +6921,17 @@ async function tick({ dryRun = false } = {}) {
       const dependencyDeferred = result.kind === "dependency-deferred";
       const routingDeferred = result.kind === "repo-routing-deferred";
       const detail = result.signal || result.code || result.exitCode;
-      const capacityKind = providerUsageExhausted ? null : classifyCapacityOutcome(result, (() => {
+      const recoveryPolicy = dispatchClaimRecoveryPolicy(result, {
+        providerUsageExhausted,
+        finalUsageExhausted,
+        logTail: (() => {
         try {
           const file = path.join(pick.logDir || "", `${new Date().toISOString().slice(0, 10).replace(/-/g, "")}.log`);
           return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(-16_384) : "";
         } catch { return ""; }
-      })());
+        })(),
+      });
+      const { capacityKind, preserveTerminalClaim } = recoveryPolicy;
       if (capacityKind && pick.issueIdentifier) {
         const previous = resumeStore.get({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier });
         const attempts = Math.min(4, (previous?.reason === "capacity" ? previous.attempts : 0) + 1);
@@ -6950,7 +6976,7 @@ async function tick({ dryRun = false } = {}) {
         try {
           const claimResult = await reconcileOwnedDispatchClaim(active.apiKey, result, runtime, {
             resumeStore,
-            preserveTerminalClaim: finalUsageExhausted || Boolean(capacityKind),
+            preserveTerminalClaim,
           });
           if (claimResult.released) logFor(pick.anchorPath, pick.sweep, `released owned claim after ${claimResult.reasonKind} ${pick.issueIdentifier}`);
         } catch (e) {
