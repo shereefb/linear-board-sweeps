@@ -51,7 +51,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   claimMigrationSummary,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
-  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
+  FAILURE_RECOVERED_TAG, FAILURE_TODO_TAG, failureFingerprint, retainCurrentRouteFailures, routeFailureTarget, sanitizeFailureMessage,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, reconcileFailureTodos, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
@@ -7022,13 +7022,131 @@ test("failureTodoDecisions: only closes recovered Todos for checked scopes", () 
   const checked = failureTodoDecisions([], [existingFailureTodo(fp, { scope: "dev" })], new Set(["dev"]), NOW);
   assert.equal(checked[0].action, "close");
 });
-test("failureTodoDecisions: repository routing failures dedupe and self-close on the matching stage scope", () => {
+test("failureTodoDecisions: repository routing failures dedupe and recover only on their exact target", () => {
   const event = failureEvent({ scope: "qa:routing", kind: "repo-routing", stableTarget: "SAF-200", message: "SAF-200 expected exactly one of app:admin" });
   const fp = failureFingerprint(event);
   assert.deepEqual(failureTodoDecisions([event, event], [], new Set(["qa:routing"]), NOW).map((decision) => decision.action), ["create"]);
   const todo = existingFailureTodo(fp, { scope: "qa:routing", description: failureTodoBody(event, fp) });
   assert.deepEqual(failureTodoDecisions([], [todo], new Set(["dev:routing"]), NOW), []);
-  assert.equal(failureTodoDecisions([], [todo], new Set(["qa:routing"]), NOW)[0].action, "close");
+  assert.deepEqual(failureTodoDecisions([], [todo], new Set(["qa:routing"]), NOW), []);
+  assert.equal(failureTodoDecisions([], [todo], new Set(), NOW, { recoveredTargets: new Set(["SAF-200"]) })[0].action, "close");
+});
+test("route recovery: same-basename workspaces have isolated canonical route failure identities", () => {
+  const a = routeFailureTarget({ sourceWorkspace: "/src/a/app", projectId: "p", sweep: "ship", issueIdentifier: "COD-158" });
+  const b = routeFailureTarget({ sourceWorkspace: "/src/b/app", projectId: "p", sweep: "ship", issueIdentifier: "COD-158" });
+  assert.notEqual(a, b);
+  assert.match(a, /"sourceWorkspaceId":"app-[a-f0-9]{8}"/);
+  assert.equal(a.includes("/src/a/app"), false);
+
+  const eventA = failureEvent({ anchorSlug: "app", projectId: "p", scope: "ship:routing", kind: "repo-routing", stableTarget: a });
+  const eventB = failureEvent({ anchorSlug: "app", projectId: "p", scope: "ship:routing", kind: "repo-routing", stableTarget: b });
+  const fingerprintA = failureFingerprint(eventA);
+  const fingerprintB = failureFingerprint(eventB);
+  assert.notEqual(fingerprintA, fingerprintB);
+  const todoB = existingFailureTodo(fingerprintB, { scope: "ship:routing", description: failureTodoBody(eventB, fingerprintB) });
+
+  assert.deepEqual(failureTodoDecisions([eventA], [todoB], new Set(), NOW).map((decision) => decision.action), ["create"]);
+  assert.deepEqual(failureTodoDecisions([], [todoB], new Set(), NOW, { recoveredTargets: new Set([a]) }), []);
+});
+test("route recovery: route Todos require exact target proof and current failures outrank healthy scans", () => {
+  const target = routeFailureTarget({ sourceWorkspace: "/src/a/app", projectId: "p", sweep: "qa", issueIdentifier: "COD-158" });
+  const event = failureEvent({ anchorSlug: "app", projectId: "p", scope: "qa:routing", kind: "repo-routing", stableTarget: target });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, { scope: "qa:routing", description: failureTodoBody(event, fingerprint), lastMessage: event.message });
+
+  assert.deepEqual(failureTodoDecisions([], [todo], new Set(["qa:routing"]), NOW), []);
+  assert.equal(failureTodoDecisions([], [todo], new Set(), NOW, { recoveredTargets: new Set([target]) })[0].action, "close");
+  const anotherStage = routeFailureTarget({ sourceWorkspace: "/src/a/app", projectId: "p", sweep: "dev", issueIdentifier: "COD-158" });
+  assert.deepEqual(failureTodoDecisions([], [todo], new Set(), NOW, { recoveredTargets: new Set([anotherStage]) }), []);
+  assert.deepEqual(failureTodoDecisions([event], [todo], new Set(["qa:routing"]), NOW, { recoveredTargets: new Set([target]) }).map((decision) => decision.action), ["update"]);
+});
+test("route recovery: a child failure remains current through immediate and final reconciliation", async () => {
+  const target = routeFailureTarget({ sourceWorkspace: "/src/a/app", projectId: "p", sweep: "dev", issueIdentifier: "COD-158" });
+  const event = failureEvent({ anchorSlug: "app", projectId: "p", scope: "dev:routing", kind: "repo-routing", stableTarget: target, message: "route changed" });
+  const fingerprint = failureFingerprint(event);
+  const todo = existingFailureTodo(fingerprint, { scope: "dev:routing", description: failureTodoBody(event, fingerprint), lastMessage: "route changed", updatedAt: new Date().toISOString() });
+  const active = { failures: [] };
+  const emitted = [];
+
+  const immediate = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "p" }, "/managed/a/app", [event], new Set(), [], {
+    recoveredTargets: new Set([target]),
+    fetchFailureTodosFn: async () => [],
+    teamMetaFn: async () => ({ teamId: "team", stateIds: { Todo: "todo", Done: "done" } }),
+    createFailureTodoFn: async () => ({ id: todo.id, identifier: todo.identifier }),
+    fetchRecoveredFailureTodoFingerprintsFn: async () => new Set(),
+    onLauncherEvidence: (entry) => emitted.push(entry),
+  });
+  assert.deepEqual(immediate.map((decision) => decision.action), ["create"]);
+  retainCurrentRouteFailures(active, [event]);
+  assert.deepEqual(active.failures, [event]);
+  const final = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "p" }, "/managed/a/app", active.failures, new Set(["dev:routing"]), [], {
+    recoveredTargets: new Set([target]),
+    fetchFailureTodosFn: async () => [todo],
+    onLauncherEvidence: (entry) => emitted.push(entry),
+  });
+  assert.deepEqual(final, []);
+  assert.deepEqual(emitted, []);
+
+  const healthy = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "p" }, "/managed/a/app", [], new Set(["dev:routing"]), [], {
+    recoveredTargets: new Set([target]),
+    fetchFailureTodosFn: async () => [todo],
+    teamMetaFn: async () => ({ stateIds: { Done: "done" } }),
+    closeFailureTodoFn: async () => {},
+    fetchClaimCardFn: async () => ({ ...todo, stateName: "Done", comments: [{ body: `${FAILURE_RECOVERED_TAG} ${fingerprint} now]` }] }),
+    onLauncherEvidence: (entry) => emitted.push(entry),
+  });
+  assert.deepEqual(healthy.map((decision) => decision.action), ["close"]);
+  assert.deepEqual(emitted.map((entry) => entry.evidence.state), ["recovered"]);
+});
+test("legacy route recovery: only a proven alias updates or recurs from legacy history", async () => {
+  const target = routeFailureTarget({ sourceWorkspace: "/src/a/app", projectId: "p", sweep: "dev", issueIdentifier: "COD-158" });
+  const event = failureEvent({ anchorSlug: "app", projectId: "p", scope: "dev:routing", kind: "repo-routing", stableTarget: target, message: "route changed", sourceWorkspace: "/src/a/app" });
+  const fingerprint = failureFingerprint(event);
+  const legacyFingerprint = failureFingerprint({ ...event, stableTarget: "COD-158" });
+  const legacyTodo = existingFailureTodo(legacyFingerprint, {
+    scope: "dev:routing",
+    description: failureTodoBody({ ...event, stableTarget: "COD-158" }, legacyFingerprint),
+    lastMessage: "old route failure",
+  });
+  const aliases = new Map([[fingerprint, legacyFingerprint]]);
+
+  const updated = failureTodoDecisions([event], [legacyTodo], new Set(), NOW, { fingerprintAliases: aliases });
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].action, "update");
+  assert.equal(updated[0].todo.id, legacyTodo.id);
+  assert.equal(updated[0].fingerprint, fingerprint);
+  assert.equal(updated[0].event.stableTarget, target);
+  assert.deepEqual(failureTodoDecisions([event], [legacyTodo], new Set(), NOW), [{ action: "create", event, fingerprint, message: "route changed" }]);
+
+  const unchangedLegacyTodo = { ...legacyTodo, lastMessage: "route changed" };
+  const migrated = failureTodoDecisions([event], [unchangedLegacyTodo], new Set(), NOW, { fingerprintAliases: aliases });
+  assert.deepEqual(migrated.map((decision) => decision.action), ["update"]);
+  assert.equal(migrated[0].todo.id, legacyTodo.id);
+
+  const emitted = [];
+  await reconcileFailureTodos("key", { teamKey: "COD", projectId: "p" }, "/managed/a/app", [event], new Set(), [], {
+    routeFailureWorkspaces: [{ sourceWorkspace: "/src/a/app", projectId: "p" }],
+    fetchFailureTodosFn: async () => [],
+    teamMetaFn: async () => ({ teamId: "team", stateIds: { Todo: "todo" } }),
+    fetchRecoveredFailureTodoFingerprintsFn: async () => new Set([legacyFingerprint]),
+    createFailureTodoFn: async () => ({ id: "new", identifier: "COD-200" }),
+    fetchClaimCardFn: async () => ({ id: "new", identifier: "COD-200", stateName: "Todo", labelNames: [] }),
+    onLauncherEvidence: (entry) => emitted.push(entry),
+  });
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].evidence.state, "recurred");
+
+  for (const routeFailureWorkspaces of [[], [
+    { sourceWorkspace: "/src/a/app", projectId: "p" },
+    { sourceWorkspace: "/src/b/app", projectId: "p" },
+  ]]) {
+    const decisions = await reconcileFailureTodos("key", { teamKey: "COD", projectId: "p" }, "/managed/a/app", [event], new Set(), [], {
+      dryRun: true,
+      routeFailureWorkspaces,
+      fetchFailureTodosFn: async () => [legacyTodo],
+    });
+    assert.deepEqual(decisions.map((decision) => decision.action), ["create"]);
+  }
 });
 test("failureTodoDecisions: dispatch failures recover only after dispatch succeeds", () => {
   const event = failureEvent({ scope: "dev:dispatch" });

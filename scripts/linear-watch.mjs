@@ -211,6 +211,12 @@ function stablePathSlug(p) {
   return `${base}-${hash}`;
 }
 
+export function routeFailureTarget({ sourceWorkspace, projectId, sweep, issueIdentifier } = {}) {
+  if (![sourceWorkspace, projectId, sweep, issueIdentifier]
+      .every((value) => typeof value === "string" && value)) return null;
+  return JSON.stringify({ sourceWorkspaceId: stablePathSlug(sourceWorkspace), projectId, sweep, issueIdentifier });
+}
+
 export function managedWorkspaceRootFor(sourceAnchorPath, { homeDir = HOME } = {}) {
   return path.join(homeDir, ".local", "share", "linear-board-sweeps", "workspaces", stablePathSlug(sourceAnchorPath));
 }
@@ -2029,6 +2035,43 @@ function failureTodoStableTarget(todo) {
   return m ? m[1] : null;
 }
 
+function failureTodoKind(todo) {
+  if (todo.kind) return todo.kind;
+  const m = String(todo.description || "").match(/What failed:.*?reported `([^`]+)`/);
+  return m ? m[1] : "_";
+}
+
+function legacyRouteFingerprint(event) {
+  if (event?.kind !== "repo-routing") return null;
+  try {
+    const target = JSON.parse(event.stableTarget);
+    if (!target?.issueIdentifier) return null;
+    return failureFingerprint({ ...event, stableTarget: target.issueIdentifier });
+  } catch {
+    return null;
+  }
+}
+
+function routeFailureFingerprintAliases(currentFailures, routeFailureWorkspaces = []) {
+  const aliases = new Map();
+  for (const event of currentFailures || []) {
+    if (event?.kind !== "repo-routing" || !event.sourceWorkspace) continue;
+    let target;
+    try { target = JSON.parse(event.stableTarget); } catch { continue; }
+    if (!target?.sourceWorkspaceId || !target.projectId || !target.sweep || !target.issueIdentifier
+        || target.sourceWorkspaceId !== stablePathSlug(event.sourceWorkspace)
+        || target.projectId !== event.projectId) continue;
+    const legacyAnchor = event.anchorSlug || anchorSlug(event.anchorPath || "_");
+    const matchingWorkspaces = (routeFailureWorkspaces || []).filter((workspace) => workspace
+      && workspace.projectId === target.projectId
+      && anchorSlug(workspace.sourceWorkspace) === legacyAnchor);
+    if (matchingWorkspaces.length !== 1 || matchingWorkspaces[0].sourceWorkspace !== event.sourceWorkspace) continue;
+    const legacyFingerprint = legacyRouteFingerprint(event);
+    if (legacyFingerprint) aliases.set(failureFingerprint(event), legacyFingerprint);
+  }
+  return aliases;
+}
+
 function failureTodoLastMessage(todo) {
   if (todo.lastMessage !== undefined) return String(todo.lastMessage);
   const matches = [...String(todo.description || "").matchAll(/Last error:\s*([\s\S]*?)(?:\n\nHow to clear:|$)/g)];
@@ -2053,7 +2096,7 @@ function shouldCommentDuplicate(todo, now) {
   return !last || now - last >= FAILURE_TODO_THROTTLE_MS;
 }
 
-export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [], recoveredTargets = new Set() } = {}) {
+export function failureTodoDecisions(currentFailures, existingTodos, checkedScopes, now = Date.now(), { envValues = [], recoveredTargets = new Set(), fingerprintAliases = new Map() } = {}) {
   const decisions = [];
   const byFingerprint = new Map();
   for (const todo of existingTodos || []) {
@@ -2071,7 +2114,10 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
   }
 
   for (const currentFailure of current.values()) {
-    const todos = byFingerprint.get(currentFailure.fingerprint) || [];
+    const alias = fingerprintAliases?.get?.(currentFailure.fingerprint);
+    const exactTodos = byFingerprint.get(currentFailure.fingerprint) || [];
+    const todos = exactTodos.length ? exactTodos : (alias ? byFingerprint.get(alias) || [] : []);
+    const migratingLegacyTodo = !exactTodos.length && todos.length > 0;
     const primary = todos[0];
     if (!primary) {
       decisions.push({ action: "create", ...currentFailure });
@@ -2082,7 +2128,7 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
     }
     const previousMessage = failureTodoLastMessage(primary);
     const age = now - Date.parse(primary.updatedAt || primary.createdAt || 0);
-    if (previousMessage !== currentFailure.message || age >= FAILURE_TODO_THROTTLE_MS) {
+    if (migratingLegacyTodo || previousMessage !== currentFailure.message || age >= FAILURE_TODO_THROTTLE_MS) {
       decisions.push({ action: "update", todo: primary, ...currentFailure });
     }
   }
@@ -2092,15 +2138,23 @@ export function failureTodoDecisions(currentFailures, existingTodos, checkedScop
     const primary = todos[0];
     const scope = failureTodoScope(primary);
     const stableTarget = failureTodoStableTarget(primary);
-    const recoveryProof = checkedScopes?.has?.(scope)
-      ? { type: "checked-scope", value: scope }
-      : (stableTarget && recoveredTargets?.has?.(stableTarget) ? { type: "recovered-target", value: stableTarget } : null);
+    const recoveryProof = failureTodoKind(primary) === "repo-routing"
+      ? (stableTarget && recoveredTargets?.has?.(stableTarget) ? { type: "recovered-target", value: stableTarget } : null)
+      : (checkedScopes?.has?.(scope)
+        ? { type: "checked-scope", value: scope }
+        : (stableTarget && recoveredTargets?.has?.(stableTarget) ? { type: "recovered-target", value: stableTarget } : null));
     if (recoveryProof) {
       decisions.push({ action: "close", fingerprint: fp, todo: primary, recoveryProof });
     }
   }
 
   return decisions;
+}
+
+export function retainCurrentRouteFailures(active, failures) {
+  const routeFailures = (failures || []).filter((failure) => failure?.kind === "repo-routing");
+  if (active?.failures) active.failures.push(...routeFailures);
+  return routeFailures;
 }
 
 export function healthStatus({ currentTick = null, lastTick, lockPid = null, isAlive = isAlivePid, now = Date.now(), intervalS = INTERVAL_S } = {}) {
@@ -4794,26 +4848,31 @@ async function commentDuplicateFailureTodo(apiKey, decision) {
 export async function reconcileFailureTodos(apiKey, config, anchorPath, currentFailures, checkedScopes, envValues, {
   dryRun = false,
   recoveredTargets = new Set(),
+  routeFailureWorkspaces = [],
+  fingerprintAliases = null,
   onLauncherEvidence = null,
   fetchFailureTodosFn = fetchFailureTodos,
+  fetchRecoveredFailureTodoFingerprintsFn = fetchRecoveredFailureTodoFingerprints,
   teamMetaFn = teamMeta,
   fetchClaimCardFn = fetchClaimCard,
+  createFailureTodoFn = createFailureTodo,
   closeFailureTodoFn = closeFailureTodo,
 } = {}) {
   const existing = await fetchFailureTodosFn(apiKey, config.teamKey, config.projectId);
-  const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues, recoveredTargets });
+  const aliases = fingerprintAliases || routeFailureFingerprintAliases(currentFailures, routeFailureWorkspaces);
+  const decisions = failureTodoDecisions(currentFailures, existing, checkedScopes, Date.now(), { envValues, recoveredTargets, fingerprintAliases: aliases });
   if (dryRun) return decisions;
   if (!decisions.length) return decisions;
   const meta = await teamMetaFn(apiKey, config.teamKey);
   const recoveredFingerprints = onLauncherEvidence && decisions.some((decision) => decision.action === "create")
-    ? await fetchRecoveredFailureTodoFingerprints(apiKey, config.teamKey, config.projectId)
+    ? await fetchRecoveredFailureTodoFingerprintsFn(apiKey, config.teamKey, config.projectId)
     : new Set();
   for (const d of decisions) {
     if (d.action === "create") {
-      const issue = await createFailureTodo(apiKey, meta, config.projectId, d.event, d.fingerprint, envValues);
+      const issue = await createFailureTodoFn(apiKey, meta, config.projectId, d.event, d.fingerprint, envValues);
       logFor(anchorPath, "_", `failure-todo create ${issue.identifier} ${d.fingerprint}`);
-      if (onLauncherEvidence && recoveredFingerprints.has(d.fingerprint)) {
-        const fresh = await fetchClaimCard(apiKey, issue.id);
+      if (onLauncherEvidence && (recoveredFingerprints.has(d.fingerprint) || recoveredFingerprints.has(aliases.get(d.fingerprint)))) {
+        const fresh = await fetchClaimCardFn(apiKey, issue.id);
         if (fresh.stateName !== "Todo") throw new Error(`${issue.identifier} recurrence Todo was not observable after creation`);
         const occurredAt = new Date().toISOString();
         onLauncherEvidence({
@@ -6973,7 +7032,7 @@ async function tick({ dryRun = false } = {}) {
     const capacityDeferredKeys = new Set();
     const refillBudget = { remaining: 0 };
     observationStore.sync();
-    const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
+    const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message, extra = {}) => ({
       anchorPath,
       anchorSlug: anchorSlug(anchorPath),
       projectId: config?.projectId || "unknown",
@@ -6982,8 +7041,10 @@ async function tick({ dryRun = false } = {}) {
       stableTarget,
       message: sanitizeFailureMessage(message),
       seenAt: new Date().toISOString(),
+      ...extra,
     });
     const launcherEvidenceOptions = (active, options = {}) => ({
+      routeFailureWorkspaces: active.routeFailureWorkspaces || [],
       ...options,
       onLauncherEvidence: ({ card, sweep, evidence }) => appendLauncherEvidenceRun({
         sourceAnchorPath: active.sourceAnchorPath,
@@ -7064,8 +7125,9 @@ async function tick({ dryRun = false } = {}) {
           pick.config,
           `${pick.sweep}:routing`,
           "repo-routing",
-          pick.issueIdentifier,
+          routeFailureTarget({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, projectId: pick.config.projectId, sweep: pick.sweep, issueIdentifier: pick.issueIdentifier }),
           `${pick.issueIdentifier} child repository preflight stopped material work: ${result.routing?.reason || result.code}`,
+          { sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath },
         )]
         : (result.kind === "success" || dependencyDeferred) ? [] : [
           failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
@@ -7100,6 +7162,7 @@ async function tick({ dryRun = false } = {}) {
           writeCurrentTick();
         }
       }
+      if (routingDeferred) retainCurrentRouteFailures(active, failures);
       if (!finalUsageExhausted) {
         try {
           await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, failures, new Set([dispatchScope]), active.envValues, launcherEvidenceOptions(active, { dryRun: false }));
@@ -7162,7 +7225,15 @@ async function tick({ dryRun = false } = {}) {
         const handoffRouting = handoffRepoRoutingDecision(pick, issue, active.repoPairs || pick.repoPairs || []);
         if (!handoffRouting.ok) {
           const routingScope = `${nextSweep}:routing`;
-          const event = failureEventFor(pick.anchorPath, pick.config, routingScope, "repo-routing", pick.issueIdentifier, handoffRouting.message);
+          const event = failureEventFor(
+            pick.anchorPath,
+            pick.config,
+            routingScope,
+            "repo-routing",
+            routeFailureTarget({ sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath, projectId: pick.config.projectId, sweep: nextSweep, issueIdentifier: pick.issueIdentifier }),
+            handoffRouting.message,
+            { sourceWorkspace: pick.sourceAnchorPath || pick.anchorPath },
+          );
           active.failures.push(event);
           logFor(pick.anchorPath, nextSweep, `handoff-skip ${pick.issueIdentifier}: ${event.message}`);
           try { await reconcileFailureTodos(active.apiKey, pick.config, pick.anchorPath, [event], new Set(), active.envValues, launcherEvidenceOptions(active, { dryRun: false })); } catch (error) { recordLocalFailure(pick.anchorPath, pick.config, routingScope, "failure-todo", pick.issueIdentifier, error.message); }
@@ -7424,8 +7495,9 @@ async function tick({ dryRun = false } = {}) {
               failedPick.config,
               `${failedPick.sweep}:routing`,
               "repo-routing",
-              failedPick.issueIdentifier,
+              routeFailureTarget({ sourceWorkspace: failedPick.sourceAnchorPath || failedPick.anchorPath, projectId: failedPick.config.projectId, sweep: failedPick.sweep, issueIdentifier: failedPick.issueIdentifier }),
               failure.message || `${failedPick.issueIdentifier} repository route changed during admission`,
+              { sourceWorkspace: failedPick.sourceAnchorPath || failedPick.anchorPath },
             )),
             onSafetyInvariant: ({ card, evidence }) => appendLauncherEvidenceRun({
               sourceAnchorPath: demand.sourceAnchorPath || demand.anchorPath,
@@ -7523,6 +7595,8 @@ async function tick({ dryRun = false } = {}) {
       anchors.push(active);
       activeByAnchor.set(managedAnchorPath, active);
     }
+    const routeFailureWorkspaces = anchors.map((active) => ({ sourceWorkspace: active.sourceAnchorPath, projectId: active.config.projectId }));
+    for (const active of anchors) active.routeFailureWorkspaces = routeFailureWorkspaces;
     attachUpdateFailuresToAnchors(anchors, updateFailures, {
       eventFor: (active, failure) => failureEventFor(active.anchorPath, active.config, failure.scope, failure.kind, failure.stableTarget, failure.message),
       onUnmapped: (failure) => recordLocalFailure(failure.anchorPath || "_", null, failure.scope, failure.kind, failure.stableTarget, failure.message),
@@ -7538,7 +7612,7 @@ async function tick({ dryRun = false } = {}) {
       const candidates = [];
       for (const active of anchors) {
         const { anchorPath, config, apiKey, envValues } = active;
-        const recordFailure = (scope, kind, stableTarget, message) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+        const recordFailure = (scope, kind, stableTarget, message, extra = {}) => active.failures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message, extra));
         const scheduledStates = [...new Set(SWEEPS.flatMap((sweep) => SWEEP_CFG[sweep].states))];
         const scheduledPass = await fetchScheduledPassCards(apiKey, config.teamKey, config.projectId, scheduledStates);
         const scheduledCardsByState = scheduledPass.admissionByState;
@@ -7675,8 +7749,18 @@ async function tick({ dryRun = false } = {}) {
           const routed = routeCardsByRepo(stageActionable, config, active.repoPairs);
           active.checkedScopes.add(`${sweep}:routing`);
           for (const failure of routed.failures) {
-            recordFailure(`${sweep}:routing`, "repo-routing", failure.identifier, failure.message);
+            recordFailure(
+              `${sweep}:routing`,
+              "repo-routing",
+              routeFailureTarget({ sourceWorkspace: active.sourceAnchorPath, projectId: config.projectId, sweep, issueIdentifier: failure.identifier }),
+              failure.message,
+              { sourceWorkspace: active.sourceAnchorPath },
+            );
             logFor(anchorPath, sweep, `repo-routing-skip ${failure.identifier}: ${failure.message}`);
+          }
+          for (const card of routed.cards) {
+            const target = routeFailureTarget({ sourceWorkspace: active.sourceAnchorPath, projectId: config.projectId, sweep, issueIdentifier: card.identifier });
+            if (target) active.recoveredTargets.add(target);
           }
           const actionable = routed.cards;
           // A retained claim is normally invisible to actionableCards(). Consult
