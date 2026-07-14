@@ -1614,6 +1614,7 @@ export function withCardDispatchEnv(pick, parentRunId, childIndex = 0, options =
       AUTO_SWEEP_SCREENSHOT_DIR: paths.screenshotDir,
       AUTO_SWEEP_BROWSER_PROFILE_DIR: paths.browserProfileDir,
       AUTO_SWEEP_OUTCOME_PATH: paths.outcomePath,
+      AUTO_SWEEP_CHILD_OUTCOME_VERSION: "1",
       AUTO_SWEEP_LEARNING_EVENTS_PATH: paths.learningEventsPath,
     },
   };
@@ -2461,7 +2462,7 @@ export function resumeResolutionNoticeNeeded(card, cfg, decision) {
 }
 
 export function classifyCapacityOutcome(outcome, logTail = "") {
-  if (!outcome || ["success", "dependency-deferred", "repo-routing-deferred"].includes(outcome.kind)) return null;
+  if (!outcome || ["success", "dependency-deferred", "repo-routing-deferred", "terminal-failed"].includes(outcome.kind)) return null;
   const text = String(logTail).slice(-16_384).toLowerCase();
   if (/\b(429|quota|rate limit|too many requests)\b/.test(text)) return "quota";
   if (/model.{0,32}(capacity|overloaded|unavailable)|capacity exceeded|server overloaded/.test(text)) return "model-capacity";
@@ -5667,7 +5668,7 @@ export async function reconcileOwnedDispatchClaim(apiKey, result, runtime, {
   const routingDeferred = result.kind === "repo-routing-deferred";
   const successfulCompletion = result.kind === "success";
   const interrupted = result.kind === "interrupted";
-  const terminalFailure = result.kind === "exit" || result.kind === "signal";
+  const terminalFailure = result.kind === "exit" || result.kind === "signal" || result.kind === "terminal-failed";
   if (!startFailure && !dependencyDeferred && !routingDeferred && !successfulCompletion && !interrupted && !terminalFailure) {
     return { attempted: false, released: false, reasonKind: null };
   }
@@ -6047,7 +6048,7 @@ export function refreshAnchorSkills(anchor, kit, marker) {
 }
 
 export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = {}) {
-  if (!reg.autoUpdate || !reg.kitPath) return;
+  if (!reg.autoUpdate || !reg.kitPath) return { changed: false };
   const updateLog = (msg) => writeLogAt(stateDir, "_", "_", msg);
   const kit = reg.kitPath;
   if (reg.kitRemote) {
@@ -6057,7 +6058,7 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
       const safeMessage = sanitizeFailureMessage(msg);
       updateLog(`update: ${safeMessage}`);
       onFailure(null, "update", "kit-remote", kit, safeMessage);
-      return;
+      return { changed: false };
     }
   }
   const before = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
@@ -6067,7 +6068,7 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
     const safeMessage = sanitizeFailureMessage(msg);
     updateLog(`update: ${safeMessage}`);
     onFailure(null, "update", "kit-fetch", kit, safeMessage);
-    return;
+    return { changed: false };
   }
   const merge = git(kit, ["merge", "--ff-only", `origin/${reg.kitRef}`], { allowFail: true });
   if (merge.status !== 0) {
@@ -6075,12 +6076,13 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
     const safeMessage = sanitizeFailureMessage(msg);
     updateLog(`update: ${safeMessage}`);
     onFailure(null, "update", "kit-fast-forward", kit, safeMessage);
-    return;
+    return { changed: false };
   }
   const after = git(kit, ["rev-parse", "HEAD"], { allowFail: true }).out;
   if (before !== after) {
     const diff = git(kit, ["log", "--oneline", `${before}..${after}`], { allowFail: true }).out;
     updateLog(`update: kit ${before?.slice(0, 8)}..${after?.slice(0, 8)}\n${diff}`);
+    return { changed: true };
   }
   const marker = kitMarker(kit);
   for (const anchor of reg.repos) {
@@ -6098,6 +6100,7 @@ export function runUpdate(reg, onFailure = () => {}, { stateDir = STATE_DIR } = 
       onFailure(anchor, "update", "skills-refresh", marker, safeMessage);
     }
   }
+  return { changed: false };
 }
 
 // ── IO: dispatch ─────────────────────────────────────────────────────────────
@@ -6282,8 +6285,20 @@ function childDeferredOutcomeForPick(pick = {}) {
   if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
   try {
     const value = JSON.parse(fs.readFileSync(pick.outcomePath, "utf8"));
-    if (value?.version !== 1 || !["dependency-deferred", "repo-routing-deferred"].includes(value?.kind)) return null;
+    if (value?.version !== 1 || !["dependency-deferred", "repo-routing-deferred", "terminal-failed"].includes(value?.kind)) return null;
     if (value.issueIdentifier && value.issueIdentifier !== pick.issueIdentifier) return null;
+    if (value.kind === "terminal-failed") {
+      if (value.issueIdentifier !== pick.issueIdentifier || value.reason !== "verification-contract-gate") return null;
+      return {
+        kind: "terminal-failed",
+        code: "VERIFICATION_CONTRACT_GATE",
+        exitCode: 1,
+        signal: null,
+        path: pick.runtimeExecutable || null,
+        cwd: pick.anchorPath || null,
+        reason: value.reason,
+      };
+    }
     if (value.kind === "repo-routing-deferred") {
       const routeExitCode = Number(value.routeExitCode);
       if (![2, 3].includes(routeExitCode)) return null;
@@ -6516,8 +6531,10 @@ function writeRunRecord({
 
 function dispatchEnvironment(anchorPath, pick = {}) {
   const envFile = path.join(anchorPath, ".env");
+  const inherited = { ...process.env };
+  delete inherited.AUTO_SWEEP_CHILD_OUTCOME_VERSION;
   return {
-    ...process.env,
+    ...inherited,
     ...parseEnv(fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : ""),
     ...(pick.childEnv || {}),
   };
@@ -7322,7 +7339,11 @@ async function tick({ dryRun = false } = {}) {
     const recordUpdateFailure = (anchorPath, scope, kind, stableTarget, message) => {
       updateFailures.push({ anchorPath, scope, kind, stableTarget, message });
     };
-    if (!dryRun) runUpdate(reg, recordUpdateFailure);
+    const update = !dryRun ? runUpdate(reg, recordUpdateFailure) : { changed: false };
+    if (update.changed) {
+      log("kit changed; ending this tick before skill refresh or dispatch");
+      return { candidates: [], selectedBatch: [], dispatched: false, updateChanged: true };
+    }
     rotateLogs();
 
     // Resolve active anchors: registered ∩ auto-sweep-labeled. One workspace's
@@ -8007,6 +8028,26 @@ async function cmdClaimMigrationReset(args = []) {
   console.log(JSON.stringify(result, null, 2));
 }
 
+function cmdChildOutcome(args = []) {
+  const [kind, reason] = args;
+  if (args.length !== 2 || kind !== "terminal-failed" || reason !== "verification-contract-gate") {
+    throw new Error("usage: child-outcome terminal-failed verification-contract-gate");
+  }
+  const outcomePath = process.env.AUTO_SWEEP_OUTCOME_PATH;
+  const issueIdentifier = process.env.AUTO_SWEEP_ISSUE;
+  if (!outcomePath || !issueIdentifier) throw new Error("child outcome requires AUTO_SWEEP_OUTCOME_PATH and AUTO_SWEEP_ISSUE");
+  const record = { version: 1, kind, issueIdentifier, reason };
+  const encoded = JSON.stringify(record);
+  try {
+    fs.writeFileSync(outcomePath, encoded, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    if (fs.readFileSync(outcomePath, "utf8") !== encoded) throw new Error("child outcome conflicts with the existing record");
+  }
+  if (fs.readFileSync(outcomePath, "utf8") !== encoded) throw new Error("child outcome write was not verified");
+  console.log(encoded);
+}
+
 export function learningStatusReport({ registry = readRegistry(), now = new Date().toISOString() } = {}) {
   const resolved = resolveRegisteredLearningWorkspaces(registry);
   const indexed = readLearningRunIndex(LEARNING_RUNS_DIR, { capturedThrough: now });
@@ -8132,11 +8173,12 @@ async function main() {
     case "doctor": return cmdDoctor(args);
     case "claim-migration-status": return cmdClaimMigrationStatus(args);
     case "claim-migration-reset": return cmdClaimMigrationReset(args);
+    case "child-outcome": return cmdChildOutcome(args);
     case "learning-event": return cmdLearningEvent(args);
     case "learning-status": return cmdLearningStatus(args);
     case "learning-run": return cmdLearningRun(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | claim-migration-reset <anchor> <Issue> <Claim> <Target> | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | claim-migration-reset <anchor> <Issue> <Claim> <Target> | child-outcome terminal-failed verification-contract-gate | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }

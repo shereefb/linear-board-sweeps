@@ -3722,6 +3722,7 @@ test("card run paths/env are isolated per issue and slot", () => {
   assert.equal(pick.childEnv.AUTO_SWEEP_CLAIM_DECLARATION, "decl-6");
   assert.equal(pick.childEnv.AUTO_SWEEP_CARD_RUN_ID, pick.cardRunId);
   assert.equal(pick.childEnv.AUTO_SWEEP_SWEEP, "dev");
+  assert.equal(pick.childEnv.AUTO_SWEEP_CHILD_OUTCOME_VERSION, "1");
   assert.equal(pick.childEnv.AUTO_SWEEP_LEARNING_EVENTS_PATH, pick.learningEventsPath);
   assert.match(pick.learningEventsPath, /learning-events-[a-f0-9]{16}\.jsonl$/);
   assert.equal(pick.globalRunsDir, globalRunsDir);
@@ -6038,6 +6039,28 @@ test("dispatchAsync: child repository outcome prevents a superficially successfu
   assert.equal(outcome.code, "REPO_ROUTE_CHANGED");
   assert.equal(outcome.routing.reason, "route-changed");
 });
+
+test("dispatchAsync: a verified terminal child outcome overrides a successful runtime and capacity-looking logs", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-terminal-outcome-"));
+  const outcomePath = path.join(anchorPath, "terminal-outcome.json");
+  const child = pipedDispatchChild(504);
+  const run = dispatchAsync(anchorPath, "spec", {}, {
+    issueIdentifier: "COD-295", logDir: path.join(anchorPath, "logs"), outcomePath, runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: () => child });
+  child.stdout.end("quota rate limit model overloaded\n");
+  fs.writeFileSync(outcomePath, JSON.stringify({
+    version: 1,
+    kind: "terminal-failed",
+    issueIdentifier: "COD-295",
+    reason: "verification-contract-gate",
+  }));
+  child.close(0);
+  const outcome = await run;
+  assert.equal(outcome.kind, "terminal-failed");
+  assert.equal(outcome.code, "VERIFICATION_CONTRACT_GATE");
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(classifyCapacityOutcome(outcome, "quota rate limit model overloaded"), null);
+});
 test("runtimeDisabledByOutcome: only executable disappearance disables a runtime lane", () => {
   const base = { path: "/resolved/codex", cwd: "/workspace" };
   const outcomes = [
@@ -7449,7 +7472,7 @@ test("doctorReport: distinguishes source advisory dirtiness from managed blockin
   assert.match(formatDoctorReport(report), /dispatch: BLOCKED/);
 });
 
-function runIsolatedWatcherCli(args, { registry = null, prepare = null } = {}) {
+function runIsolatedWatcherCli(args, { registry = null, prepare = null, env = {} } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-watcher-cli-"));
   const preparedRegistry = prepare ? prepare(home) : registry;
   if (preparedRegistry) {
@@ -7459,11 +7482,33 @@ function runIsolatedWatcherCli(args, { registry = null, prepare = null } = {}) {
   }
   const script = fileURLToPath(new URL("../scripts/linear-watch.mjs", import.meta.url));
   const result = spawnProcessSync(process.execPath, [script, ...args], {
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, ...env, HOME: home },
     encoding: "utf8",
   });
   return { ...result, home };
 }
+
+test("child-outcome writes only the exact idempotent terminal-failure envelope", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-child-outcome-"));
+  const outcomePath = path.join(home, "outcome.json");
+  const env = { AUTO_SWEEP_OUTCOME_PATH: outcomePath, AUTO_SWEEP_ISSUE: "COD-295" };
+  const first = runIsolatedWatcherCli(["child-outcome", "terminal-failed", "verification-contract-gate"], { env });
+  assert.equal(first.status, 0, first.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(outcomePath, "utf8")), {
+    version: 1,
+    kind: "terminal-failed",
+    issueIdentifier: "COD-295",
+    reason: "verification-contract-gate",
+  });
+  const repeat = runIsolatedWatcherCli(["child-outcome", "terminal-failed", "verification-contract-gate"], { env });
+  assert.equal(repeat.status, 0, repeat.stderr);
+  const conflictingIssue = runIsolatedWatcherCli(["child-outcome", "terminal-failed", "verification-contract-gate"], {
+    env: { ...env, AUTO_SWEEP_ISSUE: "COD-296" },
+  });
+  assert.equal(conflictingIssue.status, 1);
+  const invalidReason = runIsolatedWatcherCli(["child-outcome", "terminal-failed", "anything-else"], { env });
+  assert.equal(invalidReason.status, 1);
+});
 
 function prepareCredentiallessLearningWorkspace(home) {
   const anchor = path.join(home, "app");

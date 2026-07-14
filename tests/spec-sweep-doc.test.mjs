@@ -77,3 +77,31 @@ test("scope closure preserves evidence and fails the terminal gate closed", () =
   assert.match(body, /procedural[^]*independent reviewer/i);
   assert.match(body, /terminal review gate[^]*(absent|unmapped|contradictory|unresolved)/i);
 });
+
+test("spec-sweep runs a launcher-source exact-pair verification gate before landing", () => {
+  const body = read(canonicalPath);
+  const reassessAt = body.indexOf("Reassess review depth");
+  const gateAt = body.indexOf("launcher-source verification-contract validator");
+  const landAt = body.indexOf("## 3. Land it");
+  assert.ok(reassessAt < gateAt && gateAt < landAt);
+  assert.match(body, /node "\$AUTO_SWEEP_KIT_PATH\/scripts\/verification-contract\.mjs" validate[^]*--spec "\$SPEC_PATH"[^]*--plan "\$PLAN_PATH"/i);
+  assert.match(body, /attended[^]*configured anchor[^]*regular readable[^]*scripts\/verification-contract\.mjs/i);
+  assert.match(body, /exit 0[^]*readable[^]*ok:\s*true/i);
+  assert.match(body, /nonzero[^]*invalid JSON[^]*ok !== true[^]*signal[^]*missing helper[^]*unreadable artifact/i);
+  assert.match(body, /same exact paths[^]*repair[^]*rerun/i);
+});
+
+test("spec-sweep repairs verification defects without weakening downstream evidence", () => {
+  const body = read(canonicalPath);
+  assert.match(body, /review\/test-gap[^]*repair[^]*affected review[^]*rerun/i);
+  assert.match(body, /owner-only[^]*blocked:open-questions/i);
+  assert.match(body, /close\/release[^]*child-outcome terminal-failed verification-contract-gate[^]*without a card comment[^]*human-block/i);
+  assert.match(body, /Dev[^]*validator[^]*missing-design/i);
+});
+
+test("spec-sweep defers before material work without launcher outcome capability", () => {
+  const body = read(canonicalPath);
+  assert.match(body, /AUTO_SWEEP_CHILD_OUTCOME_VERSION=1[^]*immediately after[^]*dependency[^]*routing preflight/i);
+  assert.match(body, /clean\+pushed[^]*dependency-deferred[^]*launcher-capability[^]*without closing the claim/i);
+  assert.match(body, /no Linear dependency[^]*human-block label/i);
+});

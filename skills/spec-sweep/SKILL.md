@@ -92,6 +92,18 @@ Process **at most 3 cards per run**. The queue drains over successive runs. If "
 10. **Apply the terminal review gate.** Every review required by the final tier and every materially applicable specialized lens must be clear, the spec and plan must agree, and there must be no unresolved decisions. Fail the terminal review gate when a required declaration, inventory, or traceability row is absent, unmapped, contradictory, or unresolved. Doc tests protect canonical instructions; they do not prove arbitrary artifacts semantically complete. A skipped review needs a recorded rationale. If the gate fails, keep the card in Spec and follow §4 instead of landing it.
 11. **Update canonical architecture/schema docs** per `config.canonicalDocs`. If the config names an `architecture` and/or `schema` doc, and the spec changes data shape / subsystems, update those docs to reflect the design, marking not-yet-built items as *planned* (e.g. "(planned, <PREFIX>-###)"). Add a short "Schema & architecture impact" summary to the spec itself. If `config.canonicalDocs.schema` is null (single-repo project), just keep the architecture doc (e.g. `CLAUDE.md`) accurate.
 
+12. **Apply the launcher-source verification-contract validator before landing.** In scheduled mode, require `AUTO_SWEEP_CHILD_OUTCOME_VERSION=1` immediately after dependency and routing preflight and before material work. If it is absent, leave the card in Spec: preserve the exact claim and WIP unless Git proves the worktree clean+pushed; for clean+pushed only, exclusively create or verify the issue-bound v1 `dependency-deferred` envelope with `reason:"launcher-capability"` and no blockers, without closing the claim, then stop so old recovery owns its single release. This transport-only deferral creates no Linear dependency and no human-block label.
+
+    After final review/contract/canonical-doc reconciliation and before landing, validate the final exact artifact pair. Scheduled runs use the regular readable launcher-source verification-contract validator through Node:
+
+    ```bash
+    node "$AUTO_SWEEP_KIT_PATH/scripts/verification-contract.mjs" validate --spec "$SPEC_PATH" --plan "$PLAN_PATH"
+    ```
+
+    Attended runs may use only the configured anchor/current repository's regular readable `scripts/verification-contract.mjs` when the kit path is absent. Accept only exit 0 plus readable JSON with `ok: true`. Nonzero status, invalid JSON, `ok !== true`, a signal, a missing helper, or an unreadable artifact all fail closed. For an author-owned defect, emit `review/test-gap`; use the same exact paths for repair, reconcile every affected review, and rerun. Owner-only information follows the existing `blocked:open-questions` path.
+
+    For a scheduled machine failure, complete-read ownership, close/release the exact claim, verify the close, then run `node "$AUTO_SWEEP_KIT_PATH/scripts/linear-watch.mjs" child-outcome terminal-failed verification-contract-gate` and verify the issue-bound result. Stop without a card comment or human-block label; launcher reconciliation owns deduplicated retry evidence. Never weaken or skip Dev's independent validator and `missing-design` defense.
+
 ## 3. Land it (docs only; auto-merge to main)
 
 - Write spec → `<config.specsDir>/YYYY-MM-DD-<prefix-key>-<topic>-design.md` and plan → `<config.plansDir>/…-implementation.md` in the affected repo.
