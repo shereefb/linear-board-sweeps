@@ -355,9 +355,9 @@ test("learning evidence snapshots freeze capturedThrough and report partial cove
   });
   assert.deepEqual(snapshot.runRecords.map((record) => record.cardRunId), ["run-before"]);
   assert.deepEqual(snapshot.events.map((event) => event.eventId), [before.eventId]);
-  assert.equal(snapshot.observations.length, 2);
+  assert.equal(snapshot.observations.length, 1);
   assert.equal(snapshot.coverage.complete, false);
-  assert.equal(snapshot.coverage.gaps.length, 2);
+  assert.equal(snapshot.coverage.gaps.length, 1);
   assert.equal(snapshot.capturedThrough, "2026-07-10T12:00:00.000Z");
 });
 
@@ -711,7 +711,9 @@ test("throughput detectors require twenty relevant runs and both absolute and re
 
 test("coverage downgrades confidence and detector upgrades converge on a stable version-independent root", () => {
   const evidence = repeat("dispatch-failure", 2).reverse();
-  const v1 = runLearningDetectors(detectorSnapshot(evidence), { ...detectorConfig, enabledDetectors: ["repeated-dispatch-failure"] })[0];
+  const v1 = runLearningDetectors(detectorSnapshot(evidence), {
+    ...detectorConfig, enabledDetectors: ["repeated-dispatch-failure"], detectorVersions: { "repeated-dispatch-failure": "v1" },
+  })[0];
   const v2 = runLearningDetectors(detectorSnapshot(evidence.map((item) => ({ ...item, summary: "changed prose", hostDisplayName: "new host" }))), {
     ...detectorConfig,
     enabledDetectors: ["repeated-dispatch-failure"],
@@ -961,6 +963,37 @@ test("outcome evaluation recomputes its scoped post-Done metric instead of reusi
   ])).status, "regression");
 });
 
+test("legacy dispatch evaluation counts corrected failures and requires complete contributor exposure for zero", () => {
+  const contributors = [
+    { sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app" },
+    { sourceWorkspace: "/workspace/b", projectId: "project-b", repoEntry: "worker" },
+  ];
+  const evaluation = {
+    rootFingerprint: "legacy-dispatch", generation: 0,
+    completedAt: "2026-07-15T00:00:00.000Z", windowEndsAt: "2026-07-22T00:00:00.000Z",
+    detectorId: "repeated-dispatch-failure", signal: "dispatch-failure", metric: "dispatchFailureCount", aggregation: "count",
+    baseline: 5, minimumChange: 5, expectedDirection: "decrease",
+    semanticKey: JSON.stringify({ version: 1, key: "terminal:failed", ownership: { scope: "core", contributors } }),
+    ownership: { scope: "core", contributors }, activeGeneration: null,
+  };
+  const snapshot = (observations, runRecords = []) => ({
+    capturedThrough: "2026-07-22T00:00:00.000Z", observations, runRecords,
+    qualifiedFindings: [], coverage: { complete: true, gaps: [] },
+  });
+  const correctedFailure = {
+    evidenceId: "corrected-a", occurredAt: "2026-07-20T00:00:00.000Z", signal: "dispatch-failure", fingerprint: "v2-cause-a",
+    sourceWorkspace: "/workspace/a", projectId: "project-a", repoEntry: "app",
+  };
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([correctedFailure])).status, "no-measurable-change");
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([])).status, "inconclusive-evidence");
+  const healthyRun = (contributor, index) => ({
+    cardRunId: `run-${index}`, issueIdentifier: `COD-${index}`, ...contributor, sweep: "dev", runtime: "codex",
+    startedAt: "2026-07-20T00:00:00.000Z", endedAt: "2026-07-20T00:10:00.000Z",
+    outcome: { kind: "success", exitCode: 0 },
+  });
+  assert.equal(evaluateLearningOutcome(evaluation, snapshot([], contributors.map(healthyRun))).status, "verified-improvement");
+});
+
 test("recurrence requires fresh independent qualified evidence, permits one active generation, and caps at three", () => {
   const fresh = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["post-1"], occurrences: [{ id: "post-1", occurredAt: "2026-07-25T00:00:00.000Z" }], lastSeenAt: "2026-07-25T00:00:00.000Z" });
   const stale = aggregateFixture({ rootFingerprint: "root-1", occurrenceIds: ["before-1"], occurrences: [{ id: "before-1", occurredAt: "2026-07-14T00:00:00.000Z" }], lastSeenAt: "2026-07-14T00:00:00.000Z" });
@@ -1006,7 +1039,7 @@ test("production-shaped run records and structured events reach all 15 detectors
       ];
       const launcherEvidence = [];
       if (week === 2 && index < 2) {
-        learningEvents.unshift(eventFor(week, index, "terminal", "failed"));
+        launcherEvidence.push({ type: "dispatch-failure", occurredAt: new Date(weekStarts[week] + index * 60_000 + 1_500).toISOString(), key: "classified-dispatch-cause", stage: "dev", subsystem: "launcher", reason: "dispatch-exit" });
         launcherEvidence.push({ type: "stale-claim", occurredAt: new Date(weekStarts[week] + index * 60_000 + 2_000).toISOString(), key: "dev-launcher", stage: "dev", subsystem: "launcher" });
         launcherEvidence.push({ type: "machine-correctable-poison-card", occurredAt: new Date(weekStarts[week] + index * 60_000 + 3_000).toISOString(), key: "auto-reap" });
       }
@@ -1119,6 +1152,45 @@ test("child events cannot forge launcher-owned safety proof and non-detector eve
   const ignored = buildLearningEvidenceSnapshot({ capturedThrough: "2026-07-10T12:01:00.000Z", events: [advanced] });
   assert.equal(ignored.observations.length, 0);
   assert.equal(ignored.coverage.complete, true);
+});
+
+test("dispatch reliability trusts typed launcher evidence rather than child terminal failures", () => {
+  const terminal = buildLearningEvent({ kind: "terminal", category: "failed", summary: "QA gate stopped work" }, TRUSTED_ENV, {
+    now: () => "2026-07-10T11:00:00.000Z",
+  });
+  const baseRun = {
+    cardRunId: TRUSTED_ENV.AUTO_SWEEP_CARD_RUN_ID,
+    issueIdentifier: TRUSTED_ENV.AUTO_SWEEP_ISSUE,
+    sourceWorkspace: TRUSTED_ENV.AUTO_SWEEP_SOURCE_ANCHOR,
+    projectId: "project-a", repoEntry: "app", sweep: "dev",
+    startedAt: "2026-07-10T10:00:00.000Z", endedAt: "2026-07-10T11:00:00.000Z",
+    outcome: { kind: "success", exitCode: 0, success: true },
+  };
+  const snapshot = buildLearningEvidenceSnapshot({
+    capturedThrough: DETECTOR_NOW,
+    runRecords: [
+      { ...baseRun, learningEvents: [terminal] },
+      {
+        ...baseRun,
+        cardRunId: "launcher-dispatch-1",
+        issueIdentifier: "COD-144",
+        launcherEvidence: [{
+          type: "dispatch-failure", occurredAt: "2026-07-10T11:30:00.000Z", key: "cause-a",
+          stage: "dev", subsystem: "launcher", reason: "exit", summary: "classified failure",
+        }],
+      },
+    ],
+  });
+  const dispatch = snapshot.observations.filter((item) => item.signal === "dispatch-failure");
+  assert.equal(dispatch.length, 1);
+  assert.equal(dispatch[0].fingerprint, "cause-a");
+  assert.equal(dispatch[0].runId, "launcher-dispatch-1");
+  assert.equal(runLearningDetectors(snapshot, { ...detectorConfig, enabledDetectors: ["repeated-dispatch-failure"] }).length, 0);
+});
+
+test("only repeated dispatch failure defaults to detector version v2", () => {
+  assert.equal(LEARNING_DETECTORS.find((detector) => detector.id === "repeated-dispatch-failure")?.version, "v2");
+  assert.ok(LEARNING_DETECTORS.filter((detector) => detector.id !== "repeated-dispatch-failure").every((detector) => detector.version === "v1"));
 });
 
 test("semantic detectors cluster compatible evidence and enforce declared time windows", () => {

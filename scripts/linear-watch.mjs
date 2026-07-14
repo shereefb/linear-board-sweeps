@@ -1967,6 +1967,52 @@ export function failureFingerprint(event) {
   return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
+// Learning clusters operational causes, not a particular card, filesystem path,
+// or error message. Keep the Todo fingerprint above unchanged: it intentionally
+// has different per-work ownership semantics.
+export function dispatchLearningKey(facts = {}) {
+  const identity = {
+    sourceWorkspace: String(facts.sourceWorkspace || ""),
+    projectId: String(facts.projectId || ""),
+    repoEntry: String(facts.repoEntry || ""),
+    sweep: String(facts.sweep || ""),
+    runtime: String(facts.runtime || ""),
+    model: String(facts.model || ""),
+    failureKind: String(facts.failureKind || ""),
+    outcomeKind: String(facts.outcomeKind || ""),
+    code: facts.code == null ? null : String(facts.code),
+    exitCode: Number.isInteger(facts.exitCode) ? facts.exitCode : null,
+    signal: facts.signal == null ? null : String(facts.signal),
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
+export function dispatchLearningEvidenceDecision({
+  sourceWorkspace, projectId, repoEntry, sweep, runtime, model,
+  outcome = {}, capacityDeferred = false, providerExhausted = false,
+} = {}) {
+  if (capacityDeferred || providerExhausted) return null;
+  const outcomeKind = outcome?.kind;
+  let failureKind = null;
+  if (["executable-enoent", "cwd-enoent", "spawn-error"].includes(outcomeKind)) failureKind = "dispatch-start";
+  else if (outcomeKind === "dispatch-io-error") failureKind = "dispatch-io";
+  else if (outcomeKind === "exit" && Number.isInteger(outcome.exitCode) && outcome.exitCode !== 0) failureKind = "dispatch-exit";
+  else if (outcomeKind === "signal" && outcome.signal) failureKind = "dispatch-signal";
+  if (!failureKind || !sourceWorkspace || !projectId || !repoEntry || !sweep || !runtime) return null;
+  const key = dispatchLearningKey({
+    sourceWorkspace, projectId, repoEntry, sweep, runtime, model,
+    failureKind, outcomeKind, code: outcome.code, exitCode: outcome.exitCode, signal: outcome.signal,
+  });
+  return {
+    type: "dispatch-failure",
+    key,
+    stage: sweep,
+    subsystem: "launcher",
+    reason: failureKind,
+    summary: `Launcher classified ${failureKind}.`,
+  };
+}
+
 function escapeRegExp(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -6832,14 +6878,14 @@ async function tick({ dryRun = false } = {}) {
     const capacityDeferredKeys = new Set();
     const refillBudget = { remaining: 0 };
     observationStore.sync();
-    const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message) => ({
+    const failureEventFor = (anchorPath, config, scope, kind, stableTarget, message, envValues = []) => ({
       anchorPath,
       anchorSlug: anchorSlug(anchorPath),
       projectId: config?.projectId || "unknown",
       scope,
       kind,
       stableTarget,
-      message: sanitizeFailureMessage(message),
+      message: sanitizeFailureMessage(message, envValues),
       seenAt: new Date().toISOString(),
     });
     const launcherEvidenceOptions = (active, options = {}) => ({
@@ -6929,6 +6975,33 @@ async function tick({ dryRun = false } = {}) {
         : (result.kind === "success" || dependencyDeferred) ? [] : [
           failureEventFor(pick.anchorPath, pick.config, dispatchScope, startFailure ? "dispatch-start" : "dispatch-exit", stableTarget, `${pick.sweep}-sweep${pick.issueIdentifier ? ` for ${pick.issueIdentifier}` : ""} via ${runtime}${fallbackFailure ? ` ${fallbackFailure}` : ""} ended ${result.kind}${detail === null ? "" : ` (${detail})`}`),
         ];
+      const learningEvidence = dispatchLearningEvidenceDecision({
+        sourceWorkspace: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
+        projectId: pick.config?.projectId,
+        repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
+        sweep: pick.sweep,
+        runtime: runtimeCfg.runtime || "codex",
+        model: runtimeCfg.model,
+        outcome: result,
+        capacityDeferred: Boolean(capacityKind),
+        providerExhausted: finalUsageExhausted,
+      });
+      if (learningEvidence) {
+        try {
+          appendLauncherEvidenceRun({
+            sourceAnchorPath: pick.sourceAnchorPath || active.sourceAnchorPath || pick.anchorPath,
+            config: pick.config,
+            repoPairs: active.repoPairs,
+            card: { identifier: pick.issueIdentifier },
+            repoEntry: pick.repoRoute?.repoEntry || pick.config?.repos?.[0],
+            sweep: pick.sweep,
+            evidence: learningEvidence,
+            occurredAt: result.completedAt || new Date().toISOString(),
+          });
+        } catch (error) {
+          recordLocalFailure(pick.anchorPath, pick.config, dispatchScope, "learning-evidence-append", stableTarget, error?.message || error, active.envValues);
+        }
+      }
       if (runtimeDisabledByOutcome(result)) {
         const runtimeName = runtimeCfg.runtime || "codex";
         const key = result.finalRuntimeLaneKey || runtimeLaneKey(pick.anchorPath, runtimeName, os.hostname());
@@ -7136,8 +7209,8 @@ async function tick({ dryRun = false } = {}) {
       }
       return [];
     };
-    const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message) => {
-      localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message));
+    const recordLocalFailure = (anchorPath, config, scope, kind, stableTarget, message, envValues = []) => {
+      localFailures.push(failureEventFor(anchorPath, config, scope, kind, stableTarget, message, envValues));
       writeCurrentTick();
     };
     const writeCurrentTick = () => {

@@ -51,7 +51,7 @@ import {
   blockingLabelsForIssue, normalizeBlockedIssue, labelIdsAfterRemoving,
   claimMigrationSummary,
   buildUnblockAuditComment, resolutionTextFromArgs, resolveBlockedIssue,
-  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage,
+  FAILURE_TODO_TAG, failureFingerprint, sanitizeFailureMessage, dispatchLearningKey, dispatchLearningEvidenceDecision,
   failureTodoTitle, failureTodoBody, failureTodoDecisions, reconcileFailureTodos, healthStatus, atomicWriteJson, finalizeTickState,
   rotateLearningRunIndexes,
   rotateLearningEventFiles,
@@ -6615,6 +6615,36 @@ test("failureFingerprint: stable same input, different target differs", () => {
   assert.equal(a, b);
   assert.notEqual(a, c);
   assert.match(a, /^[a-f0-9]{16}$/);
+});
+
+test("dispatch learning keys cluster classified causes without leaking card, path, or prose", () => {
+  const base = {
+    sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", sweep: "dev",
+    runtime: "codex", model: "gpt-5", failureKind: "dispatch-exit", outcomeKind: "exit", code: null, exitCode: 7, signal: null,
+  };
+  const first = dispatchLearningKey({ ...base, issueIdentifier: "COD-1", worktreePath: "/tmp/COD-1", message: "token secret-a" });
+  const same = dispatchLearningKey({ ...base, issueIdentifier: "COD-2", worktreePath: "/tmp/COD-2", message: "token secret-b" });
+  const changed = dispatchLearningKey({ ...base, exitCode: 8 });
+  assert.equal(first, same);
+  assert.notEqual(first, changed);
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(first, /COD|tmp|secret/);
+});
+
+test("dispatch learning admission accepts only parent-classified operational failures", () => {
+  const base = {
+    sourceWorkspace: "/source/app", projectId: "project-1", repoEntry: "app", sweep: "dev", runtime: "codex", model: "gpt-5",
+  };
+  const admitted = dispatchLearningEvidenceDecision({ ...base, outcome: { kind: "exit", exitCode: 7, code: null, signal: null } });
+  assert.equal(admitted?.type, "dispatch-failure");
+  assert.equal(admitted?.reason, "dispatch-exit");
+  assert.match(admitted?.key || "", /^[a-f0-9]{64}$/);
+  for (const outcome of [
+    { kind: "success", exitCode: 0 }, { kind: "dependency-deferred" }, { kind: "repo-routing-deferred" },
+    { kind: "interrupted", signal: "SIGINT" },
+  ]) assert.equal(dispatchLearningEvidenceDecision({ ...base, outcome }), null, outcome.kind);
+  assert.equal(dispatchLearningEvidenceDecision({ ...base, outcome: { kind: "exit", exitCode: 7 }, capacityDeferred: true }), null);
+  assert.equal(dispatchLearningEvidenceDecision({ ...base, outcome: { kind: "exit", exitCode: 7 }, providerExhausted: true }), null);
 });
 test("sanitizeFailureMessage: strips credentials embedded in Git remote URLs", () => {
   const githubSecret = ["ghp", "supersecret"].join("_");

@@ -208,6 +208,7 @@ function normalizeSnapshotRun(record) {
 }
 
 const LAUNCHER_EVIDENCE_TYPES = Object.freeze({
+  "dispatch-failure": Object.freeze({ states: [] }),
   "stale-claim": Object.freeze({ states: [] }),
   "recovery-transition": Object.freeze({ states: ["recovered", "recurred", "open-after-healthy"] }),
   "proven-safety-invariant": Object.freeze({ states: [] }),
@@ -357,7 +358,6 @@ function eventObservation(event, run) {
   }
   if (event.kind === "bounce") return { ...base, signal: "spec-bounce" };
   if (event.kind === "canary" && event.category === "red") return { ...base, signal: "red-canary", relatedKey: "red" };
-  if (event.kind === "terminal" && event.category === "failed") return { ...base, signal: "dispatch-failure", fingerprint: "terminal:failed" };
   return null;
 }
 
@@ -384,6 +384,7 @@ function launcherEvidenceObservation(evidence, run, index) {
     summary: evidence.summary,
     references: [`launcher-run:${run.cardRunId}`],
   };
+  if (evidence.type === "dispatch-failure") return { ...base, signal: "dispatch-failure", stage: evidence.stage || run.sweep, subsystem: evidence.subsystem || "launcher" };
   if (evidence.type === "stale-claim") return { ...base, signal: "stale-claim", stage: evidence.stage || run.sweep, subsystem: evidence.subsystem || "launcher" };
   if (evidence.type === "recovery-transition") return { ...base, signal: "failure-recovery", recoveryState: evidence.state };
   if (evidence.type === "proven-safety-invariant") return { ...base, signal: "safety-invariant", proven: true };
@@ -803,7 +804,7 @@ export function learningDueDecisions({ state = emptyLearningState(), snapshot = 
 }
 
 const detectorDefinitions = [
-  ["repeated-dispatch-failure", "reliability", "dispatch-failure", 2, "runId"],
+  ["repeated-dispatch-failure", "reliability", "dispatch-failure", 2, "runId", "v2"],
   ["stale-claim-pattern", "reliability", "stale-claim", 2, "runId"],
   ["failed-recovery", "reliability", "failure-recovery", 1, "runId"],
   ["safety-invariant-violation", "reliability", "safety-invariant", 1, "evidenceId"],
@@ -927,9 +928,9 @@ function groupBy(values, keyFn) {
   return groups;
 }
 
-export const LEARNING_DETECTORS = Object.freeze(detectorDefinitions.map(([id, lens, signal, minimumSample, distinctBy]) => Object.freeze({
+export const LEARNING_DETECTORS = Object.freeze(detectorDefinitions.map(([id, lens, signal, minimumSample, distinctBy, version = "v1"]) => Object.freeze({
   id,
-  version: "v1",
+  version,
   lens,
   signal,
   minimumSample,
@@ -1389,6 +1390,34 @@ function observationOwnedBy(item, ownership) {
     && owner.projectId === item?.projectId && owner.repoEntry === item?.repoEntry);
 }
 
+function contributorIdentity(item) {
+  return JSON.stringify({
+    sourceWorkspace: String(item?.sourceWorkspace || ""),
+    projectId: String(item?.projectId || ""),
+    repoEntry: String(item?.repoEntry || ""),
+  });
+}
+
+function isLegacyDispatchCompatibility(evaluation, semanticKey) {
+  return evaluation?.detectorId === "repeated-dispatch-failure"
+    && evaluation?.signal === "dispatch-failure"
+    && semanticKey === "terminal:failed";
+}
+
+function dispatchExposureKeys(runRecords, ownership, completedAtMs, windowEndsAtMs) {
+  const exposed = new Set();
+  const deliverySweeps = new Set(["spec", "dev", "qa", "ship"]);
+  for (const run of runRecords || []) {
+    const endedAtMs = Date.parse(run?.endedAt || "");
+    if (!Number.isFinite(endedAtMs) || endedAtMs <= completedAtMs || endedAtMs > windowEndsAtMs) continue;
+    if (!observationOwnedBy(run, ownership) || !deliverySweeps.has(run?.sweep) || run?.runtime === "launcher") continue;
+    const outcome = run?.outcome;
+    if (outcome?.kind !== "success" || outcome?.exitCode !== 0 || outcome?.signal) continue;
+    exposed.add(contributorIdentity(run));
+  }
+  return exposed;
+}
+
 function parseEvaluationSemanticContract(value) {
   if (typeof value !== "string" || !value.startsWith("{")) return null;
   try {
@@ -1415,16 +1444,26 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
   const semanticKey = embeddedContract?.key || evaluation.semanticKey;
   const ownership = normalizeEvaluationOwnership(evaluation.ownership || evaluation.acceptanceMetric?.ownership) || embeddedContract?.ownership;
   const owned = ownership ? observations.filter((item) => observationOwnedBy(item, ownership)) : [];
-  const scoped = evaluation.detectorId && evaluation.signal && semanticKey
+  const legacyDispatch = isLegacyDispatchCompatibility(evaluation, semanticKey);
+  const scoped = legacyDispatch
+    ? owned.filter((item) => item.signal === "dispatch-failure")
+    : evaluation.detectorId && evaluation.signal && semanticKey
     ? owned.filter((item) => item.signal === evaluation.signal
       && detectorSemanticKey(evaluation.detectorId, item, evaluation.signal) === semanticKey)
     : owned;
+  const legacyExposure = legacyDispatch && ownership && scoped.length === 0
+    ? (() => {
+      const exposed = dispatchExposureKeys(snapshot.runRecords, ownership, Date.parse(evaluation.completedAt || ""), windowEndsAtMs);
+      for (const failure of scoped) exposed.add(contributorIdentity(failure));
+      return ownership.contributors.every((contributor) => exposed.has(contributorIdentity(contributor)));
+    })()
+    : true;
   const reviewExposureSatisfied = evaluation.detectorId !== "repeated-review-finding"
     || new Set(owned.filter((item) => item.signal === "review-completed").map((item) => item.cardId).filter(Boolean)).size >= 5;
   const values = scoped.map((item) => Number(item.metrics?.[evaluation.metric])).filter(Number.isFinite);
   let status = windowReady ? "inconclusive-evidence" : "not-due";
   const scopedContract = Boolean(evaluation.detectorId && evaluation.signal && semanticKey);
-  if (windowReady && coverageComplete && ownership && reviewExposureSatisfied && (values.length || scopedContract)) {
+  if (windowReady && coverageComplete && ownership && reviewExposureSatisfied && legacyExposure && (values.length || scopedContract)) {
     let value;
     if (evaluation.aggregation === "p90") value = percentile(values, 0.9);
     else if (evaluation.aggregation === "count") value = new Set(scoped.map((item) => item.evidenceId || item.eventId || item.runId || item.cardId).filter(Boolean)).size;
@@ -1441,7 +1480,7 @@ export function evaluateLearningOutcome(evaluation = {}, snapshot = {}) {
     }
   }
   const recurrence = { action: "none", generation: evaluation.generation || 0, rootFingerprint: evaluation.rootFingerprint };
-  if (["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration == null) {
+  if (!legacyDispatch && ["no-measurable-change", "regression"].includes(status) && evaluation.activeGeneration == null) {
     const prior = new Set(evaluation.priorEvidenceIds || []);
     const fresh = (snapshot.qualifiedFindings || []).find((finding) => finding.rootFingerprint === evaluation.rootFingerprint
       && (finding.occurrences || []).some((occurrence) => !prior.has(occurrence.id)

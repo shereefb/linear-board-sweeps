@@ -2,6 +2,14 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.3] - 2026-07-14
+
+### Fixed
+
+- Count repeated dispatch failures only from launcher-classified start, I/O, exit, and signal evidence; child `terminal/failed` audit events no longer create reliability findings.
+- Introduce cause-specific v2 dispatch identities and migration-safe legacy COD-288 evaluation, including contributor exposure before a zero result can verify improvement.
+- Preserve routing/interruption exclusions and the existing QA, Signoff, and human Ship gates for Factory Learning work.
+
 ## [1.3.0.1] - 2026-07-11
 
 ### Fixed
