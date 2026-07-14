@@ -146,6 +146,7 @@ Recent and planned launcher/workflow changes:
 - `COD-100`: introduced same-repo per-card parallelism with default spec/dev limits of 4, QA limit of 1, owner-token card claims, isolated child env, and card-specific run records; COD-140 later made Ship concurrency workspace-scoped.
 - `COD-113`: same-repo capacity refill so a Dev slot freed by a child moving to QA can be backfilled before the whole batch or next timer tick.
 - `COD-116`: managed workspace clones, exact dirty-path diagnostics, artifact isolation, and a `doctor` command so scheduled sweeps are no longer coupled to dirty human checkouts.
+- `COD-291` (planned): bind scheduled `repo-status` evidence to launcher-owned context, reject every invalid present child-outcome file, scrub inherited card-scoped sweep identity, and require workspace/card/stage-specific route failure and recovery identity with fail-closed legacy aliasing.
 
 ## Requirements
 
