@@ -13,7 +13,7 @@ import {
   retireStateAuditComment, retireStateIssueUpdateInput, retireState, REQUIRED_STATES, REQUIRED_LABELS,
   WORKFLOW_STATE_RENAMES, planWorkflowStateRenames, renameWorkflowStates, shouldDeferRequiredStateForRename,
   WORKFLOW_STATES, normalizeBlockingRelations, dependencyEligibility, fetchIssueDependencies,
-  repoRouteEligibility, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
+  repoRouteEligibility, scheduledRepoStatusContext, fetchIssueLabels, qaHandoffDecision, guardedTerminalMoveDecision,
   guardedTerminalMoveInput, fetchCompleteIssueComments, moveCardBottomIfCurrent,
 } from "../scripts/linear.mjs";
 
@@ -612,6 +612,98 @@ test("repo route eligibility requires one live mapped label matching the expecte
   assert.throws(() => repoRouteEligibility(["app:guide"], null, "app:guide", "guide"), /repoRouting.byLabel/);
 });
 
+test("scheduled repo context: non-routed invocation ignores accidental route args", () => {
+  assert.deepEqual(scheduledRepoStatusContext({
+    config: {},
+    cli: { issueIdentifier: "COD-291", expectedLabel: "/wrong", expectedRepoEntry: "repo" },
+    env: { AUTO_SWEEP_ISSUE: "COD-291" },
+  }), {
+    mode: "scheduled-non-routed",
+    issueIdentifier: "COD-291",
+    eligible: true,
+    reason: "not-routed",
+  });
+});
+
+test("scheduled repo context: routed tuple must match exported authority", () => {
+  assert.throws(() => scheduledRepoStatusContext({
+    config: { repoRouting: { byLabel: { "repo:kit": "." } } },
+    cli: { issueIdentifier: "COD-291", expectedLabel: "repo:wrong", expectedRepoEntry: "." },
+    env: {
+      AUTO_SWEEP_ISSUE: "COD-291",
+      AUTO_SWEEP_REPO_LABEL: "repo:kit",
+      AUTO_SWEEP_REPO_ENTRY: ".",
+      AUTO_SWEEP_REPO: "/managed/kit",
+    },
+  }), (error) => error.code === "SCHEDULED_CONTEXT_MISMATCH" && /scheduled route context mismatch/.test(error.message));
+});
+
+test("scheduled repo context: scheduled issue must match the CLI issue", () => {
+  assert.throws(() => scheduledRepoStatusContext({
+    config: {},
+    cli: { issueIdentifier: "COD-290" },
+    env: { AUTO_SWEEP_ISSUE: "COD-291" },
+  }), (error) => error.code === "SCHEDULED_CONTEXT_MISMATCH" && /issue identifier/.test(error.message));
+});
+
+test("scheduled repo context: configured routing requires an exported label", () => {
+  assert.throws(() => scheduledRepoStatusContext({
+    config: { repoRouting: { byLabel: { "repo:kit": "." } } },
+    cli: { issueIdentifier: "COD-291" },
+    env: { AUTO_SWEEP_ISSUE: "COD-291" },
+  }), (error) => error.code === "SCHEDULED_CONTEXT_MISMATCH");
+});
+
+test("scheduled repo context: exported routing is rejected without configured routing", () => {
+  assert.throws(() => scheduledRepoStatusContext({
+    config: {},
+    cli: { issueIdentifier: "COD-291", expectedLabel: "repo:kit", expectedRepoEntry: "." },
+    env: {
+      AUTO_SWEEP_ISSUE: "COD-291",
+      AUTO_SWEEP_REPO_LABEL: "repo:kit",
+      AUTO_SWEEP_REPO_ENTRY: ".",
+      AUTO_SWEEP_REPO: "/managed/kit",
+    },
+  }), (error) => error.code === "SCHEDULED_CONTEXT_MISMATCH");
+});
+
+test("scheduled repo context: routed context requires exported repo entry and path", () => {
+  const config = { repoRouting: { byLabel: { "repo:kit": "." } } };
+  for (const env of [
+    { AUTO_SWEEP_ISSUE: "COD-291", AUTO_SWEEP_REPO_LABEL: "repo:kit", AUTO_SWEEP_REPO: "/managed/kit" },
+    { AUTO_SWEEP_ISSUE: "COD-291", AUTO_SWEEP_REPO_LABEL: "repo:kit", AUTO_SWEEP_REPO_ENTRY: "." },
+  ]) {
+    assert.throws(() => scheduledRepoStatusContext({
+      config,
+      cli: { issueIdentifier: "COD-291", expectedLabel: "repo:kit", expectedRepoEntry: "." },
+      env,
+    }), (error) => error.code === "SCHEDULED_CONTEXT_MISMATCH");
+  }
+});
+
+test("scheduled repo context: exact routed tuple is trusted", () => {
+  assert.deepEqual(scheduledRepoStatusContext({
+    config: { repoRouting: { byLabel: { "repo:kit": "." } } },
+    cli: { issueIdentifier: "COD-291", expectedLabel: "repo:kit", expectedRepoEntry: "." },
+    env: {
+      AUTO_SWEEP_ISSUE: "COD-291",
+      AUTO_SWEEP_REPO_LABEL: "repo:kit",
+      AUTO_SWEEP_REPO_ENTRY: ".",
+      AUTO_SWEEP_REPO: "/managed/kit",
+    },
+  }), {
+    mode: "scheduled-routed",
+    issueIdentifier: "COD-291",
+    expectedLabel: "repo:kit",
+    expectedRepoEntry: ".",
+  });
+});
+
+test("scheduled repo context: attended mode preserves explicit arguments", () => {
+  const cli = { issueIdentifier: "COD-291", expectedLabel: "repo:kit", expectedRepoEntry: "." };
+  assert.deepEqual(scheduledRepoStatusContext({ config: {}, cli, env: {} }), { mode: "attended", ...cli });
+});
+
 test("fetchIssueLabels returns the canonical identifier and exact live label names", async () => {
   const calls = [];
   const result = await fetchIssueLabels("key", "SAF-207", {
@@ -756,20 +848,37 @@ function runDependencyStatusCli(inverseRelations, env = {}) {
   });
 }
 
-function runRepoStatusCli(labelNames, env = {}, { configDir, cwd } = {}) {
-  const dir = configDir || fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-status-"));
-  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
-  fs.writeFileSync(path.join(dir, ".claude", "linear-sweep.json"), JSON.stringify({
+function runRepoStatusCli(labelNames, env = {}, {
+  configDir,
+  cwd,
+  config = {
     repos: ["coach", "guide"],
     repoRouting: { byLabel: { "app:coach": "coach", "app:guide": "guide" } },
-  }));
+  },
+  args = ["SAF-207", "app:guide", "guide"],
+  fetchCountPath,
+} = {}) {
+  const dir = configDir || fs.mkdtempSync(path.join(os.tmpdir(), "linear-repo-status-"));
+  fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".claude", "linear-sweep.json"), typeof config === "string" ? config : JSON.stringify(config));
   const response = { data: { issue: { identifier: "SAF-207", labels: { nodes: labelNames.map((name) => ({ name })) } } } };
-  const preloadSource = `globalThis.fetch = async () => ({ json: async () => (${JSON.stringify(response)}) });`;
+  const countWrite = fetchCountPath ? `fs.appendFileSync(${JSON.stringify(fetchCountPath)}, "1");` : "";
+  const preloadSource = `import fs from "node:fs"; globalThis.fetch = async () => { ${countWrite} return { json: async () => (${JSON.stringify(response)}) }; };`;
   const preload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
-  return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", "SAF-207", "app:guide", "guide"], {
+  return spawnSync(process.execPath, ["--import", preload, linearCli, "repo-status", ...args], {
     cwd: cwd || dir,
     encoding: "utf8",
-    env: { ...process.env, AUTO_SWEEP_ANCHOR: "", AUTO_SWEEP_OUTCOME_PATH: "", LINEAR_API_KEY: "key", ...env },
+    env: {
+      ...process.env,
+      AUTO_SWEEP_ANCHOR: "",
+      AUTO_SWEEP_OUTCOME_PATH: "",
+      AUTO_SWEEP_ISSUE: "",
+      AUTO_SWEEP_REPO_LABEL: "",
+      AUTO_SWEEP_REPO_ENTRY: "",
+      AUTO_SWEEP_REPO: "",
+      LINEAR_API_KEY: "key",
+      ...env,
+    },
   });
 }
 
@@ -801,6 +910,82 @@ test("repo-status CLI reads routing config from the scheduled workspace anchor",
   );
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).eligible, true);
+});
+
+test("repo-status CLI scheduled non-routed context succeeds without reading Linear or writing an outcome", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-scheduled-non-routed-"));
+  const fetchCountPath = path.join(dir, "fetch-count");
+  const outcomePath = path.join(dir, "outcome.json");
+  const result = runRepoStatusCli([], {
+    AUTO_SWEEP_ISSUE: "SAF-207",
+    AUTO_SWEEP_OUTCOME_PATH: outcomePath,
+  }, { config: {}, fetchCountPath });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "{\"issue\":\"SAF-207\",\"eligible\":true,\"reason\":\"not-routed\",\"matches\":[]}\n");
+  assert.equal(fs.existsSync(fetchCountPath), false);
+  assert.equal(fs.existsSync(outcomePath), false);
+});
+
+test("repo-status CLI scheduled routed context uses the exported tuple", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-scheduled-routed-"));
+  const fetchCountPath = path.join(dir, "fetch-count");
+  const result = runRepoStatusCli(["app:guide"], {
+    AUTO_SWEEP_ISSUE: "SAF-207",
+    AUTO_SWEEP_REPO_LABEL: "app:guide",
+    AUTO_SWEEP_REPO_ENTRY: "guide",
+    AUTO_SWEEP_REPO: "/managed/guide",
+  }, { fetchCountPath });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    issue: "SAF-207",
+    eligible: true,
+    reason: "ready",
+    expectedLabel: "app:guide",
+    expectedRepoEntry: "guide",
+    matches: [{ label: "app:guide", repoEntry: "guide" }],
+  });
+  assert.equal(fs.readFileSync(fetchCountPath, "utf8"), "1");
+});
+
+test("repo-status CLI scheduled context mismatch defers with trusted exported route fields", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-scheduled-mismatch-"));
+  const outcomePath = path.join(dir, "outcome.json");
+  const result = runRepoStatusCli([], {
+    AUTO_SWEEP_ISSUE: "SAF-207",
+    AUTO_SWEEP_REPO_LABEL: "app:guide",
+    AUTO_SWEEP_REPO_ENTRY: "guide",
+    AUTO_SWEEP_REPO: "/managed/guide",
+    AUTO_SWEEP_OUTCOME_PATH: outcomePath,
+  }, { args: ["SAF-207", "app:stale", "stale"] });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /scheduled route context mismatch/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(outcomePath, "utf8")), {
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "SAF-207",
+    routeExitCode: 2,
+    routing: { reason: "scheduled-context-mismatch", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [] },
+  });
+});
+
+test("repo-status CLI scheduled config failures never report stale CLI route fields", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-scheduled-config-failure-"));
+  const outcomePath = path.join(dir, "outcome.json");
+  const result = runRepoStatusCli([], {
+    AUTO_SWEEP_ISSUE: "SAF-207",
+    AUTO_SWEEP_REPO_LABEL: "app:guide",
+    AUTO_SWEEP_REPO_ENTRY: "guide",
+    AUTO_SWEEP_REPO: "/managed/guide",
+    AUTO_SWEEP_OUTCOME_PATH: outcomePath,
+  }, { config: "{", args: ["stale-issue", "app:stale", "stale"] });
+  assert.equal(result.status, 2, result.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(outcomePath, "utf8")), {
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "SAF-207",
+    routeExitCode: 2,
+    routing: { reason: "unreadable", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [] },
+  });
 });
 test("child preflights preserve the first deferred outcome if a later check mistakenly continues", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "linear-first-outcome-"));

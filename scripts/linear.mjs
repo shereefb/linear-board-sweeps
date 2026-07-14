@@ -82,6 +82,35 @@ export function repoRouteEligibility(labelNames, byLabel, expectedLabel, expecte
   return { eligible: true, reason: "ready", matches };
 }
 
+export function scheduledRepoStatusContext({ config = {}, cli = {}, env = {} } = {}) {
+  const scheduledIssue = env.AUTO_SWEEP_ISSUE || "";
+  const byLabel = config.repoRouting?.byLabel;
+  const configured = Boolean(byLabel && typeof byLabel === "object"
+    && !Array.isArray(byLabel) && Object.keys(byLabel).length);
+  if (!scheduledIssue) return { mode: "attended", ...cli };
+  if (cli.issueIdentifier !== scheduledIssue) {
+    const error = new Error("scheduled route context mismatch: issue identifier");
+    error.code = "SCHEDULED_CONTEXT_MISMATCH";
+    throw error;
+  }
+  if (!configured && !env.AUTO_SWEEP_REPO_LABEL) {
+    return { mode: "scheduled-non-routed", issueIdentifier: scheduledIssue, eligible: true, reason: "not-routed" };
+  }
+  const expectedLabel = env.AUTO_SWEEP_REPO_LABEL || "";
+  const expectedRepoEntry = env.AUTO_SWEEP_REPO_ENTRY || "";
+  if (!configured || !expectedLabel || !expectedRepoEntry || !env.AUTO_SWEEP_REPO
+      || cli.expectedLabel !== expectedLabel
+      || cli.expectedRepoEntry !== expectedRepoEntry
+      || byLabel[expectedLabel] !== expectedRepoEntry) {
+    const error = new Error("scheduled route context mismatch: configured route authority");
+    error.code = "SCHEDULED_CONTEXT_MISMATCH";
+    error.expectedLabel = expectedLabel;
+    error.expectedRepoEntry = expectedRepoEntry;
+    throw error;
+  }
+  return { mode: "scheduled-routed", issueIdentifier: scheduledIssue, expectedLabel, expectedRepoEntry };
+}
+
 const QA_HANDOFF_BLOCKING_LABELS = new Set([
   "blocked:open-questions",
   "blocked:needs-user",
@@ -777,12 +806,22 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       try {
         const configPath = path.join(process.env.AUTO_SWEEP_ANCHOR || process.cwd(), ".claude", "linear-sweep.json");
         const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-        const result = await fetchIssueLabels(KEY, issueId);
-        const eligibility = repoRouteEligibility(result.labelNames, config.repoRouting?.byLabel, expectedLabel, expectedRepoEntry);
+        const context = scheduledRepoStatusContext({
+          config,
+          cli: { issueIdentifier: issueId, expectedLabel, expectedRepoEntry },
+          env: process.env,
+        });
+        if (context.mode === "scheduled-non-routed") {
+          console.log(JSON.stringify({ issue: context.issueIdentifier, eligible: true, reason: context.reason, matches: [] }));
+          process.exitCode = 0;
+          return;
+        }
+        const result = await fetchIssueLabels(KEY, context.issueIdentifier);
+        const eligibility = repoRouteEligibility(result.labelNames, config.repoRouting?.byLabel, context.expectedLabel, context.expectedRepoEntry);
         const routing = {
           reason: eligibility.reason,
-          expectedLabel,
-          expectedRepoEntry,
+          expectedLabel: context.expectedLabel,
+          expectedRepoEntry: context.expectedRepoEntry,
           matches: eligibility.matches,
         };
         console.log(JSON.stringify({ issue: result.issue, eligible: eligibility.eligible, ...routing }));
@@ -800,12 +839,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         console.error(String(error.message || error));
         process.exitCode = 2;
         if (process.env.AUTO_SWEEP_OUTCOME_PATH) {
+          const scheduled = Boolean(process.env.AUTO_SWEEP_ISSUE);
           writeAutoSweepOutcome({
             version: 1,
             kind: "repo-routing-deferred",
-            issueIdentifier: issueId,
+            issueIdentifier: scheduled ? process.env.AUTO_SWEEP_ISSUE : issueId,
             routeExitCode: 2,
-            routing: { reason: "unreadable", expectedLabel, expectedRepoEntry, matches: [] },
+            routing: {
+              reason: error.code === "SCHEDULED_CONTEXT_MISMATCH" ? "scheduled-context-mismatch" : "unreadable",
+              expectedLabel: scheduled ? (process.env.AUTO_SWEEP_REPO_LABEL || "") : expectedLabel,
+              expectedRepoEntry: scheduled ? (process.env.AUTO_SWEEP_REPO_ENTRY || "") : expectedRepoEntry,
+              matches: [],
+            },
           });
         }
       }
