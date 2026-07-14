@@ -3743,6 +3743,83 @@ test("card dispatch env rejects partial claim identity", () => {
   assert.throws(() => withCardDispatchEnv({ ...base, claimDeclarationId: "decl" }, "run-id"), /owner and declaration/i);
 });
 
+test("dispatch environment excludes stale parent and .env sweep identity", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-dispatch-environment-"));
+  const staleKeys = [
+    "AUTO_SWEEP_ISSUE",
+    "AUTO_SWEEP_REPO_LABEL",
+    "AUTO_SWEEP_REPO",
+    "AUTO_SWEEP_SOURCE_ANCHOR",
+    "AUTO_SWEEP_OWNER_TOKEN",
+    "AUTO_SWEEP_CLAIM_DECLARATION",
+    "AUTO_SWEEP_CARD_RUN_ID",
+    "AUTO_SWEEP_OUTCOME_PATH",
+  ];
+  const ordinaryKeys = ["PATH", "HTTPS_PROXY", "LINEAR_API_KEY"];
+  const original = Object.fromEntries([...staleKeys, ...ordinaryKeys].map((key) => [key, process.env[key]]));
+  const parentEnv = {
+    AUTO_SWEEP_ISSUE: "COD-parent",
+    AUTO_SWEEP_REPO_LABEL: "repo:parent",
+    AUTO_SWEEP_REPO: "/parent/repo",
+    AUTO_SWEEP_SOURCE_ANCHOR: "/parent/source",
+    AUTO_SWEEP_OWNER_TOKEN: "parent-owner",
+    AUTO_SWEEP_CLAIM_DECLARATION: "parent-declaration",
+    AUTO_SWEEP_CARD_RUN_ID: "parent-run",
+    AUTO_SWEEP_OUTCOME_PATH: "/parent/outcome.json",
+    PATH: "/parent/bin",
+    HTTPS_PROXY: "http://parent-proxy",
+    LINEAR_API_KEY: "parent-key",
+  };
+  fs.writeFileSync(path.join(anchorPath, ".env"), [
+    "AUTO_SWEEP_ISSUE=COD-file",
+    "AUTO_SWEEP_REPO_LABEL=repo:file",
+    "AUTO_SWEEP_REPO=/file/repo",
+    "AUTO_SWEEP_SOURCE_ANCHOR=/file/source",
+    "AUTO_SWEEP_OWNER_TOKEN=file-owner",
+    "AUTO_SWEEP_CLAIM_DECLARATION=file-declaration",
+    "AUTO_SWEEP_CARD_RUN_ID=file-run",
+    "AUTO_SWEEP_OUTCOME_PATH=/file/outcome.json",
+    "PATH=/file/bin",
+    "HTTPS_PROXY=http://file-proxy",
+    "LINEAR_API_KEY=file-key",
+  ].join("\n"));
+  Object.assign(process.env, parentEnv);
+
+  try {
+    const child = new EventEmitter();
+    child.pid = 291;
+    let spawnedEnv;
+    const run = dispatchAsync(anchorPath, "dev", {}, {
+      issueIdentifier: "COD-current",
+      logDir: path.join(anchorPath, "logs"),
+      runtimeExecutable: "/resolved/codex",
+      childEnv: {
+        AUTO_SWEEP_ISSUE: "COD-current",
+        AUTO_SWEEP_REPO_ENTRY: "current-repo",
+        AUTO_SWEEP_OWNER_TOKEN: "current-owner",
+      },
+    }, {
+      spawnFn: (_executable, _args, options) => { spawnedEnv = options.env; return child; },
+    });
+    child.emit("close", 0, null);
+    assert.equal((await run).kind, "success");
+    assert.equal(spawnedEnv.AUTO_SWEEP_ISSUE, "COD-current");
+    assert.equal(spawnedEnv.AUTO_SWEEP_REPO_ENTRY, "current-repo");
+    assert.equal(spawnedEnv.AUTO_SWEEP_OWNER_TOKEN, "current-owner");
+    for (const key of staleKeys.filter((key) => !["AUTO_SWEEP_ISSUE", "AUTO_SWEEP_OWNER_TOKEN"].includes(key))) {
+      assert.equal(Object.hasOwn(spawnedEnv, key), false, key);
+    }
+    assert.equal(spawnedEnv.PATH, "/file/bin");
+    assert.equal(spawnedEnv.HTTPS_PROXY, "http://file-proxy");
+    assert.equal(spawnedEnv.LINEAR_API_KEY, "file-key");
+  } finally {
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("run records embed structured events and mirror the exact record into the global daily index", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-learning-index-"));
   const logDir = path.join(anchorPath, "logs");

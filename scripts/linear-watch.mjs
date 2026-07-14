@@ -6649,11 +6649,17 @@ function writeRunRecord({
   }
 }
 
-function dispatchEnvironment(anchorPath, pick = {}) {
+function withoutAutoSweepKeys(value = {}) {
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !key.startsWith("AUTO_SWEEP_")));
+}
+
+export function dispatchEnvironment(anchorPath, pick = {}, { processEnv = process.env } = {}) {
   const envFile = path.join(anchorPath, ".env");
+  const fileEnv = parseEnv(fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "");
   return {
-    ...process.env,
-    ...parseEnv(fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : ""),
+    ...withoutAutoSweepKeys(processEnv),
+    ...withoutAutoSweepKeys(fileEnv),
     ...(pick.childEnv || {}),
   };
 }
