@@ -56,6 +56,22 @@ function requiredSpec(rows = [["V1", "C1", "creates evidence", "drops a row", "n
   ].join("\n");
 }
 
+function canonicalOrderRequiredSpec(rows = [["V1", "C1, C2", "creates evidence", "drops a row", "node --test", "row exists"]]) {
+  return [
+    "## Correctness contract",
+    table(correctnessHeaders, [
+      ["C1", "publish", "evidence remains traceable", "lost row", "retry", "test"],
+      ["C2", "handoff", "proof remains executable", "skipped proof", "rerun", "test"],
+    ]),
+    "",
+    "## Verification contract",
+    "Verification contract: verification-contract/v1 — required — behavior changes",
+    "",
+    "## Verification obligations",
+    table(verificationHeaders, rows),
+  ].join("\n");
+}
+
 function requiredPlan(rows = [["V1", "Task 2", "tests/verification-contract.test.mjs", "missing row", "node --test", "fixture", "none"]]) {
   return [
     "Verification contract: verification-contract/v1 — required — behavior changes",
@@ -321,6 +337,26 @@ test("reports a correctness source repeated across verification rows", () => {
   const result = validator.parseVerificationArtifact(requiredSpec([
     ["V1", "C1", "a", "b", "c", "d"],
     ["V2", "C1", "e", "f", "g", "h"],
+  ]));
+  assert.ok(diagnosticCodes(result).includes("duplicate-correctness-source"));
+});
+
+test("accepts canonical correctness sections when every source is represented once", () => {
+  const result = validator.parseVerificationArtifact(canonicalOrderRequiredSpec());
+  assert.deepEqual(result.diagnostics, []);
+});
+
+test("reports a missing correctness source when canonical sections precede verification", () => {
+  const result = validator.parseVerificationArtifact(canonicalOrderRequiredSpec([
+    ["V1", "C1", "a", "b", "c", "d"],
+  ]));
+  assert.ok(diagnosticCodes(result).includes("missing-correctness-source"));
+});
+
+test("reports a duplicate correctness source when canonical sections precede verification", () => {
+  const result = validator.parseVerificationArtifact(canonicalOrderRequiredSpec([
+    ["V1", "C1", "a", "b", "c", "d"],
+    ["V2", "C1, C2", "e", "f", "g", "h"],
   ]));
   assert.ok(diagnosticCodes(result).includes("duplicate-correctness-source"));
 });

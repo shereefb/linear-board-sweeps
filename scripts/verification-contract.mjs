@@ -60,9 +60,9 @@ function markdownTables(markdown) {
   return tables;
 }
 
-function contractSectionStart(markdown) {
+function sectionStart(markdown, heading) {
   return markdown.split(/\r?\n/).reduce(
-    (startLine, line, index) => /^#{1,6}\s+verification contract(?:\b|\s)/i.test(line) ? index : startLine,
+    (startLine, line, index) => heading.test(line) ? index : startLine,
     -1,
   );
 }
@@ -94,9 +94,10 @@ export function parseVerificationArtifact(markdown, { role } = {}) {
   if (!applicability) return { applicability: null, verificationIds: [], diagnostics: [diagnostic("missing-declaration")] };
 
   const tables = markdownTables(markdown);
-  const contractStart = contractSectionStart(markdown);
-  const obligationTables = tablesWithHeaders(tables, verificationHeaders, contractStart);
-  const traceabilityTables = tablesWithHeaders(tables, traceabilityHeaders, contractStart);
+  const verificationStart = sectionStart(markdown, /^#{1,6}\s+verification contract(?:\b|\s)/i);
+  const correctnessStart = sectionStart(markdown, /^#{1,6}\s+correctness contract(?:\b|\s)/i);
+  const obligationTables = tablesWithHeaders(tables, verificationHeaders, verificationStart);
+  const traceabilityTables = tablesWithHeaders(tables, traceabilityHeaders, verificationStart);
   const obligationTable = obligationTables[0];
   const traceabilityTable = traceabilityTables[0];
   if (obligationTables.length > 1 || traceabilityTables.length > 1) diagnostics.push(diagnostic("duplicate-verification-table"));
@@ -108,7 +109,7 @@ export function parseVerificationArtifact(markdown, { role } = {}) {
   if (duplicateIds.length) diagnostics.push(diagnostic("duplicate-verification-id"));
   if (applicability === "required" && !hasStableVerificationIds(verificationIds)) diagnostics.push(diagnostic("invalid-verification-id"));
 
-  const correctnessTable = tablesWithHeaders(tables, correctnessHeaders, contractStart)[0];
+  const correctnessTable = tablesWithHeaders(tables, correctnessHeaders, correctnessStart)[0];
   const correctnessIds = unique((correctnessTable?.rows ?? []).map((row) => row[0].trim().toUpperCase()).filter((id) => /^C\d+$/.test(id)));
   const sourcesByVerificationId = new Map();
   if (role !== "plan" && obligationTable) {
