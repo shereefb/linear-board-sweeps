@@ -2,6 +2,14 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.2] - 2026-07-14
+
+### Fixed
+
+- Make scheduled `repo-status` use the launcher’s routed identity as authority, while a scheduled non-routed invocation succeeds without Linear I/O.
+- Reject every invalid present child outcome as a failed child protocol, scrub inherited card-scoped `AUTO_SWEEP_*` identity before dispatch, and close route-failure Todos only after the exact workspace/card/stage target recovers.
+- Keep attended explicit `repo-status` use compatible; legacy route-Todo aliases remain usable only when uniquely proven.
+
 ## [1.3.0.1] - 2026-07-11
 
 ### Fixed
