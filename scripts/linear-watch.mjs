@@ -8030,13 +8030,22 @@ async function cmdClaimMigrationReset(args = []) {
 
 function cmdChildOutcome(args = []) {
   const [kind, reason] = args;
-  if (args.length !== 2 || kind !== "terminal-failed" || reason !== "verification-contract-gate") {
-    throw new Error("usage: child-outcome terminal-failed verification-contract-gate");
-  }
+  const records = {
+    "terminal-failed:verification-contract-gate": (issueIdentifier) => ({ version: 1, kind, issueIdentifier, reason }),
+    "dependency-deferred:launcher-capability": (issueIdentifier) => ({
+      version: 1,
+      kind,
+      issueIdentifier,
+      dependencyExitCode: 3,
+      dependency: { reason, blockers: [] },
+    }),
+  };
+  const makeRecord = args.length === 2 ? records[`${kind}:${reason}`] : null;
+  if (!makeRecord) throw new Error("usage: child-outcome (terminal-failed verification-contract-gate | dependency-deferred launcher-capability)");
   const outcomePath = process.env.AUTO_SWEEP_OUTCOME_PATH;
   const issueIdentifier = process.env.AUTO_SWEEP_ISSUE;
   if (!outcomePath || !issueIdentifier) throw new Error("child outcome requires AUTO_SWEEP_OUTCOME_PATH and AUTO_SWEEP_ISSUE");
-  const record = { version: 1, kind, issueIdentifier, reason };
+  const record = makeRecord(issueIdentifier);
   const encoded = JSON.stringify(record);
   try {
     fs.writeFileSync(outcomePath, encoded, { encoding: "utf8", flag: "wx" });
@@ -8178,7 +8187,7 @@ async function main() {
     case "learning-status": return cmdLearningStatus(args);
     case "learning-run": return cmdLearningRun(args);
     default:
-      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | claim-migration-reset <anchor> <Issue> <Claim> <Target> | child-outcome terminal-failed verification-contract-gate | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
+      console.error("Commands: register <anchor> | unregister <anchor> | activate [anchor] | deactivate [anchor] | ship-runner [on|off] | list | unblock-list [--json] | unblock-resolve <anchor> <issueId> <labelsCsv> (--stdin | <resolution>) | claim-migration-status [--json] | claim-migration-reset <anchor> <Issue> <Claim> <Target> | child-outcome (terminal-failed verification-contract-gate | dependency-deferred launcher-capability) | learning-event <kind> <category> <summary> [--json-metrics <json>] | learning-status [--json] | learning-run [--dry-run | --automatic] | tick [--dry-run] | health | doctor [--json] [anchor]");
       process.exit(1);
   }
 }

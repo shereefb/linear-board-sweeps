@@ -7488,7 +7488,7 @@ function runIsolatedWatcherCli(args, { registry = null, prepare = null, env = {}
   return { ...result, home };
 }
 
-test("child-outcome writes only the exact idempotent terminal-failure envelope", () => {
+test("child-outcome writes only the two exact idempotent launcher envelopes", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "linear-child-outcome-"));
   const outcomePath = path.join(home, "outcome.json");
   const env = { AUTO_SWEEP_OUTCOME_PATH: outcomePath, AUTO_SWEEP_ISSUE: "COD-295" };
@@ -7508,6 +7508,22 @@ test("child-outcome writes only the exact idempotent terminal-failure envelope",
   assert.equal(conflictingIssue.status, 1);
   const invalidReason = runIsolatedWatcherCli(["child-outcome", "terminal-failed", "anything-else"], { env });
   assert.equal(invalidReason.status, 1);
+
+  const compatibilityPath = path.join(home, "compatibility-outcome.json");
+  const compatibilityEnv = { AUTO_SWEEP_OUTCOME_PATH: compatibilityPath, AUTO_SWEEP_ISSUE: "COD-295" };
+  const compatibility = runIsolatedWatcherCli(["child-outcome", "dependency-deferred", "launcher-capability"], { env: compatibilityEnv });
+  assert.equal(compatibility.status, 0, compatibility.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(compatibilityPath, "utf8")), {
+    version: 1,
+    kind: "dependency-deferred",
+    issueIdentifier: "COD-295",
+    dependencyExitCode: 3,
+    dependency: { reason: "launcher-capability", blockers: [] },
+  });
+  const compatibilityRepeat = runIsolatedWatcherCli(["child-outcome", "dependency-deferred", "launcher-capability"], { env: compatibilityEnv });
+  assert.equal(compatibilityRepeat.status, 0, compatibilityRepeat.stderr);
+  const invalidCompatibilityReason = runIsolatedWatcherCli(["child-outcome", "dependency-deferred", "anything-else"], { env: compatibilityEnv });
+  assert.equal(invalidCompatibilityReason.status, 1);
 });
 
 function prepareCredentiallessLearningWorkspace(home) {

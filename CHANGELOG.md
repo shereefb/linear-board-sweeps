@@ -2,6 +2,18 @@
 
 All notable changes to the linear board sweeps kit are documented here.
 
+## [1.3.0.4] - 2026-07-14
+
+### Changed
+
+- Validate final exact Spec/plan pairs with the launcher-source helper before Spec commit or Dev handoff, while retaining Dev's independent downstream gate and structured learning evidence.
+- Export the matching child-outcome capability only from current launcher dispatches and end a tick after a kit update so the next process activates producer and consumer together.
+
+### Fixed
+
+- Treat canonical correctness sections before verification sections as real C-to-V sources, rejecting missing or duplicate coverage.
+- Preserve scheduled terminal verification-gate failures as exclusive issue-bound outcomes even if the child runtime exits zero, without classifying capacity-looking logs as provider exhaustion.
+
 ## [1.3.0.1] - 2026-07-11
 
 ### Fixed

@@ -244,6 +244,57 @@ test("runUpdate: newer VERSION installs matching spec-sweep bytes on anchor main
   }
 });
 
+test("runUpdate: a changed kit defers anchor skill refresh until the next tick", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-update-restart-boundary-"));
+  try {
+    const kitOrigin = path.join(root, "kit-origin.git");
+    const kit = path.join(root, "kit");
+    const kitPublisher = path.join(root, "kit-publisher");
+    const anchorOrigin = path.join(root, "anchor-origin.git");
+    const anchor = path.join(root, "anchor");
+    const stateDir = path.join(root, "state");
+    const nl = String.fromCharCode(10);
+
+    g(root, "init", "--bare", "-b", "main", kitOrigin);
+    g(root, "clone", kitOrigin, kitPublisher);
+    g(kitPublisher, "config", "user.email", "t@t.t");
+    g(kitPublisher, "config", "user.name", "t");
+    fs.cpSync(path.join(KIT, "skills"), path.join(kitPublisher, "skills"), { recursive: true });
+    fs.writeFileSync(path.join(kitPublisher, "VERSION"), `9.9.8${nl}`);
+    g(kitPublisher, "add", "skills", "VERSION");
+    g(kitPublisher, "commit", "-m", "seed kit");
+    g(kitPublisher, "push", "origin", "main");
+    g(root, "clone", kitOrigin, kit);
+    g(kit, "config", "user.email", "t@t.t");
+    g(kit, "config", "user.name", "t");
+
+    g(root, "init", "--bare", "-b", "main", anchorOrigin);
+    g(root, "clone", anchorOrigin, anchor);
+    g(anchor, "config", "user.email", "t@t.t");
+    g(anchor, "config", "user.name", "t");
+    fs.mkdirSync(path.join(anchor, ".claude", "skills"), { recursive: true });
+    fs.writeFileSync(path.join(anchor, ".claude", "skills", ".sweep-version"), `0.0.1${nl}`);
+    g(anchor, "add", ".claude/skills/.sweep-version");
+    g(anchor, "commit", "-m", "seed old anchor");
+    g(anchor, "push", "origin", "main");
+
+    fs.writeFileSync(path.join(kitPublisher, "VERSION"), `9.9.9${nl}`);
+    g(kitPublisher, "add", "VERSION");
+    g(kitPublisher, "commit", "-m", "publish newer kit");
+    g(kitPublisher, "push", "origin", "main");
+
+    const config = { autoUpdate: true, kitPath: kit, kitRef: "main", repos: [anchor] };
+    assert.deepEqual(runUpdate(config, () => {}, { stateDir }), { changed: true });
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "0.0.1");
+
+    assert.deepEqual(runUpdate(config, () => {}, { stateDir }), { changed: false });
+    g(anchor, "fetch", "origin", "main");
+    assert.equal(g(anchor, "show", "origin/main:.claude/skills/.sweep-version"), "9.9.9");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runUpdate: failed kit fetch is reported before merging stale refs", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lw-fetch-fail-"));
   try {

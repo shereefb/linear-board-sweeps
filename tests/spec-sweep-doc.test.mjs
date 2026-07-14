@@ -102,6 +102,10 @@ test("spec-sweep repairs verification defects without weakening downstream evide
 test("spec-sweep defers before material work without launcher outcome capability", () => {
   const body = read(canonicalPath);
   assert.match(body, /AUTO_SWEEP_CHILD_OUTCOME_VERSION=1[^]*immediately after[^]*dependency[^]*routing preflight/i);
-  assert.match(body, /clean\+pushed[^]*dependency-deferred[^]*launcher-capability[^]*without closing the claim/i);
+  assert.match(body, /clean\+pushed[^]*without closing the claim/i);
+  assert.match(body, /dependency-deferred[^]*launcher-capability/i);
+  assert.match(body, /node "\$AUTO_SWEEP_KIT_PATH\/scripts\/linear-watch\.mjs" child-outcome dependency-deferred launcher-capability/i);
+  assert.match(body, /exclusively creates[^]*bytes are identical[^]*conflict/i);
+  assert.match(body, /dependencyExitCode[^]*3[^]*reason[^]*launcher-capability[^]*blockers/i);
   assert.match(body, /no Linear dependency[^]*human-block label/i);
 });
