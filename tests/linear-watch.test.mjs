@@ -4800,9 +4800,9 @@ test("reconcileOwnedDispatchClaim: typed log I/O termination uses exact terminal
   }, "codex"), { attempted: false, released: false, reasonKind: null });
 });
 
-test("reconcileOwnedDispatchClaim: typed log I/O termination uses only each configured stage's exact claim cleanup", async () => {
+test("releaseFailedDispatchClaim: typed log I/O termination closes only each configured stage's owned epoch", async () => {
   for (const sweep of Object.keys(SWEEP_CFG)) {
-    const releases = [];
+    const cfg = SWEEP_CFG[sweep];
     const pick = {
       sweep,
       issueId: `issue-${sweep}`,
@@ -4810,14 +4810,53 @@ test("reconcileOwnedDispatchClaim: typed log I/O termination uses only each conf
       ownerToken: `owner-${sweep}`,
       claimDeclarationId: `decl-${sweep}`,
     };
-    assert.deepEqual(await watchModule.reconcileOwnedDispatchClaim("key", {
+    const calls = [];
+    const comments = [{
+      id: `decl-${sweep}`,
+      body: claimDeclarationMarker({ claim: cfg.claim, ownerToken: pick.ownerToken, declarationId: pick.claimDeclarationId }),
+      createdAt: claimIso(1),
+    }];
+    let labels = [cfg.claim, "security"];
+    const snapshot = () => ({
+      id: pick.issueId,
+      identifier: pick.issueIdentifier,
+      stateName: cfg.states[0],
+      labelNames: [...labels],
+      commentsComplete: true,
+      comments: [...comments],
+    });
+    assert.equal(await watchModule.releaseFailedDispatchClaim("key", pick, {
       kind: "dispatch-io-error",
       code: "LOG_WRITE_FAILED",
-      pick,
     }, "codex", {
-      releaseFailedDispatchClaimFn: async (...args) => { releases.push(args); return true; },
-    }), { attempted: true, released: true, reasonKind: "terminal failure cooldown" }, sweep);
-    assert.deepEqual(releases.map((args) => args[1]), [pick], sweep);
+      fetchClaimCardFn: async () => { calls.push("fetch"); return snapshot(); },
+      addCommentFn: async (_key, _id, body) => {
+        calls.push(body);
+        comments.push({ id: `comment-${comments.length}`, body, createdAt: claimIso(comments.length + 1) });
+      },
+      applyLabelEditFn: async (_key, _card, edit) => { calls.push(edit); labels = ["security"]; },
+    }), true, sweep);
+    assert.match(calls[1], new RegExp(`^\\[auto-sweep-retry v1 claim=${cfg.claim} owner=${pick.ownerToken} declaration=${pick.claimDeclarationId}\\]`), sweep);
+    assert.match(calls[3], new RegExp(`^\\[auto-sweep-claim-close v1 claim=${cfg.claim} declaration=${pick.claimDeclarationId} reason=terminal\\]$`), sweep);
+    assert.deepEqual(calls.at(-2), { remove: [cfg.claim] }, sweep);
+    assert.deepEqual(labels, ["security"], sweep);
+
+    const foreign = {
+      ...snapshot(),
+      labelNames: [cfg.claim, "security"],
+      comments: [{
+        id: `foreign-${sweep}`,
+        body: claimDeclarationMarker({ claim: cfg.claim, ownerToken: `foreign-${sweep}`, declarationId: `foreign-decl-${sweep}` }),
+        createdAt: claimIso(9),
+      }],
+    };
+    let foreignMutations = 0;
+    assert.equal(await watchModule.releaseFailedDispatchClaim("key", pick, { kind: "dispatch-io-error", code: "LOG_WRITE_FAILED" }, "codex", {
+      fetchClaimCardFn: async () => foreign,
+      addCommentFn: async () => { foreignMutations += 1; },
+      applyLabelEditFn: async () => { foreignMutations += 1; },
+    }), false, `${sweep} foreign epoch`);
+    assert.equal(foreignMutations, 0, `${sweep} foreign epoch`);
   }
 });
 
