@@ -5825,22 +5825,38 @@ test("dispatchAsync fallback: absent configuration preserves the exhausted Codex
 test("dispatchAsync fallback deferral: dependency and repository outcome files outrank a qualifying exhausted failure", async () => {
   for (const fixture of [
     { kind: "dependency-deferred", expected: "dependency-deferred", dependencyExitCode: 3 },
-    { kind: "repo-routing-deferred", expected: "repo-routing-deferred", routeExitCode: 3 },
+    {
+      kind: "repo-routing-deferred",
+      expected: "repo-routing-deferred",
+      routeExitCode: 3,
+      repoRoute: { label: "repo:kit", repoEntry: "." },
+      routing: {
+        reason: "route-changed",
+        expectedLabel: "repo:kit",
+        expectedRepoEntry: ".",
+        matches: [{ label: "repo:other", repoEntry: "other" }],
+      },
+    },
   ]) {
+    const { expected, repoRoute, ...deferredOutcome } = fixture;
     const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-fallback-deferral-"));
     const outcomePath = path.join(anchorPath, "outcome.json");
     const primary = pipedDispatchChild(830);
     const calls = [];
-    const run = dispatchAsync(anchorPath, "dev", {
+    const config = {
       runtimes: { dev: { runtime: "codex", fallback: { runtime: "claude", model: "claude-sonnet-5" } } },
-    }, {
+      repoRouting: { byLabel: { "repo:kit": ".", "repo:other": "other" } },
+    };
+    const run = dispatchAsync(anchorPath, "dev", config, {
       issueIdentifier: "COD-144", logDir: path.join(anchorPath, "logs"), outcomePath, runtimeExecutable: "/resolved/codex",
+      config,
+      ...(repoRoute ? { repoRoute } : {}),
     }, { spawnFn: queuedDispatchSpawn([primary], calls) });
     primary.stdout.end(`${JSON.stringify(PERSONAL_LIMIT_ERROR)}\n`);
-    fs.writeFileSync(outcomePath, JSON.stringify({ version: 1, issueIdentifier: "COD-144", ...fixture }));
+    fs.writeFileSync(outcomePath, JSON.stringify({ version: 1, issueIdentifier: "COD-144", ...deferredOutcome }));
     primary.close(1);
     const outcome = await run;
-    assert.equal(outcome.kind, fixture.expected);
+    assert.equal(outcome.kind, expected);
     assert.equal(calls.length, 1);
   }
 });
@@ -6014,6 +6030,142 @@ test("dispatchAsync: child dependency outcome channel overrides a superficially 
   const recordName = fs.readdirSync(logDir).find((name) => name.startsWith("run-records-"));
   assert.equal(JSON.parse(fs.readFileSync(path.join(logDir, recordName), "utf8")).outcome.kind, "dependency-deferred");
 });
+test("child outcome protocol: validates only bounded, trusted routed deferrals", () => {
+  const routedPick = {
+    issueIdentifier: "COD-291",
+    repoRoute: { label: "repo:kit", repoEntry: "." },
+    config: { repoRouting: { byLabel: { "repo:kit": ".", "repo:other": "other" } } },
+  };
+  const route = ({ routeExitCode, reason, matches }) => ({
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "COD-291",
+    routeExitCode,
+    routing: {
+      reason,
+      expectedLabel: "repo:kit",
+      expectedRepoEntry: ".",
+      matches,
+    },
+  });
+  const valid = [
+    route({ routeExitCode: 2, reason: "unreadable", matches: [] }),
+    route({ routeExitCode: 2, reason: "scheduled-context-mismatch", matches: [] }),
+    route({ routeExitCode: 3, reason: "missing-route-label", matches: [] }),
+    route({ routeExitCode: 3, reason: "ambiguous-route-label", matches: [
+      { label: "repo:kit", repoEntry: "." }, { label: "repo:other", repoEntry: "other" },
+    ] }),
+    route({ routeExitCode: 3, reason: "route-changed", matches: [{ label: "repo:other", repoEntry: "other" }] }),
+  ];
+
+  assert.equal(typeof watchModule.validateChildDeferredOutcome, "function");
+  for (const value of valid) {
+    const outcome = watchModule.validateChildDeferredOutcome(value, routedPick);
+    assert.equal(outcome.kind, "repo-routing-deferred");
+    assert.equal(outcome.code, value.routeExitCode === 2 ? "REPO_ROUTE_UNREADABLE" : "REPO_ROUTE_CHANGED");
+    assert.notEqual(outcome.routing, value.routing);
+    assert.deepEqual(outcome.routing, value.routing);
+  }
+  for (const value of [
+    { version: 1, kind: "dependency-deferred", issueIdentifier: "COD-291", dependencyExitCode: 3 },
+    {
+      version: 1, kind: "dependency-deferred", issueIdentifier: "COD-291", dependencyExitCode: 2,
+      dependency: { reason: "incomplete-relations", blockers: [{ identifier: "COD-290", stateName: "Dev" }] },
+    },
+    {
+      version: 1, kind: "dependency-deferred", issueIdentifier: "COD-291", dependencyExitCode: 3,
+      dependency: { reason: "blocked", blockers: [{ identifier: "COD-290", stateName: "Dev" }] },
+    },
+  ]) {
+    const dependency = watchModule.validateChildDeferredOutcome(value, routedPick);
+    assert.equal(dependency.kind, "dependency-deferred");
+    assert.equal(dependency.code, value.dependencyExitCode === 3 ? "DEPENDENCY_BLOCKED" : "DEPENDENCY_UNREADABLE");
+    if (value.dependency) {
+      assert.notEqual(dependency.dependency, value.dependency);
+      assert.deepEqual(dependency.dependency, value.dependency);
+    }
+  }
+});
+
+test("child outcome protocol: every present malformed or untrusted route file fails closed", async () => {
+  const routedPick = {
+    issueIdentifier: "COD-291",
+    repoRoute: { label: "repo:kit", repoEntry: "." },
+    config: { repoRouting: { byLabel: { "repo:kit": ".", "repo:other": "other" } } },
+  };
+  const route = ({ routeExitCode = 3, reason = "route-changed", matches = [{ label: "repo:other", repoEntry: "other" }] } = {}) => ({
+    version: 1,
+    kind: "repo-routing-deferred",
+    issueIdentifier: "COD-291",
+    routeExitCode,
+    routing: { reason, expectedLabel: "repo:kit", expectedRepoEntry: ".", matches },
+  });
+  const oversized = "x".repeat(65_537);
+  const cases = [
+    ["invalid JSON", "{\"untrusted-route-secret\":"],
+    ["oversized", oversized],
+    ["unsupported version", { ...route(), version: 2 }],
+    ["unsupported kind", { ...route(), kind: "success" }],
+    ["extra top-level field", { ...route(), extra: "untrusted-route-secret" }],
+    ["extra routing field", { ...route(), routing: { ...route().routing, extra: "untrusted-route-secret" } }],
+    ["missing issue", (() => { const value = route(); delete value.issueIdentifier; return value; })()],
+    ["missing route field", (() => { const value = route(); delete value.routing.expectedLabel; return value; })()],
+    ["non-routed pick", route(), { issueIdentifier: "COD-291", config: routedPick.config }],
+    ["wrong issue", { ...route(), issueIdentifier: "COD-292" }],
+    ["wrong tuple", { ...route(), routing: { ...route().routing, expectedRepoEntry: "other" } }],
+    ["oversized string", { ...route(), routing: { ...route().routing, expectedLabel: "x".repeat(257) } }],
+    ["oversized match string", route({ matches: [{ label: "repo:other", repoEntry: "x".repeat(257) }] })],
+    ["duplicate matches", route({ reason: "ambiguous-route-label", matches: [{ label: "repo:kit", repoEntry: "." }, { label: "repo:kit", repoEntry: "." }] })],
+    ["unconfigured match", route({ matches: [{ label: "repo:unconfigured", repoEntry: "elsewhere" }] })],
+    ["exit 2 with exit 3 reason", route({ routeExitCode: 2 })],
+    ["exit 3 with exit 2 reason", route({ reason: "unreadable" })],
+    ["unreadable with matches", route({ routeExitCode: 2, reason: "unreadable", matches: [{ label: "repo:other", repoEntry: "other" }] })],
+    ["missing with a match", route({ reason: "missing-route-label", matches: [{ label: "repo:other", repoEntry: "other" }] })],
+    ["ambiguous with one match", route({ reason: "ambiguous-route-label" })],
+    ["changed without a match", route({ matches: [] })],
+    ["non-regular path", null, routedPick, (outcomePath) => fs.mkdirSync(outcomePath)],
+  ];
+
+  for (const [name, value, pick = routedPick, writeOutcome] of cases) {
+    const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-untrusted-route-outcome-"));
+    const logDir = path.join(anchorPath, "logs");
+    const outcomePath = path.join(anchorPath, "outcome.json");
+    const child = new EventEmitter();
+    child.pid = 503;
+    const run = dispatchAsync(anchorPath, "dev", pick.config, {
+      ...pick, logDir, outcomePath, runtimeExecutable: "/resolved/codex",
+    }, { spawnFn: () => child });
+    if (writeOutcome) writeOutcome(outcomePath);
+    else fs.writeFileSync(outcomePath, typeof value === "string" ? value : JSON.stringify(value));
+    child.emit("close", 0, null);
+    const outcome = await run;
+    assert.equal(outcome.kind, "child-outcome-invalid", name);
+    assert.equal(outcome.code, "UNTRUSTED_CHILD_OUTCOME", name);
+    assert.notEqual(outcome.kind, "success", name);
+    const [batchResult] = await dispatchBatch([{ anchorPath, sweep: "dev", config: pick.config, issueIdentifier: pick.issueIdentifier }], {
+      dispatchFn: async () => outcome,
+    });
+    assert.equal(batchResult.success, false, name);
+    const recordName = fs.readdirSync(logDir).find((file) => file.startsWith("run-records-"));
+    assert.equal(fs.readFileSync(path.join(logDir, recordName), "utf8").includes("untrusted-route-secret"), false, name);
+  }
+});
+
+test("child outcome protocol: an absent outcome file preserves a successful child exit", async () => {
+  const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-absent-route-outcome-"));
+  const child = new EventEmitter();
+  child.pid = 504;
+  const run = dispatchAsync(anchorPath, "dev", {}, {
+    issueIdentifier: "COD-291",
+    logDir: path.join(anchorPath, "logs"),
+    outcomePath: path.join(anchorPath, "absent.json"),
+    runtimeExecutable: "/resolved/codex",
+  }, { spawnFn: () => child, onSpawn: () => true });
+  child.emit("close", 0, null);
+  const outcome = await run;
+  assert.equal(outcome.kind, "success");
+});
+
 test("dispatchAsync: child repository outcome prevents a superficially successful handoff", async () => {
   const anchorPath = fs.mkdtempSync(path.join(os.tmpdir(), "linear-route-outcome-"));
   const logDir = path.join(anchorPath, "logs");
@@ -6021,16 +6173,18 @@ test("dispatchAsync: child repository outcome prevents a superficially successfu
   const child = new EventEmitter();
   child.pid = 503;
   const run = dispatchAsync(anchorPath, "dev", {}, {
-    issueIdentifier: "SAF-207", issueId: "issue-207", ownerToken: "owner-207",
+    issueIdentifier: "COD-291", issueId: "issue-291", ownerToken: "owner-291",
     logDir, outcomePath, runtimeExecutable: "/resolved/codex",
     childEnv: { AUTO_SWEEP_OUTCOME_PATH: outcomePath },
+    repoRoute: { label: "repo:kit", repoEntry: "." },
+    config: { repoRouting: { byLabel: { "repo:kit": ".", "repo:other": "other" } } },
   }, { spawnFn: () => child });
   fs.writeFileSync(outcomePath, JSON.stringify({
     version: 1,
     kind: "repo-routing-deferred",
-    issueIdentifier: "SAF-207",
+    issueIdentifier: "COD-291",
     routeExitCode: 3,
-    routing: { reason: "route-changed", expectedLabel: "app:guide", expectedRepoEntry: "guide", matches: [{ label: "app:coach", repoEntry: "coach" }] },
+    routing: { reason: "route-changed", expectedLabel: "repo:kit", expectedRepoEntry: ".", matches: [{ label: "repo:other", repoEntry: "other" }] },
   }));
   child.emit("close", 0, null);
   const outcome = await run;

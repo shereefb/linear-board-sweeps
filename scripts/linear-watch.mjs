@@ -6278,40 +6278,163 @@ export function classifyDispatchOutcome(event = {}) {
   return { kind: "exit", ...base };
 }
 
-function childDeferredOutcomeForPick(pick = {}) {
-  if (!pick.outcomePath || !fs.existsSync(pick.outcomePath)) return null;
+const AUTO_SWEEP_OUTCOME_MAX_BYTES = 64 * 1024;
+const ROUTE_EXIT_2_REASONS = new Set(["unreadable", "scheduled-context-mismatch"]);
+const ROUTE_EXIT_3_REASONS = new Set([
+  "missing-route-label", "ambiguous-route-label", "route-changed",
+]);
+
+function childOutcomeInvalid(reason) {
+  return { kind: "child-outcome-invalid", code: "UNTRUSTED_CHILD_OUTCOME", reason };
+}
+
+function hasExactKeys(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function boundedOutcomeString(value) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") >= 1 && Buffer.byteLength(value, "utf8") <= 256;
+}
+
+function normalizedChildRouting(value, pick) {
+  if (!hasExactKeys(value, ["reason", "expectedLabel", "expectedRepoEntry", "matches"])
+      || !boundedOutcomeString(value.reason)
+      || !boundedOutcomeString(value.expectedLabel)
+      || !boundedOutcomeString(value.expectedRepoEntry)
+      || !Array.isArray(value.matches)) return null;
+  const expectedLabel = pick?.repoRoute?.label;
+  const expectedRepoEntry = pick?.repoRoute?.repoEntry;
+  const byLabel = pick?.config?.repoRouting?.byLabel;
+  if (!boundedOutcomeString(expectedLabel) || !boundedOutcomeString(expectedRepoEntry)
+      || !byLabel || typeof byLabel !== "object" || Array.isArray(byLabel)
+      || byLabel[expectedLabel] !== expectedRepoEntry
+      || value.expectedLabel !== expectedLabel || value.expectedRepoEntry !== expectedRepoEntry) return null;
+  const configuredPairs = new Set(Object.entries(byLabel)
+    .filter(([label, repoEntry]) => boundedOutcomeString(label) && boundedOutcomeString(repoEntry))
+    .map(([label, repoEntry]) => JSON.stringify([label, repoEntry])));
+  const matches = [];
+  const seen = new Set();
+  for (const match of value.matches) {
+    if (!hasExactKeys(match, ["label", "repoEntry"])
+        || !boundedOutcomeString(match.label) || !boundedOutcomeString(match.repoEntry)) return null;
+    const pair = JSON.stringify([match.label, match.repoEntry]);
+    if (!configuredPairs.has(pair) || seen.has(pair)) return null;
+    seen.add(pair);
+    matches.push({ label: match.label, repoEntry: match.repoEntry });
+  }
+  return { reason: value.reason, expectedLabel, expectedRepoEntry, matches };
+}
+
+function normalizedChildDependency(value) {
+  if (value === undefined) return null;
+  if (!hasExactKeys(value, ["reason", "blockers"])
+      || !boundedOutcomeString(value.reason) || !Array.isArray(value.blockers)) return undefined;
+  const blockers = [];
+  for (const blocker of value.blockers) {
+    if (!hasExactKeys(blocker, ["identifier", "stateName"])
+        || !boundedOutcomeString(blocker.identifier) || !boundedOutcomeString(blocker.stateName)) return undefined;
+    blockers.push({ identifier: blocker.identifier, stateName: blocker.stateName });
+  }
+  return { reason: value.reason, blockers };
+}
+
+export function validateChildDeferredOutcome(value, pick = {}) {
   try {
-    const value = JSON.parse(fs.readFileSync(pick.outcomePath, "utf8"));
-    if (value?.version !== 1 || !["dependency-deferred", "repo-routing-deferred"].includes(value?.kind)) return null;
-    if (value.issueIdentifier && value.issueIdentifier !== pick.issueIdentifier) return null;
+    if (!value || typeof value !== "object" || Array.isArray(value)
+        || value.version !== 1 || !["dependency-deferred", "repo-routing-deferred"].includes(value.kind)
+        || !boundedOutcomeString(value.issueIdentifier) || value.issueIdentifier !== pick.issueIdentifier) {
+      return childOutcomeInvalid("invalid-envelope");
+    }
     if (value.kind === "repo-routing-deferred") {
-      const routeExitCode = Number(value.routeExitCode);
-      if (![2, 3].includes(routeExitCode)) return null;
+      if (!hasExactKeys(value, ["version", "kind", "issueIdentifier", "routeExitCode", "routing"])
+          || !Number.isInteger(value.routeExitCode) || ![2, 3].includes(value.routeExitCode)) {
+        return childOutcomeInvalid("invalid-routing-envelope");
+      }
+      const routing = normalizedChildRouting(value.routing, pick);
+      if (!routing) return childOutcomeInvalid("invalid-routing");
+      const validReason = value.routeExitCode === 2
+        ? ROUTE_EXIT_2_REASONS.has(routing.reason) && routing.matches.length === 0
+        : ROUTE_EXIT_3_REASONS.has(routing.reason)
+          && ((routing.reason === "missing-route-label" && routing.matches.length === 0)
+            || (routing.reason === "ambiguous-route-label" && routing.matches.length >= 2)
+            || (routing.reason === "route-changed" && routing.matches.length === 1
+              && (routing.matches[0].label !== routing.expectedLabel
+                || routing.matches[0].repoEntry !== routing.expectedRepoEntry)));
+      if (!validReason) return childOutcomeInvalid("invalid-routing-classification");
       return {
         kind: "repo-routing-deferred",
-        code: routeExitCode === 3 ? "REPO_ROUTE_CHANGED" : "REPO_ROUTE_UNREADABLE",
+        code: value.routeExitCode === 3 ? "REPO_ROUTE_CHANGED" : "REPO_ROUTE_UNREADABLE",
         exitCode: 0,
         signal: null,
         path: pick.runtimeExecutable || null,
         cwd: pick.anchorPath || null,
-        routeExitCode,
-        routing: value.routing || null,
+        routeExitCode: value.routeExitCode,
+        routing,
       };
     }
-    const dependencyExitCode = Number(value.dependencyExitCode);
-    if (![2, 3].includes(dependencyExitCode)) return null;
+    if (!hasExactKeys(value, ["version", "kind", "issueIdentifier", "dependencyExitCode"])
+        && !hasExactKeys(value, ["version", "kind", "issueIdentifier", "dependencyExitCode", "dependency"])) {
+      return childOutcomeInvalid("invalid-dependency-envelope");
+    }
+    if (!Number.isInteger(value.dependencyExitCode) || ![2, 3].includes(value.dependencyExitCode)) {
+      return childOutcomeInvalid("invalid-dependency-exit");
+    }
+    const dependency = normalizedChildDependency(value.dependency);
+    if (dependency === undefined
+        || (dependency && ((value.dependencyExitCode === 2 && !["unreadable", "incomplete-relations"].includes(dependency.reason))
+          || (value.dependencyExitCode === 3 && (dependency.reason !== "blocked" || dependency.blockers.length === 0))
+          || (dependency.reason === "unreadable" && dependency.blockers.length !== 0)))) {
+      return childOutcomeInvalid("invalid-dependency");
+    }
     return {
       kind: "dependency-deferred",
-      code: dependencyExitCode === 3 ? "DEPENDENCY_BLOCKED" : "DEPENDENCY_UNREADABLE",
+      code: value.dependencyExitCode === 3 ? "DEPENDENCY_BLOCKED" : "DEPENDENCY_UNREADABLE",
       exitCode: 0,
       signal: null,
       path: pick.runtimeExecutable || null,
       cwd: pick.anchorPath || null,
-      dependencyExitCode,
-      dependency: value.dependency || null,
+      dependencyExitCode: value.dependencyExitCode,
+      dependency,
     };
   } catch {
-    return null;
+    return childOutcomeInvalid("invalid-outcome");
+  }
+}
+
+function childDeferredOutcomeForPick(pick = {}) {
+  if (!pick.outcomePath) return null;
+  let present;
+  try {
+    present = fs.existsSync(pick.outcomePath);
+  } catch {
+    return childOutcomeInvalid("outcome-path-unreadable");
+  }
+  if (!present) return null;
+  let fd = null;
+  try {
+    fd = fs.openSync(pick.outcomePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > AUTO_SWEEP_OUTCOME_MAX_BYTES) {
+      return childOutcomeInvalid("outcome-too-large");
+    }
+    const buffer = Buffer.allocUnsafe(AUTO_SWEEP_OUTCOME_MAX_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = fs.readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+    }
+    if (length > AUTO_SWEEP_OUTCOME_MAX_BYTES) return childOutcomeInvalid("outcome-too-large");
+    const raw = buffer.subarray(0, length);
+    if (!isUtf8(raw)) return childOutcomeInvalid("outcome-not-utf8");
+    return validateChildDeferredOutcome(JSON.parse(raw.toString("utf8")), pick);
+  } catch {
+    return childOutcomeInvalid("outcome-unreadable");
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
   }
 }
 
