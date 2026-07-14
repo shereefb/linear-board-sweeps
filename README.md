@@ -148,6 +148,7 @@ Recent and planned launcher/workflow changes:
 - `COD-113`: same-repo capacity refill so a Dev slot freed by a child moving to QA can be backfilled before the whole batch or next timer tick.
 - `COD-116`: managed workspace clones, exact dirty-path diagnostics, artifact isolation, and a `doctor` command so scheduled sweeps are no longer coupled to dirty human checkouts.
 - `COD-291` (planned): bind scheduled `repo-status` evidence to launcher-owned context, reject every invalid present child-outcome file, scrub inherited card-scoped sweep identity, and require workspace/card/stage-specific route failure and recovery identity with fail-closed legacy aliasing.
+- `COD-295` (planned): correct verification-contract parsing for canonical correctness-before-verification sections, then validate each final Spec/plan pair through Node with the launcher-source helper before artifact landing or a Dev move; a capability/restart boundary activates the launcher consumer before the producer skill, every unproven result remains in Spec, scheduled terminal machine failures use an issue-bound launcher outcome instead of relying on agent process exit, and Dev retains its independent gate plus honest missing-design evidence.
 
 ## Requirements
 
