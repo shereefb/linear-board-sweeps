@@ -339,9 +339,17 @@ boundary, or secret-bearing payload is introduced.
 | Active legacy evaluation sees no contributor traffic | Return `inconclusive-evidence`, not improvement. |
 | Active legacy evaluation sees corrected real failures | Count all owned corrected failures under the compatibility rule. |
 
+## Schema & architecture impact
+
+No storage schema, database, public API, service, or deploy target changes.
+Implementation stays in the existing launcher and Factory Learning modules.
+README must describe the trusted launcher-evidence boundary as planned work for
+COD-288, then remove the planned qualifier when Dev ships the behavior; S7 and
+V9 own that canonical-doc and release proof.
+
 ## Scope closure
 
-Scope closure: `scope-closure/v1` — required — COD-288 changes an automated
+Scope closure: scope-closure/v1 — required — COD-288 changes an automated
 evidence trust boundary, detector identity, acceptance evaluation, and release
 documentation.
 
@@ -350,7 +358,7 @@ documentation.
 | ID | Surface and evidence | Required outcome | Owning repo/module | Closure proof |
 | --- | --- | --- | --- | --- |
 | `S1` | Child event projection in `scripts/learning.mjs:327-361` | Terminal failures no longer assert dispatch failure; other child projections remain unchanged. | `linear-board-sweeps` / learning snapshot | Focused projection tests with success + failed terminal fixtures. |
-| `S2` | Launcher classification and exclusions in `scripts/linear-watch.mjs:6259-6278,6899-6931` | Every admitted start/I/O/exit/signal failure produces one route/runtime/outcome-keyed occurrence independent of Todo throttling; routing/interruption and existing exclusions produce none; operational Failure Todo identity/behavior is unchanged. | `linear-board-sweeps` / watcher | Pure-key and real-builder watcher tests for bounded card identity, same/different issues, start, I/O, exit, signal, routing, capacity, provider, dependency, interruption, empty Todo decisions, append throw, multi-repo/route-gap, and secret persistence paths. |
+| `S2` | Launcher outcome sources and reconciliation in `scripts/linear-watch.mjs:6259-6278,6281-6312,6639-6646,6866-6931` | Every admitted start/I/O/exit/signal failure produces one route/runtime/outcome-keyed occurrence independent of Todo throttling; routing/interruption and existing exclusions produce none; operational Failure Todo identity/behavior is unchanged. | `linear-board-sweeps` / watcher | Upstream source tests separately prove classifier, I/O, child deferral, capacity, and provider outcomes; production-shaped reconciled-result decision tests prove learning admission; real-builder, append-throw, local-failure redaction, route-gap, and Todo-independent persistence tests prove the integration. |
 | `S3` | Run/evidence normalization and projection in `scripts/learning.mjs:179-238,313-391` | Failure evidence stays typed, sanitized, bounded, route-trusted, and cause-keyed; successful delivery exposure is read from existing normalized run records without consuming observation capacity. | `linear-board-sweeps` / learning snapshot | Snapshot/evaluator tests reject malformed evidence, separate fingerprints, and admit exposure only for trusted successful delivery runs. |
 | `S4` | Detector table and qualifier in `scripts/learning.mjs:805-941` | Only repeated-dispatch-failure defaults to v2; same-cause thresholds qualify and different causes do not. | `linear-board-sweeps` / detectors | Detector-version and threshold fixtures. |
 | `S5` | Outcome evaluator in `scripts/learning.mjs:1368-1455` | Legacy COD-288 key sees corrected owned failures; zero requires per-contributor eligible exposure; new v2 keys stay cause-specific. | `linear-board-sweeps` / evaluation | Outcome fixtures for failure, zero+exposure, partial/no exposure, incomplete coverage, and unrelated detectors. |
@@ -366,31 +374,54 @@ SafeTaper sibling. The initial draft omitted a trusted positive exposure source
 for proving a zero-failure window. The pre-review self-check emitted one
 `review/scope-gap` event, added explicit trusted-run exposure, and reconciled
 `S2`, `S3`, `S5`, `V2`, `V3`, `V6`, and `V7` before formal review.
+The repair sweep found that the committed artifact also omitted the required
+schema/architecture summary and canonical planned marker. It emitted a second
+`review/scope-gap`, added the summary and README marker through existing S7/V9,
+and introduced no new implementation surface.
+
+## Correctness contract
+
+Correctness contract: correctness-contract/v1 — required — COD-288 changes the
+authority, identity, qualification, compatibility, and recovery rules for
+automated Factory Learning evidence.
+
+| ID | Trigger / transition | Required invariant | Forbidden outcome | Recovery / ownership | Verification |
+| --- | --- | --- | --- | --- | --- |
+| C1 | A child emits `terminal/failed` while the launcher exits successfully. | Child terminal evidence remains workflow audit only and cannot assert launcher failure. | A healthy launcher run produces a dispatch-failure observation or finding. | The parent launcher owns dispatch outcome authority; existing child audit retention remains unchanged. | V1 |
+| C2 | The launcher classifies a start, I/O, exit, or signal failure or a healthy delivery run. | Failure evidence and exposure use the trusted dispatch route, runtime, outcome, and bounded sanitized identity exactly once per result/key. | Card/worktree/prose identity controls clustering, a Todo throttle suppresses evidence, or a healthy run consumes observation capacity. | Existing bounded launcher evidence and normalized run records own persistence; append failure remains isolated from claim/retry/Todo handling. | V2 |
+| C3 | Capacity/provider exhaustion, dependency/routing deferral, interruption, maintenance, or learning-only work is reconciled. | Existing operational handling remains unchanged while the result supplies neither failure evidence nor healthy exposure. | An excluded outcome qualifies reliability evidence or proves a zero-failure window. | Parent-side closed admission and exposure predicates fail closed; existing retry/defer owners remain authoritative. | V3 |
+| C4 | Repeated corrected failures are qualified. | Only equal cause-specific v2 keys aggregate at the unchanged threshold. | Different causes combine or the existing count/window threshold changes. | The exact semantic key and existing qualifier own aggregation. | V4 |
+| C5 | Detector definitions are resolved after the contract change. | Only repeated-dispatch-failure defaults to v2; every unrelated detector stays v1 and explicit overrides still win. | Detector provenance drifts globally, child event schema version changes, or config override stops working. | The existing detector registry owns version resolution. | V5 |
+| C6 | The legacy COD-288 `terminal:failed` evaluation runs after v2 ships. | Corrected owned failures count, while zero without complete contributor exposure remains inconclusive. | The vanished legacy key alone reports improvement or a missing contributor hides an observed failure. | The exact legacy compatibility rule is measurement-only and the evaluator owns the exposure floor. | V6 |
+| C7 | Every declared contributor has eligible post-completion exposure and no corrected failure exists. | The target may become `verified-improvement` only from complete trusted exposure. | Deferred, launcher, learning-only, foreign-route, pre-completion, or non-zero runs satisfy the floor. | Snapshot coverage and contributor ownership remain fail-closed. | V7 |
+| C8 | A corrected v2 cause creates or recurs a Factory Learning card. | Legacy COD-288 and v2 cause roots stay separate; same-root v2 recurrence, generation cap, QA, Signoff, and human Ship gates remain unchanged. | A v2 cause recurs COD-288, bypasses generation limits, or fast-path ships a generated card. | Existing exact-root lifecycle and board workflow own recurrence and delivery. | V8 |
 
 ## Verification contract
 
-Verification contract: `verification-contract/v1` — required — the detector
+Verification contract: verification-contract/v1 — required — the detector
 trust boundary and legacy outcome compatibility need executable proof, including
 negative paths that show false evidence cannot enter the metric.
 
-| ID | Risk / acceptance behavior | Test level and proof | Expected signal | Scope row |
-| --- | --- | --- | --- | --- |
-| `V1` | A successful run with child `terminal/failed` must not count | Unit/snapshot fixture in `tests/learning.test.mjs` | No `dispatch-failure` observation or finding | `S1` |
-| `V2` | Each successful delivery run or admitted launcher start/I/O/exit/signal failure supplies trusted exposure once | Pure-key and watcher fixtures in `tests/linear-watch.test.mjs` plus production-shaped snapshot/evaluator fixtures that omit `outcome.success` | Existing kind-success/exit-zero run satisfies exposure without a new observation; failure is learning-keyed; same cause across issue/worktree paths matches while typed cause changes differ | `S2`,`S3` |
-| `V3` | Capacity, provider exhaustion, dependency/routing deferral, interruption, launcher maintenance, and learning-only runs cannot enter failure evidence or prove healthy exposure | Table-driven watcher/snapshot/evaluator fixtures | Existing operational handling may run, but no excluded result appends learning failure evidence or satisfies contributor exposure | `S2`,`S3` |
-| `V4` | Same cause qualifies at existing threshold; different causes do not aggregate | Detector fixture | One v2 finding only for repeated same key | `S3`,`S4` |
-| `V5` | Detector provenance changes only for this detector | Detector registry fixture | dispatch detector `v2`; all unrelated detectors `v1` | `S4` |
-| `V6` | Legacy COD-288 evaluation cannot go green from a vanished key | Outcome fixtures | Corrected failures count; zero without all contributor exposure is inconclusive | `S5` |
-| `V7` | Complete contributor exposure with zero corrected failures can verify the target | Outcome fixture with eligible post-completion runs | `verified-improvement` at count zero | `S5` |
-| `V8` | Legacy/v2 lineage separation and existing v2 recurrence/safety gates survive | Existing + focused root/mutation regression tests | Legacy COD-288 does not recur from a v2 cause; same-cause v2 recurrence/dedupe/generation stays unchanged; factory cards remain human-Ship-only | `S6` |
-| `V9` | Release artifact is distributed by the existing kit path | Full Node suite, README/CHANGELOG/VERSION inspection, clean diff | All tests pass; one-repo release docs complete | `S7` |
+### Verification obligations
+
+| ID | Source requirement / C ID(s) | Behavior / risk | Failure this proof must catch | Required proof | Acceptance |
+| --- | --- | --- | --- | --- | --- |
+| V1 | C1; S1 | A successful run with child `terminal/failed` must not count. | The old child projection still creates a dispatch observation/finding. | Unit/snapshot fixture in `tests/learning.test.mjs` with success plus failed terminal. | No `dispatch-failure` observation or finding. |
+| V2 | C2; S2, S3 | Each healthy delivery run or admitted launcher start/I/O/exit/signal failure supplies trusted exposure once. | Missing `outcome.success` rejects production runs; card/path/prose splits a cause; Todo throttling suppresses persistence; an append error alters claim/retry flow or leaks environment values through the local tick failure. | Separate upstream outcome-source fixtures, production-shaped reconciled-result decisions, pure-key, real-builder, captured-JSONL, Todo-independent append, append-throw/current-tick redaction, and snapshot/evaluator fixtures. | Kind-success/exit-zero run satisfies exposure without a new observation; same typed cause matches across issue/worktree paths; evidence and local failure persistence are bounded, env-aware sanitized, and isolated. |
+| V3 | C3; S2, S3 | Excluded operational outcomes cannot enter failure evidence or prove healthy exposure. | Capacity/provider/dependency/routing/interruption/maintenance/learning-only work affects the metric. | Table-driven watcher/snapshot/evaluator fixtures for every exclusion and ordinary operational controls. | Existing operational behavior remains, with no learning failure append and no contributor exposure. |
+| V4 | C4; S3, S4 | Same cause qualifies at the existing threshold; different causes do not aggregate. | Two distinct keys qualify one finding or the original threshold changes. | Detector fixtures for equal and unequal cause keys inside the retained windows. | One v2 finding only for the repeated equal key; different keys remain separate. |
+| V5 | C5; S4 | Detector provenance changes only for repeated dispatch failure. | An unrelated detector defaults to v2 or config override stops working. | Detector registry fixture covering every definition and override. | Dispatch detector defaults `v2`; all unrelated detectors default `v1`; explicit override remains honored. |
+| V6 | C6; S5 | Legacy COD-288 evaluation cannot go green from a vanished key. | Corrected failures are missed or zero passes with incomplete contributor exposure. | Exact legacy-key outcome fixtures with failures, no exposure, partial exposure, incomplete coverage, and unrelated detector controls. | Corrected owned failures count; zero without all contributor exposure is `inconclusive-evidence`. |
+| V7 | C7; S5 | Complete contributor exposure with zero corrected failures can verify the target. | An ineligible or foreign run satisfies exposure, or complete eligible exposure remains inconclusive. | Production-shaped post-completion run matrix with one eligible run per contributor and all negative controls. | Only complete owned eligible exposure produces `verified-improvement` at count zero. |
+| V8 | C8; S6 | Legacy/v2 lineage separation and existing v2 recurrence/safety gates survive. | A v2 cause recurs the legacy root, loses same-root recurrence, exceeds the cap, or enters fast path. | Focused root/mutation/recurrence tests plus existing generated-card workflow assertions. | Legacy COD-288 remains measurement-only; same-cause v2 recurrence/dedupe/generation and human-Ship gates remain unchanged. |
+| V9 | S7 | The release artifact is distributed by the existing kit path. | Runtime behavior lands without canonical docs/version evidence or with an unrelated repo diff. | Focused suites, full Node suite, dry-run, README/CHANGELOG/VERSION inspection, and clean selective diff. | All gates pass; one-repo release docs are complete and no production deploy is introduced. |
 
 No invariant depends only on manual inspection. The implementation plan must name
 the exact red-to-green commands and preserve these IDs in task proofs.
 
 ## Performance declaration
 
-Performance contract: not required. The change appends at most one bounded
+Performance contract: performance-contract/v1 — not required — the change appends at most one bounded
 synthetic evidence record per admitted dispatch failure and reads healthy
 exposure from run records already traversed by the capped snapshot/evaluator. It
 adds no per-success record, hot-path polling, retries, fan-out, deadline,
@@ -434,6 +465,9 @@ review before plan creation, and an engineering plan pass afterward.
 | Focused security (`data` lens) | Passed | No reportable vulnerability. Confirmed parent-only provenance, configured-route fail-closed behavior, hashed/sanitized identity, bounded storage, and no-traffic evaluation integrity. Local report: `.gstack/security-reports/20260714-103251.json` (ignored, not shipped). This focused AI-assisted review is not a substitute for a professional security audit. |
 | Tier 2 engineering spec pass | Passed after correction | Replaced per-success persisted evidence with existing run-record exposure; separated systemic learning identity from card-specific Failure Todo identity; kept exposure outside the observation budget; used production-populated outcome kind instead of optional success. |
 | Independent adversarial spec pass | Passed after follow-up | Required explicit measurement-only legacy lineage, Todo-independent append error isolation, learning-only routing/interruption exclusions, and dispatch-time repo-route ownership. Follow-up re-read found no unresolved blockers. |
+| Verification-contract repair pass | Passed after correction | Added exact current contract declarations, C1-C8 invariants, V1-V9 obligation schema, one-to-one C-to-V sourcing, and the shared post-boundary decision; the validator reports no diagnostics. |
+| Canonical architecture self-check | Passed after correction | Added the required Schema & architecture impact summary and planned COD-288 README marker through existing S7/V9; no schema, service, API, or deploy target was added. |
+| Independent repair plan review | Passed after two follow-ups | Corrected upstream outcome-source ownership, two-way contract ancestry, env-aware local-failure redaction proof, and the final reuse/file map. No unresolved decision or new material surface remains. |
 
 The configured preferred reviewer runtime was not available through the
 collaboration interface; the independent pass used a fresh-context read-only
@@ -480,18 +514,12 @@ does not pause Dev, QA, Signoff, or attended Ship.
 
 ## Versioned contract boundary
 
-This artifact is created after the installed sweep marker and therefore must use
-current `scope-closure/v1` and `verification-contract/v1` requirements. The plan
-must verify lineage with:
-
-```bash
-git log --diff-filter=A --format=%H -- docs/superpowers/specs/2026-07-14-COD-288-trusted-dispatch-failure-evidence-design.md
-git log --diff-filter=A --format=%H -- .claude/skills/.sweep-version
-git merge-base --is-ancestor <artifact-commit> <marker-commit>
-```
-
-For this new descendant artifact the ancestry check is expected to exit 1,
-proving it is post-boundary. Missing or incomparable commits fail closed.
+The implementation plan contains the single shared
+`Versioned contract boundary: versioned-contract-boundary/v1` decision for
+scope closure, correctness, verification, and performance. It records this
+specification's first-add commit, the installed marker's first-add commit, and
+their ancestry result. This post-boundary artifact therefore uses every current
+contract above; missing or incomparable history fails closed.
 
 ## Open questions
 

@@ -62,11 +62,62 @@ JSONL learning evidence, Markdown operator docs, git-based kit updater.
 - **Artifact scope:** this design and plan are docs-only Spec artifacts and do not
   add implementation files beyond the seven above.
 
+## Versioned contract boundary decision
+
+`Versioned contract boundary: versioned-contract-boundary/v1`
+
+This is the single shared decision for scope closure, correctness, verification,
+and performance. The reusable artifact is
+`docs/superpowers/specs/2026-07-14-COD-288-trusted-dispatch-failure-evidence-design.md`.
+It was first introduced in commit
+`2a009ba039cd2366067997056e1098f9dd2d27b2`; the installed sweep marker was
+first introduced in commit `bd467095a1ddb2451aa5271bbef9e876491a5bde`.
+
+```bash
+git log --diff-filter=A --format='%H' -- \
+  docs/superpowers/specs/2026-07-14-COD-288-trusted-dispatch-failure-evidence-design.md
+# 2a009ba039cd2366067997056e1098f9dd2d27b2
+
+git log --diff-filter=A --format='%H' -- .claude/skills/.sweep-version
+# bd467095a1ddb2451aa5271bbef9e876491a5bde
+
+git merge-base --is-ancestor \
+  2a009ba039cd2366067997056e1098f9dd2d27b2 \
+  bd467095a1ddb2451aa5271bbef9e876491a5bde
+# exit 1: the artifact is not pre-boundary
+
+git merge-base --is-ancestor \
+  bd467095a1ddb2451aa5271bbef9e876491a5bde \
+  2a009ba039cd2366067997056e1098f9dd2d27b2
+# exit 0: the marker is an ancestor of the artifact
+```
+
+The histories are comparable and the artifact was introduced after the marker.
+Current contracts apply; no legacy gate is allowed. Missing or incomparable
+history fails closed.
+
+## Contract declarations
+
+- Scope closure: scope-closure/v1 — required — automated evidence admission,
+  compatibility evaluation, failure behavior, release docs, and human-approved
+  distribution change; `S1..S7` map every material surface below.
+- Correctness contract: correctness-contract/v1 — required — authority,
+  identity, exclusion, qualification, provenance, evaluation, and recurrence
+  invariants `C1..C8` are defined in the design and sourced exactly once by
+  `V1..V8`.
+- Verification contract: verification-contract/v1 — required — behavior,
+  persistence, error handling, compatibility, rollout, and acceptance outcomes
+  change; `V1..V9` map to executable proofs below.
+- Performance contract: performance-contract/v1 — not required — the change
+  adds at most one bounded append per admitted failure and one-pass work over
+  already capped snapshot arrays, with no success-path persistence, new I/O
+  fan-out, retry, polling, or asymptotic growth.
+
 ## What already exists
 
 | Existing mechanism | Reuse decision |
 | --- | --- |
-| `classifyDispatchOutcome` in `scripts/linear-watch.mjs:6259-6278` | Reuse typed start, I/O, exit, signal, success, and interruption outcomes. |
+| Outcome producers in `scripts/linear-watch.mjs:6259-6278,6281-6312,6639-6646,6866-6929` | Reuse the process classifier for start/exit/signal/success/interruption, the direct dispatch I/O result, child deferral parser, and reconciliation-owned capacity/provider exclusions without moving ownership between them. |
 | Failure construction in `scripts/linear-watch.mjs:6899-6931` | Leave operational Failure Todo inputs unchanged; add a narrower learning decision afterward. |
 | Launcher evidence helpers in `scripts/linear-watch.mjs:6347-6436` | Reuse bounded JSONL persistence with the original dispatch card and repo route. |
 | Event/evidence projection in `scripts/learning.mjs:210-238,327-391` | Add one launcher evidence type and remove only the terminal-to-dispatch projection. |
@@ -100,17 +151,17 @@ JSONL learning evidence, Markdown operator docs, git-based kit updater.
 
 ## Verification traceability
 
-| Verification ID | Task | Executable proof |
-| --- | --- | --- |
-| `V1` | Task 1 | Terminal failed plus successful launcher run yields no dispatch observation. |
-| `V2` | Tasks 2, 3 | Key/admission tests and production-shaped run without `outcome.success`. |
-| `V3` | Tasks 2, 3 | Capacity/provider/dependency/routing/interruption/maintenance/learning negatives. |
-| `V4` | Task 1 | Same-key threshold and different-key non-aggregation tests. |
-| `V5` | Task 1 | Detector registry version assertions. |
-| `V6` | Task 3 | Legacy corrected failure, incomplete coverage, zero/partial exposure tests. |
-| `V7` | Task 3 | Every contributor exposed and corrected count zero verifies improvement. |
-| `V8` | Task 3 | Legacy root does not recur from v2; same-root v2 recurrence remains capped. |
-| `V9` | Task 4 | Focused suites, full suite, dry-run, docs/version/diff inspection. |
+| ID | Implementing task(s) | Test layer and file | RED signal | GREEN command / assertion | QA evidence | Residual gap |
+| --- | --- | --- | --- | --- | --- | --- |
+| V1 | Task 1 | Unit/snapshot, `tests/learning.test.mjs` | Successful launcher run plus child `terminal/failed` still creates a dispatch observation/finding. | Run the Task 1 focused learning command; named fixture asserts zero dispatch observations/findings. | Tested SHA, named fixture, and zero-observation/finding result. | Child terminal audit remains intentionally available to unrelated productivity paths. |
+| V2 | Tasks 2, 3 | Pure/integration/JSONL/current-tick, `tests/linear-watch.test.mjs` and `tests/learning.test.mjs` | An upstream outcome source is tested through the wrong classifier, key changes with card/path/prose, Todo throttling suppresses append, secret bytes persist in evidence or local failure state, append throw disrupts flow, or production run without `outcome.success` lacks exposure. | Run the Task 2 watcher command and Task 3 evaluator command; separate classifier/I/O/deferral/capacity/provider source fixtures, production-shaped admission decisions, key/real-builder/captured-append/current-tick redaction, and production-shaped exposure assertions pass. | Upstream-source/admission matrix, key equality/difference matrix, JSONL and current-tick captured-byte absence, append-continuation result, and production-shaped exposure fixture. | A local append failure can lose one occurrence but must stay red and cannot retain a claim. |
+| V3 | Tasks 2, 3 | Table-driven integration, watcher and learning tests | Any capacity/provider/dependency/routing/interruption/maintenance/learning-only case appends failure evidence or proves healthy exposure. | Run the Task 2 watcher command and Task 3 evaluator command; every exclusion and ordinary control assertion passes. | Exclusion table with operational control result and zero learning admission/exposure for every row. | Future outcome kinds must be added to the closed admission table before use. |
+| V4 | Task 1 | Detector unit, `tests/learning.test.mjs` | Different keys aggregate or the existing same-key threshold changes. | Run the Task 1 focused learning command; equal-key fixture qualifies and unequal-key fixture does not. | Qualified-finding identities and counts for equal/unequal fixtures. | Retained-window caps can make evidence incomplete, which remains fail-closed. |
+| V5 | Task 1 | Registry unit, `tests/learning.test.mjs` | An unrelated detector defaults to v2 or explicit override fails. | Named detector registry assertions in the Task 1 focused command. | Complete detector-version table and override assertion at tested SHA. | None. |
+| V6 | Task 3 | Evaluator unit, `tests/learning.test.mjs` | Legacy corrected failures are missed or zero passes with no/partial exposure or incomplete coverage. | Run the Task 3 evaluator command; exact legacy fixture counts corrected failures and returns inconclusive for every zero-coverage gap. | Baseline/count/verdict table for failure, no exposure, partial exposure, and incomplete coverage. | A quiet contributor intentionally delays a zero verdict. |
+| V7 | Task 3 | Evaluator unit, `tests/learning.test.mjs` | Foreign, pre-completion, launcher, learning-only, deferred, signaled, or non-zero run satisfies exposure, or full eligible exposure stays inconclusive. | Run the Task 3 evaluator command; one production-shaped eligible run per contributor yields `verified-improvement`, every negative control does not. | Contributor-by-contributor exposure matrix and final zero verdict. | Real seven-day opportunity is observed only after Ship. |
+| V8 | Task 3 | Root/mutation/recurrence unit, `tests/learning.test.mjs` | A fresh v2 cause recurs legacy COD-288, fails generation-zero creation, loses same-root recurrence, exceeds cap, or becomes fast-path eligible. | Run the Task 3 evaluator command plus generated-card workflow assertions; legacy and v2 roots remain separate and same-root v2 lifecycle passes. | Root IDs, generation/recurrence decisions, cap result, labels, and destination state. | End-to-end human Ship remains an attended QA/owner proof. |
+| V9 | Task 4 | Repository regression and operator inspection | Focused/full suite, dry-run, docs/version, two-way boundary ancestry, or selective diff is red/incomplete. | Run Task 4 focused commands, prove artifact-to-marker exit 1 and marker-to-artifact exit 0, run `node --test tests/*.test.mjs`, `node scripts/linear-watch.mjs learning-run --dry-run`, version uniqueness/equality checks, and `git diff --check`. | Tested SHA, both ancestry results, suite counts, dry-run summary, version values, and selective diff stat attached to COD-288. | Updater timing and any external release remain attended owner work. |
 
 ## Dependency graph
 
@@ -215,7 +266,7 @@ git commit -m "fix(COD-288): trust launcher dispatch evidence"
 **Files:**
 
 - Modify: `tests/linear-watch.test.mjs:5517-5560,6611-6620,7310-7435`
-- Modify: `scripts/linear-watch.mjs:1954-1968,6347-6436,6835-6971`
+- Modify: `scripts/linear-watch.mjs:1954-1968,6347-6436,6835-6971,7139-7141`
 
 **Interfaces:** consumes reconciled result, operational FailureEvents, original
 dispatch `pick`, and final runtime; produces zero or one route-trusted append per
@@ -239,9 +290,19 @@ admitted/deduplicated learning key and a local failure on append error.
     Exercise `buildLauncherEvidenceRunRecord` itself so a missing
     `card.identifier` cannot hide behind a mocked append callback.
 
-Use table-driven `classifyDispatchOutcome` cases for `dispatch-io-error`,
-ENOENT/spawn error, exit 127, signal, interruption, routing, dependency, capacity,
-provider exhaustion, and success.
+Keep the source and policy boundaries explicit:
+
+- table-drive `classifyDispatchOutcome` only for ENOENT/spawn error, exit 127,
+  signal, interruption, and success;
+- prove `dispatch-io-error` through the `dispatchAsync` log-write-failure path;
+- prove routing and dependency through production-shaped child outcome files and
+  the existing deferral parser/integration;
+- prove capacity and final provider exhaustion through their existing
+  reconciliation classifiers; and
+- feed the resulting production-shaped reconciled results into
+  `dispatchLearningEvidenceDecision(...)` to prove the positive and negative
+  learning-admission table. Do not expand `classifyDispatchOutcome` to own
+  outcomes produced by these other boundaries.
 
 - [ ] **Step 2: Write failing persistence/error-isolation tests.** Prove:
 
@@ -252,8 +313,11 @@ provider exhaustion, and success.
      original routed repo entry, producing a trusted record rather than a gap;
   4. an unprovable route writes the route-gap record, which cannot become a
      trusted observation; and
-  5. an injected append throw records one local failure and resolves without
-     throwing, allowing subsequent claim/Todo/retry callbacks; and
+  5. an injected append error containing an arbitrary value from
+     `active.envValues` records one local failure, resolves without throwing,
+     allows subsequent claim/Todo/retry callbacks, and persists neither that
+     value nor a standard token-shaped value in current-tick/local-failure bytes;
+     and
   6. a captured real JSONL append receives an arbitrary value from
      `active.envValues`, a standard token-shaped value, local path, and raw
      failure message; none appears in persisted bytes. Only typed bounded reason
@@ -279,6 +343,11 @@ Expected: helpers/imports are absent and new assertions fail.
      typed reason codes and a generic summary processed with
      `sanitizeFailureMessage(summary, active.envValues)` before append; never
      copy raw FailureEvent message, logs, child prose, paths, or secrets.
+  6. Make local append-error persistence env-aware too: extend the local failure
+     construction/recording seam to accept the active workspace's `envValues`
+     and call `sanitizeFailureMessage(message, envValues)` before
+     `writeCurrentTick()`. Preserve existing callers by defaulting the new
+     argument to an empty list.
 
 - [ ] **Step 5: Integrate direct, exception-isolated persistence.** Immediately
   after operational `failures` are computed, call the new wrapper with:
@@ -290,9 +359,9 @@ repoEntry = result.pick.repoRoute.repoEntry, or configured default repo
 ```
 
 Never call through `reconcileFailureTodos` or the anchor-source fallback in
-`launcherEvidenceOptions`. Catch append errors, record a sanitized local
-`learning-evidence-append` failure, and continue existing claim release and Todo
-blocks without reordering/changing them.
+`launcherEvidenceOptions`. Catch append errors, record an env-aware sanitized
+local `learning-evidence-append` failure with `active.envValues`, and continue
+existing claim release and Todo blocks without reordering/changing them.
 
 - [ ] **Step 6: Run focused and neighboring watcher tests.**
 
@@ -460,12 +529,18 @@ do
   if git merge-base --is-ancestor "$ARTIFACT_COMMIT" "$MARKER_COMMIT"; then
     echo "FAIL: artifact predates current contract boundary" >&2
     exit 1
+  elif git merge-base --is-ancestor "$MARKER_COMMIT" "$ARTIFACT_COMMIT"; then
+    : # comparable and post-boundary
+  else
+    echo "FAIL: artifact and contract boundary histories are incomparable" >&2
+    exit 1
   fi
 done
 ```
 
-Expected: both artifacts are post-boundary; ancestry exits 1. Missing or
-incomparable commits fail closed.
+Expected: both artifacts reject the pre-boundary direction with exit 1 and prove
+the reverse marker-to-artifact direction with exit 0. Missing or incomparable
+commits fail closed.
 
 - [ ] **Step 6: Run focused and full verification.**
 
@@ -546,13 +621,98 @@ co-author trailer from examples.
 | Focused security (`data`) | Clear | Parent provenance, route trust, hashed/sanitized identity, bounds, no-traffic fail closed. |
 | Independent adversarial spec | Corrected, clear after follow-up | Fixed interruption/routing admission, append isolation, lineage, routed-repo ownership. |
 | Tier 2 engineering plan | Corrected, clear | Added env-aware pre-persistence sanitization, one-pass exposure indexing, bounded builder card identity, and real JSONL/real-builder proofs. Independent follow-up found no unresolved blocker. |
+| Verification-contract repair | Corrected, clear | Replaced legacy declarations/table shapes with current scope/correctness/verification/performance contracts, split qualification from detector provenance, and mapped C1-C8 exactly once to executable V1-V9 proofs. |
+| Canonical architecture self-check | Corrected, clear | Added the spec impact summary and README planned COD-288 marker through existing S7/V9; no new implementation task or runtime surface. |
+| Independent repair review | Corrected, clear after follow-up | Found wrong upstream classifier ownership in Task 2, one-way ancestry in Task 4, and missing env-aware local-failure redaction proof. Follow-up confirmed the substantive fixes, then identified and cleared two residual file-map/reuse wording gaps. |
+
+### Verification repair review decisions
+
+#### D4: Prove each outcome at its real producer
+
+ELI10: one helper knows how a process exited, but other helpers produce log I/O,
+deferral, capacity, and provider outcomes. Testing all of them through the exit
+helper would make the plan green against behavior that production never uses.
+
+**A. Test real producers, then the reconciled admission policy (recommended),
+Completeness: 10/10.** Keep `classifyDispatchOutcome` scoped to its closed
+process outcomes, add separate upstream source fixtures, and table-drive
+`dispatchLearningEvidenceDecision` with the resulting production-shaped facts.
+
+**B. Expand or mock the exit classifier, Completeness: 5/10.** This is shorter
+on paper but changes ownership or tests synthetic paths and can miss the real
+integration boundaries.
+
+**Decision:** A. It matches actual code ownership and keeps the planned runtime
+edit surgical.
+
+#### D5: Prove post-boundary history in both directions
+
+ELI10: “A is not older than B” does not prove B is older than A; the two commits
+could live on unrelated branches. Delivery must distinguish a real descendant
+from incomparable history.
+
+**A. Require reverse marker ancestry (recommended), Completeness: 10/10.** Fail
+when artifact-to-marker ancestry is true, proceed only when marker-to-artifact
+ancestry is true, and fail every other result.
+
+**B. Treat the first exit 1 as post-boundary, Completeness: 4/10.** This accepts
+divergent history despite the declared fail-closed contract.
+
+**Decision:** A. The implementation task now repeats the shared decision's
+two-way proof exactly.
+
+#### D6: Redact both evidence and local failure state
+
+ELI10: when the evidence append itself breaks, the launcher writes a local
+failure record. Redacting only the rejected evidence file still leaves a second
+place where an environment secret could be stored.
+
+**A. Pass active env values through local failure sanitization (recommended),
+Completeness: 10/10.** Test arbitrary and token-shaped values against both the
+captured JSONL bytes and persisted current-tick/local-failure bytes while also
+proving continuation.
+
+**B. Redact only learning JSONL, Completeness: 5/10.** This covers the healthy
+append path but leaves the error-reporting path under-specified.
+
+**Decision:** A. The same secret boundary now covers success and append-error
+persistence without changing unrelated local-failure callers.
 
 Preferred Claude review was unavailable through the collaboration interface; the
 independent pass used a fresh-context read-only reviewer subagent. All material
 findings were emitted as structured review evidence. The completed engineering
 plan pass and independent follow-up leave no unresolved blocker.
 
+### Engineering repair completion summary
+
+- **Step 0 scope challenge:** accepted as-is; seven implementation/release
+  files, zero new module/service/dependency, and one configured repo.
+- **Architecture:** one outcome-source ownership finding and one ancestry
+  finding, both corrected.
+- **Code quality/error handling:** one env-aware local-failure redaction finding,
+  corrected without changing unrelated callers.
+- **Tests:** existing coverage diagram retained; C1-C8 source exactly one V row;
+  V1-V9 map to named RED/GREEN/QA evidence with no validator diagnostic.
+- **Performance:** no material surface; the not-required decision remains clear.
+- **NOT in scope / existing mechanisms:** both sections remain explicit and
+  accurate; no TODO.md exists and the review exposed no separate follow-up.
+- **Failure modes:** zero silent untested critical gaps after correction.
+- **Outside voice:** independent Codex reviewer ran with two focused follow-ups;
+  configured Claude reviewer dispatch was unavailable, so no cross-model
+  agreement is claimed.
+- **Parallelization:** sequential implementation remains correct because Tasks
+  1-3 share learning/watcher modules; release verification follows them.
+- **Lake score:** 3/3 review decisions chose the complete 10/10 option.
+
 ## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+| --- | --- | --- | ---: | --- | --- |
+| CEO Review | `/plan-ceo-review` | Scope and strategy | 0 | SKIPPED | Deliberately outside the Spec-sweep pipeline for this bounded reliability fix. |
+| Codex Review | independent reviewer subagent | Adversarial premise and proof trace | 1 + 2 follow-ups | CLEAR | Corrected three material plan findings and two residual reuse/file-map wording gaps. |
+| Eng Review | `/plan-eng-review` | Architecture and tests | original Tier 2 + repair pass | CLEAR | Current contracts, outcome producers, failure redaction, two-way ancestry, and V1-V9 traceability are explicit. |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | No UI, interaction, accessibility, or responsive surface. |
+| DX Review | `/plan-devex-review` | Public developer ergonomics | 0 | SKIPPED | No public API, CLI, SDK, compatibility, or adoption-flow change. |
 
 **Review target:** COD-288 Tier 2 implementation plan.
 
@@ -574,7 +734,8 @@ delivery-sweep set prevents drift, and exposure is indexed in one bounded pass.
 **Tests:** Clear. `V1..V9` cover every admission path, production run shape,
 real builder routing, Todo throttle independence, append continuation, captured
 JSONL secret absence, contributor exposure, lineage, release docs, dry-run, and
-the full suite.
+the full suite. The current contract validator reports V1-V9 with no diagnostics,
+and the repository suite passes 673/673.
 
 **Performance:** Clear. Only admitted failures append. Healthy exposure reads
 existing capped run records, consumes no observation slots, and uses a one-pass
@@ -582,6 +743,10 @@ contributor index. No benchmark or specialized performance lens is required.
 
 **Decision audit:** D1 trusted launcher authority, D2 migration-safe legacy
 measurement, and D3 narrow terminal scope were auto-selected under the unattended
-spec-sweep contract. No user-only decision remains.
+spec-sweep contract. D4 real outcome producers, D5 two-way ancestry, and D6
+env-aware local-failure redaction were also auto-selected at Completeness 10/10.
+No user-only decision remains.
+
+**VERDICT:** TIER 2 SPEC + PLAN ENG + INDEPENDENT + SECURITY CLEARED — ready for Dev.
 
 NO UNRESOLVED DECISIONS
